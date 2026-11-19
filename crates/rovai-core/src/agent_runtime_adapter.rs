@@ -3545,7 +3545,7 @@ fn zcode_permission_options() -> Vec<PermissionOptionDescriptor> {
 /// working directory; `bash`/`write`/`edit` and every undeclared extension/MCP tool are refused.
 /// `workspace_read_write` keeps the same workspace boundary and adds Pi's other two native file tools
 /// `write`/`edit`; `bash` and every extension/MCP tool stay refused. `workspace_workflow` is the same
-/// file boundary plus exactly one managed Core business tool (`rovai_loom`) that reaches only the eight
+/// file boundary plus exactly one managed Core business tool (`rovai_loom`) that reaches only the nine
 /// `loom.*` operations Core already ships — never `bash`, never an arbitrary CLI or MCP server.
 fn pi_permission_options() -> Vec<PermissionOptionDescriptor> {
     vec![PermissionOptionDescriptor {

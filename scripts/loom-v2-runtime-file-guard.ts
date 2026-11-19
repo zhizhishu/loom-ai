@@ -45,12 +45,13 @@ const GUARD_SCHEMA = 'loom.runtime.file-guard.v1'
 const GUARD_TOOLS = Object.freeze(['read', 'write', 'edit'])
 
 // The one managed Core business tool the explicitly chosen `workspace_workflow` policy adds. It is a
-// typed bridge to the eight `loom.*` operations Core already ships — never `bash`, never an arbitrary
-// command, never MCP. This guard stays authoritative for it: the operation must be one of the eight,
+// typed bridge to the nine `loom.*` operations Core already ships — never `bash`, never an arbitrary
+// command, never MCP. This guard stays authoritative for it: the operation must be one of the nine,
 // and a `loom.evidence` path goes through the SAME `read` path policy as the native tool.
 const LOOM_TOOL_NAME = 'rovai_loom'
 const LOOM_OPERATIONS = Object.freeze([
   'loom.status', 'loom.plan', 'loom.release', 'loom.claim',
+  'loom.claim_heartbeat',
   'loom.evidence', 'loom.submit', 'loom.inspect', 'loom.stage-review',
 ])
 // P0 step 3: the tools that MUTATE the workspace. When the grant says `requiresClaim`, every one of

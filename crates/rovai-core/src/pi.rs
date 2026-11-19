@@ -1094,13 +1094,13 @@ mod managed_workflow_source_tests {
     use super::*;
 
     #[test]
-    fn workflow_tool_sources_agree_on_one_tool_name_and_the_eight_operations() {
+    fn workflow_tool_sources_agree_on_one_tool_name_and_the_nine_operations() {
         // One fixture owns the Node seam; its contents must remain the actual Core schemas.
         let fixture: Value = serde_json::from_str(include_str!(
             "../../../scripts/fixtures/pi-workflow/core-input-contract.json"
         )).unwrap();
         assert_eq!(managed_workflow_contract(), fixture);
-        assert_eq!(fixture["operations"].as_array().unwrap().len(), 8);
+        assert_eq!(fixture["operations"].as_array().unwrap().len(), 9);
         // The name and the operation set live in three places that MUST agree: the Rust contract
         // (file_grant.rs / builtin_tool_transport.rs), the managed Host extension that registers the
         // tool, and the shared guard that re-checks every call. A drift here is a silent policy hole,

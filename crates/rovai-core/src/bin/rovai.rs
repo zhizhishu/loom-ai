@@ -178,7 +178,7 @@ async fn run() -> Result<u8> {
         }
         _ => bail!("invalid Rovai command; run `rovai --help`"),
     };
-    // Only the existing eight-operation managed bridge asks for a machine receipt. This marker
+    // Only the existing nine-operation managed bridge asks for a machine receipt. This marker
     // carries request identity, not authority; authentication and input validation stay unchanged.
     let managed_workflow_receipt = managed_workflow_request_id(
         &operation,
@@ -2215,7 +2215,7 @@ fn invocation_request_id(operation: &str, input: &Value) -> Result<String> {
 /// environment variable, never through the payload: a retry of the same provider call inside the same
 /// Run must replay in Core instead of executing the operation twice.
 ///
-/// Only the eight `loom.*` operations accept it. Every other operation keeps its previous behaviour,
+/// Only the nine `loom.*` operations accept it. Every other operation keeps its previous behaviour,
 /// and a malformed value is an error rather than a silent fallback, so a broken bridge can never
 /// quietly turn a retry into a second execution. The value carries no authority: Core still derives the
 /// command identity from the authenticated Run plus this request id.
@@ -2267,6 +2267,9 @@ fn operation_help_examples(operation: &str) -> &'static [&'static str] {
         "loom.plan" => &["rovai loom plan --input-file plan.json"],
         "loom.release" => &["rovai loom release --task-id report-draft"],
         "loom.claim" => &["rovai loom claim --task-id report-draft"],
+        "loom.claim_heartbeat" => &[
+            "rovai loom claim-heartbeat --claim-id claim_abc --fence-generation 1",
+        ],
         "loom.evidence" => {
             &["rovai loom evidence --relative-path out/report.md --task-id report-draft"]
         }
@@ -3597,12 +3600,13 @@ mod managed_workflow_request_id_tests {
     const ID: &str = "6e71a1b4-6b19-4f86-8c18-988552586a37";
 
     #[test]
-    fn managed_workflow_request_id_is_accepted_for_the_eight_loom_operations_only() {
+    fn managed_workflow_request_id_is_accepted_for_the_nine_loom_operations_only() {
         for operation in [
             "loom.status",
             "loom.plan",
             "loom.release",
             "loom.claim",
+            "loom.claim_heartbeat",
             "loom.evidence",
             "loom.submit",
             "loom.inspect",

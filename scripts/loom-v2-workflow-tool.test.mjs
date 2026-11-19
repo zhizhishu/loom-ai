@@ -3,7 +3,7 @@
 // Run (Root, from loom/): node --test --test-force-exit --test-timeout=120000 scripts/loom-v2-workflow-tool.test.mjs
 //
 // What this proves (no network, no model, no real CLI process, no user data):
-//   1  the operation table is exactly the eight LOOM business operations, and argv is two fixed words
+//   1  the operation table is exactly the nine LOOM business operations, and argv is two fixed words
 //      taken from that table — never model text, never a shell, never `--input-file`;
 //   2  the tool parameters are closed: `operation` plus an `input` object whose keys follow the existing
 //      Core schemas; Run/bot/Mission/creator/command identity is refused before any child starts;
@@ -64,7 +64,7 @@ test('Core input contracts replace guessed fields and reject incomplete operatio
   assert.equal(fields.additionalProperties, false)
   assert.deepEqual(fields.properties.relativePath, CONTRACTS['loom.evidence'].properties.relativePath)
   assert.deepEqual(fields.properties.tasks.items.required, ['taskId', 'title'])
-  for (const operation of EIGHT.filter(name => name !== 'loom.status')) {
+  for (const operation of LOOM_OPERATION_NAMES.filter(name => name !== 'loom.status')) {
     assert.equal(validateLoomParams({ operation, input: {} }).ok, false, operation + ' empty input')
   }
   for (const key of ['path', 'files', 'filePath', 'paths', 'file']) {
@@ -197,11 +197,12 @@ test('Pi 0.85 SDK distinguishes a returned error flag from a thrown Core rejecti
   assert.match(emptyPlan.content[0].text, /loom_input_required:goal,criteria,tasks/u)
 })
 
-const EIGHT = [
+const LOOM_OPERATION_NAMES = [
   'loom.status',
   'loom.plan',
   'loom.release',
   'loom.claim',
+  'loom.claim_heartbeat',
   'loom.evidence',
   'loom.submit',
   'loom.inspect',
@@ -292,11 +293,11 @@ function fakeSpawn(options = {}) {
 // 1 · operation table and argv
 // ---------------------------------------------------------------------------
 
-test('1 · the tool reaches exactly the eight LOOM operations through fixed argv words', () => {
+test('1 · the tool reaches exactly the nine LOOM operations through fixed argv words', () => {
   assert.equal(LOOM_TOOL_NAME, 'rovai_loom')
-  assert.deepEqual([...LOOM_OPERATIONS], EIGHT)
-  assert.equal(new Set(LOOM_OPERATIONS).size, EIGHT.length, 'no duplicate operations')
-  for (const operation of EIGHT) {
+  assert.deepEqual([...LOOM_OPERATIONS], LOOM_OPERATION_NAMES)
+  assert.equal(new Set(LOOM_OPERATIONS).size, LOOM_OPERATION_NAMES.length, 'no duplicate operations')
+  for (const operation of LOOM_OPERATION_NAMES) {
     const argv = LOOM_OPERATION_ARGV[operation]
     assert.ok(Array.isArray(argv), `${operation} must map to argv`)
     assert.equal(argv.length, 2, `${operation} argv is exactly two words`)
@@ -313,7 +314,7 @@ test('1 · the tool reaches exactly the eight LOOM operations through fixed argv
   const schema = loomToolParameters()
   assert.equal(schema.additionalProperties, false)
   assert.deepEqual(schema.required, ['operation', 'input'])
-  assert.deepEqual([...schema.properties.operation.enum], EIGHT)
+  assert.deepEqual([...schema.properties.operation.enum], LOOM_OPERATION_NAMES)
   assert.deepEqual(Object.keys(schema.properties).sort(), ['input', 'operation'])
 })
 
@@ -345,12 +346,24 @@ test('2 · parameters accept only a known operation and its existing input keys'
   // Identity can never be claimed from the payload.
   for (const key of [
     'agentRunId', 'runId', 'botId', 'missionId', 'campId', 'creatorId',
-    'commandId', 'requestId', 'fenceGeneration', 'executionEpoch', 'claimId', 'reviewerAgentId',
+    'commandId', 'requestId', 'executionEpoch', 'reviewerAgentId',
   ]) {
     const outcome = validateLoomParams({ operation: 'loom.submit', input: { taskId: 't1', evidenceIds: [], [key]: 'forged' } })
     assert.equal(outcome.ok, false, `${key} must be refused`)
     assert.match(outcome.code, /loom_identity_not_allowed/)
   }
+  // The lease identity is the one pair a caller may name, and only to `loom.claim_heartbeat`: every
+  // other operation's closed key set still refuses it, so it can never become a second authority.
+  for (const key of ['claimId', 'fenceGeneration']) {
+    const outcome = validateLoomParams({ operation: 'loom.submit', input: { taskId: 't1', evidenceIds: [], [key]: 'forged' } })
+    assert.equal(outcome.ok, false, `${key} must be refused outside a heartbeat`)
+    assert.match(outcome.code, /loom_input_not_allowed/)
+  }
+  assert.equal(
+    validateLoomParams({ operation: 'loom.claim_heartbeat', input: { claimId: 'claim-1', fenceGeneration: 1 } }).ok,
+    true,
+    'a heartbeat names the claim it renews'
+  )
   // A field that is legal for another operation is still refused here.
   assert.match(
     validateLoomParams({ operation: 'loom.release', input: { evidenceIds: [] } }).code,

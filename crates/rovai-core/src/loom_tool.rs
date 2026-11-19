@@ -19,16 +19,21 @@ pub const LOOM_STATUS_TOOL_NAME: &str = "loom.status";
 pub const LOOM_PLAN_TOOL_NAME: &str = "loom.plan";
 pub const LOOM_RELEASE_TOOL_NAME: &str = "loom.release";
 pub const LOOM_CLAIM_TOOL_NAME: &str = "loom.claim";
+/// P0 step 5: the one operation that extends a lease this Run already holds. It is deliberately a
+/// separate operation from `loom.claim`, so "claim a released Task" and "renew the lease I hold"
+/// can never be confused by a caller or by the guard.
+pub const LOOM_CLAIM_HEARTBEAT_TOOL_NAME: &str = "loom.claim_heartbeat";
 pub const LOOM_EVIDENCE_TOOL_NAME: &str = "loom.evidence";
 pub const LOOM_SUBMIT_TOOL_NAME: &str = "loom.submit";
 pub const LOOM_INSPECT_TOOL_NAME: &str = "loom.inspect";
 pub const LOOM_STAGE_REVIEW_TOOL_NAME: &str = "loom.stage-review";
 
-pub const LOOM_TOOL_NAMES: [&str; 8] = [
+pub const LOOM_TOOL_NAMES: [&str; 9] = [
     LOOM_STATUS_TOOL_NAME,
     LOOM_PLAN_TOOL_NAME,
     LOOM_RELEASE_TOOL_NAME,
     LOOM_CLAIM_TOOL_NAME,
+    LOOM_CLAIM_HEARTBEAT_TOOL_NAME,
     LOOM_EVIDENCE_TOOL_NAME,
     LOOM_SUBMIT_TOOL_NAME,
     LOOM_INSPECT_TOOL_NAME,
@@ -139,6 +144,15 @@ pub struct LoomClaimToolInput {
     pub lease_seconds: Option<i64>,
 }
 
+/// The only two fields a heartbeat carries: which claim, and at which fence. The Run and the
+/// Mission stay authenticated identity, and the Task follows from the claim row itself.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoomClaimHeartbeatToolInput {
+    pub claim_id: String,
+    pub fence_generation: i64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LoomEvidenceToolInput {
@@ -182,6 +196,9 @@ pub fn validate_input(name: &str, input: &Value) -> Result<()> {
         }
         LOOM_CLAIM_TOOL_NAME => {
             serde_json::from_value::<LoomClaimToolInput>(input.clone()).map(|_| ())
+        }
+        LOOM_CLAIM_HEARTBEAT_TOOL_NAME => {
+            serde_json::from_value::<LoomClaimHeartbeatToolInput>(input.clone()).map(|_| ())
         }
         LOOM_EVIDENCE_TOOL_NAME => {
             serde_json::from_value::<LoomEvidenceToolInput>(input.clone()).map(|_| ())
@@ -277,6 +294,22 @@ pub fn invoke(
                     claimant_agent_id: Some(caller.agent_id.to_string()),
                     command_id: caller.command_id.to_string(),
                     lease_seconds: input.lease_seconds,
+                },
+            )
+            .map_err(map_domain_error)?;
+            Ok(serde_json::to_value(result)?)
+        }
+        LOOM_CLAIM_HEARTBEAT_TOOL_NAME => {
+            let input: LoomClaimHeartbeatToolInput = serde_json::from_value(input)?;
+            // The fence is the caller's own: Core never renews a claim this authenticated Run does
+            // not hold, and the payload can only name which of its claims to renew.
+            let result = loom::claim_heartbeat(
+                database,
+                loom::LoomClaimHeartbeatInput {
+                    mission_id,
+                    agent_run_id: caller.agent_run_id.to_string(),
+                    claim_id: input.claim_id,
+                    fence_generation: input.fence_generation,
                 },
             )
             .map_err(map_domain_error)?;
@@ -616,7 +649,7 @@ fn open_object() -> Value {
     json!({"type": "object"})
 }
 
-/// The eight closed tool definitions, in `TEAM_TOOL_NAMES` order. Model-visible text follows the
+/// The nine closed tool definitions, in `TEAM_TOOL_NAMES` order. Model-visible text follows the
 /// confirmed revision of `docs/versions/v1.72/model-context-change-loom-accp.md` (the `loom.plan`
 /// description is r3), and the two control tools follow the confirmed r1 of
 /// `docs/versions/v1.72/model-context-change-loom-control.md`. Edit that text only through a new
@@ -728,6 +761,33 @@ pub fn tool_definitions() -> Vec<Value> {
                     "fenceGeneration": {"type": "integer"},
                     "leaseExpiresAt": {"type": "string"},
                     "replayed": {"type": "boolean"}
+                }
+            }
+        }),
+        json!({
+            "name": LOOM_CLAIM_HEARTBEAT_TOOL_NAME,
+            "title": "Renew this Run's claim lease",
+            "description": "Extend the lease of a task this Run already holds. Pass the claimId and fenceGeneration from `loom.claim`. An expired or released lease is never renewed, and a claim held by another Run or at an older fence is refused.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": false,
+                "required": ["claimId", "fenceGeneration"],
+                "properties": {
+                    "claimId": id_schema(),
+                    "fenceGeneration": {"type": "integer", "minimum": 1}
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["claimId", "taskId", "fenceGeneration",
+                    "previousLeaseExpiresAt", "leaseExpiresAt", "heartbeatAt"],
+                "properties": {
+                    "claimId": {"type": "string"},
+                    "taskId": {"type": "string"},
+                    "fenceGeneration": {"type": "integer"},
+                    "previousLeaseExpiresAt": {"type": "string"},
+                    "leaseExpiresAt": {"type": "string"},
+                    "heartbeatAt": {"type": "string"},
+                    "extendedSeconds": {"type": "integer"}
                 }
             }
         }),

@@ -160,6 +160,28 @@
       }
     },
     {
+      "operation": "loom.claim_heartbeat",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "claimId",
+          "fenceGeneration"
+        ],
+        "properties": {
+          "claimId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "fenceGeneration": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    },
+    {
       "operation": "loom.evidence",
       "inputSchema": {
         "type": "object",

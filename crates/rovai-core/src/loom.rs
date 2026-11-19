@@ -943,6 +943,49 @@ pub struct LoomClaimAcquireResult {
     pub replayed: bool,
 }
 
+/// Heartbeat input: the claim a Run believes it still holds, named by the identity the claim
+/// receipt gave it.
+///
+/// There is deliberately no `commandId`: a heartbeat is not a replayable command, because
+/// "renew once more" and "replay that one renewal" are not the same request. It is judged only
+/// on the claim it names, the Run that presents it and the clock. `missionId` scopes the claim,
+/// and the Task and Plan follow from the claim row itself, so a heartbeat cannot name a Task
+/// that the claim does not hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoomClaimHeartbeatInput {
+    pub mission_id: String,
+    pub agent_run_id: String,
+    pub claim_id: String,
+    /// The fence generation the Run was handed when it took the claim; a later generation means
+    /// somebody else (or a newer epoch of this Run) holds the Task now.
+    pub fence_generation: i64,
+}
+
+/// Heartbeat receipt: the lease as it now stands, plus the lease it replaced and the single
+/// server clock the extension was measured from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoomClaimHeartbeatResult {
+    pub claim_id: String,
+    pub mission_id: String,
+    pub plan_id: String,
+    pub task_id: String,
+    pub agent_run_id: String,
+    pub fence_generation: i64,
+    pub claimed_at: String,
+    /// The lease this heartbeat found. It is always still in the future: an expired lease is
+    /// refused instead of being renewed.
+    pub previous_lease_expires_at: String,
+    /// The lease after the extension; strictly later than `previousLeaseExpiresAt`.
+    pub lease_expires_at: String,
+    /// The clock instant the extension was measured from, so a caller can tell a renewal that
+    /// waited for the write lock from one that did not.
+    pub heartbeat_at: String,
+    /// How far the lease moved, in seconds.
+    pub extended_seconds: i64,
+}
+
 const DEFAULT_CLAIM_LEASE_SECONDS: i64 = 300;
 const MAX_CLAIM_LEASE_SECONDS: i64 = 3600;
 
@@ -1594,6 +1637,178 @@ pub(crate) fn claim_acquire_in(
         lease_expires_at,
         released_at: None,
         replayed: false,
+    })
+}
+
+/// LOOM heartbeat path: a Run extends the lease it already holds, and nothing else.
+///
+/// One immediate transaction with the same write ordering as the claim itself: the clock is read
+/// only after the write lock is held, so a lease that lapses while the heartbeat waits for the
+/// lock is expired and is refused rather than renewed. The guards are the claim's own identity —
+/// this Mission, this claim, this Run, this fence generation — plus `released_at IS NULL` and a
+/// lease that has not yet run out:
+///
+/// * an expired lease is never renewed, so a late heartbeat cannot revive a dead lease;
+/// * a claim released by a takeover (or by any other path) is no longer a claim and cannot be
+///   renewed either;
+/// * a stale fence generation, or a claim that belongs to another Run, is refused.
+///
+/// The lease moves forward by [`DEFAULT_CLAIM_LEASE_SECONDS`] — the same length a fresh claim
+/// takes — measured from the lease the Run already holds, so a heartbeat can only ever lengthen a
+/// lease and can never shorten the one it is extending.
+///
+/// The read of the claim and the write that extends it happen under one lock and therefore cannot
+/// interleave with another writer; the `UPDATE` still names every guard again, so a row that no
+/// longer matches can never be renewed by a stale decision made earlier in this transaction.
+pub fn claim_heartbeat(
+    database: &mut Database,
+    input: LoomClaimHeartbeatInput,
+) -> Result<LoomClaimHeartbeatResult> {
+    let transaction = database
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let result = claim_heartbeat_in(&transaction, input)?;
+    transaction.commit()?;
+    Ok(result)
+}
+
+/// The heartbeat write itself, on a caller-owned transaction, so a caller that already holds the
+/// write lock does not open a second one. This function never commits.
+fn claim_heartbeat_in(
+    transaction: &rusqlite::Transaction<'_>,
+    input: LoomClaimHeartbeatInput,
+) -> Result<LoomClaimHeartbeatResult> {
+    let mission_id = required_field("claim heartbeat", "missionId", &input.mission_id)?;
+    let agent_run_id = required_field("claim heartbeat", "agentRunId", &input.agent_run_id)?;
+    let claim_id = required_field("claim heartbeat", "claimId", &input.claim_id)?;
+    if input.fence_generation < 1 {
+        return Err(LoomCommandError::rejection(
+            LOOM_INVALID_INPUT,
+            "LOOM claim heartbeat requires a fenceGeneration of at least 1",
+        ));
+    }
+    let fence_generation = input.fence_generation;
+    // Read the clock only after the lock is held, exactly like the claim: a lease that lapses
+    // while this call waits is expired, not live, and must not be extended from a stale instant.
+    let now = chrono::Utc::now();
+    let heartbeat_at = now.to_rfc3339();
+
+    let mission_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mission WHERE id=?1)",
+        [&mission_id],
+        |row| row.get(0),
+    )?;
+    if !mission_exists {
+        return Err(LoomCommandError::rejection(
+            LOOM_MISSION_NOT_FOUND,
+            format!("mission {mission_id} does not exist"),
+        ));
+    }
+
+    // One read scoped through the Mission's own plan, so a claim of another Mission is not even
+    // visible here. Released claims are read too: the refusal has to say "absent", not "expired".
+    let claim: Option<StoredClaim> = transaction
+        .query_row(
+            "SELECT claim.claim_id, claim.plan_id, claim.task_id, claim.agent_run_id,
+                    claim.claimant_agent_id, claim.fence_generation, claim.claimed_at,
+                    claim.lease_expires_at, claim.released_at
+             FROM loom_claim AS claim
+             JOIN loom_plan AS plan ON plan.plan_id=claim.plan_id
+             WHERE plan.mission_id=?1 AND claim.claim_id=?2",
+            params![&mission_id, &claim_id],
+            StoredClaim::read,
+        )
+        .optional()?;
+    let Some(claim) = claim else {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_ABSENT,
+            format!("mission {mission_id} carries no claim {claim_id} to renew"),
+        ));
+    };
+    // A released claim is a finished lease: a takeover already closed it, so there is nothing left
+    // to extend and reviving it would hand the Task's write authority back to a superseded holder.
+    if claim.released_at.is_some() {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_ABSENT,
+            format!("claim {claim_id} on task {} is already released", claim.task_id),
+        ));
+    }
+    if lease_expired(&claim.lease_expires_at, now) {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_EXPIRED,
+            format!(
+                "claim {claim_id} on task {} expired at {}; an expired lease is never renewed",
+                claim.task_id, claim.lease_expires_at
+            ),
+        ));
+    }
+    if claim.agent_run_id != agent_run_id {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_AGENT_RUN_MISMATCH,
+            format!(
+                "claim {claim_id} on task {} belongs to agentRun {}, not {agent_run_id}",
+                claim.task_id, claim.agent_run_id
+            ),
+        ));
+    }
+    if claim.fence_generation != fence_generation {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_FENCE_STALE,
+            format!(
+                "claim {claim_id} on task {} is at fence generation {}, not the stale generation {fence_generation}",
+                claim.task_id, claim.fence_generation
+            ),
+        ));
+    }
+
+    let previous_lease_expires_at = claim.lease_expires_at.clone();
+    // `lease_expired` already refused anything that does not parse, so this cannot fail; it is
+    // written as an explicit refusal rather than an `unwrap` because a lease is data from disk.
+    let previous_expires = chrono::DateTime::parse_from_rfc3339(&previous_lease_expires_at)
+        .map(|expires| expires.with_timezone(&chrono::Utc))
+        .map_err(|_| {
+            LoomCommandError::rejection(
+                LOOM_CLAIM_EXPIRED,
+                format!("claim {claim_id} carries an unreadable lease {previous_lease_expires_at}"),
+            )
+        })?;
+    let lease_expires_at = (previous_expires
+        + chrono::Duration::seconds(DEFAULT_CLAIM_LEASE_SECONDS))
+        .to_rfc3339();
+
+    // Every guard is repeated here, so the write itself is what decides: a claim released, taken
+    // over or re-fenced after the read above matches no row and is refused instead of renewed.
+    let updated = transaction.execute(
+        "UPDATE loom_claim SET lease_expires_at=?1
+         WHERE claim_id=?2 AND agent_run_id=?3 AND fence_generation=?4 AND released_at IS NULL",
+        params![
+            &lease_expires_at,
+            &claim_id,
+            &agent_run_id,
+            fence_generation
+        ],
+    )?;
+    if updated != 1 {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_FENCE_STALE,
+            format!(
+                "claim {claim_id} no longer matches agentRun {agent_run_id} at fence generation {fence_generation}"
+            ),
+        ));
+    }
+
+    Ok(LoomClaimHeartbeatResult {
+        claim_id,
+        mission_id,
+        plan_id: claim.plan_id,
+        task_id: claim.task_id,
+        agent_run_id,
+        fence_generation,
+        claimed_at: claim.claimed_at,
+        previous_lease_expires_at,
+        lease_expires_at,
+        heartbeat_at,
+        extended_seconds: DEFAULT_CLAIM_LEASE_SECONDS,
     })
 }
 
@@ -4857,6 +5072,53 @@ mod tests {
             .unwrap();
     }
 
+    /// Your own claim's lease, read straight from the row so no projection can hide a write.
+    fn claim_lease(database: &Database, claim_id: &str) -> String {
+        database
+            .connection()
+            .query_row(
+                "SELECT lease_expires_at FROM loom_claim WHERE claim_id=?1",
+                [claim_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn released_at(database: &Database, claim_id: &str) -> Option<String> {
+        database
+            .connection()
+            .query_row(
+                "SELECT released_at FROM loom_claim WHERE claim_id=?1",
+                [claim_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The exact instant a lease would carry after one more full lease length, rendered the same
+    /// way the heartbeat renders it, so "extended by one lease length" is proven, not approximated.
+    fn lease_after_one_more_length(lease: &str) -> String {
+        (chrono::DateTime::parse_from_rfc3339(lease)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            + chrono::Duration::seconds(DEFAULT_CLAIM_LEASE_SECONDS))
+        .to_rfc3339()
+    }
+
+    fn heartbeat_input(
+        mission_id: &str,
+        agent_run_id: &str,
+        claim_id: &str,
+        fence_generation: i64,
+    ) -> LoomClaimHeartbeatInput {
+        LoomClaimHeartbeatInput {
+            mission_id: mission_id.into(),
+            agent_run_id: agent_run_id.into(),
+            claim_id: claim_id.into(),
+            fence_generation,
+        }
+    }
+
     #[test]
     fn release_moves_a_draft_task_to_ready_and_a_second_release_is_rejected() {
         let mut database = fixture();
@@ -5117,6 +5379,434 @@ mod tests {
             task_status(&database, "task_a"),
             "READY",
             "assertion takeover_keeps_the_task_ready"
+        );
+    }
+
+    #[test]
+    fn claim_heartbeat_extends_the_lease_of_the_run_that_holds_it() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claim heartbeat");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        let first_lease = claim_lease(&database, &claim.claim_id);
+        assert_eq!(
+            first_lease, claim.lease_expires_at,
+            "assertion the claim receipt names the stored lease"
+        );
+
+        let renewed = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &claim.claim_id,
+                claim.fence_generation,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            renewed.claim_id, claim.claim_id,
+            "assertion a heartbeat renews the very claim it names"
+        );
+        assert_eq!(
+            renewed.task_id, "task_a",
+            "assertion the Task comes from the claim row, not from the caller"
+        );
+        assert_eq!(
+            renewed.agent_run_id, "run_one",
+            "assertion the receipt echoes the holder's own Run"
+        );
+        assert_eq!(
+            renewed.fence_generation, claim.fence_generation,
+            "assertion a heartbeat never advances the fence"
+        );
+        assert_eq!(
+            renewed.previous_lease_expires_at, first_lease,
+            "assertion the receipt names the lease it replaced"
+        );
+        assert_eq!(
+            renewed.lease_expires_at,
+            lease_after_one_more_length(&first_lease),
+            "assertion a heartbeat lengthens the lease by exactly one lease length"
+        );
+        assert!(
+            renewed.lease_expires_at > first_lease,
+            "assertion the renewed lease is later than the lease it replaced"
+        );
+        assert_eq!(
+            renewed.extended_seconds, DEFAULT_CLAIM_LEASE_SECONDS,
+            "assertion the receipt reports the one lease length it moved"
+        );
+        assert_eq!(
+            claim_lease(&database, &claim.claim_id),
+            renewed.lease_expires_at,
+            "assertion the renewed lease is what the row now holds"
+        );
+        assert_eq!(
+            claim_rows(&database),
+            1,
+            "assertion a heartbeat writes no second claim row"
+        );
+        assert_eq!(
+            open_claims(&database, "task_a"),
+            1,
+            "assertion a heartbeat leaves exactly one open claim"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "READY",
+            "assertion a heartbeat does not move the Task"
+        );
+        let projected = claims_list(&database, &mission_id)
+            .unwrap()
+            .claims
+            .into_iter()
+            .find(|row| row.claim_id == claim.claim_id)
+            .unwrap();
+        assert_eq!(
+            projected.lease_expires_at, renewed.lease_expires_at,
+            "assertion the claim projection shows the renewed lease"
+        );
+        assert!(
+            !projected.expired,
+            "assertion a renewed lease is still live in the projection"
+        );
+
+        // A second heartbeat extends the lease it finds, so a Run that keeps beating keeps moving
+        // forward instead of falling back to a fixed wall-clock instant.
+        let again = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &claim.claim_id,
+                claim.fence_generation,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            again.lease_expires_at,
+            lease_after_one_more_length(&renewed.lease_expires_at),
+            "assertion every heartbeat extends the lease it finds"
+        );
+        assert_eq!(
+            claim_rows(&database),
+            1,
+            "assertion a second heartbeat writes no second claim row"
+        );
+    }
+
+    #[test]
+    fn claim_heartbeat_never_revives_an_expired_lease() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claim heartbeat expired");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        expire_lease(&database, &claim.claim_id);
+        let expired_lease = claim_lease(&database, &claim.claim_id);
+
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &claim.claim_id,
+                claim.fence_generation,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_EXPIRED,
+            "assertion a lease that already ran out is not renewed by its own heartbeat"
+        );
+        assert_eq!(
+            claim_lease(&database, &claim.claim_id),
+            expired_lease,
+            "assertion a refused heartbeat writes nothing"
+        );
+        assert_eq!(
+            open_claims(&database, "task_a"),
+            1,
+            "assertion a refused heartbeat leaves the lease where it was"
+        );
+        assert_eq!(
+            released_at(&database, &claim.claim_id),
+            None,
+            "assertion a refused heartbeat does not release the expired claim"
+        );
+
+        // The only way forward for the Task is a takeover, which releases this lease and advances
+        // the fence; the old heartbeat can never walk that back.
+        let takeover = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_two", "command_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            takeover.fence_generation, 2,
+            "assertion a takeover after an expiry still advances the fence"
+        );
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &claim.claim_id,
+                claim.fence_generation,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_ABSENT,
+            "assertion a heartbeat cannot renew the released lease of a takeover"
+        );
+        assert_eq!(
+            claim_lease(&database, &claim.claim_id),
+            expired_lease,
+            "assertion a late heartbeat never revives a dead lease"
+        );
+    }
+
+    #[test]
+    fn claim_heartbeat_refuses_a_stale_fence_generation() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claim heartbeat fence");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        let first_lease = claim_lease(&database, &claim.claim_id);
+
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &claim.claim_id,
+                claim.fence_generation + 1,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_FENCE_STALE,
+            "assertion a generation the claim never reached is a stale fence"
+        );
+        assert_eq!(
+            claim_lease(&database, &claim.claim_id),
+            first_lease,
+            "assertion a stale fence renews nothing"
+        );
+
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(&mission_id, "run_one", &claim.claim_id, 0),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_INVALID_INPUT,
+            "assertion generation zero is not a fence at all"
+        );
+
+        // Fence 2 exists, but it belongs to the takeover's claim: naming the new generation with
+        // an older holder's identity is still a stale pair, not a renewal.
+        expire_lease(&database, &claim.claim_id);
+        let takeover = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_two", "command_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            takeover.fence_generation, 2,
+            "assertion the takeover holds the newest generation"
+        );
+        let takeover_lease = claim_lease(&database, &takeover.claim_id);
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(&mission_id, "run_two", &takeover.claim_id, 1),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_FENCE_STALE,
+            "assertion the previous generation cannot renew the current claim"
+        );
+        assert_eq!(
+            claim_lease(&database, &takeover.claim_id),
+            takeover_lease,
+            "assertion a refused stale pair leaves the current lease untouched"
+        );
+        claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_two",
+                &takeover.claim_id,
+                takeover.fence_generation,
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn claim_heartbeat_refuses_another_runs_claim() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claim heartbeat foreign");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        let first_lease = claim_lease(&database, &claim.claim_id);
+
+        // Another Run knows the claim id and the generation, and still cannot renew it.
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_two",
+                &claim.claim_id,
+                claim.fence_generation,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_AGENT_RUN_MISMATCH,
+            "assertion a claim belongs to the Run that holds it"
+        );
+        assert_eq!(
+            claim_lease(&database, &claim.claim_id),
+            first_lease,
+            "assertion a foreign heartbeat extends nothing"
+        );
+
+        // The refusal was about the Run, not about the lease: its own holder still renews it.
+        let renewed = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &claim.claim_id,
+                claim.fence_generation,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            renewed.lease_expires_at,
+            lease_after_one_more_length(&first_lease),
+            "assertion the holder still renews the same lease"
+        );
+    }
+
+    #[test]
+    fn claim_heartbeat_refuses_a_released_claim() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claim heartbeat released");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        let live_lease = claim_lease(&database, &claim.claim_id);
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_claim SET released_at='2026-11-18T00:00:00+00:00' WHERE claim_id=?1",
+                [&claim.claim_id],
+            )
+            .unwrap();
+
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &claim.claim_id,
+                claim.fence_generation,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_ABSENT,
+            "assertion a released claim is no longer a claim to renew"
+        );
+        assert_eq!(
+            claim_lease(&database, &claim.claim_id),
+            live_lease,
+            "assertion a released lease is never extended"
+        );
+
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(&mission_id, "run_one", "claim_missing", 1),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_ABSENT,
+            "assertion an unknown claim id has nothing to renew"
+        );
+
+        // A claim of another Mission is not reachable through this Mission at all.
+        let other_mission = create_mission(&mut database, "LOOM claim heartbeat other mission");
+        plan_import(&mut database, plan_input(&other_mission)).unwrap();
+        task_release(
+            &mut database,
+            release_input(&other_mission, "task_a"),
+        )
+        .unwrap();
+        let other = claim_acquire(
+            &mut database,
+            claim_input(&other_mission, "task_a", "run_other", "command_other"),
+        )
+        .unwrap();
+        let other_lease = claim_lease(&database, &other.claim_id);
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(&mission_id, "run_other", &other.claim_id, other.fence_generation),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_ABSENT,
+            "assertion a heartbeat is scoped to its own Mission"
+        );
+        assert_eq!(
+            claim_lease(&database, &other.claim_id),
+            other_lease,
+            "assertion a cross-Mission heartbeat extends nothing"
+        );
+        assert_eq!(
+            claim_rows(&database),
+            2,
+            "assertion no refused heartbeat wrote a claim row"
         );
     }
 

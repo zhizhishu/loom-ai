@@ -51,7 +51,7 @@ pub const TEAM_CREATE_TASK_TOOL_NAME: &str = "team.create_task";
 pub const TEAM_GET_TASK_TOOL_NAME: &str = "team.get_task";
 pub const TEAM_UPDATE_TASK_TOOL_NAME: &str = "team.update_task";
 pub const TEAM_LIST_TASKS_TOOL_NAME: &str = "team.list_tasks";
-pub const TEAM_TOOL_NAMES: [&str; 43] = [
+pub const TEAM_TOOL_NAMES: [&str; 44] = [
     "mission.list",
     "mission.get",
     "mission.update",
@@ -60,6 +60,7 @@ pub const TEAM_TOOL_NAMES: [&str; 43] = [
     "loom.plan",
     "loom.release",
     "loom.claim",
+    "loom.claim_heartbeat",
     "loom.evidence",
     "loom.submit",
     "loom.inspect",

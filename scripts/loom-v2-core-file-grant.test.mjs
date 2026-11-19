@@ -354,7 +354,7 @@ test('workflow policy: the managed loom tool reaches the eight operations only, 
       )
     }
 
-    // Nothing outside the eight operations is reachable, even with a plausible looking name.
+    // Nothing outside the nine operations is reachable, even with a plausible looking name.
     for (const operation of ['loom.workspace.run', 'loom.accept', 'thread.message.send', 'bash', 'memory.write', '']) {
       const outcome = workflow(toolEvent('rovai_loom', `op_bad_${operation}`, { operation, input: {} }), ctx)
       assert.equal(outcome?.block, true, `${operation} must be refused`)

@@ -23,16 +23,17 @@ pub const ROVAI_RUN_TMP_ENV: &str = "ROVAI_RUN_TMP";
 ///
 /// The Pi managed bridge sets this on the exact child process it spawns, derived from the provider
 /// tool-call id plus the authenticated Run binding and the operation. It is never read from model
-/// output, so a payload can never name its own command identity. The CLI accepts it for the eight
+/// output, so a payload can never name its own command identity. The CLI accepts it for the nine
 /// `loom.*` operations only; every other operation keeps its previous request-id behaviour.
 pub const ROVAI_BUILTIN_REQUEST_ID_ENV: &str = "ROVAI_BUILTIN_REQUEST_ID";
-/// The complete operation set the managed workflow tool may reach: the eight LOOM business
+/// The complete operation set the managed workflow tool may reach: the nine LOOM business
 /// operations the CLI already ships. `bash`, MCP, and every other operation stay outside it.
-pub const MANAGED_WORKFLOW_OPERATIONS: [&str; 8] = [
+pub const MANAGED_WORKFLOW_OPERATIONS: [&str; 9] = [
     "loom.status",
     "loom.plan",
     "loom.release",
     "loom.claim",
+    "loom.claim_heartbeat",
     "loom.evidence",
     "loom.submit",
     "loom.inspect",
@@ -164,7 +165,7 @@ pub struct BuiltinToolCliIdentity {
     pub action: &'static str,
 }
 
-pub const BUILTIN_TOOL_CLI_IDENTITIES: [BuiltinToolCliIdentity; 43] = [
+pub const BUILTIN_TOOL_CLI_IDENTITIES: [BuiltinToolCliIdentity; 44] = [
     BuiltinToolCliIdentity {
         operation: "thread.message.send",
         group: "send",
@@ -299,6 +300,13 @@ pub const BUILTIN_TOOL_CLI_IDENTITIES: [BuiltinToolCliIdentity; 43] = [
         operation: "loom.claim",
         group: "loom",
         action: "claim",
+    },
+    // The one operation whose payload names a claim: the CLI word stays hyphenated like the other
+    // multi-word LOOM actions, while the operation keeps its `loom.*` name.
+    BuiltinToolCliIdentity {
+        operation: "loom.claim_heartbeat",
+        group: "loom",
+        action: "claim-heartbeat",
     },
     BuiltinToolCliIdentity {
         operation: "loom.evidence",
@@ -1331,8 +1339,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn managed_workflow_operations_are_exactly_the_eight_loom_business_operations() {
-        assert_eq!(MANAGED_WORKFLOW_OPERATIONS.len(), 8);
+    fn managed_workflow_operations_are_exactly_the_nine_loom_business_operations() {
+        assert_eq!(MANAGED_WORKFLOW_OPERATIONS.len(), 9);
         for operation in MANAGED_WORKFLOW_OPERATIONS {
             assert!(operation.starts_with("loom."), "{operation} is not a loom operation");
             assert!(is_managed_workflow_operation(operation));

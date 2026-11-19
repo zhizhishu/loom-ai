@@ -36,6 +36,7 @@ export const BUILTIN_CLI_NAMES: Readonly<Record<string, string>> = Object.freeze
   'loom.plan': 'rovai loom plan',
   'loom.release': 'rovai loom release',
   'loom.claim': 'rovai loom claim',
+  'loom.claim_heartbeat': 'rovai loom claim-heartbeat',
   'loom.evidence': 'rovai loom evidence',
   'loom.submit': 'rovai loom submit',
   'loom.inspect': 'rovai loom inspect',

@@ -8,7 +8,7 @@
  *   deliberately outside every guarded policy. The result was that a human/test host recorded the
  *   Run's own artifacts for it.
  * - This module is the *typed bridge* for exactly that gap: one tool (`rovai_loom`) that can reach
- *   only the eight `loom.*` operations Core already ships, spawned as a fixed trusted executable with
+ *   only the nine `loom.*` operations Core already ships, spawned as a fixed trusted executable with
  *   no shell, with the operation parameters on stdin as one JSON object.
  *
  * This file is a pure contract plus one injected-runtime helper:
@@ -39,12 +39,13 @@ export const REQUEST_ID_ENV = "ROVAI_BUILTIN_REQUEST_ID"
 /** Core-filled absolute path of the bundled Rovai Agent CLI for this Run. */
 export const CLI_ENV = "ROVAI_AGENT_CLI"
 
-/** The only operations this tool may reach: the eight LOOM business operations the CLI already ships. */
+/** The only operations this tool may reach: the nine LOOM business operations the CLI already ships. */
 export const LOOM_OPERATIONS = Object.freeze([
   "loom.status",
   "loom.plan",
   "loom.release",
   "loom.claim",
+  "loom.claim_heartbeat",
   "loom.evidence",
   "loom.submit",
   "loom.inspect",
@@ -57,6 +58,7 @@ export const LOOM_OPERATION_ARGV: Readonly<Record<string, readonly string[]>> = 
   "loom.plan": ["loom", "plan"],
   "loom.release": ["loom", "release"],
   "loom.claim": ["loom", "claim"],
+  "loom.claim_heartbeat": ["loom", "claim-heartbeat"],
   "loom.evidence": ["loom", "evidence"],
   "loom.submit": ["loom", "submit"],
   "loom.inspect": ["loom", "inspect"],
@@ -66,14 +68,20 @@ export const LOOM_OPERATION_ARGV: Readonly<Record<string, readonly string[]>> = 
 /**
  * The exact parameter keys each operation may carry, mirroring Core's closed input schemas
  * (`crates/rovai-core/src/loom_tool.rs`). Anything else — `agentRunId`, `commandId`, `missionId`,
- * `creatorId`, `fenceGeneration`, `executionEpoch`, … — is rejected before a child is started, and
- * Core's `additionalProperties: false` schemas reject it again on the wire.
+ * `creatorId`, `executionEpoch`, … — is rejected before a child is started, and Core's
+ * `additionalProperties: false` schemas reject it again on the wire.
+ *
+ * `claimId`/`fenceGeneration` are the one exception below, and only as input to
+ * `loom.claim_heartbeat`: a heartbeat names which of *this Run's own* claims to renew, and Core
+ * still refuses a claim this Run does not hold. No other operation lists them, so the per-operation
+ * key set below stays the authority.
  */
 export const LOOM_INPUT_KEYS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   "loom.status": [],
   "loom.plan": ["goal", "acceptanceCriteriaVersion", "criteria", "tasks", "dependencies"],
   "loom.release": ["taskId"],
   "loom.claim": ["taskId", "leaseSeconds"],
+  "loom.claim_heartbeat": ["claimId", "fenceGeneration"],
   "loom.evidence": ["relativePath", "taskId", "contentType"],
   "loom.submit": ["taskId", "evidenceIds", "previousCandidateId"],
   "loom.inspect": ["taskId"],
@@ -88,7 +96,14 @@ export const LOOM_INPUT_KEYS: Readonly<Record<string, readonly string[]>> = Obje
   ],
 })
 
-/** Identity an operation could try to claim for itself. Never accepted from the model. */
+/**
+ * Identity an operation could try to claim for itself. Never accepted from the model.
+ *
+ * `claimId` and `fenceGeneration` are intentionally absent: `loom.claim_heartbeat` takes them as
+ * input to name the lease it renews. They grant nothing on their own — Core renews only a claim
+ * held by the authenticated Run at the current fence — and every other operation's key set above
+ * still refuses them.
+ */
 export const FORBIDDEN_INPUT_KEYS = Object.freeze([
   "agentRunId",
   "runId",
@@ -99,9 +114,7 @@ export const FORBIDDEN_INPUT_KEYS = Object.freeze([
   "creatorId",
   "commandId",
   "requestId",
-  "fenceGeneration",
   "executionEpoch",
-  "claimId",
   "reviewerAgentId",
   "reviewedAt",
   "tenantId",
@@ -278,7 +291,7 @@ export function readWorkflowContracts(file: string): WorkflowContracts {
   return workflowContracts(JSON.parse(readFileSync(file, "utf8")))
 }
 
-/** Accept exactly `{ operation, input? }` for one of the eight operations with its closed key set. */
+/** Accept exactly `{ operation, input? }` for one of the nine operations with its closed key set. */
 export function validateLoomParams(
   params: unknown,
   contracts: WorkflowContracts,
@@ -346,6 +359,7 @@ export function loomToolDescription(contracts: WorkflowContracts): string {
     "loom.plan": { goal: "Deliver the requested file", criteria: [{ criterionId: "file", text: "File is registered and awaits User acceptance" }], tasks: [{ taskId: "task-1", title: "Write the requested file" }] },
     "loom.release": { taskId: "task-1" },
     "loom.claim": { taskId: "task-1" },
+    "loom.claim_heartbeat": { claimId: "claim-from-claim", fenceGeneration: 1 },
     "loom.evidence": { relativePath: "result.md", taskId: "task-1" },
     "loom.submit": { taskId: "task-1", evidenceIds: ["artifact-from-evidence"] },
     "loom.inspect": { taskId: "task-1" },
