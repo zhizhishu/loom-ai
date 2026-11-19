@@ -2,6 +2,7 @@ import type {
   LoomAcceptanceCriterion,
   LoomAcceptanceCriterionResult,
   LoomArtifactPreviewResult,
+  LoomDispatch,
   LoomReviewRecordInput,
   LoomReviewRecordReceipt,
   LoomTaskStatus
@@ -9,8 +10,23 @@ import type {
 // 只借类型：ThreadClient 是已认证的 Core 通道，这里不发任何自制 RPC。
 import type { ThreadClient } from '../camp-client'
 import { readErrorMessage } from '../error-message'
-import { loomCandidateAcceptable, loomCandidateVersions, loomVersionLabel } from '../loom-control-model'
-import type { ArtifactSelection, LoomArtifact, LoomCandidate, LoomReview, LoomTask, LoomVerification, WorkBundle } from './types'
+import {
+  loomCandidateAcceptable,
+  loomCandidateVersions,
+  loomStageReviewFreshness,
+  loomStageReviewLatest,
+  loomVersionLabel
+} from '../loom-control-model'
+import type {
+  ArtifactSelection,
+  LoomArtifact,
+  LoomCandidate,
+  LoomReview,
+  LoomTask,
+  LoomVerification,
+  WorkBundle,
+  WorkControlFacts
+} from './types'
 
 /**
  * 成果浮层的数据层：纯函数 + 两个真实 Core 调用，不含 React、不含样式、不 import 任何旧界面组件。
@@ -104,6 +120,149 @@ export function acceptanceLabel(state: LoomCandidate['acceptanceStatus']): strin
   return state === 'accepted' ? '已验收' : state === 'rejected' ? '已驳回' : '待验收'
 }
 
+// ------------------------------------------------------ artifact review status (M7-C)
+
+/**
+ * 成果状态。判定顺序移植上游 `lib/factory/artifact-review.ts`
+ * （终局 → 受阻 → 返工 → 等你的审查 → 还没交付），事实源换成 LOOM 契约：
+ * 任务状态、候选不可变的验收状态、人工验收记录、控制投影里的阶段审查与派发。
+ *
+ * - `none`：还没有成果侧结论（卡片沿用任务状态本身）。
+ * - `preparing`：准备中——候选已登记，归档成果还没出现。
+ * - `ready`：已归档——有这份成果，但没有可验收的候选（没有候选持有它，或它是历史版本）。
+ * - `reviewing`：审查中——助手阶段审查还没交回结论，或控制事实还没读到。
+ * - `fixing`：返工中——被要求返工/被人工退回，助手正在改。
+ * - `review`：等你——审查结论已交回，等你的验收。
+ * - `accepted`：已接受。
+ * - `blocked`：受阻——任务阻塞，或当前授权下的阶段审查结论就是阻塞。
+ */
+export type ArtifactReviewKind =
+  | 'none'
+  | 'preparing'
+  | 'ready'
+  | 'reviewing'
+  | 'fixing'
+  | 'review'
+  | 'accepted'
+  | 'blocked'
+
+const ARTIFACT_REVIEW_LABEL: Record<ArtifactReviewKind, string> = {
+  none: '',
+  preparing: '准备中',
+  ready: '已归档',
+  reviewing: '审查中',
+  fixing: '返工中',
+  review: '等你',
+  accepted: '已接受',
+  blocked: '受阻'
+}
+
+/** 界面文案；`none` 没有话可说，调用方据此不渲染状态位。 */
+export function artifactReviewLabel(kind: ArtifactReviewKind): string {
+  return ARTIFACT_REVIEW_LABEL[kind]
+}
+
+/** 状态色调（上游 artifactReviewDot）：amber 等你、grey 在办、purple 已接受、red 受阻。 */
+export function artifactReviewTone(kind: ArtifactReviewKind): 'warning' | 'neutral' | 'merged' | 'destructive' | null {
+  if (kind === 'review') return 'warning'
+  if (kind === 'reviewing' || kind === 'fixing') return 'neutral'
+  if (kind === 'accepted') return 'merged'
+  if (kind === 'blocked') return 'destructive'
+  return null
+}
+
+/** 某候选上最新一条人工验收记录；按 reviewedAt，平手取数组靠后的一条（与阶段审查同规则）。 */
+export function latestCandidateReview(reviews: readonly LoomReview[], candidateId: string): LoomReview | null {
+  if (!Array.isArray(reviews)) return null
+  const time = (review: LoomReview): number => {
+    const value = Date.parse(review.reviewedAt)
+    return Number.isNaN(value) ? -Infinity : value
+  }
+  return reviews
+    .filter(review => review.candidateId === candidateId)
+    .reduce<LoomReview | null>((latest, review) =>
+      latest === null || time(review) >= time(latest) ? review : latest, null)
+}
+
+/** 只有 `waiting`/`dispatched` 才算还在办；settled/blocked/cancelled 都已有结局。 */
+function dispatchInFlight(
+  dispatches: readonly LoomDispatch[] | undefined,
+  taskId: string | null,
+  kind: LoomDispatch['kind'],
+  candidateId: string | null
+): boolean {
+  if (taskId === null || !Array.isArray(dispatches)) return false
+  return dispatches.some(dispatch => dispatch.taskId === taskId
+    && dispatch.kind === kind
+    && (dispatch.status === 'waiting' || dispatch.status === 'dispatched')
+    && (dispatch.candidateId === null || candidateId === null || dispatch.candidateId === candidateId))
+}
+
+/** 控制事实只有 `observed` 才能用来下结论；未知一律不外推。 */
+function observedControl(control: WorkControlFacts | undefined): (WorkControlFacts & { status: 'observed' })['snapshot'] | null {
+  return control?.status === 'observed' ? control.snapshot : null
+}
+
+export type ArtifactReviewInput = {
+  /** 这个任务已经有归档成果（候选的证据确实在归档里） */
+  hasArtifact: boolean
+  taskId: string | null
+  taskStatus: LoomTaskStatus | null
+  /** 成果归属候选；没有候选引用这份证据时为 null */
+  candidate: LoomCandidate | null
+  /** 候选是否返工链链头；历史版本恒为 false */
+  latest: boolean
+  /** 这个任务的人工验收记录（按候选筛选最新一条） */
+  reviews?: readonly LoomReview[]
+  /** 控制／阶段审查事实；缺省＝尚未读取，不得外推 */
+  control?: WorkControlFacts
+}
+
+/**
+ * 成果状态：纯函数，只读真实投影。
+ *
+ * 关键约束（与 types.ts 的控制事实约定一致）：读不到控制事实时，候选的 `pending`
+ * 绝不外推成「等你」——那时只能说「审查中」，因为助手审查的结论还没读到。
+ */
+export function artifactReviewKind(input: ArtifactReviewInput): ArtifactReviewKind {
+  const { taskStatus, candidate, latest } = input
+  const snapshot = observedControl(input.control)
+  const candidateId = candidate?.candidateId ?? null
+  const review = candidateId === null ? null : latestCandidateReview(input.reviews ?? [], candidateId)
+  const stageReview = candidateId === null || snapshot === null
+    ? null
+    : loomStageReviewLatest(snapshot.stageReviews, candidateId)
+  // 旧授权下的阶段审查结论已被新授权取代：只作历史，不当现在的判定。
+  const stale = stageReview !== null && loomStageReviewFreshness(stageReview, snapshot?.policy ?? null) === 'stale'
+
+  // 1. 任务阻塞是当下的真事实：卡片不因候选还在等验收就藏起来。
+  if (taskStatus === 'blocked') return 'blocked'
+  // 2. 人工终判已经成立。
+  if (candidate !== null && (candidate.acceptanceStatus === 'accepted' || review?.verdict === 'accepted')) return 'accepted'
+  // 3. 已取消的工作不再向人要验收。
+  if (taskStatus === 'canceled') return 'none'
+  // 4. 当前授权下的阶段审查判了阻塞：这也是受阻。
+  if (stageReview !== null && !stale && stageReview.verdict === 'blocked') return 'blocked'
+  // 5. 返工中：人工退回、当前授权要求返工，或返工派发还在办。
+  if (candidate !== null && (candidate.acceptanceStatus === 'rejected' || review?.verdict === 'rejected')) return 'fixing'
+  if (stageReview !== null && !stale && stageReview.verdict === 'request_changes') return 'fixing'
+  if (dispatchInFlight(snapshot?.dispatches, input.taskId, 'rework', candidateId)) return 'fixing'
+  // 6. 还没有归档成果：候选已登记就是「准备中」，否则沿用任务状态本身。
+  if (!input.hasArtifact) return candidate !== null ? 'preparing' : 'none'
+  // 7. 有成果但没有可验收的候选：没有候选持有它，或它是历史版本（旧版本不能接受）。
+  if (candidate === null || !latest) return 'ready'
+  // 8. 助手审查还在办：不归你处理，也绝不说「等你」。
+  if (dispatchInFlight(snapshot?.dispatches, input.taskId, 'review', candidateId)) return 'reviewing'
+  // 9. 控制事实还没读到：pending 不外推成「等你」。
+  if (snapshot === null) return 'reviewing'
+  // 10. 当前授权指定了独立审查者，却还没交回当前授权下的结论：审查中。
+  if (snapshot.policy !== null
+    && snapshot.policy.taskIds.includes(input.taskId ?? '')
+    && (stageReview === null || stale)) return 'reviewing'
+  // 11. 审查结论已交回（通过），或这份工作没有机器审查：等你。
+  return 'review'
+}
+
 /**
  * 浮层上下文里唯一的一份事实：绑定「拥有这份证据的那个候选」，不换成链头。
  * 看历史版本的正文时，候选仍是当初产出它的那一版，latest=false 因此关掉接受入口。
@@ -123,6 +282,8 @@ export type ArtifactCandidateFacts = {
   /** 逐条验收标准：一律取候选自己钉住的快照，不读计划现值 */
   criteria: readonly LoomAcceptanceCriterion[]
   criteriaVersion: string
+  /** 成果状态（M7-C）：只描述位置，不接管可写入口 */
+  reviewKind: ArtifactReviewKind
 }
 
 export function artifactCandidateFacts(
@@ -148,6 +309,16 @@ export function artifactCandidateFacts(
   const verification = owner === null
     ? null
     : bundle.verifications.find(entry => entry.candidateId === owner.candidateId) ?? null
+  // 这份归档成果确实在这里：状态从真实投影推导，不另存一份。
+  const reviewKind = artifactReviewKind({
+    hasArtifact: true,
+    taskId: ownedTaskId,
+    taskStatus: task?.status ?? null,
+    candidate: owner,
+    latest,
+    reviews: bundle.reviews,
+    control: bundle.control
+  })
   return {
     candidate: owner,
     task,
@@ -159,7 +330,8 @@ export function artifactCandidateFacts(
     latest,
     reviewable: owner !== null && latest && review === null,
     criteria: owner?.acceptanceCriteria.criteria ?? [],
-    criteriaVersion: owner?.acceptanceCriteria.version ?? ''
+    criteriaVersion: owner?.acceptanceCriteria.version ?? '',
+    reviewKind
   }
 }
 

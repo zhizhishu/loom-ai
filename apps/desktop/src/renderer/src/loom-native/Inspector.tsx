@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { loomLatestCandidate } from '@contracts'
 import type { ThreadClient } from '../camp-client'
 import type { HostWorkbench } from './host-services'
-import type { AgentProfile, ArtifactSelection, InspectorTab, InspectorMode, WorkBundle, WorkItem } from './types'
+import type { AgentProfile, ArtifactSelection, InspectorTab, InspectorMode, LoomReview, WorkBundle, WorkControlFacts, WorkItem } from './types'
 import { Avatar } from './Avatar'
 import { Icon, IconButton, type IconName } from './icons'
 import { Markdown } from './ConversationView'
@@ -10,6 +10,7 @@ import { ChoiceMenu } from './Controls'
 import { WorkMap } from './WorkMap'
 import { ComputerWorkspace } from './ComputerWorkspace'
 import { modeFor, panelFor, scopedBundles, type WorkspacePanel, type WorkspaceScope } from './workspace-panel'
+import { artifactCandidateFacts, artifactReviewKind, artifactReviewLabel, type ArtifactReviewKind } from './artifact-service'
 
 export function relativeDate(value: string): string {
   const date = new Date(value)
@@ -20,18 +21,88 @@ export function relativeDate(value: string): string {
   if (days < 7) return `${days}天前`
   return date.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })
 }
-export function workStatus(item: WorkItem): { label: string; group: string; icon: IconName } {
+
+/**
+ * 一张任务卡片上的事实：任务 + 链头候选 + 归档证据是否存在 + 验收/控制投影。
+ * 全部取自同一个 Bundle，不在界面里另存一份状态。
+ */
+export type WorkItemFacts = WorkItem & {
+  /** 链头候选的证据确实在归档里（false＝候选已登记但归档还没见到） */
+  hasArtifact: boolean
+  reviews: readonly LoomReview[]
+  control?: WorkControlFacts
+}
+
+/** `flattenWork` 之外调用时可缺省：缺省不当作「没有评审」，只是界面还没拿到那几份事实。 */
+export type WorkStatusInput = WorkItem & {
+  hasArtifact?: boolean
+  reviews?: readonly LoomReview[]
+  control?: WorkControlFacts
+}
+
+const REVIEW_GROUP: Record<ArtifactReviewKind, string | null> = {
+  // none / ready：成果侧没有结论，卡片沿用任务状态本身（待开始、进行中、已取消…）。
+  none: null,
+  preparing: '进行中',
+  ready: null,
+  reviewing: '进行中',
+  fixing: '进行中',
+  review: '等待你',
+  accepted: '已完成',
+  blocked: '受阻'
+}
+const REVIEW_ICON: Record<ArtifactReviewKind, IconName | null> = {
+  none: null,
+  preparing: 'progress',
+  ready: null,
+  reviewing: 'progress',
+  fixing: 'progress',
+  review: 'hand',
+  accepted: 'check',
+  blocked: 'blocked'
+}
+
+/**
+ * 卡片状态：先看成果侧的真实结论（M7-C），只有它不下结论时才沿用任务状态本身。
+ * 关键约束：助手审查还在办、或控制事实还没读到，候选的 `pending` 都不是「等你」。
+ */
+export function workStatus(item: WorkStatusInput): { label: string; group: string; icon: IconName } {
+  const kind = artifactReviewKind({
+    // 卡片只跟链头候选：链头没有归档证据时才是「准备中」。
+    hasArtifact: item.hasArtifact ?? item.candidate !== null,
+    taskId: item.task.taskId,
+    taskStatus: item.task.status,
+    candidate: item.candidate,
+    latest: true,
+    reviews: item.reviews ?? [],
+    control: item.control
+  })
+  const group = REVIEW_GROUP[kind]
+  const icon = REVIEW_ICON[kind]
+  if (group !== null && icon !== null) return { label: artifactReviewLabel(kind), group, icon }
   if (item.task.status === 'blocked') return { label: '受阻', group: '受阻', icon: 'blocked' }
-  if (item.candidate?.acceptanceStatus === 'pending') return { label: '等待审阅', group: '等待你', icon: 'hand' }
-  if (item.task.status === 'in_review') return { label: '审查中', group: '进行中', icon: 'progress' }
-  if (item.task.status === 'done') return { label: item.candidate?.acceptanceStatus === 'accepted' ? '已接受' : '执行已结束', group: '已完成', icon: 'check' }
   if (item.task.status === 'canceled') return { label: '已取消', group: '已完成', icon: 'check' }
+  if (item.task.status === 'done') return { label: '执行已结束', group: '已完成', icon: 'check' }
+  if (item.task.status === 'in_review') return { label: '审查中', group: '进行中', icon: 'progress' }
   if (item.task.assigneeAgentId && item.mission.runningAgentIds.includes(item.task.assigneeAgentId)) return { label: '进行中', group: '进行中', icon: 'progress' }
   return { label: item.task.status === 'draft' ? '计划中' : '待开始', group: '待开始', icon: 'clock' }
 }
-export function flattenWork(bundles: WorkBundle[]): WorkItem[] {
-  return bundles.flatMap(bundle => bundle.tasks.map(task => ({ task, mission: bundle.mission,
-    candidate: loomLatestCandidate(task.taskId, bundle.candidates) })))
+
+export function flattenWork(bundles: WorkBundle[]): WorkItemFacts[] {
+  return bundles.flatMap(bundle => {
+    const archived = new Set(bundle.artifacts.map(artifact => artifact.artifactId))
+    return bundle.tasks.map(task => {
+      const candidate = loomLatestCandidate(task.taskId, bundle.candidates)
+      return {
+        task,
+        mission: bundle.mission,
+        candidate,
+        hasArtifact: candidate !== null && candidate.evidenceIds.some(id => archived.has(id)),
+        reviews: bundle.reviews,
+        control: bundle.control
+      }
+    })
+  })
 }
 
 const PANELS: { id: WorkspacePanel; label: string; icon: IconName }[] = [
@@ -66,16 +137,23 @@ export function Inspector({ agents, bundles, agent, mode, tab, onMode, onClose, 
   const all = useMemo(() => flattenWork(currentBundles), [currentBundles])
   const shown = all.filter(item => (!query || `${item.task.title} ${item.task.description}`.toLocaleLowerCase().includes(query.toLocaleLowerCase())) && (!owner || item.task.assigneeAgentId === owner))
   const selectedTask = all.find(item => item.task.taskId === selectedTaskId) ?? null
-  const assets = currentBundles.flatMap(bundle => bundle.artifacts.map(artifact => ({ artifact, bundle,
-    candidate: bundle.candidates.find(candidate => candidate.evidenceIds.includes(artifact.artifactId)) ?? null })))
+  const assets = currentBundles.flatMap(bundle => bundle.artifacts.map(artifact => {
+    // 成果行只跟「拥有这份归档」的那个候选：历史成果仍打开它自己的归档，不跳到链头。
+    const facts = artifactCandidateFacts(bundle, artifact, null)
+    return { artifact, bundle, candidate: facts.candidate, reviewKind: facts.reviewKind }
+  }))
   const attentionCount = all.filter(item => workStatus(item).group === '等待你').length
   const changePanel = (value: WorkspacePanel) => { onMode(modeFor(value)); setSearchOpen(false) }
   const renderAssets = (onlyTask?: string) => {
     const rows = assets.filter(selection => (!onlyTask || selection.artifact.taskId === onlyTask)
       && (!query || selection.artifact.relativePath.toLocaleLowerCase().includes(query.toLocaleLowerCase())))
-    return <div className="ln-assets-list">{rows.map(selection => <button key={selection.artifact.artifactId} type="button" className="ln-asset-row" onClick={() => onArtifact(selection)}>
-      <span className="ln-document-icon"><Icon name="file" size={23}/></span><span><strong>{selection.artifact.relativePath.split(/[\\/]/).pop()}</strong><small>{selection.bundle.mission.title} · {relativeDate(selection.artifact.createdAt)}</small></span><Icon name="right" size={14}/>
-    </button>)}{!rows.length && <div className="ln-dock-empty"><Icon name="files" size={30}/><strong>{query ? '没有匹配的成果' : '成果会留在这里'}</strong><p>文档、代码和版本记录会随工作自动归档。打开文件不会自动接受成果。</p>{scope === 'conversation' && threadId && <button type="button" className="ln-text-action" onClick={() => setScope('all')}>查看所有工作中的资产</button>}</div>}</div>
+    return <div className="ln-assets-list">{rows.map(selection => {
+      // 成果行也读同一条规则：历史成果显示「已归档」，审查还在办时不会写成「等你」。
+      const status = artifactReviewLabel(selection.reviewKind)
+      return <button key={selection.artifact.artifactId} type="button" className="ln-asset-row" onClick={() => onArtifact(selection)}>
+      <span className="ln-document-icon"><Icon name="file" size={23}/></span><span><strong>{selection.artifact.relativePath.split(/[\\/]/).pop()}</strong><small>{selection.bundle.mission.title} · {relativeDate(selection.artifact.createdAt)}{status !== '' && <> · <span data-state={selection.reviewKind}>{status}</span></>}</small></span><Icon name="right" size={14}/>
+    </button>
+    })}{!rows.length && <div className="ln-dock-empty"><Icon name="files" size={30}/><strong>{query ? '没有匹配的成果' : '成果会留在这里'}</strong><p>文档、代码和版本记录会随工作自动归档。打开文件不会自动接受成果。</p>{scope === 'conversation' && threadId && <button type="button" className="ln-text-action" onClick={() => setScope('all')}>查看所有工作中的资产</button>}</div>}</div>
   }
   const renderWork = () => <div className="ln-work-groups">{['等待你', '进行中', '受阻', '待开始', '已完成'].map(group => {
     const rows = shown.filter(item => workStatus(item).group === group)

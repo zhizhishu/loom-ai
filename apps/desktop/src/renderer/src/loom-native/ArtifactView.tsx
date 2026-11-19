@@ -13,6 +13,7 @@ import {
   artifactCandidateFacts,
   artifactFileName,
   artifactPreviewKind,
+  artifactReviewLabel,
   artifactSizeLabel,
   artifactVersionLabel,
   newReviewDraft,
@@ -28,8 +29,28 @@ import {
   verificationLabel,
   type ArtifactPreviewState,
   type ArtifactReviewDraft,
-  type ArtifactReviewAttempt
+  type ArtifactReviewAttempt,
+  type ArtifactReviewKind
 } from './artifact-service'
+
+/**
+ * 成果状态位（M7-C）：只描述这份成果现在在哪一步，不接管验收写入口。
+ * 审查还在办、或控制事实还没读到，这里就是「审查中」，不会是「等你」。
+ * 导出成纯组件，让状态文案能在静态渲染里被验证。
+ */
+export function ArtifactReviewStatus({ kind }: { kind: ArtifactReviewKind }): React.JSX.Element | null {
+  const label = artifactReviewLabel(kind)
+  if (label === '') return null
+  return <>
+    <div className="ln-artifact-fact" data-fact="review-status">
+      <span className="ln-artifact-fact-label">成果状态</span>
+      <span className="ln-artifact-badge" data-state={kind}>{label}</span>
+    </div>
+    {kind === 'reviewing' && <p className="ln-artifact-fact-note">助手审查还没有交回结论。</p>}
+    {kind === 'fixing' && <p className="ln-artifact-fact-note">助手正在按审查意见返工。</p>}
+    {kind === 'ready' && <p className="ln-artifact-fact-note">这份归档没有可验收的候选。</p>}
+  </>
+}
 
 /**
  * 成果浮层（原生界面）。焦点陷阱、Escape 关闭、滚动锁由 Radix Dialog 提供；
@@ -287,6 +308,8 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
                   {taskStatusLabel(facts.task.status)}
                 </span>}
               </div>
+
+              <ArtifactReviewStatus kind={facts.reviewKind}/>
 
               <details className="ln-artifact-metadata"><summary>文件信息</summary>              <div className="ln-artifact-fact" data-fact="artifact">
                 <span className="ln-artifact-fact-label">档案</span>

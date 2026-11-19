@@ -1,9 +1,19 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { LoomReviewRecordReceipt } from '@contracts'
-import type { LoomArtifact, LoomCandidate, LoomTask, WorkBundle } from './types'
+import type {
+  LoomControlPolicy,
+  LoomControlSnapshot,
+  LoomDispatch,
+  LoomReviewRecordReceipt,
+  LoomStageReview
+} from '@contracts'
+import type { LoomArtifact, LoomCandidate, LoomReview, LoomTask, WorkBundle, WorkControlFacts } from './types'
 import {
   artifactCandidateFacts,
+  artifactReviewKind,
+  artifactReviewLabel,
+  artifactReviewTone,
   discardUnconfirmedReviewAttempt,
+  latestCandidateReview,
   prepareArtifactReviewAttempt,
   recallUnconfirmedReviewAttempt,
   refreshArtifactSelection,
@@ -12,6 +22,7 @@ import {
   submitArtifactReview,
   unconfirmedAttemptLifecycle,
   type ArtifactReviewAttempt,
+  type ArtifactReviewInput,
   type LoomRpc
 } from './artifact-service'
 
@@ -560,5 +571,146 @@ describe('legacy submitArtifactReview stays backward compatible', () => {
     )
     await expect(submitArtifactReview(rpc(request), 'm', historical, draft())).rejects.toThrow()
     expect(request).not.toHaveBeenCalled()
+  })
+})
+
+// ------------------------------------------------- artifact status (M7-C port)
+
+const stageReview = (over: Partial<LoomStageReview> = {}): LoomStageReview => ({
+  stageReviewId: 'sr1', taskId: 't', candidateId: 'c1', reviewerAgentId: 'r', reviewerAgentRunId: 'rr',
+  policyRevision: 1, manifestHash: 'h', verdict: 'pass', reason: '', criteriaResults: [],
+  reviewedAt: '2026-11-13T06:00:00Z', ...over
+})
+const dispatchOf = (over: Partial<LoomDispatch> = {}): LoomDispatch => ({
+  dispatchId: 'd1', taskId: 't', kind: 'review', candidateId: 'c1', policyRevision: 1,
+  recipientAgentId: 'r', deliveryId: null, status: 'dispatched', reason: null,
+  createdAt: '2026-11-13T06:00:00Z', ...over
+})
+const policy = (over: Partial<LoomControlPolicy> = {}): LoomControlPolicy => ({
+  missionId: 'm', planId: 'p', revision: 1, authorizationRevision: 1, enabled: true, paused: false,
+  taskIds: ['t'], reviewers: [{ taskId: 't', reviewerAgentId: 'r' }], maxDispatches: 4,
+  maxReworksPerTask: 1, expiresAt: null, approvedBy: 'local_user',
+  approvedAt: '2026-11-13T05:00:00Z', updatedAt: '2026-11-13T05:00:00Z', ...over
+})
+const observed = (over: Partial<LoomControlSnapshot> = {}): WorkControlFacts => ({
+  status: 'observed',
+  snapshot: { missionId: 'm', policy: null, stageReviews: [], dispatches: [], evaluatedAt: '2026-11-13T06:00:00Z', ...over }
+})
+const unknownControl = (reason: 'not_read' | 'read_failed' | 'invalid'): WorkControlFacts =>
+  ({ status: 'unknown', reason, message: reason })
+const reviewOf = (over: Partial<LoomReview> = {}): LoomReview => ({
+  reviewId: 'rev1', candidateId: 'c1', acceptanceCriteriaVersion: criteria.version,
+  verdict: 'rejected', reason: 'Needs another pass', criteriaResults: [],
+  reviewerId: 'local_user', reviewedAt: '2026-11-13T06:00:00Z', ...over
+})
+
+/** 卡片/浮层共用的判定入参默认值：一份已归档成果、链头候选、任务在审查。 */
+const statusOf = (over: Partial<ArtifactReviewInput> = {}): ArtifactReviewInput => ({
+  hasArtifact: true, taskId: 't', taskStatus: 'in_review', candidate: first, latest: true,
+  reviews: [], control: observed(), ...over
+})
+const kindOf = (over: Partial<ArtifactReviewInput> = {}) => artifactReviewKind(statusOf(over))
+
+describe('artifact status is derived from the real control and acceptance projections', () => {
+  it('port of the upstream order: nothing yet, then preparing, archived, your turn', () => {
+    // 还没成果：没有候选也没有归档，不由成果侧下结论（卡片沿用任务状态）。
+    expect(kindOf({ hasArtifact: false, taskStatus: 'ready', candidate: null })).toBe('none')
+    expect(kindOf({ hasArtifact: false, taskStatus: 'done', candidate: null })).toBe('none')
+    // 准备中：候选已登记，归档成果还没出现——这是 LOOM 里唯一「正在准备」的正面证据。
+    expect(kindOf({ hasArtifact: false })).toBe('preparing')
+    // 已归档：有这份成果，但没有可验收的候选。
+    expect(kindOf({ candidate: null })).toBe('ready')
+    // 有可验收的链头候选、审查结论已交回（这里没有机器审查）：等你。
+    expect(kindOf()).toBe('review')
+  })
+
+  it('a machine review still in flight keeps a pending candidate out of your queue', () => {
+    for (const status of ['waiting', 'dispatched'] as const) {
+      expect(kindOf({ control: observed({ dispatches: [dispatchOf({ status })] }) })).toBe('reviewing')
+    }
+    // settled / cancelled / blocked 都是已有结局：不再算在办。
+    for (const status of ['settled', 'cancelled', 'blocked'] as const) {
+      expect(kindOf({ control: observed({ dispatches: [dispatchOf({ status })] }) })).toBe('review')
+    }
+    // 别的任务的派发不影响这份成果。
+    expect(kindOf({ control: observed({ dispatches: [dispatchOf({ taskId: 'other' })] }) })).toBe('review')
+  })
+
+  it('the assigned reviewer decides when the machine review has really concluded', () => {
+    const assigned = policy()
+    // 指定了独立审查者，但还没有当前授权下的结论：审查中。
+    expect(kindOf({ control: observed({ policy: assigned }) })).toBe('reviewing')
+    // 当前授权下通过：交回结论，等你。
+    expect(kindOf({ control: observed({ policy: assigned, stageReviews: [stageReview()] }) })).toBe('review')
+    // 旧授权下的通过已被取代：要新授权下重审，还是审查中。
+    expect(kindOf({ control: observed({ policy: policy({ authorizationRevision: 2 }), stageReviews: [stageReview()] }) }))
+      .toBe('reviewing')
+    // 没有把任务纳入机器审查：人工验收就是终判，等你。
+    expect(kindOf({ control: observed({ policy: policy({ taskIds: [], reviewers: [] }) }) })).toBe('review')
+  })
+
+  it('rework and blockage come from the same facts a person can inspect', () => {
+    expect(kindOf({ control: observed({ policy: policy(), stageReviews: [stageReview({ verdict: 'request_changes' })] }) }))
+      .toBe('fixing')
+    expect(kindOf({ candidate: { ...first, acceptanceStatus: 'rejected' } })).toBe('fixing')
+    expect(kindOf({ reviews: [reviewOf()] })).toBe('fixing')
+    expect(kindOf({ control: observed({ dispatches: [dispatchOf({ kind: 'rework' })] }) })).toBe('fixing')
+    // 任务阻塞优先于候选还在等验收。
+    expect(kindOf({ taskStatus: 'blocked' })).toBe('blocked')
+    // 当前授权下的阶段审查判了阻塞：也是受阻。
+    expect(kindOf({ control: observed({ policy: policy(), stageReviews: [stageReview({ verdict: 'blocked' })] }) }))
+      .toBe('blocked')
+    // 旧授权下的阻塞已被取代，不当现在的受阻。
+    expect(kindOf({ control: observed({ policy: policy({ authorizationRevision: 2 }), stageReviews: [stageReview({ verdict: 'blocked' })] }) }))
+      .toBe('reviewing')
+  })
+
+  it('an accepted result is terminal and a cancelled task asks nothing of you', () => {
+    expect(kindOf({ candidate: { ...first, acceptanceStatus: 'accepted' } })).toBe('accepted')
+    expect(kindOf({ reviews: [reviewOf({ verdict: 'accepted' })] })).toBe('accepted')
+    // 接受是终判：旧授权下的阻塞结论不再改写它。
+    expect(kindOf({
+      candidate: { ...first, acceptanceStatus: 'accepted' },
+      control: observed({ policy: policy(), stageReviews: [stageReview({ verdict: 'blocked' })] })
+    })).toBe('accepted')
+    expect(kindOf({ taskStatus: 'canceled' })).toBe('none')
+    // 历史版本仍是一份归档，但不归你验收。
+    expect(kindOf({ latest: false })).toBe('ready')
+  })
+
+  it('unknown control facts never turn a pending candidate into waiting for you', () => {
+    for (const reason of ['not_read', 'read_failed', 'invalid'] as const) {
+      expect(kindOf({ control: unknownControl(reason) })).toBe('reviewing')
+    }
+    // 缺省（从未读取）与三种未知同一判定。
+    expect(kindOf({ control: undefined })).toBe('reviewing')
+    // 没有控制事实也能下结论的只有人工终判与任务状态本身。
+    expect(kindOf({ control: undefined, reviews: [reviewOf({ verdict: 'accepted' })] })).toBe('accepted')
+    expect(kindOf({ control: undefined, taskStatus: 'blocked' })).toBe('blocked')
+  })
+
+  it('tone and copy: amber waiting, grey work, green accepted, red blocked', () => {
+    const kinds = ['none', 'preparing', 'ready', 'review', 'fixing', 'reviewing', 'accepted', 'blocked'] as const
+    expect(kinds.map(artifactReviewTone))
+      .toEqual([null, null, null, 'warning', 'neutral', 'neutral', 'merged', 'destructive'])
+    expect(kinds.map(artifactReviewLabel))
+      .toEqual(['', '准备中', '已归档', '等你', '返工中', '审查中', '已接受', '受阻'])
+  })
+
+  it('the artifact facts carry the status, so the overlay and the list read one rule', () => {
+    const withControl = (control: WorkControlFacts) => ({ ...bundle([first], [artifact]), control })
+    expect(artifactCandidateFacts(withControl(observed({ dispatches: [dispatchOf()] })), artifact, first).reviewKind)
+      .toBe('reviewing')
+    expect(artifactCandidateFacts(withControl(observed()), artifact, first).reviewKind).toBe('review')
+    expect(artifactCandidateFacts(bundle([first], [artifact]), artifact, first).reviewKind).toBe('reviewing')
+  })
+
+  it('the latest human review of one candidate is picked by time, not array order', () => {
+    const earlier = reviewOf({ reviewId: 'rev-a', verdict: 'rejected', reviewedAt: '2026-11-13T06:00:00Z' })
+    const later = reviewOf({ reviewId: 'rev-b', verdict: 'accepted', reviewedAt: '2026-11-13T07:00:00Z' })
+    expect(latestCandidateReview([later, earlier], 'c1')?.reviewId).toBe('rev-b')
+    expect(latestCandidateReview([earlier, later], 'c1')?.reviewId).toBe('rev-b')
+    expect(latestCandidateReview([earlier], 'other')).toBeNull()
+    expect(latestCandidateReview([], 'c1')).toBeNull()
   })
 })
