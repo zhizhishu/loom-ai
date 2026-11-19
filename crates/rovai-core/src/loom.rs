@@ -1123,6 +1123,38 @@ fn lease_expired(lease_expires_at: &str, now: chrono::DateTime<chrono::Utc>) -> 
     }
 }
 
+/// LOOM 自有决定（P0 步骤 1）：本 Run 当前持有的活 claim（没有就是 `None`）。
+///
+/// 规则与提交侧的 fence（`candidate_record` 的 `released_at IS NULL` 查询）和
+/// [`lease_expired`] 完全对齐：释放过的 claim 和过期/不可解析的 lease 都不算活。
+/// 同一 Run 可能因为接管而有多代 fence，只报最大的那一代；它已经过期时不回退到
+/// 更早的世代——过期就是没有活 claim。此函数不写库、不加锁，调用方自己持有连接与
+/// 时钟，避免在这里偷偷读第二个时钟。
+#[allow(dead_code)] // 只读口先落地，消费方（提交侧/远端接管）随后接上。
+pub(crate) fn live_claim_for_run(
+    connection: &rusqlite::Connection,
+    agent_run_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<LiveClaim>> {
+    let claim: Option<LiveClaim> = connection
+        .query_row(
+            "SELECT claim_id, agent_run_id, fence_generation, lease_expires_at FROM loom_claim
+             WHERE agent_run_id=?1 AND released_at IS NULL
+             ORDER BY fence_generation DESC, rowid DESC LIMIT 1",
+            params![agent_run_id],
+            |row| {
+                Ok(LiveClaim {
+                    claim_id: row.get(0)?,
+                    agent_run_id: row.get(1)?,
+                    fence_generation: row.get(2)?,
+                    lease_expires_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(claim.filter(|claim| !lease_expired(&claim.lease_expires_at, now)))
+}
+
 /// The edges that still block a claim, using the same rule as the contract's
 /// `loomEvaluateDependency`: a frozen release wins, otherwise a `TASK_DONE` edge needs its
 /// upstream Task `DONE`. The `ARTIFACT_ACCEPTED` branch needs a candidate and an accepted
@@ -1673,11 +1705,14 @@ impl StoredCandidate {
 
 /// The live claim a submitting Run must hold: the fence is the Run identity, the claim
 /// identity, the fence generation and an unexpired lease, never a task state alone.
-struct LiveClaim {
-    claim_id: String,
-    agent_run_id: String,
-    fence_generation: i64,
-    lease_expires_at: String,
+///
+/// LOOM 自有决定：同一个类型既是提交侧的 fence，也是只读口
+/// [`live_claim_for_run`] 的返回值，不再造平行的镜像类型。
+pub(crate) struct LiveClaim {
+    pub(crate) claim_id: String,
+    pub(crate) agent_run_id: String,
+    pub(crate) fence_generation: i64,
+    pub(crate) lease_expires_at: String,
 }
 
 /// LOOM candidate path: a Run submits the delivery for the Task it holds, and the Task
@@ -7158,6 +7193,83 @@ mod tests {
         assert!(
             !released.claims[0].expired,
             "assertion a released claim must not also read as expired"
+        );
+    }
+
+    /// LOOM 自有决定（P0 步骤 1）：`live_claim_for_run` 只报「这个 Run 现在真的还活着」的 claim。
+    /// 释放过的、过期的、以及被更新一代 fence 接管的一律不报。
+    #[test]
+    fn live_claim_for_run_reports_only_the_open_unexpired_claim() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM live claim for run");
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
+
+        let live = live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+            .unwrap()
+            .expect("an open, unexpired lease must read as live");
+        assert_eq!(live.claim_id, claim.claim_id.as_str());
+        assert_eq!(live.agent_run_id, "run_one");
+        assert_eq!(
+            live.fence_generation, 1,
+            "assertion the live claim reports its own fence generation"
+        );
+        assert_eq!(live.lease_expires_at, claim.lease_expires_at.as_str());
+        assert!(
+            live_claim_for_run(database.connection(), "run_two", chrono::Utc::now())
+                .unwrap()
+                .is_none(),
+            "assertion a released or expired lease is never reported as live"
+        );
+
+        // 过期租约不算活：过期就是没有活 claim，不回退也不静默续期。
+        expire_lease(&database, &claim.claim_id);
+        assert!(
+            live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+                .unwrap()
+                .is_none(),
+            "assertion a released or expired lease is never reported as live"
+        );
+
+        let takeover = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_two", "command_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            takeover.fence_generation, 2,
+            "assertion the takeover advances the fence generation"
+        );
+        assert!(
+            live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+                .unwrap()
+                .is_none(),
+            "assertion a released or expired lease is never reported as live"
+        );
+        let second = live_claim_for_run(database.connection(), "run_two", chrono::Utc::now())
+            .unwrap()
+            .expect("the takeover Run holds the live claim");
+        assert_eq!(second.claim_id, takeover.claim_id.as_str());
+        assert_eq!(second.fence_generation, 2);
+
+        // 显式释放同样立刻失效：交还的 claim 不能再支撑提交。
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_claim SET released_at=?1 WHERE claim_id=?2",
+                rusqlite::params![chrono::Utc::now().to_rfc3339(), &takeover.claim_id],
+            )
+            .unwrap();
+        assert!(
+            live_claim_for_run(database.connection(), "run_two", chrono::Utc::now())
+                .unwrap()
+                .is_none(),
+            "assertion a released or expired lease is never reported as live"
         );
     }
 
