@@ -25,6 +25,21 @@
 //!   current assignment, the producer's identity and the Candidate's freshness are re-proved
 //!   before the Delivery lane is entered, so a rejected admission leaves no ledger row and no
 //!   Camp message behind.
+//! * **A failure is a fact, not a silence.** When the recipient cannot take the work right now,
+//!   the pass writes exactly one reason: `loom.dispatch_recipient_disabled`, then
+//!   `loom.dispatch_recipient_offline`, then `loom.dispatch_harness_unavailable`, judged in that
+//!   order — the switch, then presence, then the harness — ported from Mikka
+//!   `lib/factory/dispatch-recovery.ts:factoryDispatchFailureReason`. The facts are read inside the
+//!   same `IMMEDIATE` transaction as the decision, so a recipient that comes back while the pass
+//!   waits for the write lock is dispatched instead of being reported as absent. The reason is
+//!   deduped by value (a repeated tick writes nothing at all), and the moment the recipient is
+//!   reachable again the same Task is handed out under its own unchanged event identity: recovery
+//!   resumes the Delivery/queued Run the earlier pass could not start, and never mints a second
+//!   one.
+//!
+//! The cloud half of the upstream module (`FACTORY_CLOUD_DISPATCH_AVAILABLE`, `switchToCloud`) has
+//! no counterpart here: cloud (E2B) dispatch stays unavailable, so no pass of this module can start
+//! one and no code in it can be turned on to try.
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -44,6 +59,18 @@ const BUDGET_EXHAUSTED_REASON: &str = "loom.dispatch_budget_exhausted";
 const REWORK_EXHAUSTED_REASON: &str = "loom.rework_budget_exhausted";
 const PREVIOUS_OUTCOME_REASON: &str = "loom.dispatch_previous_outcome_unknown";
 const RECIPIENT_UNAVAILABLE_REASON: &str = "loom.dispatch_recipient_unavailable";
+
+/// The failure vocabulary of one dispatch, ported from Mikka
+/// `lib/factory/dispatch-recovery.ts:FACTORY_DISPATCH_FAILURE_REASONS` (`deviceDisabled`,
+/// `deviceOffline`, `harnessUnavailable`). A recipient Agent and the runtime it is bound to are
+/// LOOM's device: the switch is the membership/profile, presence is the bound installation and its
+/// executable, and the harness is the Adapter kind that installation actually offers.
+///
+/// These are permanent `loom_task.blocked_reason` codes and are judged in exactly this order, so a
+/// recipient that is both switched off and unreachable is reported as switched off.
+const RECIPIENT_DISABLED_REASON: &str = "loom.dispatch_recipient_disabled";
+const RECIPIENT_OFFLINE_REASON: &str = "loom.dispatch_recipient_offline";
+const HARNESS_UNAVAILABLE_REASON: &str = "loom.dispatch_harness_unavailable";
 
 const EXECUTE: &str = "EXECUTE";
 const REVIEW: &str = "REVIEW";
@@ -257,14 +284,20 @@ fn admit_plan(
             None,
         )? {
             match problem {
-                RECIPIENT_UNAVAILABLE_REASON | "loom.dispatch_recipient_not_reviewer"
+                RECIPIENT_UNAVAILABLE_REASON | RECIPIENT_DISABLED_REASON
+                | RECIPIENT_OFFLINE_REASON | HARNESS_UNAVAILABLE_REASON
+                | "loom.dispatch_recipient_not_reviewer"
                 | "loom.dispatch_recipient_not_assignee" | "loom.dispatch_recipient_is_assignee"
                 | "loom.dispatch_recipient_is_producer" | "loom.dispatch_recipient_not_lead" => {
+                    // The recorded reason is the specific code, not a generic "cannot reach".
+                    // Writing it is a compare-and-set on the value: an unchanged reason writes
+                    // nothing (so a repeated tick cannot produce a second event for the same
+                    // failure), and a changed one replaces it once.
                     set_control_blocked_reason(
                         transaction,
                         plan_id,
                         &event.task_id,
-                        RECIPIENT_UNAVAILABLE_REASON,
+                        problem,
                         now,
                     )?;
                 }
@@ -587,8 +620,11 @@ fn event_problem(
     let Some(camp_id) = camp_id else {
         return Ok(Some("loom.dispatch_mission_missing"));
     };
-    if !active_member(transaction, &camp_id, recipient)? {
-        return Ok(Some(RECIPIENT_UNAVAILABLE_REASON));
+    // The recipient's own availability, in the upstream order disabled → offline → harness. It is
+    // read from the transaction that is about to decide, never from an earlier reading: an
+    // availability change that commits while this pass waits for the write lock is observed here.
+    if let Some(reason) = recipient_failure_reason(transaction, &camp_id, recipient)? {
+        return Ok(Some(reason));
     }
 
     let task_state: Option<(String, Option<String>)> = transaction
@@ -973,6 +1009,128 @@ fn latest_stage_review_id(
         .optional()?)
 }
 
+/// The persisted presence of one recipient: the switch (profile and Camp membership), the runtime
+/// it is bound to, and the harness that runtime actually offers. Read from the connection that is
+/// about to decide, so the facts are the ones the write lock ordered.
+struct RecipientPresence {
+    profile_status: String,
+    profile_removed: bool,
+    profile_archived: bool,
+    member_status: Option<String>,
+    leave_requested: bool,
+    /// The Adapter kind the Agent is configured to run, when one is configured at all.
+    selected_adapter_kind: Option<String>,
+    /// `(enabled, adapter_kind, path_state)` of the installation bound to the Agent.
+    installation: Option<(i64, String, String)>,
+    /// The probe the installation last reported, when it ever reported one.
+    probe_status: Option<String>,
+}
+
+/// Why this recipient cannot take a Delivery right now, or `None` when it can.
+///
+/// The order is the upstream one — `disabled`, then `offline`, then `harness` — so the reason
+/// names the *first* fact that makes the recipient unusable instead of whichever fact was cheapest
+/// to read. Each step is asked only when the step above it passed, and an unreadable fact fails
+/// closed into the step it belongs to: nothing here answers "maybe".
+fn recipient_failure_reason(
+    connection: &Connection,
+    camp_id: &str,
+    agent_id: &str,
+) -> Result<Option<&'static str>> {
+    let presence: Option<RecipientPresence> = connection
+        .query_row(
+            "SELECT profile.profile_status,
+                    profile.removed_at IS NOT NULL,
+                    profile.archived_at IS NOT NULL,
+                    member.status,
+                    member.leave_requested_at IS NOT NULL,
+                    profile.selected_runtime_adapter_kind,
+                    installation.enabled,
+                    installation.adapter_kind,
+                    installation.path_state,
+                    snapshot.probe_status
+             FROM agent_profile profile
+             LEFT JOIN camp_member member
+                    ON member.camp_id=?1 AND member.agent_id=profile.id
+             LEFT JOIN adapter_installation installation
+                    ON installation.id=profile.default_runtime_installation_id
+             LEFT JOIN adapter_capability_snapshot snapshot
+                    ON snapshot.installation_id=installation.id
+             WHERE profile.id=?2",
+            params![camp_id, agent_id],
+            |row| {
+                let enabled: Option<i64> = row.get(6)?;
+                let adapter_kind: Option<String> = row.get(7)?;
+                let path_state: Option<String> = row.get(8)?;
+                let installation = match (enabled, adapter_kind, path_state) {
+                    (Some(enabled), Some(adapter_kind), Some(path_state)) => {
+                        Some((enabled, adapter_kind, path_state))
+                    }
+                    // A half-bound installation is not a reachable runtime.
+                    _ => None,
+                };
+                Ok(RecipientPresence {
+                    profile_status: row.get(0)?,
+                    profile_removed: row.get(1)?,
+                    profile_archived: row.get(2)?,
+                    member_status: row.get(3)?,
+                    leave_requested: row.get(4)?,
+                    selected_adapter_kind: row.get(5)?,
+                    installation,
+                    probe_status: row.get(9)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(presence) = presence else {
+        // An Agent with no profile at all cannot be asked: that is the switch, not a transient
+        // absence, so it is never reported as merely offline.
+        return Ok(Some(RECIPIENT_DISABLED_REASON));
+    };
+
+    // 1. disabled — the recipient is switched off, so nothing below can make it usable.
+    if presence.profile_removed
+        || presence.profile_archived
+        || !matches!(presence.profile_status.as_str(), "present" | "away")
+        || presence.member_status.as_deref() != Some("active")
+        || presence.leave_requested
+    {
+        return Ok(Some(RECIPIENT_DISABLED_REASON));
+    }
+
+    // 2. offline — the member stands, but it is not present now, or the runtime bound to it cannot
+    //    be reached: no installation, a switched-off installation, or an executable that is gone.
+    if presence.profile_status != "present" {
+        return Ok(Some(RECIPIENT_OFFLINE_REASON));
+    }
+    let Some((enabled, adapter_kind, path_state)) = presence.installation else {
+        return Ok(Some(RECIPIENT_OFFLINE_REASON));
+    };
+    if enabled != 1 || path_state != "valid" {
+        return Ok(Some(RECIPIENT_OFFLINE_REASON));
+    }
+
+    // 3. harness — reachable, but the harness the Agent must run is not the one installed there.
+    //    An Agent with no configured Adapter asks for no particular harness, exactly as an upstream
+    //    device with no harness requirement.
+    if let Some(selected) = presence
+        .selected_adapter_kind
+        .as_deref()
+        .filter(|kind| !kind.is_empty())
+    {
+        if selected != adapter_kind || presence.probe_status.as_deref() != Some("ready") {
+            return Ok(Some(HARNESS_UNAVAILABLE_REASON));
+        }
+    }
+
+    // The Camp membership rule remains the last word: any fact the ladder above did not name still
+    // fails closed under the module's generic code instead of being waved through.
+    if !active_member(connection, camp_id, agent_id)? {
+        return Ok(Some(RECIPIENT_UNAVAILABLE_REASON));
+    }
+    Ok(None)
+}
+
 fn agent_of_run(connection: &Connection, agent_run_id: &str) -> Result<Option<String>> {
     Ok(connection
         .query_row(
@@ -985,8 +1143,9 @@ fn agent_of_run(connection: &Connection, agent_run_id: &str) -> Result<Option<St
         .optional()?)
 }
 
-/// Write one of this module's three reasons. An existing reason written by somebody else — a User
-/// or another owner — is never overwritten, and an unchanged value writes nothing at all.
+/// Write one of this module's reasons. An existing reason written by somebody else — a User or
+/// another owner — is never overwritten, and an unchanged value writes nothing at all, which is
+/// what makes the recorded failure one event per `(task, code)` and not one per pass.
 fn set_control_blocked_reason(
     transaction: &Transaction<'_>,
     plan_id: &str,
@@ -997,7 +1156,7 @@ fn set_control_blocked_reason(
     transaction.execute(
         "UPDATE loom_task SET blocked_reason=?1, updated_at=?2, revision=revision+1
          WHERE plan_id=?3 AND task_id=?4
-           AND (blocked_reason IS NULL OR blocked_reason IN (?5,?6,?7))
+           AND (blocked_reason IS NULL OR blocked_reason IN (?5,?6,?7,?8,?9,?10,?11))
            AND (blocked_reason IS NULL OR blocked_reason <> ?1)",
         params![
             reason,
@@ -1006,13 +1165,17 @@ fn set_control_blocked_reason(
             task_id,
             BUDGET_EXHAUSTED_REASON,
             REWORK_EXHAUSTED_REASON,
-            PREVIOUS_OUTCOME_REASON
+            PREVIOUS_OUTCOME_REASON,
+            RECIPIENT_UNAVAILABLE_REASON,
+            RECIPIENT_DISABLED_REASON,
+            RECIPIENT_OFFLINE_REASON,
+            HARNESS_UNAVAILABLE_REASON
         ],
     )?;
     Ok(())
 }
 
-/// Clear this module's own reasons — all three of them — and nothing else.
+/// Clear this module's own reasons — all of them, including the harness code — and nothing else.
 fn clear_control_blocked_reason(
     transaction: &Transaction<'_>,
     plan_id: &str,
@@ -1021,14 +1184,18 @@ fn clear_control_blocked_reason(
 ) -> Result<()> {
     transaction.execute(
         "UPDATE loom_task SET blocked_reason=NULL, updated_at=?1, revision=revision+1
-         WHERE plan_id=?2 AND task_id=?3 AND blocked_reason IN (?4,?5,?6)",
+         WHERE plan_id=?2 AND task_id=?3 AND blocked_reason IN (?4,?5,?6,?7,?8,?9,?10)",
         params![
             now,
             plan_id,
             task_id,
             BUDGET_EXHAUSTED_REASON,
             REWORK_EXHAUSTED_REASON,
-            PREVIOUS_OUTCOME_REASON
+            PREVIOUS_OUTCOME_REASON,
+            RECIPIENT_UNAVAILABLE_REASON,
+            RECIPIENT_DISABLED_REASON,
+            RECIPIENT_OFFLINE_REASON,
+            HARNESS_UNAVAILABLE_REASON
         ],
     )?;
     Ok(())
