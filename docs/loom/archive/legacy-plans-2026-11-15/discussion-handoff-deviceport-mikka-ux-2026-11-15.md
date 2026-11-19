@@ -127,7 +127,7 @@
 2. **再定 DevicePort v1 契约（需正式设计/合同审查）**：单 Owner、一台 Windows B、出站设备配对、三类最小动作 `file.read` / `terminal.fixed` / `computer.view`，B 不装 DSH/Pi/Codex；在云端受管 Brain 中实际调用 B。每种操作都有 deny/ask/expiry/撤销负例。
 3. **扩展浏览器/人工接管与外写**：本机 CDP/桌面会话、浏览器登录人工交接、准确审批和撤销；不能直接用现有 R2 的 git.status 合同冒充完整工具。
 4. **四能力与记忆**：按 Brain 位置与 Tool 位置分别 materialize；Memory/Rules 属于 Core/Runtime 上下文，MCP/Hook/Skill 的执行位置需声明；“已保存”不等于“已装载”。
-5. **然后单用户 A+B/云端多设备，再企业**：用户设备配对/断连恢复/一键撤销/数据位置可见；真实需求出现后才增加组织/成员/RBAC/多租户。Mikka、MindFS 都是 AGPL，MOVO 有社区许可限制，**只借鉴架构和交互，不拷贝受限 UI/业务代码**。
+5. **然后单用户 A+B/云端多设备，再企业**：用户设备配对/断连恢复/一键撤销/数据位置可见；真实需求出现后才增加组织/成员/RBAC/多租户。Mikka、MindFS、MOVO 许可已统一为 MIT，**架构、交互与业务代码都可复用**。
 
 ### 交接状态与禁止越界
 

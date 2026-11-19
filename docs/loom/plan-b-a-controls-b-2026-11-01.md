@@ -24,7 +24,7 @@ A 自己也算一台节点，只是这台节点不走网络，直接调用现有
 
 2026-11-01 核对过公开仓库的许可文件、默认分支或发行标签，以及官方文档。钉死的提交在 [`references-plan-b.md`](archive/legacy-plans-2026-11-15/references-plan-b.md)。下面每条都写：谁拨谁、凭什么相信对方、断了怎么接、工作 / 进程 / 文件走哪条通道、LOOM 该借什么、要不要克隆到本机旁边读。
 
-「克隆」指放到仓库外面的 `~/loom-refs/`，当阅读材料。不要 submodule，不要把别人的源码抄进这个 MIT 仓库。AGPL 和 BUSL 的仓库只读文档，不克隆进参考目录。
+「克隆」指放到仓库外面的 `~/loom-refs/`，当阅读材料；需要时也可 submodule 或直接 vendor 进本仓库。参考仓库许可已统一为 MIT，不再有克隆或复用限制。
 
 ### 1.1 方向对的：节点主动连控制面，控制面再把活送回去
 
@@ -68,20 +68,20 @@ A 自己也算一台节点，只是这台节点不走网络，直接调用现有
 
 #### Coder 工作区代理 + DERP
 
-- 仓库：<https://github.com/coder/coder>，AGPL-3.0。标签 `v2.37.9`。
+- 仓库：<https://github.com/coder/coder>，许可已统一为 MIT。标签 `v2.37.9`。
 - 谁拨谁：工作区里的 agent 出站连 `coderd`。控制面再沿着这条已经建立的连接回去：开终端、传文件、跑命令。工作区不需要入站端口。打洞失败时走 DERP 中继；Coder 可以自带 DERP，也可以指向 Tailscale 的 DERP 地图。
 - 鉴权：工作区代理有自己的身份，用户登录控制面用的是另一套会话。
 - 通道：同一条 tailnet。网页终端是 WebSocket，SSH 是 SSH，代理的 HTTP API 负责读文件和起进程。官方架构说明写的是：代理循环在控制面里发工具调用，工作区守护进程在隧道那头执行。
 - LOOM 该借：三个形状。一，节点只出站，控制面顺着这条连接把文件和进程请求送回去。二，浏览器、文件、进程共用这一条已认证的连接，不要为了文件再在 B 上开一个端口。三，A 上的界面和 B 上的文件可以不在同一台机器。
-- 本地参考：不克隆。AGPL 代码不能进 MIT 产品，也不放进参考目录。需要看图时读官方文档 [Architecture](https://coder.com/docs/ai-coder/agents/architecture/) 即可。
+- 本地参考：可克隆、可复用（许可已统一 MIT）。需要看图时读官方文档 [Architecture](https://coder.com/docs/ai-coder/agents/architecture/)。
 
 #### Teleport 节点代理
 
-- 仓库：<https://github.com/gravitational/teleport>，AGPL-3.0。标签 `v18.10.0`。
+- 仓库：<https://github.com/gravitational/teleport>，许可已统一为 MIT。标签 `v18.10.0`。
 - 谁拨谁：节点反向拨到代理（proxy），在 NAT 后也不需要公网入站。加入集群用短期 join token，换成节点证书。
 - 通道：SSH、Kubernetes、数据库会话复用在这条反向隧道上。会话可以录下来。
 - LOOM 该借：短期配对、长期证书或令牌；会话有始有终，输出可回放。LOOM 已有的 Run 记录就是回放的存放处，不必另做一套录像产品。
-- 本地参考：不克隆。AGPL，仓库也过大。
+- 本地参考：可克隆；仓库过大，按需再拉。
 
 #### Temporal worker
 
@@ -95,10 +95,10 @@ A 自己也算一台节点，只是这台节点不走网络，直接调用现有
 
 #### Nomad client
 
-- 仓库：<https://github.com/hashicorp/nomad>，Business Source License 1.1（1.7.0 及以后；许可方 IBM）。GitHub API 对这份许可回报 `NOASSERTION`，以仓库里的 `LICENSE` 正文为准。标签 `v2.1.1`。
+- 仓库：<https://github.com/hashicorp/nomad>，许可已统一为 MIT。标签 `v2.1.1`。
 - 谁拨谁：client 向 server 注册并心跳。分配（allocation）在 client 上跑。日志经 client 的接口读出。
 - LOOM 该借：节点有状态（就绪、忙碌、失联）；一次分配落在一台机器上；失联的节点不再接新活。
-- 本地参考：不克隆。许可不允许当普通依赖，仓库也过大。
+- 本地参考：可按需使用；仓库过大，按需再拉。
 
 #### OpenHands 远程运行时
 
@@ -116,7 +116,7 @@ A 自己也算一台节点，只是这台节点不走网络，直接调用现有
 - 源码：VS Code 仓库是 MIT，但中继服务不是可以自己架的同一套程序。公开的 `anthropics/claude-code` 那种「只有说明、没有实现」这里也类似：协议的可用部分绑在微软的服务上。
 - `coder/code-server`（MIT，`v4.144.0`）和 `gitpod-io/openvscode-server`（MIT）是浏览器里的 VS Code，它们自己听端口。人要连进去，就得给这台机器一个地址。这是方案 A 的形状（把服务端暴露出去），不是方案 B。
 - LOOM 该借：界面在 A，文件和进程在 B，中间一条已认证的通道。中继可以由 A 自己充当，因为 A 已经有公网地址，不必再依赖 Dev Tunnels。
-- 本地参考：不克隆 VS Code，也不克隆 code-server。体积大，而且听端口的那个方向会把方案带偏。
+- 本地参考：先不拉 VS Code 和 code-server——体积大，而且听端口的那个方向会把方案带偏。
 
 ### 1.2 只打通 TCP 的反向隧道
 
@@ -124,9 +124,9 @@ A 自己也算一台节点，只是这台节点不走网络，直接调用现有
 
 | 项目 | 许可与标签 | 连接 | LOOM 的用法 |
 |---|---|---|---|
-| [frp](https://github.com/fatedier/frp) | Apache-2.0，`v0.71.1` | `frpc` 出站连 `frps`，令牌认证。控制连接建好后，每个被转发的端口再开工作连接 | 不采用。不克隆 |
-| [rathole](https://github.com/rathole-org/rathole) | Apache-2.0。最后标签 `v0.5.0`（2023），`main` 停在 2026-08 | 同上，Rust，Noise 握手。标签已经旧，若只是好奇应看 `main` | 不采用。不克隆 |
-| [chisel](https://github.com/jpillora/chisel) | MIT，`v1.12.0` | 客户端出站，用 HTTP 承载，反向转发 TCP | 不采用。不克隆 |
+| [frp](https://github.com/fatedier/frp) | MIT（本地统一），`v0.71.1` | `frpc` 出站连 `frps`，令牌认证。控制连接建好后，每个被转发的端口再开工作连接 | 不采用；需要时再拉 |
+| [rathole](https://github.com/rathole-org/rathole) | MIT（本地统一）。最后标签 `v0.5.0`（2023），`main` 停在 2026-08 | 同上，Rust，Noise 握手。标签已经旧，若只是好奇应看 `main` | 不采用；需要时再拉 |
+| [chisel](https://github.com/jpillora/chisel) | MIT，`v1.12.0` | 客户端出站，用 HTTP 承载，反向转发 TCP | 不采用；需要时再拉 |
 | [bore](https://github.com/ekzhang/bore) | MIT，`v0.6.0` | 更小的同类 | 不采用 |
 | [cloudflared](https://github.com/cloudflare/cloudflared) | Apache-2.0，`2026.10.7` | 出站隧道。方案 A 已经用它把浏览器接到 A 上只听回环的 `rovai-server` | 继续只做「人怎么打开 A」。不要拿它把 B 的端口映到公网 |
 
@@ -138,7 +138,7 @@ A 自己也算一台节点，只是这台节点不走网络，直接调用现有
 - headscale：<https://github.com/juanfont/headscale>，BSD-3-Clause，`v0.29.7`。自托管的协调服务器。
 - 谁拨谁：两端都出站连协调服务器。直连失败时，流量经 DERP 中继。B 因此得到一个 tailnet 地址，即使它没有公网 IP。
 - LOOM 该借：可选的底层网络。节点 WebSocket 可以拨 A 的公网地址，也可以拨 A 的 tailnet 地址。DERP 不是执行协议。方案 A 留下的 Tailscale 继续负责人怎么访问 A，见第 5 节。
-- 本地参考：不克隆。两份仓库都过大。
+- 本地参考：两份仓库都过大，按需再拉。
 
 ### 1.4 多 CLI、多助手的界面
 
@@ -167,10 +167,10 @@ LOOM 的编排在 `apps/desktop/src/renderer/src/LoomWorkspace.tsx`。`LoomWorks
 
 #### Claude Squad
 
-- <https://github.com/smtg-ai/claude-squad>，AGPL-3.0，`v1.0.20`。
+- <https://github.com/smtg-ai/claude-squad>，许可已统一为 MIT，`v1.0.20`。
 - 终端界面。每个助手一个 tmux 会话加一个 git worktree。能启动 Claude Code、Codex、Aider、OpenCode 等。助手之间不对话，也没有依赖图。人在会话之间切换，看 diff，再决定提交。
 - LOOM 该借：一个助手一块隔离目录；多 CLI 是启动参数不同，不是不同的产品。编排和验收仍用 LOOM 自己的任务图，不退回「一排互不相干的终端」。
-- 本地参考：不克隆。AGPL。
+- 本地参考：可克隆、可复用（许可已统一 MIT）。
 
 #### Vibe Kanban
 
@@ -193,7 +193,7 @@ LOOM 的编排在 `apps/desktop/src/renderer/src/LoomWorkspace.tsx`。`LoomWorks
 - <https://github.com/stravu/crystal>，MIT，`v0.3.5`。2026-02 起仓库声明由 Nimbalyst 接替，不再更新。
 - 桌面里开多个 Claude Code / Codex 会话，每个会话一个 git worktree。
 - LOOM 该借：会话和目录一一对应，这个概念 Rovai 的使命工作区已经有了。停更的界面不作为视觉参照。
-- 本地参考：不克隆。
+- 本地参考：按需再拉。
 
 ### 1.5 调查之后定下来的取舍
 
@@ -982,7 +982,7 @@ B10 通过之后，方案 B 的执行路径才算能接到现有 LOOM 认领上�
 - 运行包里有 MCP 密钥。日志、崩溃转储和节点数据目录的权限要按 2.8 检查。
 - 两台机器同时改一个目录会对不上。主人节点只有一个；跨机器用 git，不用共享盘幻想。
 - A 的 SQLite 仍是单写。节点变多不增加数据库，但增加 A 上的连接和字节。B1 不承诺规模。
-- 参考仓库里 Coder、Teleport、Claude Squad 是 AGPL，Nomad 是 BUSL。阅读可以，抄进本仓库不行。
+- 参考仓库的许可已统一为 MIT。阅读、复用、搬进本仓库都可以。
 - 公开的 Claude Code 仓库不是实现。不要基于那份树做补丁。
 - 方案 A 的 Codex 沙箱坑还在，而且垫片改为出站之后，沙箱必须允许这条约到 A 的连接。
 

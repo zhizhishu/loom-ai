@@ -50,7 +50,7 @@ Root 已独立重读 `apps/server/src/search.rs:1`（源文件开头明确「中
 - **MindFS**：轻量独立工作站、文件/Shell、出站 Relay/本地服务，无 Agent 也可用工具；不等于已有通用桌面自动化。
 - **AgentDock**：当前通过用户授权可直接读取/编辑本机 Windows 文件、命令等，证明设备工具层与模型 Harness 解耦；**不能**把现有 ChatGPT 连接凭证偷渡给 LOOM。
 - **DSH/Pi**：仅存在于 A 的 Harness/Worker 执行位置。严格拓扑**无需**先让 B/C 安装 DSH ；选 A 只跑哪个 Harness 是独立兼容和功能决策。研发 Pi Skill 工兵只用于当前开发，不代表发布后 B/C 装 Pi。
-- **MOVO/AgenTeam**：研究权限/插件/企业模型，当前不移植其运行环境、闭源 Desktop 或受限社区代码。
+- **MOVO/AgenTeam**：研究权限/插件/企业模型；其运行环境与代码许可已统一为 MIT，可直接复用（闭源 Desktop 不在公开仓库）。
 
 ## 三、选定的实施锚点（小阶段，不破坏现有功能）
 

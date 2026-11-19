@@ -1,6 +1,22 @@
 # LOOM — Mindkit 阶段交接与用户架构解释
 
-> **本轮用户要求（置顶）**：先交接、先讲清楚，再决定是否实现。只整理项目记忆/说明，不改产品代码、不切新 Core、不重启服务、不动模型/凭据/权限。
+## 2026-11-18 最新交接（下个聊天从这里接）
+
+**本次用户要求：只收口交接，后续在新聊天继续。** 只动 LOOM 子仓本地项目记录，不改父仓、现有应用、用户配置和数据库；不要在新聊天重新规划架构。
+
+- **入口和任务**：项目 `C:\Users\echo\Downloads\claude\skill-cli\loom`；先看根目录 `TASK.md`、`LOOM-IMPLEMENTATION.md`、`LOG.md` 和本页。AgentDock 续接任务 ID `tsk_2b561e30d7cf5f58`，其 `runtime` 仍在进行中，`delivery` 未完成；不可把记录动作记作产品签收。
+- **已经实际完成**：修复 `crates/rovai-core/src/dsh/local-hooks.mjs` 并发 Hook handlerId 串号，旧版并发用例失败、新版 `scripts/lib/dsh-host.test.mjs` **7/7 通过**；干净 DSH `0.2.0-rc.2` 封包核验 **534 个包、25,262 个清单文件**，独立执行 `dsh.cmd --version` 返回 `0.2.0-rc.2`。本机 Rust Host/Core/Server/CLI 同源编译 exit0，四个 PE 均为 8 MiB 栈，目标 SQLite schema **186** / migration **236**；独立 Pi `0.85.1` 与电脑运行包已校验。
+- **候选程序**：`_artifacts/delivery-20261117/resume-06/loom-personal-local-186-f24a461-r3`，完整清单 33,844 文件，`candidate-manifest.json` 已生成。证据：同目录上级 `personal-186-local-build.json`、`dsh020-candidate-r2/dsh-runtime-bundle.json`、`hook-private-safety.json`。这是带本地未提交修改的**开发预览包**，不是 GitHub E3 或正式发布包。
+- **安装器回归**：合成测试 **12 PASS、0 FAIL、1 真包启动 SKIP**；E3 工作流合同 **13/13 PASS**。首次独立真实安装测试在 240 秒上限超时，未开始启动。已将只针对真包的子流程预算改为 600 秒、总预算 900 秒，安全文件核验未取消。第二次会话 `session-1c06f5d45a931f857a5f95d8` 和只读 SQLite 观察会话 `session-ae06c2e730a0d333743b505d` 本次交接查询均返回 **SESSION_NOT_FOUND**；独立安装目录和 SQLite 未出现，`local-personal-186-install-proof.json` 不存在。因此真实安装/启动/登录/重启 **尚未通过**，下次从检查安装性能与重跑原测试继续，不能把失联会话算 PASS。
+- **Pi Purge**：真实 UI 第 06 轮报告 `_artifacts/delivery-20261117/resume-05/pi-purge-ui-06/report.json` 明确失败，隔离 Host `runtime.product.check` 90 秒超时，0 个模型 Run、Task、Artifact。已把验收 Host 客户端等待改为 120 秒，但没有进行新的实测。先验真实运行端/模型，再跑 UI→Pi→成果整链。Codex MCP 模型实际调用、电脑模型主动截图、DSH 原生 Hook 正反例仍未通过。
+- **DSH 版本和权限**：用户隔离配置 `.dsh-020rc2` 的官方 DSH 为 `0.2.0-rc.2`；系统 PATH 的旧 `dsh --version` 仍返回 `0.1.5-rc.2`，不得误判用户版本。私有独立 Hook executor 仍锁 `0.1.5-rc.2`，只验证了 **5/5** 无模型的沙箱边界；不把它说成 DSH 0.2 模型 Hook 验收完成。DSH 许可证源中 brotli/dfa 的具体版权文本正式分发前需复核。
+- **现有用户程序**：`127.0.0.1:64852` 仍由已装 `915ffa1` 的 `rovai-server.exe` 提供，最新检查 PID 18800；旧版仍可用。保留 64851、正式用户数据、账号配置、安装路径，不擅自切换或重启。Git 工作树有用户既有 WIP，HEAD `f24a461`，本地分支领先远端 8 个提交，当前改动未提交、未推送；不要 `reset`/清理/覆盖。
+
+**下次最短路线**：先读本节和 `TASK.md`，检查目前 Git/服务/测试证据是否变化；复现实包安装超时并优化逐文件核验或使用允许的完整测试预算，取得独立启动+登录+保存偏好+重启+实际 SQLite 186/236 的报告；然后继续 Pi Purge 和 DSH 真模型能力验收。新版未实际通过安装前不要替换 64852。不要以文档更新、构建成功或模型被调用代替真实用户可用。
+
+---
+
+> **历史交接界限（2026-11-13，当时只要求解释架构）**：先交接、先讲清楚，再决定是否实现。该历史边界不覆盖 2026-11-18 的开发事实、用户已授权的 LOOM 个人版工程范围及当前交接要求。
 >
 > **下一位接手者从这里开始**：看本页 → 根 TASK.md → PROJECT_CONTEXT.md → 已有 LOOM-IMPLEMENTATION.md 末尾最终记录与接口文档。避免沿用旧阶段的“未实现”口径，也不能把测试通过说成全部生产功能完结。
 >
@@ -42,8 +58,8 @@ Rust Core：唯一的业务事实和调度、版本、授权、审查、接受
 
 | 参考 | 借鉴到 LOOM 的点 | 没有直接照搬的点 / 原因 |
 |---|---|---|
-| PiBot | 每个 Bot/助手独立勾选能力；保存版本与设备实际装载分离；恢复时不悄悄换版本 | PiBot 整体 AGPL 业务层、自己的调度和数据库；LOOM已有 Core 数据真源，不再并存两套 |
-| Mikka | “和协调者聊天、右边看工作、对成果作决定”；任务、运行、候选版、独立审查与关系图分开 | 私有官方 UI 不在公开仓库；不复制 AGPL 私有/公开业务组件；借用户体验和可证事实而不是伪称1:1复刻 |
+| PiBot | 每个 Bot/助手独立勾选能力；保存版本与设备实际装载分离；恢复时不悄悄换版本 | PiBot 的调度与数据库可复用（许可已统一 MIT）；LOOM 已有 Core 数据真源，不再并存两套 |
+| Mikka | “和协调者聊天、右边看工作、对成果作决定”；任务、运行、候选版、独立审查与关系图分开 | 私有官方 UI 不在公开仓库；公开业务组件可直接复用；借用户体验和可证事实而不是伪称1:1复刻 |
 | ACCP | 责任 Accountability、证据 Evidence、交付物 Deliverable、验收 Acceptance 分开，用户接受必须有对应版本和条件 | ACCP 在这里是产品/工作合同，不是已支持的通用网络线协议，也不新增并行任务调度器 |
 | Pi SDK / ACP / MCP / Agent Skills | 用既有原生适配器和标准能力接口减少重复开发 | “协议/SDK能通信”不代表整个用户界面、权限、生效与远端执行已经打通；Pi SDK 不能替 Claude/Codex/DSH 的原生代理 |
 

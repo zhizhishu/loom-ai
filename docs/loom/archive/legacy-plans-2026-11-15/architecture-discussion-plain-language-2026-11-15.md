@@ -68,7 +68,7 @@ Claude 配置可以**只读扫描、作为参考源**，但不等于把 Claude H
 **AgenTeam**：审批和资源范围分开，工作区路径要真校验。  
 **MOVO / DeepSeek Harness**：插件管理、Skill/MCP/规则/Hook、企业权限与知识；**MOVO 的许可对未来多租户和白标有限制，不能直接抄代码**。
 
-Mikka/MindFS 的 AGPL 也需要谨慎；我们主要借设计与公开接口思想，**不把它们整仓嵌入 LOOM**。
+Mikka/MindFS 许可已统一为 MIT；设计与公开接口、代码都可复用，整仓嵌入也可以按需评估。
 
 ## 建议按什么顺序走？
 

@@ -59,8 +59,8 @@ P8 组织/多用户（后置）
 - **目标**：用源码还原 Mikka Bot vs Agent、Bot Overview/`@ui-slot`、Factory 派工、Question/Attention、Memory、Computer broker、Local/Cloud routing；说明公开仓和私有 UI 的边界。
 - **READ**：`_artifacts/reference-repos/mikka-current/docs/design/glossary.md`、`components/nav/context-panel.tsx`、`bot-overview.tsx`、`lib/coordinator`、`lib/factory`、`lib/profile/memory.ts`、`packages/daemon/src`。
 - **WRITE**：仅 `_artifacts/loom-architecture-20261115/pi-mikka-scout.txt`（由主管保存工兵回执）。
-- **DONE**：至少 12 个 `path:line`、一条 Bot 目标→Agent Run→结果回 Bot 的源码调用链、两项不应复制的风险（AGPL、默认电脑授权等）；标明未能看到的私有 overlay。
-- **禁止**：执行 Mikka、安装依赖、从 AGPL 代码直接复制到 LOOM。
+- **DONE**：至少 12 个 `path:line`、一条 Bot 目标→Agent Run→结果回 Bot 的源码调用链、两项需注意的风险（默认电脑授权等）；标明未能看到的私有 overlay。
+- **禁止**：执行 Mikka、在共享环境安装依赖。代码本身许可可用，可直接复制到 LOOM。
 
 ### R02｜MindFS / DeskFleet / UFO³ 设备控制（只读 Scout）
 

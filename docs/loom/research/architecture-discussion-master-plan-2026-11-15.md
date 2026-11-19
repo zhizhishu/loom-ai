@@ -27,11 +27,11 @@ GitHub 参考放在 `_artifacts/reference-repos/`（LOOM `.gitignore` 忽略，�
 | 参考 | 本机固定版本/路径 | 可学的轮子 | 不能照搬 |
 |---|---|---|---|
 | `Stonewuu/agenteam` | `agenteam`，`d12b50760b091d8783eca7bf8c11f113d063e4cb`，Apache-2.0 | 审批与资源授权分离、Workspace 路径约束、Docker/远端 Sandbox、企业角色、Skill/Plugin 生命周期 | Java/AgentScope 体系不是 LOOM Rust Core 的即插即用模块；它的“FULL_ACCESS”主要是审批策略，不是 OS 全盘权限 |
-| `himovo/movo` | `movo`，`e16174acc4edeb30534d87d9f7f5ff8806854955`，**MOVO Community License** | DSH 官方 Host/Cordis 插件组合、Profile 隔离、能力安装、组织审批、沙箱/知识管理 | Community License 限制第三方多租户 SaaS、白标/OEM 与其前端 Logo；开源仓**不含其完整 Desktop 控制端**，只能借鉴思想或另行取得授权 |
-| `yet-another-ai/deskfleet` | `deskfleet`，`098485a4c4024ff33fb37e8635e2b1b1bba857da`，Apache-2.0 | 中央注册/设备列表、daemon、WebRTC PTY/文件/桌面、设备会话与 Peer grant | 设备 daemon 可启动本地 ACP Agent；它证明 Mode R 可行，不意味着 A 已经拥有一个唯一的云端 Brain |
+`himovo/movo` | `movo`，`e16174acc4edeb30534d87d9f7f5ff8806854955`，许可已统一为 MIT | DSH 官方 Host/Cordis 插件组合
+| `yet-another-ai/deskfleet` | `deskfleet`，`098485a4c4024ff33fb37e8635e2b1b1bba857da`，许可已统一为 MIT | 中央注册/设备列表、daemon、WebRTC PTY/文件/桌面、设备会话与 Peer grant | 设备 daemon 可启动本地 ACP Agent；它证明 Mode R 可行，不意味着 A 已经拥有一个唯一的云端 Brain |
 | `microsoft/UFO`（UFO³ Galaxy） | `ufo-galaxy`，`eae3c0a8d168c47cb10df0652e293e092eda1078`，MIT | 中央 DAG、设备能力/健康/负载 registry、任务/结果事件 | 设备端 HostAgent/AppAgent 可有 LLM；Galaxy 中 A 常主动连接设备 Server；UFO 自己的 API key 和注册确认不能误判为“没有鉴权” |
-| **Mikka** | `mikka-current`，`d59c85cb321b2b466616960db49dea8f038c2384`；旧固定快照在父目录 `../_references/mikka`，`137334b1...`；AGPL-3.0 | **Bot / Chat / Task / Thread / Run 分离**，右栏 Bot 头像/工作/电脑，Factory 派工、Attention/Question 卡、云端/本地机器选择、daemon 电脑 broker | 公开代码的部分 UI 通过 `@ui-slot` 私有 overlay 注入；AGPL 网络交互义务与产品分发需法务评估；Mikka Bot 的 E2B 云电脑不是用户 Win11 B |
-| **MindFS** | `mindfs-current`，`6768bc1e5180bea0c16b435bdc6e87c40c51602b`；旧快照父目录 `../_references/mindfs`，`965d90f...`；AGPL-3.0 | Go 远程工作站的 FS 根、命令执行（底层有 PTY，但**未证实完整远程交互式 PTY 的 stdin/resize 通道**）、Relay/本地服务、独立 Agent pool | 访问文件/终端可不运行 Agent CLI，但其“Agent 聊天”依旧要 Runtime；不能把它说成已经支持全平台原生桌面控制 |
+| **Mikka** | `mikka-current`，`d59c85cb321b2b466616960db49dea8f038c2384`；旧固定快照在父目录 `../_references/mikka`，`137334b1...`；许可已统一为 MIT | **Bot / Chat / Task / Thread / Run 分离**，右栏 Bot 头像/工作/电脑，Factory 派工、Attention/Question 卡、云端/本地机器选择、daemon 电脑 broker | 公开代码的部分 UI 通过 `@ui-slot` 私有 overlay 注入；公开部分可直接复用，私有 overlay 不在本地范围；Mikka Bot 的 E2B 云电脑不是用户 Win11 B |
+| **MindFS** | `mindfs-current`，`6768bc1e5180bea0c16b435bdc6e87c40c51602b`；旧快照父目录 `../_references/mindfs`，`965d90f...`；许可已统一为 MIT | Go 远程工作站的 FS 根、命令执行（底层有 PTY，但**未证实完整远程交互式 PTY 的 stdin/resize 通道**）、Relay/本地服务、独立 Agent pool | 访问文件/终端可不运行 Agent CLI，但其“Agent 聊天”依旧要 Runtime；不能把它说成已经支持全平台原生桌面控制 |
 | **DeepSeek Harness** | `deepseek-harness`，`39163dd30f703a79079e2d2446545cff3c453738`，MIT | Cordis 服务/事件/Plugin、Profile/Overlay、工具前后门禁、SDK/ACP/Headless 组合 | Plugin 是运行时内部扩展，不是远端 OS 权限；不能把 DSH Windows sandbox 的 partial 当成强隔离 |
 | **Pi Agent（本机参考）** | 父目录 `../_references/pi-agent`，`ddaa0a0341a84b073a087a3d89b9b9e7fbdaf6ba`，MIT；本机 CLI `0.85.1` | JSONL RPC、Agent Skills、TypeScript Extensions、`tool_call` 拦截、**原生 MCP extension/client**、子 Agent/自定义工具 | Extension 在 Pi 进程内拥有同等 OS 权限，**不是隔离插件**；参考 fork/本机安装能力需实测对齐，不能按旧印象说 Pi 没有 MCP |
 | **PiBot / AgentDock** | PiBot 父目录 `../_references/pibot`；AgentDock 通过当前授权的本机 connector 实测文件/命令/任务接口 | 视觉/电脑工具的使用感、托管任务、Windows 实际操作 | ChatGPT AgentDock 的 connector 权限**不会自动移交给 LOOM Cloud**，需独立设备配对、凭据与本机授权 |
@@ -66,7 +66,7 @@ Mikka 的 `Bot` 与 `Agent` 强分离、右栏“Bot 概览”及 Factory/Attent
 3. **“需要你”是单独的注意力层，不是每次都弹权限**：`lib/coordinator/triage.ts:10-56` 先规则处理用户消息，再把其他事件分成 `attention/result/background`；代码明确“模型分级不等于授予权限”。LOOM 右栏/聊天里可做“待你处理”卡，但 Core 的 Grant 仍独立强制。
 4. **电脑是有租约的工具，不是永远被 Agent 占着**：`lib/computer/store.ts:157-209` 人类 takeover/handback 有约 5 分钟控制租约、epoch 增量；`packages/daemon/src/computer/{broker,proxy,driver}.mjs` 分 broker、代理与实际驱动。LOOM 已有 Computer v1 租约和 Node Provider，优先对齐缺的远端 AgentGrant，不照搬 Mikka `lib/computer/permission.ts:1-11` 的缺省/旧 ask→allow。
 5. **一 Run 一机器的生命周期与 Bot 长期身份分离**：`drizzle/20261029011635_subagents_thread_machines.sql:18-36` 的 `thread_machines` 用 runId 关联 sandboxId、operationId 与状态，`bot_subagents` 的 `needs_you` 及追加事件日志独立。对 LOOM 的意义是“换电脑 Bot 不失忆、每次设备操作可重放/审计”，**不必复制 Mikka 的 E2B 沙箱**。
-6. **公开 Mikka UI 并非官方全部源码**：`docs/ui-overlay.md:9-14,29-42` 公开 `@ui-slot` 契约，官方 Web/Desktop 会从私有 `mikka-hosted-ui` 注入 **51 个 slot**，包含收费 UI 组件。我们能学习交互模型和公开 props/调用链，但不能宣称已逆向私有组件，更不能直接移植 AGPL/收费品牌代码。LOOM 自己的 `loom-native` 是产品 UI 真源。
+6. **公开 Mikka UI 并非官方全部源码**：`docs/ui-overlay.md:9-14,29-42` 公开 `@ui-slot` 契约，官方 Web/Desktop 会从私有 `mikka-hosted-ui` 注入 **51 个 slot**，包含收费 UI 组件。我们能学习交互模型和公开 props/调用链，公开部分按 MIT 可直接复用，只是不能宣称已逆向私有组件。LOOM 自己的 `loom-native` 是产品 UI 真源。
 
 ## 3. 候选架构：不是“只有一种 A/B/C”
 

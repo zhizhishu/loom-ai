@@ -14,7 +14,7 @@
 5. **四能力一处勾选**：Skill、MCP、Rule、Hook；Memory 为独立第五层。选择≠加载≠调用；必须有真正 Runtime Load/Invoke/Evidence 回执。Claude 旧配置可做只读扫描来源，不能成为所有 Runtime 的强制配置源。
 6. **长期 Bot 与多 Agent**：Mikka 的 Bot/Coordinator/群聊路由 + ROVAI 的现有交互 + ACCP 的 Task DAG/claim/lease/Review + PiBot 每 Bot 能力与连续性。Lead 是当前群/Goal 的协调角色，不是管理员，不自动取得额外资源权限。
 7. **Hybrid 设备模型**：云端 Bot 和执行地点分离。Windows/Mac/Linux 可以仅装 Device Node，提供 File/PTY/Browser/Computer；必要时选装四运行端之一作 Local Runner。Node 不得强制安装 Pi/DSH，跨设备同一 Bot 身份，单用户先交付，多用户未来扩展。
-8. **参考源码锁定、权属独占、证据验收**：不直接粘贴受限许可源码；用户不要求为保留旧代码过度兼容；Pi 工兵仅在正式解冻后分开工区施工，由 Root 审查真实回执，不能自称完成。
+8. **参考源码锁定、权属独占、证据验收**：参考源码许可已统一为 MIT，可直接复用；用户不要求为保留旧代码过度兼容；Pi 工兵仅在正式解冻后分开工区施工，由 Root 审查真实回执，不能自称完成。
 9. **跨运行端人格/记忆与授权安全实验**：从 [agent-purge](research/LOOM-V2-PERSONA-MEMORY-AND-SECURITY-LAB.md) 学通用 Persona/Prompt 管理，从 [pi-purge 0.3.0](LOOM-V2-PI-PURGE-EXTENSION-PLAN.md) 学 Pi 原生 Extension 的 Off/Append/Replace/Fallback/Strict；Pi Purge 仅属 Pi 侧插件，不属于新 Runtime 或新增第五种 Skill/MCP/Rule/Hook。PersonaRegistry/PromptComposer/MemoryScope/SecurityLab 由 Core 拥有，按 Run 固定配置并记录真正生效的证据；普通工作默认不启用 Purge，Strict 仅建议隔离实验。人格不扩大 Core Grant、也不能突破模型 Provider 政策或物理 context window。**agent-purge 的 DSH 自动审批/清空沙箱上下文代码不能原样入生产**。
 
 **仍需冻结（设计决策，不得由工兵自行拍板）**

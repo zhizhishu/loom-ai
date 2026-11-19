@@ -144,7 +144,7 @@ configSchema, upgradePolicy, healthProbe, activationReceipt
 1. **本机候选 DSH Sidecar + 插件样板**：不碰现有 Pi/Rust Core；以固定 DSH 发行包、独立数据根启动，接上 RuntimePort。只用 DeepSeek V4.1 Flash/max 做一条只读会话；真实证明 `Skill→load→call`、`MCP→connect→tool`、`Rule→context`、`Hook→pretool deny`，不得改用户全局 DSH settings。保留 Pi 工兵作对照，失败回退应是显式选择，不自动换模型。
 2. **单用户能力资产中心 + Policy**：四类资源导入、版本/来源、目标 Runtime 的实际生效/拒绝事实；基本 `Ask/Never/Full` UI、动作级审批审计和回滚；不做多人组织/收费。
 3. **云端一人多设备，真实 Windows B E2E**：从现有 Node/R1/R2/B7/ComputerPort 接入设备配对和出站通道，实测离线/重连/撤销/unknown/同 Run 跨根；B 原生沙箱按实际 partial/full 报告，虚拟屏幕有真实用户会话才显示远程桌面。阶段完成后才可叫“云端控制电脑 B”。
-4. **企业模式**：组织、成员、资源 RBAC、审计导出、知识 RAG/脱敏、配额、跨域审批与独立部署。按真实多用户需求逐步展开。这里可以借鉴 AgenTeam 的关系约束与 MOVO 的清晰产品边界，但不能复制 MOVO 受限许可代码做第三方多租户 SaaS。
+4. **企业模式**：组织、成员、资源 RBAC、审计导出、知识 RAG/脱敏、配额、跨域审批与独立部署。按真实多用户需求逐步展开。这里可以借鉴 AgenTeam 的关系约束与 MOVO 的清晰产品边界；MOVO 代码可按 MIT 复用，第三方多租户 SaaS 无需额外授权。
 
 ### 最低 E2E 准入证据
 

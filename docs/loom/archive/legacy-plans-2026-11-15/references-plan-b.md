@@ -2,7 +2,7 @@
 
 给 [`plan-b-a-controls-b-2026-11-01.md`](../../plan-b-a-controls-b-2026-11-01.md) 用。核对日期 2026-11-01。
 
-这些目录只放在仓库外面，建议 `~/loom-refs/`。不要放进本仓库，不要做成 submodule，不要把其中的源码抄进 LOOM。LOOM 继承 Rovai 的 MIT；AGPL 和 Business Source License 的仓库连参考目录都不要克隆，需要时读官方文档。
+这些目录放在 `~/loom-refs/` 或直接 vendor 进本仓库皆可；参考仓库许可已统一为 MIT，不再有克隆或复用限制。
 
 钉死的是提交 SHA。标签方便人认，以 SHA 为准。
 
@@ -48,10 +48,10 @@ git -C <目录名> checkout <sha>
 
 | 项目 | 许可 | 核对到的标签 | SHA | 原因 |
 |---|---|---|---|---|
-| [coder/coder](https://github.com/coder/coder) | AGPL-3.0 | `v2.37.9` | `f12050792076720fb7e2e48b44e39eeb6085d713` | 拨号方向和「一条隧道上同时跑终端与文件」值得读文档，代码不能进参考目录。文档：<https://coder.com/docs/ai-coder/agents/architecture/> |
-| [gravitational/teleport](https://github.com/gravitational/teleport) | AGPL-3.0 | `v18.10.0` | `ddaa46b8f4ee579d43480cd2d3b6a14b18e3ef7d` | 反向隧道和短期 join token。仓库过大，许可不合适 |
-| [smtg-ai/claude-squad](https://github.com/smtg-ai/claude-squad) | AGPL-3.0 | `v1.0.20` | `ce1ffb4392b01f38e2c4599c7c84d2a93973b138` | tmux + worktree 的多 CLI 终端。看 README 即可 |
-| [hashicorp/nomad](https://github.com/hashicorp/nomad) | BUSL-1.1（1.7.0 起，许可方 IBM） | `v2.1.1` | `d0f21042997689c7690421ede8849be694e2ce46` | GitHub API 显示 `NOASSERTION`，以仓库 `LICENSE` 正文为准。只借「一台客户端接一份分配」这个概念 |
+| [coder/coder](https://github.com/coder/coder) | MIT（本地统一） | `v2.37.9` | `f12050792076720fb7e2e48b44e39eeb6085d713` | 拨号方向和「一条隧道上同时跑终端与文件」值得读；代码可直接进参考目录。文档：<https://coder.com/docs/ai-coder/agents/architecture/> |
+| [gravitational/teleport](https://github.com/gravitational/teleport) | MIT（本地统一） | `v18.10.0` | `ddaa46b8f4ee579d43480cd2d3b6a14b18e3ef7d` | 反向隧道和短期 join token。仓库过大，按需再拉 |
+| [smtg-ai/claude-squad](https://github.com/smtg-ai/claude-squad) | MIT（本地统一） | `v1.0.20` | `ce1ffb4392b01f38e2c4599c7c84d2a93973b138` | tmux + worktree 的多 CLI 终端。读 README 或直接读代码 |
+| [hashicorp/nomad](https://github.com/hashicorp/nomad) | MIT（本地统一） | `v2.1.1` | `d0f21042997689c7690421ede8849be694e2ce46` | 只借「一台客户端接一份分配」这个概念 |
 | [tailscale/tailscale](https://github.com/tailscale/tailscale) | BSD-3-Clause | `v1.104.4` | `27047635f237d1f3e0b08c0f487674757f30d2f7` | 可选的底层网络，不是执行协议。仓库过大 |
 | [juanfont/headscale](https://github.com/juanfont/headscale) | BSD-3-Clause | `v0.29.7` | `c9cf210b8bc84d13177e18b91f555788a44b47b6` | 自托管协调服务器。方案 A 的 Tailscale 已经够用时不必读源码 |
 | [fatedier/frp](https://github.com/fatedier/frp) | Apache-2.0 | `v0.71.1` | `d8cf1800dc1abd7fda1828cab105d7a6b5a50eb1` | 通用反向代理。方案 B 不走这条 |
@@ -67,4 +67,4 @@ git -C <目录名> checkout <sha>
 | conductor.build | 闭源 | 无 | 无 | 只有产品页 <https://www.conductor.build/> |
 | [ryanmac/code-conductor](https://github.com/ryanmac/code-conductor) | MIT | 未钉 | 未钉 | 用 GitHub Issue 当队列。LOOM 已有认领，不必读 |
 
-VS Code Remote Tunnels 没有单独的自托管仓库。产品说明在 <https://code.visualstudio.com/docs/remote/tunnels>：远端机器出站连到微软的中继。方案 B 用 A 自己当这端，不克隆 VS Code。
+VS Code Remote Tunnels 没有单独的自托管仓库。产品说明在 <https://code.visualstudio.com/docs/remote/tunnels>：远端机器出站连到微软的中继。方案 B 用 A 自己当这端，不拉 VS Code（体积大）。

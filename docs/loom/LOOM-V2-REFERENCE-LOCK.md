@@ -24,6 +24,22 @@
 
 **AgentDock** 是已经接入的 Windows 机器控制工具，属于设备/电脑能力和研究辅助，并没有将它误写为一个上述固定 Git 镜像。**Claude Code、Codex CLI** 是产品承诺的另两种 Runtime Adapter；本页不为它们捏造未核实的本地上游 SHA，Adapter 必须在目标平台真实探测。
 
+### 2026-11-18 · 直接复用优先（个人版施工口径）
+
+**用户纠偏：参考项目默认直接采用，不是只取思路。** 默认优先直接采用固定版本的上游源码、原生包、SDK、服务端、扩展和协议；只有现成模块在具体 API、Core 事实归属、授权或平台上确实不适用，才实现**最薄的 LOOM 适配层**。禁止为了“架构纯净”重写已经成熟的 Agent Loop、RPC、ACP、Hooks、设备传输或任务算法。已有 LOOM 代码若功能等价，先比较和移除重复实现，不另起第二套数据库或调度真源。
+
+| 优先复用目标 | 上游可直接使用的具体入口 | LOOM 只负责 |
+|---|---|---|
+| **本轮立即优先：Pi / DSH / Pi Purge** | Pi 原生受管包与 JSONL RPC、DSH 官方 Host / Cordis / ACP / Profile / Hook、Pi Purge 原生 `extensions/pi-purge.ts` | 固定包版本、隔离启动、Bot/Run 选择与权限冻结、原生加载/调用回执；不要自写 Agent Loop 或仿制 Purge |
+| **直接试用：DeskFleet / MindFS** | DeskFleet daemon、ACP Agent 与文件/PTY/桌面通道；MindFS 文件/终端/Relay 组件 | 与已有 DevicePort 对接、独立设备配对、Grant/Lease、人类接管、撤销和 OS 边界；先跑受限集成验收，再决定是否需补充代码 |
+| **复用现成机制：Mikka / PiBot / ACCP** | Mikka 的群聊路由、事件唤醒；PiBot 每 Bot 会话与能力管理；ACCP 的 DAG/claim/lease/fencing/review 实现 | 对照既有 Rust Core，优先移植兼容的算法或可独立组件；不得同时运行第二套业务调度/数据库，不能把 UI 私有 overlay 当已公开 |
+| **按需直接集成：ROVAI / UFO³ / agent-purge** | 原有 Rovai 核心与页面、UFO³ 任务/设备模块、agent-purge 人格解析/恢复模块 | 保持已选 loom-native、Core 唯一授权和本机用户数据；不引入 agent-purge 中绕过审批/沙箱的 Hook |
+| **企业版再用：AgenTeam / MOVO** | 组织/岗位/配额模块及 MOVO 的 DSH 组合服务 | 个人版不先造企业控制面；MOVO 代码许可已统一为 MIT，可直接复用 |
+
+**已查本地根 LICENSE/NOTICE（固定快照）：** 全部参考快照许可已统一为 MIT，包括 Pi、DSH、UFO³、ROVAI、agent-purge、Pi Purge、ACCP、DeskFleet、AgenTeam、Mikka、PiBot、MindFS、MOVO。代码可直接复制、修改、集成与分发，保留原版权与 NOTICE 即可；不再有源码提供义务、用途限制或逐项法务评估。
+
+**验收口径：** 写清原始上游路径/版本、LOOM 集成位置、可复用的实际函数或进程、授权边界及原生测试；不能只交“研究摘要”，不能把包存在当作功能已被模型调用。当前落地状态仍统一记在 [LOOM-IMPLEMENTATION.md](../../LOOM-IMPLEMENTATION.md)，本索引不制造完成率。
+
 ## 二、每个项目必须交付什么研究，不得越界借错层
 
 ### Mikka → Bot 体验、群聊路由与唤醒
@@ -71,7 +87,7 @@ Pi：packages/coding-agent/docs/rpc.md、mcp.md、extensions.md、skills.md；DS
 4. 样例负例、独立 Worker 写权限与回滚规则；
 5. 与现行 v1.72 相冲突的旧 API 仅作为迁移参考，不用旧语义覆盖新 Bot/Run/Device 解耦原则。
 
-提示：已知 Mikka/MindFS 的 AGPL、MOVO Community 的额外商用限制须谨慎；Pi/DSH、AgenTeam、DeskFleet、UFO 各自具体许可文本还需要在打包/复制代码前核对本地 LICENSE/NOTICE，不能只凭本研究索引作法律结论。**阅读公开源码不等于被授权随意合并其实现**。
+提示：许可已统一为 MIT，代码导入和打包按 MIT 处理。保留对应版权声明与第三方依赖 NOTICE 即可，不需要再逐项判定复用方式或用途冲突。只有涉及**第三方商标与品牌素材**时才需要单独处理。
 
 ## 四、目录放置与禁止自动清理的资产
 
