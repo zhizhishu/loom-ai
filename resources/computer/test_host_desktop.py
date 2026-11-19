@@ -11,7 +11,8 @@ The real desktop acceptance (`LiveDesktopAcceptance`) is opt-in through
 `scripts/bero/loom-dev-setup.sh`). It drives the shipped one-shot helper over
 stdin, one process per operation, and one of its cases switches that display's
 keyboard layout, so typed text is proven against a layout the helper does not
-hard-code.
+hard-code, and two cases change the display's own keyboard state (a second
+layout group and Caps Lock) before typing.
 
 Run pure only:
     python3 -m unittest discover -s resources/computer -p test_host_desktop.py -v
@@ -21,6 +22,7 @@ Run pure + real desktop:
 """
 
 import ctypes
+import ctypes.util
 import importlib.util
 import io
 import json
@@ -203,10 +205,11 @@ def keymap(rows):
     return sorted(rows, key=lambda row: row[0])
 
 
-# The two layouts differ in exactly one row: the key that carries `+` (shift level
-# of `=` on us, a bare key on de).
+# The two layouts differ in the key that carries `+` (shift level of `=` on us, a
+# bare key on de), and in the letter row that carries `ä` on de only.
 US_KEYMAP = keymap(COMMON_KEYMAP + [(21, [ord("="), ord("+")])])
-DE_KEYMAP = keymap(COMMON_KEYMAP + [(21, [ord("+"), ord("*")])])
+DE_KEYMAP = keymap(COMMON_KEYMAP + [(21, [ord("+"), ord("*")]),
+                                   (48, [ord("\u00e4"), ord("\u00c4")])])
 
 
 class X11TextLevels(unittest.TestCase):
@@ -253,6 +256,21 @@ class X11TextLevels(unittest.TestCase):
         self.assertEqual(helper.plan_text_steps([ord("+")], levels), [("keycode", 35)])
         # A shifted duplicate keeps the first keycode it was found on.
         self.assertEqual(levels[ord("*")], (35, True))
+
+    def test_a_group_specific_letter_keeps_its_own_keycode_and_shift(self):
+        # On de `ä` is the base level of its own key; on us that key types `'`.
+        de = helper.keyboard_levels(DE_KEYMAP)
+        us = helper.keyboard_levels(US_KEYMAP)
+        self.assertEqual(helper.plan_text_steps([ord("\u00e4")], de), [("keycode", 48)])
+        self.assertEqual(
+            helper.plan_text_steps([ord("\u00c4")], de),
+            [("key", "shift", "down"), ("keycode", 48), ("key", "shift", "up")],
+        )
+        # The same character has no level in the other group, so it is refused
+        # rather than typed as the neighbour that group puts on that key.
+        with self.assertRaises(helper.Failure) as raised:
+            helper.plan_text_steps([ord("\u00e4")], us)
+        self.assertEqual(raised.exception.code, "unsupported_input")
 
     def test_expansion_resolves_only_the_text_taps(self):
         levels = helper.keyboard_levels(US_KEYMAP)
@@ -1024,6 +1042,83 @@ class LiveFixtureContract(unittest.TestCase):
         self.assertIsNone(display.process, "a failed start leaks no server")
 
 
+class XServerKeyboard:
+    """The fixture display's own keyboard state, read and changed from outside the helper.
+
+    The helper must type what the user would get, so the fixture changes the
+    display the way a user does: select a second layout group, or lock Caps Lock.
+    Those changes are server state, not fixture bookkeeping, so every assertion
+    below reads them back from the X server instead of trusting a variable.
+    """
+
+    XKB_USE_CORE_KEYBOARD = 0x0100
+    LOCK_MASK = 0x02  # Caps Lock
+
+    class State(ctypes.Structure):
+        # XkbStateRec from X11/extensions/XKBlib.h, in declaration order.
+        _fields_ = [
+            ("group", ctypes.c_ubyte), ("locked_group", ctypes.c_ubyte),
+            ("base_group", ctypes.c_ushort), ("latched_group", ctypes.c_ushort),
+            ("mods", ctypes.c_ubyte), ("base_mods", ctypes.c_ubyte),
+            ("latched_mods", ctypes.c_ubyte), ("locked_mods", ctypes.c_ubyte),
+            ("compat_state", ctypes.c_ubyte), ("grab_mods", ctypes.c_ubyte),
+            ("compat_grab_mods", ctypes.c_ubyte), ("lookup_mods", ctypes.c_ubyte),
+            ("compat_lookup_mods", ctypes.c_ubyte),
+            ("ptr_buttons", ctypes.c_ushort),
+        ]
+
+    def __init__(self, environment):
+        name = ctypes.util.find_library("X11")
+        if not name:
+            raise AssertionError("the live fixture needs libX11")
+        self.x11 = ctypes.CDLL(name)
+        self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self.x11.XOpenDisplay.restype = ctypes.c_void_p
+        self.display = ctypes.c_void_p(
+            self.x11.XOpenDisplay(environment["DISPLAY"].encode("utf-8"))
+        )
+        if not self.display:
+            raise AssertionError("cannot open the fixture display %r" % environment["DISPLAY"])
+        self.x11.XkbGetState.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                        ctypes.POINTER(self.State)]
+        self.x11.XkbGetState.restype = ctypes.c_int
+        self.x11.XkbLockGroup.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
+        self.x11.XkbLockModifiers.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                             ctypes.c_uint, ctypes.c_uint]
+        self.x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+
+    def close(self):
+        if self.display:
+            self.x11.XCloseDisplay(self.display)
+            self.display = None
+
+    def state(self):
+        state = self.State()
+        # XkbGetState reports Success as zero; the lock requests below are Bool.
+        if self.x11.XkbGetState(self.display, self.XKB_USE_CORE_KEYBOARD,
+                                ctypes.byref(state)) != 0:
+            raise AssertionError("could not read the keyboard state on the fixture display")
+        self.x11.XSync(self.display, 0)
+        return {"group": state.group, "locked_mods": state.locked_mods}
+
+    def lock_group(self, group):
+        self.assert_ok(self.x11.XkbLockGroup(self.display, self.XKB_USE_CORE_KEYBOARD, group),
+                       "select keyboard group %d" % group)
+        self.x11.XSync(self.display, 0)
+
+    def lock_modifiers(self, mask, value):
+        self.assert_ok(self.x11.XkbLockModifiers(self.display, self.XKB_USE_CORE_KEYBOARD,
+                                                 mask, value),
+                       "set locked modifiers %d" % value)
+        self.x11.XSync(self.display, 0)
+
+    @staticmethod
+    def assert_ok(status, action):
+        if not status:
+            raise AssertionError("could not %s on the fixture display" % action)
+
+
 @unittest.skipUnless(
     live_acceptance_enabled(),
     "set LOOM_COMPUTER_LIVE_ACCEPTANCE=1 to run the real desktop acceptance",
@@ -1263,6 +1358,50 @@ class LiveDesktopAcceptance(unittest.TestCase):
         received = self.typed_line(environment, "layout", "Mikka + CUA")
         self.assertIn("+", received, "the de `+` key must not arrive as another character")
         self.assertNotIn("=", received)
+
+    def test_typed_text_follows_the_active_keyboard_group(self):
+        """A second layout group must type its own characters, including non-ASCII.
+
+        The core keysym table has no portable group stride (a layout may put four
+        levels on one group and two on the next), so a reader that always takes
+        the first group types the wrong characters or refuses characters the
+        active group can reach. `ä` is a base-level character of the German group
+        and `+` is unshifted there, while the US group has neither.
+        """
+        display = IsolatedDisplay(*LIVE_SCREEN)
+        self.addCleanup(display.stop)
+        display.start()
+        environment = display.environment()
+        set_keyboard_layout(environment, "us,de")
+        keyboard = XServerKeyboard(environment)
+        self.addCleanup(keyboard.close)
+        keyboard.lock_group(1)
+        state = keyboard.state()
+        self.assertEqual(state["group"], 1, "the fixture must be in the second group")
+        self.assertEqual(state["locked_mods"] & keyboard.LOCK_MASK, 0)
+        received = self.typed_line(environment, "group", "Mikka \u00e4 + CUA")
+        self.assertIn("\u00e4", received, "the active group's own letter must arrive")
+        self.assertIn("+", received, "the active group's unshifted `+` must arrive")
+        self.assertNotIn("=", received)
+
+    def test_typed_text_keeps_its_case_under_caps_lock(self):
+        """Caps Lock must not swap the case of typed text, and must stay locked."""
+        display = IsolatedDisplay(*LIVE_SCREEN)
+        self.addCleanup(display.stop)
+        display.start()
+        environment = display.environment()
+        set_keyboard_layout(environment, "us")
+        keyboard = XServerKeyboard(environment)
+        self.addCleanup(keyboard.close)
+        keyboard.lock_modifiers(XServerKeyboard.LOCK_MASK, XServerKeyboard.LOCK_MASK)
+        self.assertEqual(keyboard.state()["locked_mods"] & keyboard.LOCK_MASK,
+                         keyboard.LOCK_MASK,
+                         "Caps Lock must be locked before the text is typed")
+        received = self.typed_line(environment, "caps", LIVE_MARKER)
+        self.assertEqual(received, LIVE_MARKER, "Caps Lock must not change the typed case")
+        self.assertEqual(keyboard.state()["locked_mods"] & keyboard.LOCK_MASK,
+                         keyboard.LOCK_MASK,
+                         "typing must restore the user's Caps Lock")
 
     def typed_line(self, environment, label, text):
         """Type `text` then Enter into a dedicated xterm; return what it received.
