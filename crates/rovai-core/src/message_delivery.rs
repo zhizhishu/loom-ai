@@ -13,7 +13,10 @@ use crate::{
         AGENT_USER_DISPLAY_NAME, LEGACY_AGENT_USER_DISPLAY_NAME, StructuredThreadMessageSegment,
         canonical_content_digest, normalize_content, render_current_plain_text,
     },
-    collaboration::{append_domain_event, build_effective_config},
+    collaboration::{
+        AddressRejectionReason, ThreadMessageAddress, append_domain_event, build_effective_config,
+        resolve_group_address,
+    },
     command::{ActorRef, CommandHandlerResult, EntityReference, canonical_json_digest},
     context::{
         ContextService, DEFAULT_MAX_CONTEXT_PAYLOAD_BYTES, DeliveryContextPreview,
@@ -206,6 +209,26 @@ struct ActiveThreadAgent {
     display_name: String,
 }
 
+/// The structured address an Agent-authored body describes: its inline mentions
+/// in mention order, then footer `--to` recipients not already named. Naming no
+/// Agent leaves the message public group context (Mikka's `observe`), never a
+/// Default Lead wake-up.
+///
+/// upstream: Mikka d59c85cb lib/coordinator/group-routing.ts:mentionRoute
+fn agent_send_address(explicit_order: &[String], inline_order: &[String]) -> ThreadMessageAddress {
+    let mut agent_ids = inline_order.to_vec();
+    for recipient in explicit_order {
+        if !agent_ids.contains(recipient) {
+            agent_ids.push(recipient.clone());
+        }
+    }
+    if agent_ids.is_empty() {
+        ThreadMessageAddress::PublicOnly
+    } else {
+        ThreadMessageAddress::Explicit { agent_ids }
+    }
+}
+
 pub fn persist_queued_agent_message(
     transaction: &Transaction<'_>,
     request: &SendQueuedAgentMessage<'_>,
@@ -231,10 +254,6 @@ pub fn persist_queued_agent_message(
     // PublicOnly still recognizes Principal in a mixed leading mention cluster;
     // member identities participate in parsing, never in routing in that mode.
     let active_agents = load_active_camp_agents(transaction, request.camp_id)?;
-    let active_agent_ids = active_agents
-        .iter()
-        .map(|agent| agent.agent_id.clone())
-        .collect::<HashSet<_>>();
     let mut inline = parse_inline_addressing(request.body, &active_agents);
     if !automatic_addressing {
         inline.occurrences.clear();
@@ -275,31 +294,48 @@ pub fn persist_queued_agent_message(
             });
         }
     }
-    let mut candidate_sources = Vec::new();
-    candidate_sources.extend(
-        explicit_order
-            .iter()
-            .filter(|value| parse_agent_id(value).is_some())
-            .cloned()
-            .map(|value| ("--to", value)),
-    );
-    candidate_sources.extend(inline_order.iter().cloned().map(|value| ("inline", value)));
-    for (source, value) in &candidate_sources {
-        let reason = if value == request.author_agent_id {
-            Some("self_target")
-        } else if !active_agent_ids.contains(value) {
-            Some("not_current_camp_member")
-        } else {
+    // A `--to` value that is not an opaque Agent id is a format offender, never a route.
+    let valid_explicit_order = explicit_order
+        .iter()
+        .filter(|value| parse_agent_id(value).is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    // Who is called, and whether a named member may be woken, is decided once by
+    // the Thread router. An Agent-authored body is plain text, so this lane only
+    // turns its mentions into the same structured address a Composer send
+    // produces; naming no Agent means the message is group context (Mikka's
+    // `observe`), never a default Lead wake-up.
+    //
+    // upstream: Mikka d59c85cb lib/coordinator/group-routing.ts:mentionRoute
+    let address = agent_send_address(&valid_explicit_order, &inline_order);
+    let sender = ActorRef::Agent {
+        agent_id: request.author_agent_id.to_string(),
+        source_agent_run_id: request.source_agent_run_id.to_string(),
+    };
+    let resolution = match resolve_group_address(transaction, request.camp_id, &address, &sender)? {
+        Ok(resolution) => Some(resolution),
+        Err(rejection) => {
+            for offender in rejection.offenders() {
+                let source = if inline_order
+                    .iter()
+                    .any(|value| value == offender.agent_id())
+                {
+                    "inline"
+                } else {
+                    "--to"
+                };
+                offenders.push(AddressingOffender {
+                    source,
+                    value: offender.agent_id().to_string(),
+                    reason: match offender.reason() {
+                        AddressRejectionReason::SelfTarget => "self_target",
+                        _ => "not_current_camp_member",
+                    },
+                });
+            }
             None
-        };
-        if let Some(reason) = reason {
-            offenders.push(AddressingOffender {
-                source,
-                value: value.clone(),
-                reason,
-            });
         }
-    }
+    };
     offenders.sort_by(|left, right| {
         (&left.source, left.value.as_bytes(), &left.reason).cmp(&(
             &right.source,
@@ -318,13 +354,14 @@ pub fn persist_queued_agent_message(
             }),
         ));
     }
+    // No offenders were reported, so the router accepted the address.
+    let resolution = resolution.expect("accepted Thread address");
 
-    let mut effective_recipients = candidate_sources
-        .iter()
-        .map(|(_, value)| value.clone())
-        .collect::<Vec<_>>();
+    let mut effective_recipients = resolution.agent_ids();
+    // Deliveries keep one canonical recipient order so a message's recipient set
+    // digest never depends on the order two lanes happened to mention. The
+    // authored mention order stays in `recipient_presentation.inlineOrder`.
     effective_recipients.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    effective_recipients.dedup();
     let anchor_message_id =
         load_run_reply_anchor(transaction, request.source_agent_run_id, request.camp_id)?;
     let source_files =
@@ -456,6 +493,9 @@ pub fn persist_queued_agent_message(
         &json!({
             "sequence": camp_sequence,
             "addressSource": "agent_send",
+            // Mikka's `GroupRoute.by`: an Agent body that named members is a
+            // mention route, one that named none is group context only.
+            "addressRoute": resolution.route_label(),
             "addressedAgentIds": effective_recipients,
             "deliveryIds": delivery_ids,
             "sourceAgentRunId": request.source_agent_run_id,
@@ -487,6 +527,7 @@ pub fn persist_queued_agent_message(
             "visibility": "camp_public",
             "anchorMessageId": anchor_message_id,
             "agentAddressingMode": request.agent_addressing_mode,
+            "addressRoute": resolution.route_label(),
             "effectiveRecipients": effective_recipients,
             "recipientPresentation": recipient_presentation,
             "recipientSetDigest": recipient_set_digest,
@@ -2244,6 +2285,14 @@ fn stable_unique(values: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
+/// The mentions an Agent-authored body names.
+///
+/// Mikka receives `message.mentions` as structured data from its own client, so
+/// this is the only place LOOM has to recover that structure from plain text.
+/// It decides nothing: which of these members may be woken is the Thread
+/// router's answer (`collaboration::resolve_group_address`).
+///
+/// upstream: Mikka d59c85cb lib/coordinator/group-routing.ts:mentionRoute
 fn parse_inline_addressing(body: &str, active_agents: &[ActiveThreadAgent]) -> InlineAddressing {
     let bytes = body.as_bytes();
     let mut occurrences = Vec::new();
@@ -3000,6 +3049,78 @@ https://example.test/@agent_7
         let mut values = vec!["agent_9".to_string(), "agent_104".to_string()];
         values.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         assert_eq!(values, vec!["agent_104", "agent_9"]);
+    }
+
+    /// One Thread router serves both send lanes: a Composer send hands over
+    /// structured Member Mentions, an Agent-authored body hands over the same
+    /// address built from its plain-text mentions.
+    ///
+    /// upstream: Mikka d59c85cb lib/coordinator/group-routing.test.ts
+    #[test]
+    fn agent_body_address_matches_the_composer_address_vocabulary() {
+        assert_eq!(
+            agent_send_address(&[], &[]),
+            ThreadMessageAddress::PublicOnly
+        );
+        assert_eq!(
+            agent_send_address(&["infra".into()], &["ui".into(), "infra".into()]),
+            ThreadMessageAddress::Explicit {
+                agent_ids: vec!["ui".into(), "infra".into()],
+            },
+            "inline mention order first, footer recipients after, without duplicates"
+        );
+    }
+
+    #[test]
+    fn an_agent_send_routes_through_the_single_thread_router() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE camp(id TEXT PRIMARY KEY, default_lead_agent_id TEXT);
+                CREATE TABLE camp_member(
+                    camp_id TEXT, agent_id TEXT, status TEXT,
+                    leave_requested_at TEXT, joined_at TEXT
+                );
+                CREATE TABLE agent_profile(
+                    id TEXT PRIMARY KEY, profile_status TEXT, display_name TEXT
+                );
+                CREATE TABLE conversation(id TEXT PRIMARY KEY, camp_id TEXT, agent_id TEXT);
+                INSERT INTO camp VALUES ('camp', 'lead');
+                INSERT INTO camp_member VALUES ('camp', 'lead', 'active', NULL, '2026-01-01');
+                INSERT INTO camp_member VALUES ('camp', 'ui', 'active', NULL, '2026-01-02');
+                INSERT INTO agent_profile VALUES ('lead', 'present', 'Lead');
+                INSERT INTO agent_profile VALUES ('ui', 'present', '爱丽丝');
+                "#,
+            )
+            .unwrap();
+        let sender = ActorRef::Agent {
+            agent_id: "ui".to_string(),
+            source_agent_run_id: "run_1".to_string(),
+        };
+
+        // Naming no member is context only: nobody wakes, not even the Lead.
+        let observe = crate::collaboration::resolve_group_address(
+            &connection,
+            "camp",
+            &agent_send_address(&[], &[]),
+            &sender,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(observe.route_label(), "observe");
+        assert!(observe.agent_ids().is_empty());
+
+        let mention = crate::collaboration::resolve_group_address(
+            &connection,
+            "camp",
+            &agent_send_address(&[], &["lead".to_string()]),
+            &sender,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(mention.route_label(), "mention");
+        assert_eq!(mention.agent_ids(), vec!["lead".to_string()]);
     }
 
     #[test]
