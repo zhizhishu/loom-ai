@@ -17,6 +17,8 @@ export type RuntimeUserStatus =
   | 'unavailable'
   | 'not_qualified'
   | 'unsupported'
+  /** LOOM 自有决定（Claude 禁用，2026-11-18）：产品策略禁用，只识别不启动。 */
+  | 'disabled'
   | 'unknown'
 
 export interface RuntimeStatusPresentation {
@@ -58,6 +60,7 @@ const STATUS_LABELS: Record<RuntimeUserStatus, string> = {
   unavailable: '不可用',
   not_qualified: '当前平台尚未验证',
   unsupported: '此平台不支持',
+  disabled: '已禁用',
   unknown: '暂时无法确认'
 }
 
@@ -172,6 +175,13 @@ export function runtimeProductPresentation(
   if (admission.status === 'unsupported') {
     return presentation('unsupported', uiAttribute('该智能体不支持当前平台。'))
   }
+  if (admission.status === 'disabled') {
+    // LOOM 自有决定（Claude 禁用，2026-11-18）：产品策略禁用，与平台支持/资格无关。
+    return presentation(
+      'disabled',
+      uiAttribute('该智能体已按产品策略禁用：只识别，不启动。')
+    )
+  }
   const availabilityPresentation = runtimeAvailabilityPresentation(availability, pending)
   if (admission.status !== 'preview') return availabilityPresentation
   const previewDetail = uiAttribute('当前平台已开放使用，完整的平台资格验证记录尚未齐备。')
@@ -209,6 +219,7 @@ export function memberRuntimePresentation(
       || availabilityStatus.status === 'unavailable'
       || availabilityStatus.status === 'not_qualified'
       || availabilityStatus.status === 'unsupported'
+      || availabilityStatus.status === 'disabled'
     ) {
       return availabilityStatus
     }
@@ -221,7 +232,7 @@ export function memberRuntimePresentation(
   }
 
   if (agent.runtimeReadiness.status === 'light_ready' || agent.runtimeReadiness.status === 'installed_unverified') {
-    if (availabilityStatus.status === 'not_qualified' || availabilityStatus.status === 'unsupported') return availabilityStatus
+    if (availabilityStatus.status === 'not_qualified' || availabilityStatus.status === 'unsupported' || availabilityStatus.status === 'disabled') return availabilityStatus
     return presentation('available')
   }
 

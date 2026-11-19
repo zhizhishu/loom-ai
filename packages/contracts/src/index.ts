@@ -465,7 +465,11 @@ export interface ProductRuntimeCatalogEntry {
 
 export type HostPlatformKey = 'macos-arm64' | 'macos-x64' | 'windows-x64' | 'linux-x64'
 
-export type RuntimePlatformAdmissionStatus = 'qualified' | 'preview' | 'not_qualified' | 'unsupported'
+/**
+ * LOOM 自有决定（Claude 禁用，2026-11-18）：`disabled` 是产品策略禁用（只识别，不启动），
+ * 与 `unsupported`（上游/平台不支持）和 `not_qualified`（缺资格证据）区分开。
+ */
+export type RuntimePlatformAdmissionStatus = 'qualified' | 'preview' | 'not_qualified' | 'unsupported' | 'disabled'
 
 export type RuntimePlatformAdmissionReasonCode =
   | 'runtime_platform.qualification_evidence_missing'

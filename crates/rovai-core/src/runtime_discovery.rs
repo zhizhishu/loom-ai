@@ -249,8 +249,22 @@ pub enum RuntimeLaunchPurpose {
     AgentExecution,
 }
 
-pub fn runtime_launch_allowed(_kind: AdapterKind, _purpose: RuntimeLaunchPurpose) -> bool {
-    // Every current Product Runtime participates in the same purpose-scoped
+pub fn runtime_launch_allowed(kind: AdapterKind, purpose: RuntimeLaunchPurpose) -> bool {
+    // LOOM 自有决定（Claude 禁用，2026-11-18）：Claude Code 只识别，不启动。
+    // 所有 purpose（DiscoveryVersion / AvailabilityCheck / InstallationRefresh /
+    // HealthProbe / DispatchPreflight / AgentExecution）一律拒绝启动进程："只识别"=
+    // 只看 PATH/文件存在。路径发现仍报 Found，版本探测退回
+    // `discover_runtime_version_scoped` 的静态读取分支（
+    // `runtime_version_unavailable_static_only`），因此不需要新类型。
+    // 唯一例外：显式 opt-in（经渠道网关的 Claude 端点测试），见
+    // runtime_platform_admission::claude_runtime_enabled_by_policy_opt_in。
+    if kind == AdapterKind::ClaudeCodeCli
+        && !crate::runtime_platform_admission::claude_runtime_enabled_by_policy_opt_in()
+    {
+        return false;
+    }
+    let _ = purpose;
+    // Every other current Product Runtime participates in the same purpose-scoped
     // lifecycle. Keeping this gate central ensures new Adapters must still make
     // an explicit launch-policy decision without reintroducing caller-local
     // exceptions.
@@ -2484,10 +2498,10 @@ mod tests {
             sources: vec![SearchPathSource::InheritedPath],
         }]);
 
-        for (index, kind) in AdapterKind::ALL
+        let mut executions = 0;
+        for kind in AdapterKind::ALL
             .into_iter()
             .filter(|kind| *kind != AdapterKind::ZcodeApp)
-            .enumerate()
         {
             use crate::agent_runtime_adapter::FULL_HASH_READS;
             FULL_HASH_READS.set(0);
@@ -2573,12 +2587,34 @@ mod tests {
             let invocations_before = fs::read_to_string(&marker).unwrap_or_default();
             assert_eq!(
                 invocations_before.lines().count(),
-                index,
+                executions,
                 "{} path discovery must not execute the CLI",
                 kind.as_str()
             );
 
             discover_runtime_version(&mut observation, &search).await;
+            if kind == AdapterKind::ClaudeCodeCli {
+                // LOOM 自有决定（Claude 禁用，2026-11-18）：Claude Code 只识别，不启动。
+                // 路径发现仍报 Found，但版本必须退回静态读取（这里的 shell 夹具没有可读的
+                // 版本元数据，所以给出 runtime_version_unavailable_static_only）。
+                assert_eq!(
+                    observation.reported_version, None,
+                    "disabled Claude Code must not run --version"
+                );
+                assert_eq!(
+                    observation.diagnostic_code.as_deref(),
+                    Some("runtime_version_unavailable_static_only")
+                );
+                assert_eq!(
+                    fs::read_to_string(&marker)
+                        .unwrap_or_default()
+                        .lines()
+                        .count(),
+                    executions,
+                    "disabled Claude Code must not execute any command"
+                );
+                continue;
+            }
             let expected_version = match kind {
                 AdapterKind::CodexCli => "codex 1.2.3",
                 AdapterKind::TraeCnCli => "trae 9.9.9",
@@ -2598,10 +2634,11 @@ mod tests {
                 "{} light version check must succeed",
                 kind.as_str()
             );
+            executions += 1;
             let invocations_after = fs::read_to_string(&marker).unwrap();
             assert_eq!(
                 invocations_after.lines().count(),
-                index + 1,
+                executions,
                 "{} version enrichment must execute exactly once",
                 kind.as_str()
             );
@@ -2609,7 +2646,15 @@ mod tests {
 
         let invocations = fs::read_to_string(&marker).unwrap();
         let lines = invocations.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), AdapterKind::ALL.len() - 1);
+        // LOOM 自有决定（Claude 禁用，2026-11-18）：ZcodeApp 不用 `--version`，
+        // Claude Code 是策略禁用的「只识别」Runtime，两者都不在一个启动计数内。
+        assert_eq!(lines.len(), AdapterKind::ALL.len() - 2);
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains(AdapterKind::ClaudeCodeCli.command_name())),
+            "disabled Claude Code must never appear in the launch log"
+        );
         assert!(lines.iter().all(|line| line.ends_with(":--version")));
         assert!(!invocations.contains("acp"));
         assert!(!invocations.contains("session"));
@@ -2675,8 +2720,37 @@ mod tests {
             RuntimeLaunchPurpose::AgentExecution,
         ] {
             for kind in AdapterKind::ALL {
+                // LOOM 自有决定（Claude 禁用，2026-11-18）：Claude Code 是这个
+                // 统一启动策略的显式例外（只识别，不启动）。
+                if kind == AdapterKind::ClaudeCodeCli {
+                    continue;
+                }
                 assert!(runtime_launch_allowed(kind, purpose));
             }
+        }
+    }
+
+    /// LOOM 自有决定（Claude 禁用，2026-11-18）：Claude Code 的每个启动 purpose
+    /// 都必须被拒，包括版本探测与健康探测——否则「只识别」就不成立。
+    #[test]
+    fn claude_code_launch_is_refused_for_every_purpose() {
+        assert!(
+            !crate::runtime_platform_admission::claude_runtime_enabled_by_policy_opt_in(),
+            "这个用例断言默认策略（Claude 已禁用）；LOOM_CLAUDE_RUNTIME_ENABLED=1 是
+             手工的渠道网关测试开关，不要在测试进程里设置"
+        );
+        for purpose in [
+            RuntimeLaunchPurpose::DiscoveryVersion,
+            RuntimeLaunchPurpose::AvailabilityCheck,
+            RuntimeLaunchPurpose::InstallationRefresh,
+            RuntimeLaunchPurpose::HealthProbe,
+            RuntimeLaunchPurpose::DispatchPreflight,
+            RuntimeLaunchPurpose::AgentExecution,
+        ] {
+            assert!(
+                !runtime_launch_allowed(AdapterKind::ClaudeCodeCli, purpose),
+                "{purpose:?} must not launch Claude Code"
+            );
         }
     }
 

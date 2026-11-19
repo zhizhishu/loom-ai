@@ -14,7 +14,7 @@ import { hostFeatureError, type NativeCapability, type NativeCatalog, type Nativ
 const RUNTIMES = [{ value:'claude-code-cli',label:'Claude Code',mark:'C' },{ value:'codex-cli',label:'Codex',mark:'▧' },{ value:'deepseek-harness',label:'DSH',mark:'D' },{ value:'pi',label:'Pi',mark:'π' }] as const
 const KIND_LABEL: Record<NativeKind,string> = { skill:'Skills',mcp:'MCP',rule:'规则',hook:'Hooks' }
 const KIND_ICON: Record<NativeKind,IconName> = { skill:'bulb',mcp:'globe',rule:'file',hook:'branch' }
-const STATUS: Record<RuntimeSetupState,string> = { verified:'检查通过',check_pending:'正在检查',found_unverified:'已发现 · 待检查',missing:'尚未发现',authentication_required:'需要登录',incompatible:'版本待处理',needs_attention:'需要处理',disabled:'已停用',platform_unsupported:'当前平台不支持',unknown:'未确认' }
+const STATUS: Record<RuntimeSetupState,string> = { verified:'检查通过',check_pending:'正在检查',found_unverified:'已发现 · 待检查',missing:'尚未发现',authentication_required:'需要登录',incompatible:'版本待处理',needs_attention:'需要处理',disabled:'已停用',policy_disabled:'已禁用',platform_unsupported:'当前平台不支持',unknown:'未确认' }
 type Tab = 'runtime' | 'native' | 'mcp' | 'devices'
 type ImportReview = { item: NativeCapability; preview?: NativePreview; skill?: SkillImportInspection; configDigest?: string; id: string }
 

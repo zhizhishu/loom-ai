@@ -747,6 +747,15 @@ impl AgentRuntimeAdapterRegistry {
         kind: AdapterKind,
         platform: HostPlatformKey,
     ) -> RuntimePlatformAdmission {
+        // LOOM 自有决定（Claude 禁用，2026-11-18）：Claude Code 已按产品决定禁用：
+        // 只识别，不启动。这个分支必须排在函数最前面：任何平台证据、debug Windows 本地
+        // 资格覆盖、后续 Adapter 分支顺序都不能把它重新放回已准入。唯一例外是显式 opt-in
+        // （见 runtime_platform_admission::claude_runtime_enabled_by_policy_opt_in）。
+        if kind == AdapterKind::ClaudeCodeCli
+            && !crate::runtime_platform_admission::claude_runtime_enabled_by_policy_opt_in()
+        {
+            return RuntimePlatformAdmission::disabled(kind, platform);
+        }
         if platform == HostPlatformKey::LinuxX64
             && matches!(
                 kind,

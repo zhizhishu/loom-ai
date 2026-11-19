@@ -47,6 +47,8 @@ export function compactRuntimeState(status: RuntimeUserStatus): CompactRuntimeSt
     || status === 'unknown'
     || status === 'not_qualified'
     || status === 'unsupported'
+    // LOOM 自有决定（Claude 禁用，2026-11-18）：产品策略禁用不是用户能处理的故障。
+    || status === 'disabled'
   ) return 'neutral'
   return 'action'
 }

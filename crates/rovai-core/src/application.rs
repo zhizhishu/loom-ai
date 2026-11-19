@@ -280,7 +280,7 @@ use rovai_core::{
         RuntimeFailureError, RuntimeFailureOrigin, RuntimeFailurePhase, RuntimeFailureView,
         public_runtime_failure_from_output,
     },
-    runtime_platform_admission::RuntimePlatformAdmission,
+    runtime_platform_admission::{RuntimePlatformAdmission, RuntimePlatformAdmissionStatus},
     runtime_resolution::RuntimeResolutionService,
     runtime_search_operation,
     single_chat::{
@@ -2441,6 +2441,13 @@ enum RuntimeCheckFinalization {
 }
 
 fn windows_runtime_qualification_allows(runtime_kind: AdapterKind) -> bool {
+    // LOOM 自有决定（Claude 禁用，2026-11-18）：debug Windows 的本地资格开关不得把
+    // Claude Code 放回启用集合/准入（它与验证的准入矩阵共用同一个产品策略）。
+    if runtime_kind == AdapterKind::ClaudeCodeCli
+        && !crate::runtime_platform_admission::claude_runtime_enabled_by_policy_opt_in()
+    {
+        return false;
+    }
     #[cfg(all(debug_assertions, target_os = "windows"))]
     {
         std::env::var("ROVAI_WINDOWS_RUNTIME_QUALIFICATION_ADAPTER")
@@ -2466,6 +2473,11 @@ fn apply_windows_runtime_qualification_override(
     admission: RuntimePlatformAdmission,
     locally_qualified: bool,
 ) -> RuntimePlatformAdmission {
+    // LOOM 自有决定（Claude 禁用，2026-11-18）：产品策略禁用不可被 Windows 本地资格
+    // 证据覆盖，否则调试开关会绕过「只识别，不启动」。
+    if admission.status() == RuntimePlatformAdmissionStatus::Disabled {
+        return admission;
+    }
     if locally_qualified && admission.platform() == HostPlatformKey::WindowsX64 {
         RuntimePlatformAdmission::qualified(
             admission.runtime_kind(),
@@ -33708,6 +33720,50 @@ done
         let qualified = HostPlatformKey::current() != Some(HostPlatformKey::LinuxX64);
         assert_eq!(admission.is_qualified(), qualified);
         assert_eq!(admission.evidence_revision().is_some(), qualified);
+    }
+
+    /// LOOM 自有决定（Claude 禁用，2026-11-18）：Claude Code 只识别，不启动，
+    /// 所以选择 Claude 派发在任何进程存在之前就被策略拒绝，且本地 Windows 资格证据
+    /// 不得把它翻回启用。
+    #[test]
+    fn selecting_claude_code_dispatch_is_rejected_before_any_process() {
+        assert!(
+            !crate::runtime_platform_admission::claude_runtime_enabled_by_policy_opt_in(),
+            "这个用例断言默认策略（Claude 已禁用）；LOOM_CLAUDE_RUNTIME_ENABLED=1 是\
+             经渠道网关（如 oct）的手工测试开关，不要在测试进程里设置"
+        );
+        let enabled = current_platform_enabled_runtime_kinds();
+        assert!(!enabled.contains(&AdapterKind::ClaudeCodeCli));
+
+        let blocker = current_runtime_platform_blocker(AdapterKind::ClaudeCodeCli)
+            .expect("a policy-disabled Runtime has a blocker");
+        assert_eq!(blocker.code, "runtime_disabled_by_policy");
+        assert_eq!(blocker.status, crate::command::CommandResultStatus::Rejected);
+        assert_eq!(blocker.payload["runtimeKind"], "claude-code-cli");
+        assert_eq!(blocker.payload["platformAdmission"]["status"], "disabled");
+
+        let admission = current_runtime_platform_admission(AdapterKind::ClaudeCodeCli).unwrap();
+        assert_eq!(admission.status(), RuntimePlatformAdmissionStatus::Disabled);
+        assert!(!admission.allows_runtime_use());
+
+        // debug Windows 的本地资格覆盖不得绕过产品策略。
+        let overridden = apply_windows_runtime_qualification_override(
+            AgentRuntimeAdapterRegistry::default()
+                .platform_admission(AdapterKind::ClaudeCodeCli, HostPlatformKey::WindowsX64),
+            true,
+        );
+        assert_eq!(overridden.status(), RuntimePlatformAdmissionStatus::Disabled);
+        assert!(!overridden.allows_runtime_use());
+        assert_eq!(overridden.blocker_code(), Some("runtime_disabled_by_policy"));
+        assert!(overridden.evidence_revision().is_none());
+
+        // 机器可读证据：没有任何 Claude 进程被登记过。
+        let directory = std::env::temp_dir().join(format!(
+            "rovai-claude-disabled-policy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let adapter = crate::claude::ClaudeCodeCliRuntimeAdapter::deferred(&directory);
+        assert!(adapter.get_agent_run("run", 1).is_none());
     }
 
     #[test]

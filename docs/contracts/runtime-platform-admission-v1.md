@@ -24,6 +24,7 @@ export type RuntimePlatformAdmissionStatus =
   | 'qualified'
   | 'not_qualified'
   | 'unsupported'
+  | 'disabled'
 
 export type RuntimePlatformAdmissionReasonCode =
   | 'runtime_platform.qualification_evidence_missing'
@@ -59,14 +60,20 @@ Rust `AgentRuntimeAdapter` Registry 为唯一真源，并必须为 Product Runti
 
 ## 3. Admission effects
 
-| Consumer | `qualified` | `not_qualified` | `unsupported` |
-| --- | --- | --- | --- |
-| automatic discovery / availability check | allowed | omitted | omitted |
-| managed Installation create/relocate | allowed | denied | denied |
-| Onboarding / Member selection | enabled | disabled: `Windows 尚未验证` | disabled: `此平台不支持` |
-| diagnostics | platform row + machine facts | platform row only | platform row only |
-| AgentRun preflight | continue | `runtime_platform_not_qualified` | `runtime_platform_unsupported` |
-| migration/default materialization | allowed | forbidden | forbidden |
+| Consumer | `qualified` | `not_qualified` | `unsupported` | `disabled` |
+| --- | --- | --- | --- | --- |
+| automatic discovery / availability check | allowed | omitted | omitted | omitted（只识别） |
+| managed Installation create/relocate | allowed | denied | denied | denied |
+| Onboarding / Member selection | enabled | disabled: `Windows 尚未验证` | disabled: `此平台不支持` | disabled: `已禁用` |
+| diagnostics | platform row + machine facts | platform row only | platform row only | platform row only |
+| AgentRun preflight | continue | `runtime_platform_not_qualified` | `runtime_platform_unsupported` | `runtime_disabled_by_policy` |
+| migration/default materialization | allowed | forbidden | forbidden | forbidden |
+
+`disabled` 是 LOOM 自有决定（Claude 禁用，2026-11-18）：`claude-code-cli` 在所有平台的准入都是
+`disabled`（`reasonCode = runtime_platform.upstream_unsupported`，`evidenceRevision = null`），
+只识别（PATH/文件存在仍可被发现），不启动任何进程——所有 launch purpose 都被拒绝。它与
+`unsupported`（上游/平台不支持）和 `not_qualified`（缺资格证据）是三种不同的结论；Windows 本地
+资格覆盖也不得把它翻回 `qualified`。
 
 Machine states such as `not_installed`, `needs_login`, `probe_failed`, `light_ready` or `ready` are unreachable until
 platform admission is `qualified` and cannot encode either denied state.

@@ -293,6 +293,28 @@ describe('readRuntimeSetup', () => {
     expect(card.platformAdmission.status).toBe('not_qualified')
     expect(card.setupState).toBe('platform_unsupported')
   })
+
+  // LOOM 自有决定（Claude 禁用，2026-11-18）：产品策略禁用的准入不能因为本机
+  // `ready` 就变成 verified；它有自己的「已禁用」状态。
+  it('keeps a policy-disabled admission out of every usable state', async () => {
+    const read = await readRuntimeSetup(rpc(reader({
+      status: status({
+        runtimeAvailability: [availability({ runtimeKind: 'claude-code-cli', status: 'ready' })],
+        runtimePlatformAdmission: PRODUCT_RUNTIME_KINDS.map((runtimeKind) => ({
+          runtimeKind,
+          platform: 'windows-x64',
+          status: runtimeKind === 'claude-code-cli' ? 'disabled' : 'qualified',
+          reasonCode: runtimeKind === 'claude-code-cli'
+            ? 'runtime_platform.upstream_unsupported'
+            : null,
+          evidenceRevision: null
+        }))
+      })
+    })))
+    const card = cardOf(read, 'claude-code-cli') as { setupState: string, platformAdmission: { status: string } }
+    expect(card.platformAdmission.status).toBe('disabled')
+    expect(card.setupState).toBe('policy_disabled')
+  })
 })
 
 describe('explicit runtime actions', () => {

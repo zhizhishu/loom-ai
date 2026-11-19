@@ -111,6 +111,9 @@ export type RuntimeSetupState =
   | 'incompatible'
   | 'needs_attention'
   | 'disabled'
+  // LOOM 自有决定（Claude 禁用，2026-11-18）：准入层的策略禁用单独一个状态，
+  // 不和用户自己关掉的 `disabled` 混用。
+  | 'policy_disabled'
   | 'platform_unsupported'
   | 'unknown'
 
@@ -206,7 +209,9 @@ const KNOWN_ADMISSION_STATUS: readonly RuntimePlatformAdmissionStatus[] = [
   'qualified',
   'preview',
   'not_qualified',
-  'unsupported'
+  'unsupported',
+  // LOOM 自有决定（Claude 禁用，2026-11-18）：产品策略禁用的准入状态。
+  'disabled'
 ]
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -366,6 +371,9 @@ function setupStateOf(
 ): RuntimeSetupState {
   if (admission?.status === 'unsupported') return 'platform_unsupported'
   if (admission?.status === 'not_qualified') return 'platform_unsupported'
+  // LOOM 自有决定（Claude 禁用，2026-11-18）：产品策略禁用排在可用性之前，
+  // 无论本机发现/探测结果如何都不能把它升级成 verified。
+  if (admission?.status === 'disabled') return 'policy_disabled'
   if (!availability) return 'unknown'
   switch (availability.status) {
     case 'ready':
