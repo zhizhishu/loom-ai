@@ -463,7 +463,32 @@ pub(crate) async fn dispatch_queued_run_for_test(
     database: Database,
     agent_run_id: &str,
 ) -> Result<()> {
+    dispatch_queued_run_with_remote_launcher_for_test(directory, database, agent_run_id, None).await
+}
+
+/// The same scheduler step, with the remote process transport a real remote Run needs installed on
+/// the Core first.
+///
+/// A remote Run cannot be prepared without an installed launcher at all (`prepare_runtime_for_
+/// dispatch` answers a missing transport with a terminal rejection), so the launcher is plumbing of
+/// the same kind as the Core itself: it decides nothing about the dispatch, it only lets the real
+/// scheduler reach the same steps it reaches in production. A test installs a launcher whose
+/// `start` never settles, so the Run's own claim is the last thing the step does.
+#[cfg(test)]
+pub(crate) async fn dispatch_queued_run_with_remote_launcher_for_test(
+    directory: &Path,
+    database: Database,
+    agent_run_id: &str,
+    launcher: Option<Arc<dyn crate::remote_process::RemoteProcessLauncher>>,
+) -> Result<()> {
     let core = Arc::new(tests::test_core_for_database(directory, database)?);
+    if let Some(launcher) = launcher {
+        core.remote_runtime_services
+            .install_launcher(launcher)
+            .map_err(|error| {
+                anyhow::anyhow!("the remote process launcher could not be installed: {error}")
+            })?;
+    }
     let (output, _output_rx) = mpsc::unbounded_channel();
     let candidate = {
         let database = core.database.lock().await;
@@ -488,15 +513,15 @@ fn ready_subsystems_for_test() -> CoreSubsystems {
     subsystems
 }
 
-/// Why a queued Run must keep waiting for the LOOM control plane instead of being prepared, or
+/// Why a queued Run must keep waiting for the LOOM control plane instead of being dispatched, or
 /// `None` when its dispatch may start now.
 ///
-/// The claim asks the control plane only *after* `prepare_runtime_for_dispatch` has run, so a device
-/// that is merely gone would be answered by the preparation with a terminal dispatch rejection: the
-/// Run would be `failed` and its Task stranded, although the control plane only ever wanted that Run
-/// to wait for the device. This asks the same ledger question one step earlier — a `WAITING` or
-/// `DISPATCHED` dispatch of this Run, judged by the same owner the claim uses — and `Some(_)` means
-/// "do not prepare", never "failed".
+/// Every later step answers a device that is merely gone with a terminal dispatch rejection — the
+/// remote target revalidation and the Runtime preparation both do — so the Run would be `failed`
+/// and its Task stranded, although the control plane only ever wanted that Run to wait for the
+/// device. This asks the same ledger question before any of those steps — a `WAITING` or
+/// `DISPATCHED` dispatch of this Run, judged by the same owner the claim uses, on the target the
+/// Run is frozen to — and `Some(_)` means "do not dispatch yet", never "failed".
 fn loom_dispatch_wait_reason(
     connection: &rusqlite::Connection,
     agent_run_id: &str,
@@ -14397,6 +14422,39 @@ impl Core {
             }
             Ok(None) => {}
         }
+        // A LOOM dispatch the control plane still holds back must not be dispatched at all: every
+        // step below answers an unavailable device with a terminal rejection — the remote target
+        // revalidation reports a Node that stopped reporting its harness as
+        // `remote_target_unavailable`, and Runtime preparation reports a disabled installation the
+        // same way — and either one fails this Run and strands its Task although the control plane
+        // only wants it to wait. The judgement is therefore the first thing this dispatch asks,
+        // before anything can answer terminally, and `Some(_)` means "do not start this Run yet",
+        // never "failed". The Run stays queued, its Delivery stays claimed and the pending Dispatch
+        // row keeps the Delivery recovery timer armed, so this very Run is dispatched again once
+        // the device is back. An already materialised Run is judged by the target it was frozen to,
+        // so the device that is waited for is the device that will run the work.
+        let loom_wait = {
+            let database = self.database.lock().await;
+            loom_dispatch_wait_reason(
+                database.connection(),
+                &candidate.agent_run_id,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+        };
+        match loom_wait {
+            Ok(Some(reason)) => {
+                eprintln!(
+                    "deferring LOOM dispatch for AgentRun {}: {reason}",
+                    candidate.agent_run_id
+                );
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "failed to judge the LOOM dispatch of AgentRun {}: {error:#}",
+                candidate.agent_run_id
+            ),
+        }
         let Some(launch_permit) = self.planned_shutdown.enter_launch().await else {
             return;
         };
@@ -14464,33 +14522,6 @@ impl Core {
                 return;
             }
         };
-        // A LOOM dispatch the control plane still holds back must not be prepared: preparation
-        // answers an unavailable device with a terminal dispatch rejection, which would fail this
-        // Run and strand its Task even though the control plane only wants it to wait. The Run stays
-        // queued and its Delivery stays claimed, and the pending Dispatch row keeps the Delivery
-        // recovery timer armed, so this very Run is prepared again once the device is back.
-        let loom_wait = {
-            let database = self.database.lock().await;
-            loom_dispatch_wait_reason(
-                database.connection(),
-                &candidate.agent_run_id,
-                &chrono::Utc::now().to_rfc3339(),
-            )
-        };
-        match loom_wait {
-            Ok(Some(reason)) => {
-                eprintln!(
-                    "deferring LOOM dispatch for AgentRun {}: {reason}",
-                    candidate.agent_run_id
-                );
-                return;
-            }
-            Ok(None) => {}
-            Err(error) => eprintln!(
-                "failed to judge the LOOM dispatch of AgentRun {}: {error:#}",
-                candidate.agent_run_id
-            ),
-        }
         match self
             .prepare_runtime_for_dispatch(&candidate, runtime, &workspace)
             .await

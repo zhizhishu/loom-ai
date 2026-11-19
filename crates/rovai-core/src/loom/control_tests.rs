@@ -3469,3 +3469,230 @@ async fn a_loom_dispatch_waits_for_the_device_before_the_runtime_is_prepared() {
         "assertion recovery_adds_no_second_ledger_row_delivery_or_run"
     );
 }
+
+/// A remote process transport that is installed but never starts anything: the claim of a real
+/// remote Run is the last thing a scheduler step does, so this keeps the Run at the state the
+/// dispatch reached instead of letting a launch settle it.
+struct NeverStartingRemoteLauncher;
+
+impl crate::remote_process::RemoteProcessLauncher for NeverStartingRemoteLauncher {
+    fn start(
+        &self,
+        _launch: crate::remote_process::ScopedRemoteLaunch,
+    ) -> crate::remote_process::RemoteFuture<'_, crate::remote_process::RemoteProcess> {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// Remote boundary of the same production order: a Node is the device, and its harness is reported
+/// in the catalog the dispatch re-validates *before* the Runtime is prepared. A Node that stops
+/// reporting its harness therefore has to be a wait, not the terminal rejection Core's own remote
+/// target revalidation would answer with. This drives the real scheduler step on a real remote
+/// queued Run — materialised by the real Delivery claim with the real bundle capture — and proves
+/// the Run keeps its identity, its Delivery and its target across the outage, then starts on the
+/// same facts once the Node reports the harness again.
+#[tokio::test]
+async fn a_remote_queued_run_waits_for_its_harness_instead_of_being_rejected() {
+    let mut database = fixture();
+    let (mission_id, _plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch remote wait",
+        "command_approve_remote_wait",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    let fresh = chrono::Utc::now().to_rfc3339();
+    select_remote_node(
+        &database,
+        &camp_id,
+        PRODUCER_AGENT,
+        "node_remote",
+        AdapterKind::CodexCli,
+        &fresh,
+    );
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_reachable_node_reserves_the_approved_work"
+    );
+
+    // The real claim materialises the Run and freezes its Node, workspace and bundle source.
+    let directory = database.directory().to_path_buf();
+    let store = crate::mcp::McpConfigStore::new(directory.join("fixture-mcp.json"));
+    let context = crate::remote_bundle_owner::RemoteBundleCaptureContext {
+        data_dir: &directory,
+        mcp_store: &store,
+    };
+    let claimed = crate::delivery_queue::claim_waiting_delivery_batches_with_sources(
+        &mut database,
+        1,
+        &Default::default(),
+        Some(&context),
+    )
+    .expect("the real remote claim must materialise the queued Run");
+    assert_eq!(
+        claimed.len(),
+        1,
+        "assertion the_reserved_delivery_materialises_one_run"
+    );
+    let run_id = claimed[0].clone();
+    assert_eq!(
+        run_status(&database, &run_id),
+        "queued",
+        "assertion the_materialised_remote_run_waits_queued"
+    );
+    let frozen = crate::remote_execution::load_run_target(database.connection(), &run_id)
+        .expect("the frozen target must be readable")
+        .expect("a remote claim must freeze its Node target");
+    assert_eq!(
+        frozen.target.node_id, "node_remote",
+        "assertion the_run_is_frozen_to_the_selected_node"
+    );
+    let (dispatch_id, delivery_id): (String, String) = database
+        .connection()
+        .query_row(
+            "SELECT dispatch_id, delivery_id FROM loom_control_dispatch WHERE task_id='task_a'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    // The Node stops reporting the harness it will run. Core's own remote target revalidation
+    // answers that with a code, and a dispatch must not turn that code into a failed Run.
+    database
+        .connection()
+        .execute(
+            "UPDATE execution_node_cli SET path_present=0
+             WHERE node_id='node_remote' AND adapter_kind='codex-cli'",
+            [],
+        )
+        .unwrap();
+
+    database.close();
+    let database = Database::open(&directory).expect("the fixture database must reopen");
+    crate::application::dispatch_queued_run_for_test(&directory, database, &run_id)
+        .await
+        .expect("one scheduler step must be runnable");
+
+    let mut database = Database::open(&directory).expect("the fixture database must reopen");
+    assert_eq!(
+        run_status(&database, &run_id),
+        "queued",
+        "assertion a_node_that_stopped_reporting_its_harness_leaves_the_run_queued"
+    );
+    let (delivery_status, delivery_run, dispatch_status): (String, Option<String>, String) =
+        database
+            .connection()
+            .query_row(
+                "SELECT delivery.status, delivery.claimed_agent_run_id, dispatch.status
+                 FROM loom_control_dispatch AS dispatch
+                 JOIN camp_message_delivery AS delivery ON delivery.id = dispatch.delivery_id
+                 WHERE dispatch.dispatch_id=?1",
+                [&dispatch_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+    assert_eq!(
+        (
+            delivery_status.as_str(),
+            delivery_run.as_deref(),
+            dispatch_status.as_str()
+        ),
+        ("claimed", Some(run_id.as_str()), "DISPATCHED"),
+        "assertion the_remote_run_keeps_its_claimed_delivery_and_pending_dispatch"
+    );
+    let terminal: i64 = database
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM event_log
+             WHERE entity_type='agent_run' AND entity_id=?1
+               AND event_type IN ('agent_run.failed','agent_run.dispatch_rejected')",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        terminal, 0,
+        "assertion a_missing_remote_harness_never_terminally_rejects_the_run"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database),
+            count(&database, "SELECT COUNT(*) FROM agent_run")
+        ),
+        (1, 1, 1),
+        "assertion waiting_for_a_remote_harness_starts_and_mints_nothing"
+    );
+    let (delivery_row, ledger_row): (String, String) = database
+        .connection()
+        .query_row(
+            "SELECT delivery.id, dispatch.delivery_id
+             FROM loom_control_dispatch AS dispatch
+             JOIN camp_message_delivery AS delivery ON delivery.id = dispatch.delivery_id
+             WHERE dispatch.dispatch_id=?1",
+            [&dispatch_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (delivery_row.as_str(), ledger_row.as_str()),
+        (delivery_id.as_str(), delivery_id.as_str()),
+        "assertion the_waiting_remote_run_keeps_the_reservation_it_started_with"
+    );
+    // The ordinary pass of the same control plane records the outage of the reserved work, once,
+    // without admitting a second dispatch of it.
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion waiting_for_the_remote_harness_is_not_a_second_dispatch"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![failure_fact("loom.dispatch_harness_unavailable")],
+        "assertion the_remote_outage_is_recorded_as_the_harness_fact_once"
+    );
+
+    // The Node reports the harness again: the same Run is the one the scheduler claims, on the Node
+    // and Delivery it already had.
+    database
+        .connection()
+        .execute(
+            "UPDATE execution_node_cli SET path_present=1
+             WHERE node_id='node_remote' AND adapter_kind='codex-cli'",
+            [],
+        )
+        .unwrap();
+    drop(database);
+    let database = Database::open(&directory).expect("the fixture database must reopen");
+    crate::application::dispatch_queued_run_with_remote_launcher_for_test(
+        &directory,
+        database,
+        &run_id,
+        Some(std::sync::Arc::new(NeverStartingRemoteLauncher)),
+    )
+    .await
+    .expect("the recovered scheduler step must be runnable");
+
+    let database = Database::open(&directory).expect("the fixture database must reopen");
+    assert_eq!(
+        run_status(&database, &run_id),
+        "running",
+        "assertion the_same_remote_run_starts_once_the_harness_is_reported"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database),
+            count(&database, "SELECT COUNT(*) FROM agent_run")
+        ),
+        (1, 1, 1),
+        "assertion remote_recovery_adds_no_second_ledger_row_delivery_or_run"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![failure_fact("loom.dispatch_harness_unavailable")],
+        "assertion the_remote_outage_keeps_its_single_fact_after_recovery"
+    );
+}
