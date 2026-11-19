@@ -23,6 +23,16 @@ coordinates never reach an OS process list, shell history or argv log.
     {"op":"text","text":"..."}          (<= 2048 codepoints, no control chars)
     {"op":"release"}                    (best effort: release every button)
 
+Typed text keeps its case on every backend: the Windows path sends UTF-16 units,
+and the X11 path resolves each character against the display's own keyboard
+mapping, holding shift exactly where the mapping puts the character on level 1.
+The mapping is read for the keyboard group that is active right now, so a
+text like `+` follows whichever layout the user switched to. Caps Lock inverts
+shift for letters, so it is cleared for the duration of a text request and
+restored afterwards; the user's lock state is never changed permanently. A
+character that mapping cannot reach without AltGr is refused
+(`unsupported_input`) instead of being typed as its unshifted neighbour.
+
 A refusal is `{"ok":false,"error":"<code>"}` on stdout with exit status 1:
 `invalid_request`, `unsupported_backend`, `no_display`, `session_locked`,
 `encoder_unavailable`, `unsupported_input`, `capture_failed`.
@@ -92,6 +102,12 @@ WINDOWS_VK = {
     "f1": 0x70, "f2": 0x71, "f3": 0x72, "f4": 0x73, "f5": 0x74, "f6": 0x75,
     "f7": 0x76, "f8": 0x77, "f9": 0x78, "f10": 0x79, "f11": 0x7A, "f12": 0x7B,
 }
+
+# XKB request arguments used by the X11 text path (X11/extensions/XKB.h).
+XKB_USE_CORE_KEYBOARD = 0x0100  # XkbUseCoreKbd
+XKB_ALL_CLIENT_INFO = 0x07      # key types + key symbols + modifier map
+XKB_GROUP_SHIFT = 13            # the group lives in these core modifier bits
+LOCK_MASK = 0x02                # LockMask: Caps Lock / Lock
 
 X11_KEYSYM = {
     "enter": 0xFF0D, "tab": 0xFF09, "escape": 0xFF1B, "backspace": 0xFF08,
@@ -228,8 +244,70 @@ def plan_input(request, bounds, unicode_text):
         for character in text:
             if ord(character) > 0xFF:
                 raise Failure("unsupported_input", "text encoding")
+        # Layout-independent: which key and which shift level a character needs is
+        # a property of the display's keyboard mapping, resolved at apply time.
         return [("keysym", ord(character)) for character in text]
     raise Failure("invalid_request", "op")
+
+
+def keyboard_levels(rows):
+    """Inverse keyboard map: keysym -> (keycode, needs_shift).
+
+    `rows` is an iterable of `(keycode, [level0, level1, ...])` in ascending
+    keycode order, the shape the X server reports. Only the first two levels are
+    used, because shift is the only modifier this helper can hold: a character a
+    layout only reaches through AltGr (its third level) is not reachable here and
+    must be refused instead of typed as a neighbouring character.
+    """
+    levels = {}
+    for keycode, keysyms in rows:
+        for level, value in enumerate(keysyms[:2]):
+            if not value:
+                continue  # NoSymbol: this level types nothing
+            known = levels.get(value)
+            if known is not None and (not known[1] or level == 1):
+                # A character reachable without shift always wins, and a shifted
+                # duplicate keeps the first keycode it was found on.
+                continue
+            levels[value] = (keycode, level == 1)
+    return levels
+
+
+def plan_text_steps(values, levels):
+    """Taps for keysym `values` against one display's own keyboard mapping.
+
+    A character the mapping puts on level 1 needs shift held around its tap; one
+    it puts on level 0 must never take shift, because shift would turn it into a
+    different character there (`+` is a bare key on `de` and shift+`=` on `us`).
+    A character the mapping cannot reach with shift alone is refused: typing a
+    neighbour instead of what was asked would be silent text corruption.
+    """
+    steps = []
+    for value in values:
+        entry = levels.get(value)
+        if not entry:
+            raise Failure("unsupported_input", "keysym")
+        keycode, shifted = entry
+        if not keycode:
+            raise Failure("unsupported_input", "keycode")
+        if not shifted:
+            steps.append(("keycode", keycode))
+            continue
+        steps.append(("key", "shift", "down"))
+        steps.append(("keycode", keycode))
+        steps.append(("key", "shift", "up"))
+    return steps
+
+
+def expand_keysym_taps(plan, levels):
+    """Resolve the layout-independent keysym taps of `plan` for this display."""
+    steps = []
+    for step in plan:
+        if step[0] == "keysym":
+            steps.extend(plan_text_steps([step[1]], levels))
+        else:
+            steps.append(step)
+    return steps
 
 
 def normalize(x, y, bounds):
@@ -642,36 +720,206 @@ def _xtst():
     return xtst
 
 
+def xkb_state(ctypes, x11, display):
+    """(active keyboard group, locked modifiers) for the request's display.
+
+    `None` when this server does not answer the XKB request, so the caller can
+    fall back to the first group and no lock handling instead of guessing.
+    """
+
+    class XkbState(ctypes.Structure):
+        # XkbStateRec from X11/extensions/XKBlib.h, in declaration order.
+        _fields_ = [
+            ("group", ctypes.c_ubyte), ("locked_group", ctypes.c_ubyte),
+            ("base_group", ctypes.c_ushort), ("latched_group", ctypes.c_ushort),
+            ("mods", ctypes.c_ubyte), ("base_mods", ctypes.c_ubyte),
+            ("latched_mods", ctypes.c_ubyte), ("locked_mods", ctypes.c_ubyte),
+            ("compat_state", ctypes.c_ubyte), ("grab_mods", ctypes.c_ubyte),
+            ("compat_grab_mods", ctypes.c_ubyte), ("lookup_mods", ctypes.c_ubyte),
+            ("compat_lookup_mods", ctypes.c_ubyte),
+            ("ptr_buttons", ctypes.c_ushort),
+        ]
+
+    x11.XkbGetState.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                ctypes.POINTER(XkbState)]
+    x11.XkbGetState.restype = ctypes.c_int
+    state = XkbState()
+    if x11.XkbGetState(display, XKB_USE_CORE_KEYBOARD, ctypes.byref(state)) != 0:
+        return None
+    return int(state.group), int(state.locked_mods)
+
+
+def set_locked_modifiers(ctypes, x11, display, locked):
+    """Server-side change of the Lock (Caps Lock) modifier; best effort."""
+    x11.XkbLockModifiers.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+                                     ctypes.c_uint]
+    x11.XkbLockModifiers.restype = ctypes.c_int
+    if not x11.XkbLockModifiers(display, XKB_USE_CORE_KEYBOARD, LOCK_MASK, locked):
+        return False
+    x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XSync(display, 0)
+    return True
+
+
+def core_keyboard_rows(ctypes, x11, display, first, count):
+    """The core mapping's first group, for servers that do not answer XKB."""
+    per_keycode = ctypes.c_int()
+    x11.XGetKeyboardMapping.argtypes = [ctypes.c_void_p, ctypes.c_ubyte, ctypes.c_int,
+                                       ctypes.POINTER(ctypes.c_int)]
+    x11.XGetKeyboardMapping.restype = ctypes.POINTER(ctypes.c_ulong)
+    x11.XFree.argtypes = [ctypes.c_void_p]
+    x11.XFree.restype = ctypes.c_int
+    table = x11.XGetKeyboardMapping(display, int(first), count,
+                                   ctypes.byref(per_keycode))
+    if not table:
+        return None
+    try:
+        per = int(per_keycode.value)
+        return [(int(first) + index,
+                 [int(table[index * per + level]) for level in range(min(per, 2))])
+                for index in range(count)]
+    finally:
+        x11.XFree(table)
+
+
+def group_keyboard_rows(ctypes, x11, display, group, first, count):
+    """Rows for one keyboard group, translated by the server itself.
+
+    The core keysym table cannot be split into groups portably: a layout may put
+    four levels on one group and two on the next, so the flat list has no fixed
+    stride. `XkbTranslateKeyCode` answers with the symbol the server would type
+    for a key at a level of a named group, which is exactly what this helper has
+    to reproduce. Returns `None` when the XKB map is unavailable.
+    """
+    x11.XkbGetMap.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
+    x11.XkbGetMap.restype = ctypes.c_void_p
+    x11.XkbFreeKeyboard.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int]
+    x11.XkbTranslateKeyCode.argtypes = [
+        ctypes.c_void_p, ctypes.c_ubyte, ctypes.c_uint,
+        ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_ulong),
+    ]
+    x11.XkbTranslateKeyCode.restype = ctypes.c_int
+    xkb = x11.XkbGetMap(display, XKB_ALL_CLIENT_INFO, XKB_USE_CORE_KEYBOARD)
+    if not xkb:
+        return None
+    rows = []
+    try:
+        for keycode in range(int(first), int(first) + count):
+            levels = []
+            for shifted in (0, 1):
+                ignored = ctypes.c_uint()
+                keysym = ctypes.c_ulong()
+                translated = x11.XkbTranslateKeyCode(
+                    xkb, keycode, (group << XKB_GROUP_SHIFT) | shifted,
+                    ctypes.byref(ignored), ctypes.byref(keysym),
+                )
+                levels.append(int(keysym.value) if translated else 0)
+            rows.append((keycode, levels))
+    finally:
+        x11.XkbFreeKeyboard(xkb, 0, 1)
+    return rows
+
+
+def read_keyboard_levels(ctypes, x11, display):
+    """`(keyboard_levels, locked modifiers)` for the active keyboard group.
+
+    The mapping and the lock state are read before any event is injected, so a
+    multi-layout display types the characters of the group the user selected and
+    the caller can keep Caps Lock from inverting them.
+    """
+    first, last = ctypes.c_int(), ctypes.c_int()
+    x11.XDisplayKeycodes.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+                                     ctypes.POINTER(ctypes.c_int)]
+    x11.XDisplayKeycodes.restype = ctypes.c_int
+    if not x11.XDisplayKeycodes(display, ctypes.byref(first), ctypes.byref(last)):
+        raise Failure("unsupported_input", "keymap")
+    count = int(last.value) - int(first.value) + 1
+    if count <= 0:
+        raise Failure("unsupported_input", "keymap")
+    state = xkb_state(ctypes, x11, display)
+    group, locked = state if state is not None else (0, 0)
+    rows = group_keyboard_rows(ctypes, x11, display, group, first.value, count)
+    if rows is None:
+        # A server without XKB has one group and no group switching; keep the
+        # previous behaviour instead of refusing to type at all.
+        rows = core_keyboard_rows(ctypes, x11, display, first.value, count)
+        locked = 0
+    if rows is None:
+        raise Failure("unsupported_input", "keymap")
+    return keyboard_levels(rows), locked
+
+
 def linux_apply(plan, bounds):
     ctypes, x11, display, screen, bounds = linux_display()
     xtst = _xtst()
-    for step in plan:
-        kind = step[0]
-        if kind in ("move", "button", "wheel"):
-            _, x, y = step[0], step[1], step[2]
-            xtst.XTestFakeMotionEvent(display, screen, x, y, 0)
-            if kind == "wheel":
-                synthetic = 4 if step[3] > 0 else 5
-                for _ in range(min(abs(step[3]), MAX_WHEEL_CLICKS)):
-                    xtst.XTestFakeButtonEvent(display, synthetic, 1, 0)
-                    xtst.XTestFakeButtonEvent(display, synthetic, 0, 0)
-            elif kind == "button":
-                xtst.XTestFakeButtonEvent(display, BUTTONS[step[3]],
-                                         1 if step[4] == "down" else 0, 0)
-        elif kind == "key":
-            code = x11.XKeysymToKeycode(display, X11_KEYSYM[step[1]])
-            if not code:
-                raise Failure("unsupported_input", "keycode")
-            xtst.XTestFakeKeyEvent(display, code, 1 if step[2] == "down" else 0, 0)
-        elif kind == "keysym":
-            code = x11.XKeysymToKeycode(display, step[1])
-            if not code:
-                raise Failure("unsupported_input", "keysym")
-            xtst.XTestFakeKeyEvent(display, code, 1, 0)
-            xtst.XTestFakeKeyEvent(display, code, 0, 0)
-        else:
-            raise Failure("unsupported_input", kind)
+    typing = any(step[0] == "keysym" for step in plan)
+    locked = 0
+    if typing:
+        # The layout belongs to the display, not to the request: resolve every
+        # character against the group and mapping this X server serves before
+        # touching it.
+        levels, locked = read_keyboard_levels(ctypes, x11, display)
+        plan = expand_keysym_taps(plan, levels)
+    # Caps Lock inverts the shift level of letters, so typing with it locked
+    # would swap the case of the text. Clear it for this request only, and put
+    # the user's lock state back even if the plan fails halfway. A server that
+    # refuses the change must not be typed over: the case would silently flip.
+    caps_cleared = False
+    if typing and locked & LOCK_MASK:
+        if not set_locked_modifiers(ctypes, x11, display, 0):
+            raise Failure("unsupported_input", "lock")
+        caps_cleared = True
+    # Anything this plan presses and has not released yet. A plan that fails
+    # halfway (an unmapped keysym, a dropped display) must not leave a modifier
+    # or a button held on the user's desktop.
+    held = []
+    try:
+        for step in plan:
+            kind = step[0]
+            if kind in ("move", "button", "wheel"):
+                _, x, y = step[0], step[1], step[2]
+                xtst.XTestFakeMotionEvent(display, screen, x, y, 0)
+                if kind == "wheel":
+                    synthetic = 4 if step[3] > 0 else 5
+                    for _ in range(min(abs(step[3]), MAX_WHEEL_CLICKS)):
+                        xtst.XTestFakeButtonEvent(display, synthetic, 1, 0)
+                        xtst.XTestFakeButtonEvent(display, synthetic, 0, 0)
+                elif kind == "button":
+                    code = BUTTONS[step[3]]
+                    xtst.XTestFakeButtonEvent(display, code,
+                                             1 if step[4] == "down" else 0, 0)
+                    if step[4] == "down":
+                        held.append(("button", code))
+                    elif ("button", code) in held:
+                        held.remove(("button", code))
+            elif kind == "key":
+                code = x11.XKeysymToKeycode(display, X11_KEYSYM[step[1]])
+                if not code:
+                    raise Failure("unsupported_input", "keycode")
+                xtst.XTestFakeKeyEvent(display, code, 1 if step[2] == "down" else 0, 0)
+                if step[2] == "down":
+                    held.append(("key", code))
+                elif ("key", code) in held:
+                    held.remove(("key", code))
+            elif kind == "keycode":
+                # A resolved character tap: keycode and shift already decided by
+                # the display's own mapping, so no level is guessed here.
+                xtst.XTestFakeKeyEvent(display, step[1], 1, 0)
+                xtst.XTestFakeKeyEvent(display, step[1], 0, 0)
+            else:
+                raise Failure("unsupported_input", kind)
+            x11.XFlush(display)
+    except BaseException:
+        for kind, code in held:
+            if kind == "key":
+                xtst.XTestFakeKeyEvent(display, code, 0, 0)
+            else:
+                xtst.XTestFakeButtonEvent(display, code, 0, 0)
         x11.XFlush(display)
+        raise
+    finally:
+        if caps_cleared:
+            set_locked_modifiers(ctypes, x11, display, LOCK_MASK)
 
 
 def linux_release():
