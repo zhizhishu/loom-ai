@@ -84,8 +84,9 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { mkdtemp, mkdir, readFile, readdir, lstat, realpath, rm, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
+import { zstdDecompressSync } from 'node:zlib'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { createConfiguredCampAndSend } from './lib/create-configured-camp.mjs'
 import { startQualificationCore } from './lib/qualification-core.mjs'
@@ -97,6 +98,8 @@ export const SCRIPT_NAME = 'accept-core-dsh-capabilities'
 export const OPT_IN_ENV = 'LOOM_ACCEPT_DSH_CAPABILITIES'
 export const PROVIDER_KEY_ENVS = Object.freeze(['LOOM_E4_PROVIDER_KEY', 'OCT_API_KEY'])
 export const ADAPTER_KIND = 'deepseek-harness'
+/** The embedded runtime root Core resolves its pinned Hook executor from. */
+export const EMBEDDED_PI_ROOT_ENV = 'ROVAI_EMBEDDED_PI_ROOT'
 export const CELLS = Object.freeze(['skill', 'rule', 'mcp', 'hook'])
 /** dsh_permission_options(): the DSH sandbox values. danger-full-access is never offered. */
 export const DSH_PERMISSION_MODES = Object.freeze(['read-only', 'workspace-write'])
@@ -119,12 +122,19 @@ const VALUE_FLAGS = {
   '--approval-policy': 'approvalPolicy',
   '--skill-transport': 'skillTransport',
   '--run-timeout-ms': 'runTimeoutMs',
-  '--label': 'label'
+  '--label': 'label',
+  // The pinned private Hook executor lives inside the same runtime directory as
+  // the embedded Node; Core resolves it from this root, never from PATH.
+  '--embedded-pi-root': 'embeddedPiRoot'
 }
 const BOOLEAN_FLAGS = {
   '--prepare-only': 'prepareOnly',
   '--skip-negative': 'skipNegative',
-  '--keep-fixture': 'keepFixture'
+  '--keep-fixture': 'keepFixture',
+  // L3 is its own acceptance mode, never a variant of the linear capability
+  // flow: that flow commits the fixture, selects an unreviewed Stop Hook and
+  // pins `nativeRegistryVerified:false`, so it cannot prove either L3 fact.
+  '--l3-native': 'l3Native'
 }
 
 export function parseArguments (argv) {
@@ -132,6 +142,7 @@ export function parseArguments (argv) {
     prepareOnly: false,
     skipNegative: false,
     keepFixture: false,
+    l3Native: false,
     permissionMode: 'workspace-write',
     approvalPolicy: 'never',
     runTimeoutMs: 240_000
@@ -924,6 +935,7 @@ export function runNarration (snapshot, runId) {
 
 export async function main (argv = process.argv.slice(2), env = process.env) {
   const options = parseArguments(argv)
+  if (options.l3Native) return await mainL3({ options, env })
   const providerKey = selectProviderKey(env)
   const secrets = providerKey === null ? [] : [providerKey.value]
   const dshBin = options.dshBin ?? env.ROVAI_DEEPSEEK_HARNESS_BIN ?? ''
@@ -1707,6 +1719,870 @@ async function waitForRun (core, threadId, runId, budgetMs, observe = async () =
     await new Promise(done => setTimeout(done, 500))
   }
   throw new UsageError('run_timeout', `the Run did not settle within ${budgetMs}ms (last status ${last?.status ?? 'unknown'})`)
+}
+
+/* --------------------------------------------------------- L3 native mode */
+
+/**
+ * The L3 entry is a separate acceptance mode, not a variant of the linear flow
+ * above. That flow git-commits its fixture, selects a `Stop` Hook it never
+ * reviews, treats every non-Codex adapter as having no Hook transport and pins
+ * `nativeRegistryVerified:false`. L3 proves the two opposite facts over two real
+ * Runs, so it owns its own fixture layout, its own Hook review and its verdicts.
+ */
+
+/** The lane's isolated layout. Every home-like root is this run's own directory. */
+export function l3Paths (fixtureRoot) {
+  const root = resolve(fixtureRoot)
+  const paths = fixturePaths(root)
+  const project = join(root, 'workspace')
+  return {
+    ...paths,
+    dshHome: join(root, 'isolated-home'),
+    dshAgentsHome: join(root, 'isolated-agents'),
+    data: join(root, 'core-data'),
+    project,
+    skillSource: join(root, 'skill-source'),
+    hookProof: join(project, 'hook-proof.txt'),
+    readTarget: join(project, 'read-target.txt')
+  }
+}
+
+/**
+ * One synchronous `PostToolUse` command Hook. Core owns the native dialect: the
+ * reviewed body names ONE bare tool (`read`), and Core is the only side that
+ * turns it into the native `^read$` matcher. The platform command is part of the
+ * reviewed body, so both dialects are supplied and only Windows runs the .ps1 one.
+ */
+export function l3HookBody ({ command, commandWindows, matcher = 'read' }) {
+  const handler = { type: 'command', command, timeout: 5 }
+  if (typeof commandWindows === 'string') handler.commandWindows = commandWindows
+  return JSON.stringify({ hooks: { PostToolUse: [{ matcher, hooks: [handler] }] } })
+}
+
+/**
+ * The exact review tuple the catalog itself publishes for one local Hook. The
+ * digests are read from the Core, never computed here: a fabricated pair would
+ * make the review meaningless.
+ */
+export function l3HookReview (catalog, itemId) {
+  const item = (Array.isArray(catalog?.items) ? catalog.items : []).find(entry => entry?.id === itemId)
+  const definition = item?.hookDefinition
+  if (!definition || typeof definition.definitionDigest !== 'string' || definition.definitionDigest.length === 0
+    || typeof definition.scopeDigest !== 'string' || definition.scopeDigest.length === 0) {
+    return { ready: false, code: 'hook_definition_unavailable', item: item ?? null }
+  }
+  return {
+    ready: true,
+    review: { id: itemId, definitionDigest: definition.definitionDigest, scopeDigest: definition.scopeDigest },
+    scope: definition.reviewScope ?? null,
+    reviewed: definition.reviewed === true,
+    definitionDigest: definition.definitionDigest,
+    scopeDigest: definition.scopeDigest
+  }
+}
+
+/* ------------------------------------------------- native DSH session events */
+
+async function jsonlUnder (directory, depth = 0, out = []) {
+  if (depth > 6) return out
+  let entries
+  try { entries = await readdir(directory, { withFileTypes: true }) } catch { return out }
+  for (const entry of entries) {
+    const path = join(directory, entry.name)
+    if (entry.isDirectory()) await jsonlUnder(path, depth + 1, out)
+    else if (entry.isFile() && (entry.name.endsWith('.jsonl') || entry.name.endsWith('.jsonl.zstd'))) out.push(path)
+  }
+  return out
+}
+
+const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+
+/**
+ * DSH appends one zstd frame per log write, so a single decompression call stops
+ * after the first frame. Each frame is decoded on its own; a frame that will not
+ * decode is reported, never skipped in silence.
+ */
+export function decodeSessionGeneration (bytes) {
+  if (!bytes.includes(ZSTD_MAGIC)) return { text: bytes.toString('utf8'), frames: 0, undecodable: 0 }
+  const offsets = []
+  let index = 0
+  while ((index = bytes.indexOf(ZSTD_MAGIC, index)) >= 0) { offsets.push(index); index += ZSTD_MAGIC.length }
+  let text = ''
+  let undecodable = 0
+  for (let frame = 0; frame < offsets.length; frame += 1) {
+    const slice = bytes.subarray(offsets[frame], frame + 1 < offsets.length ? offsets[frame + 1] : bytes.length)
+    try { text += zstdDecompressSync(slice).toString('utf8') } catch { undecodable += 1 }
+  }
+  return { text, frames: offsets.length, undecodable }
+}
+
+/**
+ * Reads the native Session log DSH wrote for one Session under the isolated Home.
+ * The layout is `<root>/<projectKey>/<sessionSegment>/<generation>.jsonl`, so the
+ * file is located by content, never by a guessed name. A compressed generation
+ * is reported, not silently treated as an empty Session.
+ */
+export async function readNativeSessionLog (dshHome, sessionId) {
+  const files = await jsonlUnder(dshHome)
+  let pathMatch = null
+  for (const file of files) {
+    let generation
+    try { generation = decodeSessionGeneration(await readFile(file)) } catch { continue }
+    // The Session id is either stamped in the log or carried by its directory
+    // segment; a file that names neither is another Session's log.
+    if (!generation.text.includes(sessionId)) {
+      if (pathMatch === null && file.includes(sessionId)) pathMatch = generation
+      continue
+    }
+    const parsed = parseSessionLog(generation.text)
+    if (parsed !== null) return { ...parsed, frames: generation.frames, undecodableFrames: generation.undecodable, path: 'isolated-home' }
+  }
+  if (pathMatch !== null) {
+    const parsed = parseSessionLog(pathMatch.text)
+    if (parsed !== null) return { ...parsed, frames: pathMatch.frames, undecodableFrames: pathMatch.undecodable, path: 'isolated-home' }
+  }
+  return { found: false, path: null, events: [], unparsedLines: 0 }
+}
+
+function parseSessionLog (text) {
+  const events = []
+  let unparsed = 0
+  for (const line of text.split('\n')) {
+    if (line.trim().length === 0) continue
+    try { events.push(JSON.parse(line)) } catch { unparsed += 1 }
+  }
+  return events.length === 0 ? null : { found: true, events, unparsedLines: unparsed }
+}
+
+const textOf = value => typeof value === 'string'
+  ? value
+  : Array.isArray(value)
+    ? value.map(textOf).join('\n')
+    : value && typeof value === 'object'
+      ? Object.values(value).map(textOf).join('\n')
+      : ''
+
+const objectOf = value => value && typeof value === 'object' ? value : null
+
+/** Every `{type, data}` pair of a native session log, whatever wrapper it uses. */
+function nativeEvents (log) {
+  return (Array.isArray(log?.events) ? log.events : [])
+    .map(line => ({ type: line?.type ?? null, data: objectOf(line?.data) ?? objectOf(line) ?? {} }))
+    .filter(event => typeof event.type === 'string')
+}
+
+function nativeToolCalls (log) {
+  const calls = [], results = []
+  for (const event of nativeEvents(log)) {
+    if (event.type === 'tool/call') {
+      let args = null
+      try { args = JSON.parse(String(event.data?.arguments ?? '')) } catch { args = null }
+      calls.push({ callId: event.data?.callId ?? null, name: event.data?.name ?? null, args })
+    } else if (event.type === 'tool/result') {
+      results.push({
+        callId: event.data?.callId ?? event.data?.message?.callId ?? null,
+        isError: event.data?.message?.isError ?? event.data?.isError ?? null,
+        error: event.data?.error ?? null,
+        text: textOf(event.data?.message?.content ?? event.data?.content)
+      })
+    }
+  }
+  return { calls, results }
+}
+
+const pairResult = ({ calls, results }, index) => {
+  const call = calls[index]
+  if (call === undefined) return null
+  if (call.callId === null) return results[index] ?? null
+  return results.find(entry => entry.callId === call.callId) ?? results[index] ?? null
+}
+
+/** The names the native `skill` catalog advertised in this Session. */
+export function nativeSkillCatalog (log) {
+  const names = new Set()
+  let published = false
+  for (const event of nativeEvents(log)) {
+    const source = objectOf(event.data?.message?.source) ?? objectOf(event.data?.source)
+    if (source?.kind !== 'skill-catalog') continue
+    published = true
+    for (const entry of Array.isArray(source.entries) ? source.entries : []) {
+      if (typeof entry?.name === 'string') names.add(entry.name)
+    }
+  }
+  return { published, names: [...names].sort() }
+}
+
+/**
+ * The `skill` tool call and its result from the native log. The instructions body
+ * and the resource base are read out of the provider's own rendered result, so a
+ * body that did not come from the frozen tree cannot satisfy this check.
+ */
+export function nativeSkillCall (log, skillName) {
+  const tools = nativeToolCalls(log)
+  const index = tools.calls.findIndex(entry => entry.name === 'skill' && entry.args?.name === skillName)
+  if (index < 0) return { found: false, reason: 'skill_call_absent' }
+  const call = tools.calls[index]
+  const result = pairResult(tools, index)
+  if (result === null) return { found: false, reason: 'skill_result_absent', callId: call.callId }
+  const base = /Base directory for this skill: (.+)/u.exec(result.text)
+  const instructions = /<skill_instructions>\n?([\s\S]*?)\n?<\/skill_instructions>/u.exec(result.text)
+  return {
+    found: true,
+    callId: call.callId,
+    callArguments: call.args,
+    isError: result.isError === true,
+    errorText: result.error === null ? null : textOf(result.error).slice(0, 240),
+    resourceBasePath: base === null ? null : base[1].trim(),
+    // The provider stores the body trimmed, so the digest is taken on the same bytes.
+    instructionsSha256: instructions === null ? null : sha256(instructions[1].trim())
+  }
+}
+
+/** The `read` tool call and its outcome from the native log. */
+export function nativeReadCall (log, targetName) {
+  const tools = nativeToolCalls(log)
+  // The native file tools name the operand `file_path`; an older dialect uses
+  // `path`. Both are the same call and neither is inferred from the tool name.
+  const operand = entry => [entry.args?.file_path, entry.args?.path]
+    .find(value => typeof value === 'string' && value.includes(targetName))
+  const index = tools.calls.findIndex(entry => entry.name === 'read' && operand(entry) !== undefined)
+  if (index < 0) return { found: false }
+  const result = pairResult(tools, index)
+  return { found: true, callId: tools.calls[index].callId, isError: result === null ? null : result.isError === true }
+}
+
+/* --------------------------------------------------------------- verdicts */
+
+const settlementFacts = result => ({
+  exitCode: result?.exitCode ?? null,
+  sandboxDenied: result?.sandboxDenied ?? null,
+  sandboxEnforcement: result?.sandboxEnforcement ?? null,
+  timedOut: result?.timedOut ?? null,
+  aborted: result?.aborted ?? null,
+  decision: result?.decision ?? null
+})
+
+/**
+ * Run A: every reached Hook invocation has exactly one result on the same
+ * handler, turn and Session, and every result really passed. A model may read
+ * twice, so the pair count is not fixed - what must hold is one-to-one pairing.
+ */
+export function l3ObservedHookVerdict (hookView) {
+  const reasons = []
+  const events = Array.isArray(hookView?.events) ? hookView.events : []
+  const invoked = events.filter(entry => entry?.kind === 'invoked')
+  const results = events.filter(entry => entry?.kind === 'result')
+  if (hookView === null || hookView === undefined) reasons.push('hooks_view_absent')
+  else if (hookView.status !== 'observed') reasons.push(`hooks_status_${hookView.status ?? 'missing'}`)
+  if (invoked.length < 1) reasons.push('invoked_count_0')
+  if (results.length !== invoked.length) reasons.push(`result_count_${results.length}`)
+  for (const start of invoked) {
+    const paired = results.filter(entry => entry?.handlerId === start.handlerId)
+    if (paired.length !== 1) { reasons.push('handler_pair_mismatch'); continue }
+    const [end] = paired
+    if (start.turn !== end.turn) reasons.push('turn_pair_mismatch')
+    if (start.sessionId !== end.sessionId) reasons.push('session_pair_mismatch')
+    if (end.exitCode !== 0) reasons.push(`exit_code_${end.exitCode ?? 'absent'}`)
+    if (end.sandboxDenied !== false) reasons.push('sandbox_denied_not_false')
+    if (end.timedOut !== false) reasons.push('hook_timed_out')
+    if (end.aborted !== false) reasons.push('hook_aborted')
+    if (!['partial', 'full'].includes(end.sandboxEnforcement)) reasons.push('sandbox_enforcement_missing')
+  }
+  return {
+    status: reasons.length === 0 ? 'PASS' : 'FAIL',
+    reasons: [...new Set(reasons)],
+    invoked: invoked.map(entry => ({ kind: entry.kind, handlerId: entry.handlerId ?? null,
+      turn: entry.turn ?? null, seq: entry.seq ?? null })),
+    results: results.map(entry => ({ kind: entry.kind, handlerId: entry.handlerId ?? null,
+      turn: entry.turn ?? null, seq: entry.seq ?? null, ...settlementFacts(entry) }))
+  }
+}
+
+/** True when `child` is `root` or a directory below it. */
+const insideRoot = (child, root) => {
+  const target = resolve(child)
+  const base = resolve(root)
+  return target === base || target.startsWith(base + sep)
+}
+
+/** Run A: the frozen Skill really loaded through the native `skill` tool. */
+export function l3SkillLoadVerdict ({ catalog, call, skillName, frozenBodySha256, frozenRoot }) {
+  const reasons = []
+  if (catalog?.published !== true) reasons.push('native_catalog_absent')
+  if (!Array.isArray(catalog?.names) || !catalog.names.includes(skillName)) reasons.push('skill_absent_from_native_catalog')
+  if (call?.found !== true) reasons.push(call?.reason ?? 'skill_call_absent')
+  else {
+    if (call.isError === true) reasons.push('skill_call_failed')
+    if (typeof call.resourceBasePath !== 'string' || call.resourceBasePath.length === 0) reasons.push('skill_resource_base_absent')
+    else if (typeof frozenRoot === 'string' && !insideRoot(call.resourceBasePath, frozenRoot)) {
+      reasons.push('skill_resource_base_not_frozen_root')
+    }
+    if (typeof frozenBodySha256 === 'string' && call.instructionsSha256 !== frozenBodySha256) reasons.push('skill_body_digest_mismatch')
+  }
+  return { status: reasons.length === 0 ? 'PASS' : 'FAIL', reasons }
+}
+
+/**
+ * Run B: the same reviewed command was reached and refused. A Run that merely
+ * failed to start, failed to review, or never selected the tool is NOT a refusal.
+ */
+export function l3RefusalVerdict ({ hookView, before, after, marker, readCall, catalog, skillName }) {
+  const events = Array.isArray(hookView?.events) ? hookView.events : []
+  const invoked = events.filter(entry => entry?.kind === 'invoked')
+  const results = events.filter(entry => entry?.kind === 'result')
+  const deniedResult = results.find(entry => entry?.sandboxDenied === true) ?? null
+  const criteria = {
+    hookReached: invoked.length >= 1,
+    receiptPaired: invoked.length >= 1 && results.length === invoked.length,
+    coreStatusFailed: hookView?.status === 'failed',
+    sandboxDenied: deniedResult !== null,
+    nonZeroExit: deniedResult !== null && Number.isInteger(deniedResult.exitCode) && deniedResult.exitCode !== 0,
+    notTimedOut: deniedResult !== null && deniedResult.timedOut === false,
+    notCancelled: deniedResult !== null && deniedResult.aborted === false,
+    enforcementRecorded: deniedResult !== null && ['partial', 'full'].includes(deniedResult.sandboxEnforcement),
+    readAttempted: readCall?.found === true,
+    skillUnavailable: Array.isArray(catalog?.names) && !catalog.names.includes(skillName),
+    // An absent baseline is the strongest case: any byte at all is a real write.
+    fileUnchanged: after === before
+      || (before === null && typeof after === 'string' && !after.includes(marker))
+  }
+  const reasons = Object.entries(criteria).filter(([, ok]) => ok !== true).map(([name]) => name)
+  return {
+    status: reasons.length === 0 ? 'PASS' : 'FAIL',
+    reasons,
+    criteria,
+    invokedCount: invoked.length,
+    resultCount: results.length,
+    settlement: settlementFacts(deniedResult),
+    hookStatus: hookView?.status ?? null,
+    readCallId: readCall?.callId ?? null
+  }
+}
+
+/** The L3 overall verdict: both Runs must prove their own cell. */
+export function l3OverallVerdict ({ runA, runB }) {
+  const cells = { skill: runA?.skill ?? null, hookInvoked: runA?.hook ?? null, hookRefused: runB?.hook ?? null }
+  const reasons = []
+  for (const [name, cell] of Object.entries(cells)) {
+    if (cell === null || cell === undefined) reasons.push(`${name}_not_run`)
+    else if (cell.status !== 'PASS') reasons.push(`${name}_${String(cell.status).toLowerCase()}`)
+  }
+  return {
+    status: reasons.length === 0 ? 'PASS' : 'FAIL',
+    reasons,
+    cells: Object.fromEntries(Object.entries(cells).map(([name, cell]) => [name, cell?.status ?? 'NOT_RUN']))
+  }
+}
+
+/* ------------------------------------------------------------------ driver */
+
+function l3Refusal (code, detail) { return new UsageError(code, detail) }
+
+async function l3CoreRequest (core, method, params = {}, timeoutMs) {
+  return timeoutMs === undefined ? await core.request(method, params) : await core.request(method, params, timeoutMs)
+}
+
+/** Creates one Camp and returns its thread id, without sending any message. */
+async function l3CreateCamp (core, { commandId, workspace, agentId }) {
+  const created = await l3CoreRequest(core, 'threads.create', {
+    commandId: `${commandId}:camp`,
+    name: null,
+    workspace: { projectPath: workspace.projectPath },
+    memberAgentIds: [agentId],
+    defaultLeadAgentId: agentId,
+    collaborationMode: 'peer'
+  })
+  const threadId = created?.payload?.threadId ?? created?.payload?.campId
+  if (created?.status !== 'applied' || typeof threadId !== 'string' || threadId.length === 0) {
+    throw l3Refusal('camp_creation_failed', `threads.create did not apply: ${JSON.stringify(created?.status)}`)
+  }
+  return threadId
+}
+
+async function l3Send (core, { commandId, threadId, agentId, body, purpose }) {
+  const sent = await l3CoreRequest(core, 'thread.messages.send', {
+    commandId,
+    threadId,
+    content: {
+      version: 2,
+      segments: [
+        { kind: 'atom', atom: { type: 'member', agentId } },
+        { kind: 'text', text: ` ${body}` }
+      ]
+    },
+    sourceAttachments: [],
+    quotes: [],
+    replyToThreadMessageId: null,
+    execution: { taskId: null, purpose, completionRole: 'required' }
+  })
+  const command = sent?.commandResult ?? sent
+  assert.equal(command?.status, 'accepted', `the L3 message must be accepted: ${JSON.stringify(command?.status)}`)
+  return command.payload
+}
+
+/** Settles one Run without hiding a non-success status: Run B is expected to fail. */
+async function l3WaitForRun (core, threadId, runId, budgetMs) {
+  const deadline = Date.now() + budgetMs
+  let last = null
+  while (Date.now() < deadline) {
+    const snapshot = await l3CoreRequest(core, 'camps.snapshot', { threadId })
+    const run = (snapshot.agentRuns ?? []).find(entry => entry?.id === runId)
+    last = run ?? last
+    if ((snapshot.approvals ?? []).some(approval => approval?.status === 'pending')) {
+      throw l3Refusal('approval_required', 'the L3 Run asked for an interactive approval; none is ever granted')
+    }
+    if (run && ['succeeded', 'failed', 'cancelled'].includes(run.status)) return { snapshot, run }
+    await new Promise(done => setTimeout(done, 500))
+  }
+  throw l3Refusal('run_timeout', `Run ${runId} did not settle within ${budgetMs}ms (last ${last?.status ?? 'unknown'})`)
+}
+
+async function l3WaitForAdmittedRun (core, threadId, agentId, payload) {
+  // Message admission precedes asynchronous Run creation. Never invent a Run ID
+  // or treat an accepted message as completed model execution.
+  const messageId = payload?.threadMessageId ?? payload?.messageId ?? null
+  const deadline = Date.now() + 90_000
+  while (Date.now() < deadline) {
+    const snapshot = await l3CoreRequest(core, 'camps.snapshot', { threadId }, SETUP_REQUEST_MS)
+    const runs = (snapshot?.agentRuns ?? []).filter(run => run.agentId === agentId
+      && (messageId === null || run.anchorMessageId === messageId || run.inputMessageIds?.includes(messageId)))
+    if (runs.length === 1) return runs[0].id
+    if (runs.length > 1) throw l3Refusal('ambiguous_run', 'one message admitted more than one AgentRun')
+    await new Promise(done => setTimeout(done, 250))
+  }
+  throw l3Refusal('run_not_admitted', 'the accepted message never produced an AgentRun')
+}
+
+async function l3FileState (path) {
+  try { return { exists: true, content: await readFile(path, 'utf8') } } catch { return { exists: false, content: null } }
+}
+
+/**
+ * The L3 driver: two real Runs over the real Core and the real 0.2 Host.
+ * Run A proves the frozen Skill loaded and the reviewed Hook ran; Run B proves
+ * the same command is refused once the Skill is deselected and the Run is
+ * read-only. Neither Run is graded on model wording.
+ */
+export async function mainL3 ({ options, env }) {
+  const providerKey = selectProviderKey(env)
+  const secrets = providerKey === null ? [] : [providerKey.value]
+  const dshBin = options.dshBin ?? env.ROVAI_DEEPSEEK_HARNESS_BIN ?? ''
+  const program = resolveDshProgramPath({ platform: process.platform, dshBin })
+  const coreBinary = resolve(options.coreBinary ?? join(repoRoot(), 'target', 'debug', 'rovai-core'))
+  const embeddedPiRoot = options.embeddedPiRoot ?? env[EMBEDDED_PI_ROOT_ENV] ?? null
+
+  if (options.fixtureRoot === undefined) {
+    throw new UsageError('fixture_root', '--l3-native needs --fixture-root <lane directory>; it owns every isolated root')
+  }
+  if (env[OPT_IN_ENV] !== '1') {
+    process.stdout.write(`${JSON.stringify({ script: SCRIPT_NAME, mode: 'l3-native', status: 'NOT_RUN',
+      reason: 'not_opted_in', requiredEnv: OPT_IN_ENV }, null, 2)}\n`)
+    return EXIT.NOT_RUN
+  }
+  if (options.publicConfig === undefined) {
+    process.stdout.write(`${JSON.stringify({ script: SCRIPT_NAME, mode: 'l3-native', status: 'NOT_RUN',
+      reason: 'no_public_route', requiredFlag: '--public-config <provider.baseUrl+api, model.id>' }, null, 2)}\n`)
+    return EXIT.NOT_RUN
+  }
+  if (providerKey === null) throw new UsageError('provider_key', `one of ${PROVIDER_KEY_ENVS.join(' | ')} must carry the real provider credential`)
+  if (!program.ok) throw new UsageError(program.code, program.reason)
+  if (!existsSync(coreBinary)) throw new UsageError('core_binary_missing', `${coreBinary} does not exist; build it with cargo build -p rovai-core --bins`)
+  // The reviewed Hook command runs only through Core's own pinned private
+  // executor inside the embedded runtime. Without that root Core refuses the
+  // Host outright (`local_hook_bundled_node_unavailable`), so this is required
+  // rather than silently falling back to a PATH node.
+  if (embeddedPiRoot === null || !existsSync(join(embeddedPiRoot, 'node'))) {
+    throw new UsageError('embedded_pi_root', `pass --embedded-pi-root or set ${EMBEDDED_PI_ROOT_ENV} to the embedded runtime root that holds node/ and dsh-hook-executor/`)
+  }
+
+  const declared = readPublicConfig(await readFile(options.publicConfig, 'utf8'))
+  const nativeSettings = buildDshNativeSettings({ publicConfig: declared, apiKeyEnv: providerKey.name })
+  const root = resolve(options.fixtureRoot)
+  await mkdir(root, { recursive: true })
+  const paths = l3Paths(root)
+  const evidencePath = resolve(options.evidence ?? join(root, 'summary.json'))
+  const evidenceRoot = resolve(evidencePath, '..')
+  const versionsPath = join(evidenceRoot, 'versions.json')
+  const runAPath = join(evidenceRoot, 'run-a.json')
+  const runBPath = join(evidenceRoot, 'run-b.json')
+  const skillName = `dsh-l3-${randomBytes(4).toString('hex')}`
+  const skillMarker = `L3_SKILL_MARK_${randomBytes(8).toString('hex')}`
+  const hookValue = `L3_HOOK_WROTE_${randomBytes(8).toString('hex')}`
+  const events = []
+  const report = {
+    version: ACCEPT_VERSION,
+    script: SCRIPT_NAME,
+    mode: 'l3-native',
+    adapterKind: ADAPTER_KIND,
+    startedAt: new Date().toISOString(),
+    platform: `${process.platform}-${process.arch}`,
+    isolated: paths,
+    providerKeyEnv: providerKey.name,
+    providerKeyPersisted: false,
+    declaredModelId: declared.declaredModelId,
+    permissionModeRunA: options.permissionMode,
+    permissionModeRunB: 'read-only',
+    runs: {},
+    cells: {},
+    notes: [
+      'Run A needs a native skill() load plus one observed PostToolUse receipt with exitCode 0',
+      'Run B is only a refusal when the same reviewed command was reached and denied; a setup failure is not a refusal',
+      'Windows enforcement is reported at its measured value, never widened to full'
+    ]
+  }
+  let core = null
+  try {
+    const isolated = buildIsolatedEnvironment({ paths, providerKeyName: providerKey.name, env })
+    report.maskedCredentialNames = isolated.maskedSort
+    report.environmentNames = Object.keys(isolated.overrides).sort()
+    for (const directory of ordinarySubroots(paths)) await mkdir(directory, { recursive: true })
+    await mkdir(paths.dshHome, { recursive: true })
+
+    if (process.platform === 'win32') {
+      let stdout
+      try {
+        stdout = execFileSync(coreBinary, windowsDataRootPreparationArgs(paths.formal), {
+          encoding: 'utf8', windowsHide: true, timeout: 120_000,
+          env: { ...process.env, ...isolated.overrides }
+        })
+      } catch (error) {
+        throw l3Refusal('win32_data_root_unprepared', String(error?.message ?? error).slice(0, 400))
+      }
+      const layout = parseWindowsDataRootLayout(stdout, paths.formal)
+      if (!layout.ok) throw l3Refusal('win32_data_root_unprepared', layout.code)
+      paths.data = layout.core
+    }
+
+    await writeFile(join(paths.dshHome, 'settings.yaml'), `${JSON.stringify(nativeSettings)}\n`, { mode: 0o600 })
+    const acpPatchPath = join(paths.dshHome, 'profiles', 'acp', 'cordis.patch.yml')
+    const acpPatch = buildDshAcpPatch({ nativeSettings, modelId: declared.declaredModelId })
+    await mkdir(join(paths.dshHome, 'profiles', 'acp'), { recursive: true })
+    await writeFile(acpPatchPath, `${JSON.stringify(acpPatch)}\n`, { mode: 0o600 })
+
+    // The fixture workspace is the Run's boundary. No git commit is created: the
+    // frozen copy is what must load, not a project-local directory.
+    await writeFile(join(paths.project, 'README.md'), '# L3 isolated DSH native capability workspace\n')
+    await writeFile(paths.readTarget, 'L3 read target: one short line.\n')
+    const skillSource = skillSourceLayout({ skillSourceRoot: paths.skillSource, skillName, marker: skillMarker })
+    await mkdir(skillSource.directory, { recursive: true })
+    await writeFile(join(skillSource.directory, 'SKILL.md'), skillSource.document)
+    const bodyOnly = skillSource.document.replace(/^---\n[\s\S]*?\n---\n/u, '').replace(/^\n/u, '')
+    report.skill = {
+      name: skillName,
+      markerSha256: sha256(skillMarker),
+      documentSha256: sha256(skillSource.document),
+      bodySha256: sha256(bodyOnly.trim()),
+      transport: 'native-registry'
+    }
+
+    core = startQualificationCore({
+      coreExecutable: coreBinary,
+      dataDirectory: paths.data,
+      workingDirectory: repoRoot(),
+      runtimeCacheDirectory: join(root, 'runtime-cache'),
+      mcpConfigPath: join(paths.data, 'mcp.json'),
+      onNotification: event => events.push(event),
+      environmentOverrides: {
+        ...isolated.overrides,
+        DSH_TELEMETRY_DISABLED: '1',
+        ROVAI_DEEPSEEK_HARNESS_BIN: program.programPath,
+        [EMBEDDED_PI_ROOT_ENV]: resolve(embeddedPiRoot),
+        [providerKey.name]: providerKey.value
+      }
+    })
+    await l3CoreRequest(core, 'health.check')
+    const workspace = await l3CoreRequest(core, 'workspaces.inspect', { path: paths.project })
+    const preflight = await l3CoreRequest(core, 'threads.creationPreflight')
+    const present = (preflight?.presentMembers ?? []).map(entry => entry.agentId)
+    const agentId = present.includes('agent_2') ? 'agent_2' : present[0]
+    assert.ok(typeof agentId === 'string' && agentId.length > 0, 'the isolated Core must expose one present member')
+    report.agentId = agentId
+
+    // --- the real DSH native route ----------------------------------------
+    const startup = await l3CoreRequest(core, 'runtime.startup.get', { runtimeKind: ADAPTER_KIND })
+    await l3CoreRequest(core, 'runtime.startup.save', startupSaveParams({
+      runtimeKind: ADAPTER_KIND,
+      edits: startupSaveEdits({
+        beforeProgramPath: typeof startup?.configuration?.programPath === 'string' ? startup.configuration.programPath : null,
+        afterProgramPath: program.programPath,
+        label: 'L3 isolated DSH native acceptance'
+      })
+    }))
+    await l3CoreRequest(core, 'runtime.product.check', { runtimeKind: ADAPTER_KIND })
+    let installation = null
+    for (let attempt = 0; attempt < MAX_OBSERVATIONS && installation === null; attempt += 1) {
+      await l3CoreRequest(core, 'runtime.product.check', { runtimeKind: ADAPTER_KIND })
+      const list = await l3CoreRequest(core, 'runtime.installations.list')
+      installation = (Array.isArray(list) ? list : []).find(candidate =>
+        candidate?.adapterKind === ADAPTER_KIND
+        && candidate?.installationClass === 'managed_default'
+        && candidate?.authScope === 'default'
+        && candidate?.memberRuntimeDefaults) ?? null
+    }
+    if (installation === null) throw l3Refusal('dsh_installation_unavailable', 'Core reports no DSH installation')
+    if (installation.snapshot?.probeStatus !== 'ready') {
+      const originalId = installation.installationId ?? installation.id
+      await l3CoreRequest(core, 'runtime.modelCatalog.open', { runtimeKind: ADAPTER_KIND, waitForRefresh: true })
+      const refreshed = await l3CoreRequest(core, 'runtime.installations.list')
+      installation = (Array.isArray(refreshed) ? refreshed : []).find(row =>
+        (row.installationId ?? row.id) === originalId && row.adapterKind === ADAPTER_KIND) ?? installation
+    }
+    report.dshDiscovery = { installationClass: installation.installationClass ?? null,
+      probeStatus: installation?.snapshot?.probeStatus ?? null, version: installation?.snapshot?.version ?? null }
+    if (installation.snapshot?.probeStatus !== 'ready') {
+      throw l3Refusal('dsh_catalog_not_ready', `the DSH installation did not probe ready: ${JSON.stringify(installation?.lastProbeAttempt?.failure ?? null).slice(0, 300)}`)
+    }
+
+    const relayPick = selectRelayCatalogEntry({ models: installation.snapshot?.models,
+      expectedId: relayModelPair({ modelId: declared.declaredModelId }) })
+    if (relayPick.entry === null) throw l3Refusal(relayPick.code ?? 'relay_model_absent', 'the declared model is not in the native catalog')
+    report.catalogModelId = relayPick.entry.id
+
+    // --- capability materialization through the real APIs -----------------
+    const inspection = await l3CoreRequest(core, 'skills.import.inspect', { path: paths.skillSource })
+    const candidate = (inspection?.candidates ?? []).find(entry => entry?.name === skillName)
+    assert.ok(candidate, `the Skill import inspection must offer ${skillName}`)
+    const commit = await l3CoreRequest(core, 'skills.import.commit', {
+      commandId: randomUUID(),
+      command: {
+        stagingToken: inspection.stagingToken,
+        candidateName: candidate.name,
+        expectedDigest: candidate.contentDigest,
+        expectedSkillVersion: candidate.existingSkillVersion ?? null,
+        confirmUpdate: false
+      }
+    })
+    assert.equal(commit.status, 'applied', `Skill import commit must apply: ${JSON.stringify(commit.payload)}`)
+    const skillId = commit.payload?.skillId
+    assert.ok(typeof skillId === 'string' && skillId.length > 0, 'the Skill import must return payload.skillId')
+    const registeredSkill = await l3CoreRequest(core, 'members.capabilityCatalog.putItem', {
+      kind: 'skill', itemId: `library:${skillId}`, toolNames: []
+    })
+    report.skill.itemId = registeredSkill.id
+    report.skill.revisionId = commit.payload?.revisionId ?? null
+    report.skill.contentDigest = candidate.contentDigest
+
+    // The reviewed command only writes one non-sensitive value inside the Run's
+    // own workspace. Both dialects carry the same bytes so a non-Windows Host
+    // proves the same fact.
+    const hookCommand = `printf '%s' '${hookValue}' > '${paths.hookProof}'`
+    const hookCommandWindows = `Set-Content -LiteralPath '${paths.hookProof}' -Value '${hookValue}' -NoNewline`
+    const hookItem = await l3CoreRequest(core, 'members.capabilityCatalog.putItem', {
+      kind: 'hook',
+      itemId: `hook_l3_${randomBytes(4).toString('hex')}`,
+      name: `l3-native-hook-${randomBytes(3).toString('hex')}`,
+      note: 'L3 isolated PostToolUse command Hook for a real refusal experiment',
+      scope: 'cloud',
+      body: l3HookBody({ command: hookCommand, commandWindows: hookCommandWindows }),
+      toolNames: []
+    })
+    report.hook = { itemId: hookItem.id, reviewedMatcher: 'read', nativeMatcher: '^read$',
+      point: 'PostToolUse', commandSha256: sha256(hookCommandWindows), valueSha256: sha256(hookValue) }
+
+    const setPermissions = async (mode) => {
+      const member = await l3CoreRequest(core, 'members.get', { agentId })
+      const configured = await l3CoreRequest(core, 'members.runtime.set', {
+        commandId: randomUUID(),
+        command: {
+          agentId,
+          expectedVersion: member.version,
+          adapterKind: ADAPTER_KIND,
+          model: { mode: 'explicit', modelId: relayPick.entry.id, options: assertModelOptions({}) },
+          permissions: {
+            ...installation.memberRuntimeDefaults.permissions,
+            values: { sandbox_mode: mode, approval_policy: options.approvalPolicy }
+          }
+        }
+      }, SETUP_REQUEST_MS)
+      if (configured?.status !== 'applied') throw l3Refusal('dsh_member_runtime_set_rejected', 'members.runtime.set did not apply')
+      const readback = await l3CoreRequest(core, 'members.get', { agentId })
+      const observed = readback?.runtimeConfiguration?.permissions?.values?.sandbox_mode ?? null
+      assert.equal(observed, mode, `the member permission must read back as ${mode}`)
+      return observed
+    }
+
+    const selectCapabilities = async ({ threadId, skillSelected }) => {
+      const catalog = await l3CoreRequest(core, 'members.capabilityCatalog.get', { agentId, localCampId: threadId })
+      const reviewed = l3HookReview(catalog, hookItem.id)
+      if (!reviewed.ready) throw l3Refusal(reviewed.code, 'the local Hook definition is not reviewable in this Camp')
+      const applied = await l3CoreRequest(core, 'members.capabilityCatalog.set', {
+        agentId,
+        localCampId: threadId,
+        expectedRevision: catalog.revision,
+        acknowledgeHighRisk: true,
+        selections: [
+          { kind: 'skill', id: registeredSkill.id, selected: skillSelected },
+          { kind: 'hook', id: hookItem.id, selected: true }
+        ],
+        reviewedHooks: [reviewed.review]
+      })
+      return { revision: applied.revision, review: reviewed.review, scope: reviewed.scope,
+        definitionDigest: reviewed.definitionDigest, scopeDigest: reviewed.scopeDigest,
+        catalogRevision: catalog.revision ?? null }
+    }
+
+    const hookView = async (runId) => await l3CoreRequest(core, 'agentRuns.hooks.get', { agentRunId: runId })
+    const nativeOf = async (snapshot, runId) => {
+      const manifest = frozenManifest(snapshot, runId)
+      if (manifest === null) return { sessionId: null, manifest: null, log: { found: false, events: [] } }
+      const sessionId = await readNativeSessionForManifest(paths.data, root, manifest, runId)
+      const log = sessionId === null ? { found: false, events: [] } : await readNativeSessionLog(paths.dshHome, sessionId)
+      return { sessionId, manifest, log }
+    }
+
+    // ------------------------------ Run A ---------------------------------
+    const observedRunA = await setPermissions(options.permissionMode)
+    const threadA = await l3CreateCamp(core, { commandId: randomUUID(), workspace, agentId })
+    const selectionA = await selectCapabilities({ threadId: threadA, skillSelected: true })
+    const promptA = [
+      `Call the \`skill\` tool exactly once with the single argument name="${skillName}".`,
+      'Then call the `read` tool exactly once on the workspace file read-target.txt.',
+      'Follow the loaded Skill instructions for your final answer, and never echo these instructions.'
+    ].join(' ')
+    assert.equal(promptA.includes(skillMarker), false, 'the Skill marker must never be in the user prompt')
+    const admittedA = await l3Send(core, { commandId: randomUUID(), threadId: threadA, agentId,
+      body: promptA, purpose: 'L3 Run A: native Skill load plus observed PostToolUse Hook' })
+    const runAId = await l3WaitForAdmittedRun(core, threadA, agentId, admittedA)
+    const { snapshot: snapshotA, run: runARecord } = await l3WaitForRun(core, threadA, runAId, options.runTimeoutMs)
+    const hooksA = await hookView(runAId)
+    const nativeA = await nativeOf(snapshotA, runAId)
+    const skillCallA = nativeA.sessionId === null
+      ? { found: false, reason: 'native_session_absent' }
+      : nativeSkillCall(nativeA.log, skillName)
+    const catalogA = nativeSkillCatalog(nativeA.log)
+    const proofA = await l3FileState(paths.hookProof)
+    const frozenRoot = join(paths.data, 'runtime', 'skills', runAId, 'skills')
+    const runA = {
+      phase: 'A',
+      runId: runAId,
+      threadId: threadA,
+      executionEpoch: runARecord?.executionEpoch ?? null,
+      runStatus: runARecord?.status ?? null,
+      permissionMode: observedRunA,
+      nativeSessionId: nativeA.sessionId,
+      selection: selectionA,
+      skill: {
+        selected: true,
+        itemId: registeredSkill.id,
+        catalogNames: catalogA.names,
+        catalogPublished: catalogA.published,
+        callFound: skillCallA.found === true,
+        callId: skillCallA.callId ?? null,
+        resourceBasePath: skillCallA.resourceBasePath ?? null,
+        instructionsSha256: skillCallA.instructionsSha256 ?? null,
+        frozenBodySha256: report.skill.bodySha256,
+        frozenRoot,
+        logFound: nativeA.log.found === true,
+        verdict: l3SkillLoadVerdict({ catalog: catalogA, call: skillCallA, skillName,
+          frozenBodySha256: report.skill.bodySha256, frozenRoot })
+      },
+      hook: {
+        ...l3ObservedHookVerdict(hooksA),
+        coreStatus: hooksA?.status ?? null,
+        // A Run A PASS also needs the reviewed command to have really written its
+        // value inside the workspace: exit 0 alone is not an execution proof.
+        receiptValueMatches: proofA.exists === true && proofA.content === hookValue,
+        receiptFile: proofA.exists ? { exists: true, bytes: Buffer.byteLength(proofA.content ?? '') } : { exists: false, bytes: 0 },
+        view: { status: hooksA?.status ?? null, snapshotDigest: hooksA?.snapshotDigest ?? null,
+          hooks: hooksA?.hooks ?? [], events: hooksA?.events ?? [] }
+      }
+    }
+    if (runA.hook.status === 'PASS' && runA.hook.receiptValueMatches !== true) {
+      runA.hook.status = 'FAIL'
+      runA.hook.reasons = [...runA.hook.reasons, 'receipt_value_missing']
+    }
+    report.runs.a = runA
+    report.cells.skill = runA.skill.verdict
+    report.cells.hookInvoked = { status: runA.hook.status, reasons: runA.hook.reasons }
+    await writeFile(runAPath, `${JSON.stringify(assertNoSecrets(runA, secrets), null, 2)}\n`, { mode: 0o600 })
+    process.stdout.write(`run A ${runAId} skill=${runA.skill.verdict.status} hook=${runA.hook.status} run=${runA.runStatus}\n`)
+
+    // ------------------------------ Run B ---------------------------------
+    await rm(paths.hookProof, { force: true })
+    const beforeB = await l3FileState(paths.hookProof)
+    const observedRunB = await setPermissions('read-only')
+    const threadB = await l3CreateCamp(core, { commandId: randomUUID(), workspace, agentId })
+    const selectionB = await selectCapabilities({ threadId: threadB, skillSelected: false })
+    const promptB = [
+      `Call the \`skill\` tool exactly once with the single argument name="${skillName}".`,
+      'Then call the `read` tool exactly once on the workspace file read-target.txt.',
+      'Do not write, edit or create any file.'
+    ].join(' ')
+    const admittedB = await l3Send(core, { commandId: randomUUID(), threadId: threadB, agentId,
+      body: promptB, purpose: 'L3 Run B: deselected Skill plus refused PostToolUse Hook' })
+    const runBId = await l3WaitForAdmittedRun(core, threadB, agentId, admittedB)
+    const { snapshot: snapshotB, run: runBRecord } = await l3WaitForRun(core, threadB, runBId, options.runTimeoutMs)
+    const hooksB = await hookView(runBId)
+    const nativeB = await nativeOf(snapshotB, runBId)
+    const skillCallB = nativeB.sessionId === null
+      ? { found: false, reason: 'native_session_absent' }
+      : nativeSkillCall(nativeB.log, skillName)
+    const catalogB = nativeSkillCatalog(nativeB.log)
+    const readCallB = nativeReadCall(nativeB.log, 'read-target.txt')
+    const afterB = await l3FileState(paths.hookProof)
+    const runB = {
+      phase: 'B',
+      runId: runBId,
+      threadId: threadB,
+      executionEpoch: runBRecord?.executionEpoch ?? null,
+      runStatus: runBRecord?.status ?? null,
+      permissionMode: observedRunB,
+      nativeSessionId: nativeB.sessionId,
+      selection: selectionB,
+      skill: {
+        selected: false,
+        catalogNames: catalogB.names,
+        catalogPublished: catalogB.published,
+        callFound: skillCallB.found === true,
+        isError: skillCallB.isError ?? null,
+        errorText: skillCallB.errorText ?? skillCallB.reason ?? null,
+        logFound: nativeB.log.found === true
+      },
+      file: {
+        before: beforeB.exists ? { exists: true, bytes: Buffer.byteLength(beforeB.content ?? '') } : { exists: false, bytes: 0 },
+        after: afterB.exists ? { exists: true, bytes: Buffer.byteLength(afterB.content ?? '') } : { exists: false, bytes: 0 },
+        markerAbsent: afterB.content === null || !String(afterB.content).includes(hookValue),
+        unchanged: afterB.content === beforeB.content
+      },
+      hook: {
+        ...l3RefusalVerdict({ hookView: hooksB, before: beforeB.content, after: afterB.content,
+          marker: hookValue, readCall: readCallB, catalog: catalogB, skillName }),
+        view: { status: hooksB?.status ?? null, snapshotDigest: hooksB?.snapshotDigest ?? null,
+          hooks: hooksB?.hooks ?? [], events: hooksB?.events ?? [] }
+      }
+    }
+    report.runs.b = runB
+    report.cells.hookRefused = { status: runB.hook.status, reasons: runB.hook.reasons, criteria: runB.hook.criteria }
+    await writeFile(runBPath, `${JSON.stringify(assertNoSecrets(runB, secrets), null, 2)}\n`, { mode: 0o600 })
+    process.stdout.write(`run B ${runBId} hook=${runB.hook.status} run=${runB.runStatus}\n`)
+
+    report.overall = l3OverallVerdict({ runA: { skill: runA.skill.verdict, hook: report.cells.hookInvoked }, runB: { hook: report.cells.hookRefused } })
+    report.overall.exitCode = report.overall.status === 'PASS' ? EXIT.PASS : EXIT.FAIL
+    report.coreNotifications = events.length
+    report.finishedAt = new Date().toISOString()
+    await writeFile(versionsPath, `${JSON.stringify(assertNoSecrets({
+      schemaVersion: 1,
+      mode: 'l3-native',
+      coreBinary,
+      coreSha256: sha256(await readFile(coreBinary)),
+      nodeVersion: process.version,
+      dshBin,
+      dshProgramPath: program.programPath,
+      dshInstallationVersion: report.dshDiscovery?.version ?? null,
+      hookExecutor: 'private-pinned dsh-hook-executor (resources/dsh-hook-executor)',
+      embeddedPiRoot: resolve(embeddedPiRoot),
+      declaredModelId: declared.declaredModelId,
+      catalogModelId: report.catalogModelId ?? null,
+      isolatedHome: paths.dshHome
+    }, secrets), null, 2)}\n`, { mode: 0o600 })
+    await writeFile(evidencePath, `${JSON.stringify(assertNoSecrets(report, secrets), null, 2)}\n`, { mode: 0o600 })
+    process.stdout.write(`overall ${report.overall.status} — ${report.overall.reasons.join('+') || 'both Runs proved their cell'}\nevidence ${evidencePath}\n`)
+    return report.overall.status === 'PASS' ? EXIT.PASS : EXIT.FAIL
+  } finally {
+    if (core) await core.stop().catch(() => {})
+    await removeEphemeralRuntimeCampFilesRoot(paths.data, { homeDirectory: paths.home }).catch(() => {})
+  }
 }
 
 /* -------------------------------------------------------------------- entry */

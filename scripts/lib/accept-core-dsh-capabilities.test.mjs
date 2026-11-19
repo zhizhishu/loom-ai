@@ -45,12 +45,24 @@ import {
   mcpVerdict,
   messageText,
   nativeModelReadback,
+  nativeReadCall,
+  nativeSkillCall,
+  nativeSkillCatalog,
+  l3HookBody,
+  l3HookReview,
+  l3ObservedHookVerdict,
+  l3OverallVerdict,
+  l3Paths,
+  l3RefusalVerdict,
+  l3SkillLoadVerdict,
+  decodeSessionGeneration,
   observationAllowed,
   ordinarySubroots,
   overallVerdict,
   parseArguments,
   parseWindowsDataRootLayout,
   readCoreWindowsLocator,
+  readNativeSessionLog,
   readPublicConfig,
   redact,
   relayModelPair,
@@ -885,4 +897,234 @@ test('evidence digests are stable and short markers are not confused', () => {
   assert.notEqual(sha256('abc'), sha256('abd'))
   assert.equal(sha256('abc').length, 64)
   assert.equal(skillVerdict({ ...skillInput, reply: `x${SKILL_MARK.slice(0, 5)}` }).status, 'FAIL')
+})
+
+// --- L3 native mode -------------------------------------------------------
+// L3 is a separate acceptance entry. These cases pin the decision boundary it
+// needs and the refusals that keep a setup failure from being read as a pass.
+
+test('L3 is an independent mode with its own isolated roots and flag', () => {
+  const options = parseArguments(['--l3-native', '--fixture-root', 'fixtures', '--public-config', 'route.json'])
+  assert.equal(options.l3Native, true)
+  assert.equal(options.fixtureRoot, 'fixtures')
+  // The linear flow must stay exactly as it was when L3 is not asked for.
+  assert.equal(parseArguments([]).l3Native, false)
+  const paths = l3Paths(join(tmpdir(), 'l3-layout'))
+  for (const name of ['dshHome', 'dshAgentsHome', 'data', 'project', 'skillSource', 'hookProof']) {
+    assert.equal(typeof paths[name], 'string')
+    assert.ok(paths[name].length > 0)
+  }
+  assert.equal(paths.dshHome.endsWith('isolated-home'), true)
+  assert.equal(paths.dshAgentsHome.endsWith('isolated-agents'), true)
+  // The Hook may only write inside the Run's own workspace boundary.
+  assert.equal(paths.hookProof.startsWith(paths.project + sep), true)
+  assert.equal(paths.readTarget.startsWith(paths.project + sep), true)
+  // Every home-like root of the layout stays inside the lane directory.
+  for (const name of HOMELIKE_ENV_NAMES) void name
+  for (const name of ['dshHome', 'dshAgentsHome', 'project', 'skillSource', 'home', 'temp']) {
+    assert.equal(paths[name].startsWith(paths.root + sep), true)
+  }
+})
+
+test('L3 Hook fixture body names one bare tool and both platform commands', () => {
+  const body = JSON.parse(l3HookBody({ command: 'posix', commandWindows: 'windows' }))
+  assert.deepEqual(Object.keys(body), ['hooks'])
+  assert.deepEqual(Object.keys(body.hooks), ['PostToolUse'])
+  assert.equal(body.hooks.PostToolUse.length, 1)
+  const group = body.hooks.PostToolUse[0]
+  assert.deepEqual(Object.keys(group).sort(), ['hooks', 'matcher'])
+  // Core owns the native matcher: the reviewed body names the tool, never a regex.
+  assert.equal(group.matcher, 'read')
+  assert.deepEqual(Object.keys(group.hooks[0]).sort(), ['command', 'commandWindows', 'timeout', 'type'])
+  assert.equal(group.hooks[0].command, 'posix')
+  assert.equal(group.hooks[0].commandWindows, 'windows')
+  assert.equal(group.hooks[0].timeout <= 5, true)
+  // A single-dialect body stays valid and simply omits the Windows override.
+  assert.deepEqual(Object.keys(JSON.parse(l3HookBody({ command: 'posix' })).hooks.PostToolUse[0].hooks[0]).sort(),
+    ['command', 'timeout', 'type'])
+})
+
+test('L3 refuses to review a Hook whose Core-published digest pair is absent', () => {
+  assert.equal(l3HookReview({ items: [] }, 'h').ready, false)
+  assert.equal(l3HookReview({ items: [{ id: 'h', hookDefinition: { definitionDigest: 'd' } }] }, 'h').code,
+    'hook_definition_unavailable')
+  const ready = l3HookReview({ items: [{ id: 'h', hookDefinition: {
+    definitionDigest: 'd'.repeat(64), scopeDigest: 's'.repeat(64), reviewed: false, reviewScope: { scopeKind: 'local' }
+  } }] }, 'h')
+  assert.equal(ready.ready, true)
+  assert.deepEqual(ready.review, { id: 'h', definitionDigest: 'd'.repeat(64), scopeDigest: 's'.repeat(64) })
+})
+
+const HOOK_OBSERVED = {
+  status: 'observed',
+  events: [
+    { kind: 'invoked', handlerId: 'loom:1', turn: 3, seq: 11, sessionId: 'session-a' },
+    { kind: 'result', handlerId: 'loom:1', turn: 3, seq: 12, sessionId: 'session-a',
+      exitCode: 0, sandboxDenied: false, sandboxEnforcement: 'partial',
+      timedOut: false, aborted: false, decision: 'pass' }
+  ]
+}
+
+test('L3 Run A needs one paired, really-executed Hook receipt', () => {
+  assert.equal(l3ObservedHookVerdict(HOOK_OBSERVED).status, 'PASS')
+  const refuse = mutate => l3ObservedHookVerdict(mutate(structuredClone(HOOK_OBSERVED)))
+  assert.match(refuse(view => { view.status = 'not_observed'; return view }).reasons.join(), /hooks_status_not_observed/)
+  assert.match(refuse(view => { view.events[1].exitCode = 1; return view }).reasons.join(), /exit_code_1/)
+  assert.match(refuse(view => { view.events[1].sandboxDenied = true; return view }).reasons.join(), /sandbox_denied_not_false/)
+  assert.match(refuse(view => { view.events[1].timedOut = true; return view }).reasons.join(), /hook_timed_out/)
+  assert.match(refuse(view => { view.events[1].handlerId = 'loom:2'; return view }).reasons.join(), /handler_pair_mismatch/)
+  // Two reads in one Run are two real pairs, not one too many.
+  const twice = structuredClone(HOOK_OBSERVED)
+  twice.events = [twice.events[0], twice.events[1],
+    { ...twice.events[0], handlerId: 'loom:2', seq: 21 }, { ...twice.events[1], handlerId: 'loom:2', seq: 22 }]
+  assert.equal(l3ObservedHookVerdict(twice).status, 'PASS')
+  const extraResult = structuredClone(twice)
+  extraResult.events = [...twice.events, { ...twice.events[1], handlerId: 'loom:3', seq: 23 }]
+  assert.match(l3ObservedHookVerdict(extraResult).reasons.join(), /result_count_3/)
+  const unpaired = structuredClone(twice)
+  unpaired.events = [twice.events[0], twice.events[1], twice.events[2], { ...twice.events[3], handlerId: 'loom:1' }]
+  assert.match(l3ObservedHookVerdict(unpaired).reasons.join(), /handler_pair_mismatch/)
+  assert.match(refuse(view => { view.events[1].turn = 4; return view }).reasons.join(), /turn_pair_mismatch/)
+  assert.match(refuse(view => { view.events[1].sandboxEnforcement = null; return view }).reasons.join(), /sandbox_enforcement_missing/)
+  assert.match(refuse(view => { view.events.pop(); return view }).reasons.join(), /result_count_0/)
+  // An execution claim without a receipt is never a pass, whatever the bytes say.
+  assert.match(refuse(view => { view.events = []; return view }).reasons.join(), /invoked_count_0/)
+  assert.equal(l3ObservedHookVerdict(null).status, 'FAIL')
+})
+
+test('L3 Run A proves the frozen body loaded through the native skill tool', () => {
+  const body = 'Loaded instructions\n'
+  const call = { found: true, isError: false, resourceBasePath: '/frozen/dsh-l3',
+    instructionsSha256: sha256(body.trim()) }
+  const catalog = { published: true, names: ['dsh-l3'] }
+  assert.equal(l3SkillLoadVerdict({ catalog, call, skillName: 'dsh-l3',
+    frozenBodySha256: sha256(body.trim()), frozenRoot: '/frozen/dsh-l3' }).status, 'PASS')
+  const reasonsOf = patch => l3SkillLoadVerdict({ catalog, call, skillName: 'dsh-l3',
+    frozenBodySha256: sha256(body.trim()), frozenRoot: '/frozen/dsh-l3', ...patch }).reasons.join()
+  assert.equal(reasonsOf({ catalog: { published: true, names: [] } }), 'skill_absent_from_native_catalog')
+  assert.equal(reasonsOf({ catalog: { published: false, names: ['dsh-l3'] } }), 'native_catalog_absent')
+  assert.equal(reasonsOf({ call: { found: false, reason: 'skill_call_absent' } }), 'skill_call_absent')
+  assert.equal(reasonsOf({ call: { ...call, isError: true } }), 'skill_call_failed')
+  assert.equal(reasonsOf({ call: { ...call, instructionsSha256: sha256('other') } }), 'skill_body_digest_mismatch')
+  // A body served from any directory but the frozen one is another copy.
+  assert.equal(reasonsOf({ call: { ...call, resourceBasePath: '/elsewhere/dsh-l3' } }),
+    'skill_resource_base_not_frozen_root')
+  // The provider reports the per-skill directory inside the frozen Run tree.
+  assert.equal(l3SkillLoadVerdict({ catalog, skillName: 'dsh-l3', frozenBodySha256: sha256(body.trim()),
+    frozenRoot: '/frozen', call: { ...call, resourceBasePath: '/frozen/dsh-l3' } }).status, 'PASS')
+  // A sibling with the same prefix is still another directory.
+  assert.equal(l3SkillLoadVerdict({ catalog, skillName: 'dsh-l3', frozenBodySha256: sha256(body.trim()),
+    frozenRoot: '/frozen', call: { ...call, resourceBasePath: '/frozen-evil/dsh-l3' } }).status, 'FAIL')
+  assert.equal(reasonsOf({ call: { ...call, resourceBasePath: null } }), 'skill_resource_base_absent')
+})
+
+test('L3 Run B is a refusal only when the reviewed command was reached and denied', () => {
+  const deniedView = (exitCode = 1) => ({
+    status: 'failed',
+    events: [
+      { kind: 'invoked', handlerId: 'loom:1', turn: 2, seq: 5, sessionId: 'session-b' },
+      { kind: 'result', handlerId: 'loom:1', turn: 2, seq: 6, sessionId: 'session-b',
+        exitCode, sandboxDenied: true, sandboxEnforcement: 'partial',
+        timedOut: false, aborted: false, decision: 'pass' }
+    ]
+  })
+  const input = { hookView: deniedView(), before: null, after: null, marker: 'L3_HOOK_WROTE_x',
+    readCall: { found: true, callId: 'call-1' }, catalog: { published: true, names: [] }, skillName: 'dsh-l3' }
+  const pass = l3RefusalVerdict(input)
+  assert.equal(pass.status, 'PASS')
+  for (const value of Object.values(pass.criteria)) assert.equal(value, true)
+  assert.equal(pass.settlement.sandboxEnforcement, 'partial')
+  const reasonsOf = patch => l3RefusalVerdict({ ...input, ...patch }).reasons.join()
+  // A Run that never selected or never reached the Hook is not a refusal.
+  assert.equal(reasonsOf({ hookView: { status: 'not_selected', events: [] } }),
+    'hookReached,receiptPaired,coreStatusFailed,sandboxDenied,nonZeroExit,notTimedOut,notCancelled,enforcementRecorded')
+  assert.match(reasonsOf({ hookView: { status: 'observed', events: [input.hookView.events[0]] } }), /coreStatusFailed/)
+  assert.match(reasonsOf({ hookView: deniedView(0) }), /nonZeroExit/)
+  assert.match(reasonsOf({ hookView: { ...deniedView(), events: [deniedView().events[0],
+    { ...deniedView().events[1], sandboxDenied: false }] } }), /sandboxDenied/)
+  assert.match(reasonsOf({ hookView: { ...deniedView(), events: [deniedView().events[0],
+    { ...deniedView().events[1], timedOut: true }] } }), /notTimedOut/)
+  assert.match(reasonsOf({ readCall: { found: false } }), /readAttempted/)
+  assert.match(reasonsOf({ catalog: { published: true, names: ['dsh-l3'] } }), /skillUnavailable/)
+  // A file that changed is a real write, so the refusal did not hold.
+  assert.match(reasonsOf({ after: 'L3_HOOK_WROTE_x' }), /fileUnchanged/)
+  assert.match(reasonsOf({ before: 'base', after: 'changed' }), /fileUnchanged/)
+  // An absent baseline with no marker is still "no write of the reviewed value".
+  assert.equal(l3RefusalVerdict({ ...input, after: '' }).status, 'PASS')
+})
+
+test('L3 overall verdict needs both Runs and never upgrades a partial cell', () => {
+  const a = { skill: { status: 'PASS', reasons: [] }, hook: { status: 'PASS', reasons: [] } }
+  const b = { hook: { status: 'PASS', reasons: [] } }
+  assert.equal(l3OverallVerdict({ runA: a, runB: b }).status, 'PASS')
+  assert.deepEqual(l3OverallVerdict({ runA: a, runB: b }).cells,
+    { skill: 'PASS', hookInvoked: 'PASS', hookRefused: 'PASS' })
+  assert.equal(l3OverallVerdict({ runA: a, runB: null }).reasons.join(), 'hookRefused_not_run')
+  assert.equal(l3OverallVerdict({ runA: { skill: { status: 'FAIL' }, hook: a.hook }, runB: b }).reasons.join(),
+    'skill_fail')
+  assert.equal(l3OverallVerdict({ runA: null, runB: null }).status, 'FAIL')
+})
+
+test('L3 reads every zstd generation frame, not only the first append', async () => {
+  const { zstdCompressSync } = await import('node:zlib')
+  const first = JSON.stringify({ type: 'tool/call', seq: 1, data: { callId: 'c1', name: 'read', arguments: '{}' } }) + String.fromCharCode(10)
+  const second = JSON.stringify({ type: 'tool/result', seq: 2, data: { callId: 'c1', message: { isError: false } } }) + String.fromCharCode(10)
+  const bytes = Buffer.concat([zstdCompressSync(Buffer.from(first)), zstdCompressSync(Buffer.from(second))])
+  const decoded = decodeSessionGeneration(bytes)
+  assert.equal(decoded.frames, 2)
+  assert.equal(decoded.undecodable, 0)
+  assert.equal(decoded.text, first + second)
+  // A plain generation is passed through untouched.
+  assert.equal(decodeSessionGeneration(Buffer.from(first)).text, first)
+  assert.equal(decodeSessionGeneration(Buffer.from(first)).frames, 0)
+  // A generation with a trailing truncated frame still yields every frame that
+  // does decode; the read is not abandoned because the last append was torn.
+  const torn = Buffer.concat([zstdCompressSync(Buffer.from(first)),
+    Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x01, 0x02, 0x03])])
+  const partial = decodeSessionGeneration(torn)
+  assert.equal(partial.frames, 2)
+  assert.equal(partial.text.startsWith(first), true)
+})
+
+test('L3 native readers take the turn, the base directory and the body from the log', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'l3-native-log-'))
+  try {
+    const body = 'Isolated acceptance instructions.\n'
+    const { mkdirSync } = await import('node:fs')
+    mkdirSync(join(root, 'sessions', 'project-key', 'segment'), { recursive: true })
+    const events = [
+      { type: 'user/message', data: { turn: 1, message: { content: [], source: {
+        kind: 'skill-catalog', form: 'catalog', entries: [{ name: 'dsh-l3', description: 'd' }] } } } },
+      { type: 'tool/call', data: { turn: 1, callId: 'call-skill', name: 'skill', arguments: '{"name":"dsh-l3"}' } },
+      { type: 'tool/result', data: { turn: 1, message: { callId: 'call-skill', isError: false, content: [
+        { type: 'text', text: `<skill_content name="dsh-l3">\n<skill_resources>\nBase directory for this skill: /frozen/dsh-l3\n</skill_resources>\n\n<skill_instructions>\n${body}</skill_instructions>\n</skill_content>` }
+      ] } } },
+      { type: 'tool/call', data: { turn: 1, callId: 'call-read', name: 'read', arguments: '{"path":"read-target.txt"}' } },
+      { type: 'tool/result', data: { turn: 1, message: { callId: 'call-read', isError: false, content: [{ type: 'text', text: 'line' }] } } }
+    ]
+    writeFileSync(join(root, 'sessions', 'project-key', 'segment', 'session-abc.jsonl'),
+      `${events.map(event => JSON.stringify(event)).join('\n')}\n`)
+    const log = await readNativeSessionLog(root, 'session-abc')
+    assert.equal(log.found, true)
+    assert.equal(log.unparsedLines, 0)
+    // An id nothing wrote is absent evidence, not an empty Session.
+    assert.equal((await readNativeSessionLog(root, 'session-other')).found, false)
+    const catalog = nativeSkillCatalog(log)
+    assert.deepEqual(catalog, { published: true, names: ['dsh-l3'] })
+    const call = nativeSkillCall(log, 'dsh-l3')
+    assert.equal(call.found, true)
+    assert.equal(call.callId, 'call-skill')
+    assert.equal(call.isError, false)
+    assert.equal(call.resourceBasePath, '/frozen/dsh-l3')
+    assert.equal(call.instructionsSha256, sha256(body.trim()))
+    assert.equal(nativeSkillCall(log, 'other-skill').found, false)
+    assert.deepEqual(nativeReadCall(log, 'read-target.txt'), { found: true, callId: 'call-read', isError: false })
+    // The native file tools name the operand `file_path`.
+    const filePathLog = { events: [{ type: 'tool/call', data: { callId: 'c9', name: 'read', arguments: '{"file_path":"docs/read-target.txt"}' } }] }
+    assert.deepEqual(nativeReadCall(filePathLog, 'read-target.txt'), { found: true, callId: 'c9', isError: null })
+    assert.equal(nativeReadCall(log, 'absent.txt').found, false)
+    // The loaded body and the frozen body must be the same bytes.
+    assert.equal(l3SkillLoadVerdict({ catalog, call, skillName: 'dsh-l3',
+      frozenBodySha256: sha256(body.trim()), frozenRoot: '/frozen/dsh-l3' }).status, 'PASS')
+  } finally { rmSync(root, { recursive: true, force: true }) }
 })

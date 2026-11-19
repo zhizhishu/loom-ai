@@ -58,6 +58,7 @@ function Package-Files([string]$Root) {
     $queue = New-Object 'Collections.Generic.Queue[string]'
     $nativeRoot = if ($Root.StartsWith('\\')) { '\\?\UNC\' + $Root.Substring(2) } else { '\\?\' + $Root }
     $queue.Enqueue($nativeRoot)
+    $found = New-Object 'Collections.Generic.List[string]'
     while ($queue.Count) {
         foreach ($path_ in [IO.Directory]::EnumerateFileSystemEntries($queue.Dequeue())) {
             $attributes = [IO.File]::GetAttributes($path_)
@@ -65,10 +66,101 @@ function Package-Files([string]$Root) {
                 throw "Package contains a linked path: $path_"
             }
             if ($attributes -band [IO.FileAttributes]::Directory) { $queue.Enqueue($path_) }
-            elseif ($path_.StartsWith('\\?\UNC\')) { '\\' + $path_.Substring(8) }
-            else { $path_.Substring(4) }
+            elseif ($path_.StartsWith('\\?\UNC\')) { $found.Add('\\' + $path_.Substring(8)) }
+            else { $found.Add($path_.Substring(4)) }
         }
     }
+    # One object, not 33k pipeline items: the closure check walks this list.
+    return ,$found
+}
+
+# Serial batch hasher used by the parallel closure check. One SHA-256 instance
+# per worker, an explicit Initialize() before every file, and the bytes still
+# read in full. Nothing here skips a file or trusts a timestamp.
+$closureWorker = {
+    param([string[]]$Relative, [string[]]$Native, [string[]]$Expected)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    $count = 0
+    $bytes = 0L
+    $damaged = New-Object 'Collections.Generic.List[string]'
+    try {
+        for ($i = 0; $i -lt $Relative.Count; $i++) {
+            $stream = [IO.File]::OpenRead($Native[$i])
+            try {
+                $bytes += $stream.Length
+                $algorithm.Initialize()
+                $digest = $algorithm.ComputeHash($stream)
+            } finally { $stream.Dispose() }
+            if ([BitConverter]::ToString($digest).Replace('-', '') -cne $Expected[$i]) { $damaged.Add($Relative[$i]) }
+            $count++
+        }
+    } finally { $algorithm.Dispose() }
+    , @($count, $bytes, $damaged.ToArray())
+}
+
+# Full closure check over every file in the package, in parallel batches.
+# Every byte of the packaged closure is read and compared to the manifest; the
+# only change against the serial version is that the same work is spread over
+# ProcessorCount workers instead of one PowerShell statement stream.
+function Verify-Closure([string]$Root, $Manifest, $Allowed) {
+    $hashes = $Manifest.files
+    $relative = New-Object 'Collections.Generic.List[string]'
+    $native = New-Object 'Collections.Generic.List[string]'
+    $expected = New-Object 'Collections.Generic.List[string]'
+    $seen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in (Package-Files $Root)) {
+        $name = $file.Substring($Root.Length + 1).Replace('\', '/')
+        if ($name -eq 'candidate-manifest.json') { continue }
+        if (-not $Allowed.Contains($name)) { throw "Unexpected package file: $name" }
+        if (-not $hashes.ContainsKey($name)) { throw "Package file list is invalid: $name" }
+        $relative.Add($name)
+        $native.Add('\\?\' + $file)
+        $expected.Add($hashes[$name].ToUpperInvariant())
+        [void]$seen.Add($name)
+    }
+    if ($seen.Count -ne $Allowed.Count) { throw 'Package files are missing. Extract the complete download again.' }
+    $degree = [Math]::Min([Math]::Max(1, [Environment]::ProcessorCount), 8)
+    $batch = [Math]::Max(64, [int][Math]::Ceiling($relative.Count / ($degree * 4)))
+    $batches = New-Object 'Collections.Generic.List[object]'
+    for ($start = 0; $start -lt $relative.Count; $start += $batch) {
+        $take = [Math]::Min($batch, $relative.Count - $start)
+        $batches.Add(@($relative.GetRange($start, $take).ToArray(),
+            $native.GetRange($start, $take).ToArray(), $expected.GetRange($start, $take).ToArray()))
+    }
+    $pool = [runspacefactory]::CreateRunspacePool(1, [Math]::Min($degree, $batches.Count))
+    $pool.Open()
+    try {
+        $handles = New-Object 'Collections.Generic.List[object]'
+        foreach ($work in $batches) {
+            $shell = [powershell]::Create()
+            $shell.RunspacePool = $pool
+            [void]$shell.AddScript($closureWorker).AddArgument($work[0]).AddArgument($work[1]).AddArgument($work[2])
+            $handles.Add([pscustomobject]@{ Shell = $shell; Handle = $shell.BeginInvoke() })
+        }
+        $count = 0
+        $bytes = 0L
+        $damaged = New-Object 'Collections.Generic.List[string]'
+        foreach ($item in $handles) {
+            try {
+                $result = @($item.Shell.EndInvoke($item.Handle))
+                if ($result.Count -ne 1) {
+                    $detail = if ($item.Shell.Streams.Error.Count) { $item.Shell.Streams.Error[0].ToString() } else { 'no result' }
+                    throw "Package verification worker failed: $detail"
+                }
+                $count += $result[0][0]
+                $bytes += $result[0][1]
+                if ($result[0][2]) { foreach ($name in $result[0][2]) { $damaged.Add($name) } }
+            } finally { $item.Shell.Dispose() }
+        }
+        if ($damaged.Count) {
+            throw "Damaged package file: $($damaged[0])"
+        }
+        if ($count -ne $Allowed.Count) { throw 'Package files are missing. Extract the complete download again.' }
+    } finally {
+        $pool.Close()
+        $pool.Dispose()
+    }
+    return $bytes
 }
 
 function Verify-Package([string]$Root, [switch]$InstalledStart) {
@@ -113,6 +205,19 @@ function Verify-Package([string]$Root, [switch]$InstalledStart) {
             throw 'DSH Hook manifest does not match the package file list.'
         }
     }
+    if ($manifest.ContainsKey('dshRuntime')) {
+        $dsh = $manifest.dshRuntime
+        if ($dsh.rootVersion -cne '0.2.0-rc.2') { throw 'Unsupported bundled DSH version.' }
+        foreach ($required in @('runtime/pi/node/node.exe', 'runtime/dsh/dsh-runtime-bundle.json',
+            'runtime/dsh/verify.mjs', 'runtime/dsh/package.json', 'runtime/dsh/package-lock.json',
+            'runtime/dsh/node_modules/.bin/dsh.cmd', 'runtime/dsh/THIRD-PARTY-NOTICES.txt')) {
+            if (-not $allowed.Contains($required)) { throw "DSH runtime is incomplete: $required" }
+        }
+        if ($dsh.manifestSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $dsh.manifestSha256 -cne $manifest.files.'runtime/dsh/dsh-runtime-bundle.json') {
+            throw 'DSH runtime manifest does not match the package file list.'
+        }
+    }
     if ($InstalledStart) {
         # The whole closure was verified before activation. Recheck entry
         # points on launch without rereading thousands of Pi dependency files.
@@ -121,21 +226,18 @@ function Verify-Package([string]$Root, [switch]$InstalledStart) {
             @($allowed | Where-Object {
                 $_ -match '^runtime/dsh-hook-executor/(hook-executor-bundle\.json|executor\.mjs|verify\.mjs|package(?:-lock)?\.json|THIRD-PARTY-NOTICES\.txt)$'
             })
+        if ($manifest.ContainsKey('dshRuntime')) {
+            $entries += @('runtime/pi/node/node.exe', 'runtime/dsh/dsh-runtime-bundle.json',
+                'runtime/dsh/verify.mjs', 'runtime/dsh/package.json', 'runtime/dsh/package-lock.json',
+                'runtime/dsh/node_modules/.bin/dsh.cmd')
+        }
         foreach ($relative in $entries) {
             $file = Resolve-Directory (Join-Path $Root $relative)
-            if ((File-Hash $file) -cne $manifest.files.$relative) { throw "Damaged program file: $relative" }
+            if ((File-Hash $file) -cne $manifest.files[$relative]) { throw "Damaged program file: $relative" }
         }
         return $manifest
     }
-    $seen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    foreach ($file in Package-Files $Root) {
-        $relative = $file.Substring($Root.Length + 1).Replace('\', '/')
-        if ($relative -eq 'candidate-manifest.json') { continue }
-        if (-not $allowed.Contains($relative)) { throw "Unexpected package file: $relative" }
-        if ((File-Hash $file) -cne $manifest.files.$relative) { throw "Damaged package file: $relative" }
-        [void]$seen.Add($relative)
-    }
-    if ($seen.Count -ne $allowed.Count) { throw 'Package files are missing. Extract the complete download again.' }
+    [void](Verify-Closure $Root $manifest $allowed)
     return $manifest
 }
 
@@ -192,6 +294,30 @@ function Run-Loom([string]$Root, [string]$DataRoot, [int]$ListenPort, $Manifest)
     $env:CODEX_HOME = Join-Path $DataRoot 'runtime-home\codex'
     $env:CLAUDE_CONFIG_DIR = Join-Path $DataRoot 'runtime-home\claude'
     $env:DSH_HOME = Join-Path $DataRoot 'runtime-home\dsh'
+    $oldPath = $env:Path
+    $oldNodeOptions = $env:NODE_OPTIONS
+    $oldNodePath = $env:NODE_PATH
+    $oldDshBinary = $env:ROVAI_DEEPSEEK_HARNESS_BIN
+    if ($Manifest.ContainsKey('dshRuntime')) {
+        $node = Join-Path $Root 'runtime\pi\node\node.exe'
+        $dsh = Join-Path $Root 'runtime\dsh'
+        $dshBinary = Join-Path $dsh 'node_modules\.bin\dsh.cmd'
+        $env:NODE_OPTIONS = $null
+        $env:NODE_PATH = $null
+        $env:Path = (Split-Path -Parent $node) + [IO.Path]::PathSeparator + $oldPath
+        $ownedPriorDsh = $oldDshBinary -and $oldDshBinary -match '(?i)[\\/]LOOM-Personal[\\/]versions[\\/][0-9a-f]{40}[\\/]runtime[\\/]dsh[\\/]node_modules[\\/]\.bin[\\/]dsh\.cmd$'
+        if (-not $oldDshBinary -or $ownedPriorDsh) { $env:ROVAI_DEEPSEEK_HARNESS_BIN = $dshBinary }
+        try {
+            & $node (Join-Path $dsh 'verify.mjs') $Manifest.dshRuntime.manifestSha256 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Bundled DSH runtime verification failed before startup.' }
+        } catch {
+            $env:Path = $oldPath
+            $env:NODE_OPTIONS = $oldNodeOptions
+            $env:NODE_PATH = $oldNodePath
+            $env:ROVAI_DEEPSEEK_HARNESS_BIN = $oldDshBinary
+            throw
+        }
+    }
     # Host-owned configuration only. The browser still requires independent
     # view/control consent; the assistant bridge still requires its own grant.
     if ($Manifest.ContainsKey('computerRuntime')) {
@@ -206,8 +332,17 @@ function Run-Loom([string]$Root, [string]$DataRoot, [int]$ListenPort, $Manifest)
     Write-Host "Personal data: $DataRoot"
     # The native Server prepares its private data root, Skill library and MCP
     # path. Never create this directory with inherited ACLs in the launcher.
-    & (Join-Path $Root 'rovai-server.exe') --data-dir $DataRoot --listen "127.0.0.1:$ListenPort"
-    if ($LASTEXITCODE -ne 0) { throw "LOOM could not start (exit $LASTEXITCODE). Your data was kept." }
+    try {
+        & (Join-Path $Root 'rovai-server.exe') --data-dir $DataRoot --listen "127.0.0.1:$ListenPort"
+        if ($LASTEXITCODE -ne 0) { throw "LOOM could not start (exit $LASTEXITCODE). Your data was kept." }
+    } finally {
+        if ($Manifest.ContainsKey('dshRuntime')) {
+            $env:Path = $oldPath
+            $env:NODE_OPTIONS = $oldNodeOptions
+            $env:NODE_PATH = $oldNodePath
+            $env:ROVAI_DEEPSEEK_HARNESS_BIN = $oldDshBinary
+        }
+    }
 }
 
 $InstallDirectory = Resolve-Directory $InstallDirectory

@@ -6,25 +6,178 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash, randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises'
-import { dirname, join, relative, resolve, sep } from 'node:path'
+import { lstat, mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { prepareLivePiHost } from './loom-live-pi-host.mjs'
 import { redactDeep, verifyArchivedArtifact } from '../accept-loom-live-lead.mjs'
-import { UI, TEXT, findSecretLeak, pickNewMission, rosterJs, tagMemberJs, tagByTextJs, tagChoiceItemJs } from './loom-browser-live-mode.mjs'
+import { UI, TEXT, findSecretLeak, pickNewMission, rosterJs, tagMemberJs, tagByTextJs } from './loom-browser-live-mode.mjs'
 import * as ab from './ab-browser.mjs'
-import { confirmOwnedPage, pageScript } from './loom-owned-page.mjs'
+import { confirmOwnedPage, pageScript, radioChoiceSelector } from './loom-owned-page.mjs'
 
 const OUT = resolve(process.env.LOOM_PI_PURGE_UI_EVIDENCE ?? '')
 const optIn = process.env.LOOM_ALLOW_LIVE_ACCEPTANCE === '1' && process.env.LOOM_ALLOW_PI_PURGE_UI_ACCEPTANCE === '1'
 const pause = ms => new Promise(done => setTimeout(done, ms))
 const hash = data => createHash('sha256').update(data).digest('hex')
+
+// The rendered value of the Lead choice trigger; the controlled read for both the
+// re-pick decision and its read-back.
+const LEAD_TEXT_JS = 'document.querySelector(' + JSON.stringify(UI.leadTrigger) + ')?.querySelector(":scope > span:not(.ln-avatar)")?.textContent.trim()'
+
+// The Lead is re-picked only when the rendered controlled value is not the target
+// member. One pick, then the rendered value is read back. Kept as one extractable
+// function so the offline page-script test drives this branch instead of the live run.
+async function applyLeadChoice(evalValue, choose, persist, report, target, assert) {
+  const currentLead = await evalValue(LEAD_TEXT_JS)
+  const patch = { currentLead: currentLead ?? null, targetMember: target.displayName, repicked: currentLead !== target.displayName }
+  report.steps.leadChoice = patch
+  if (currentLead === target.displayName) {
+    await persist()
+    return patch
+  }
+  await choose(UI.leadTrigger, target.displayName, 'purge-lead')
+  const appliedLead = await evalValue(LEAD_TEXT_JS)
+  assert.equal(appliedLead, target.displayName, 'the chosen Lead must render as the controlled value')
+  patch.appliedLead = appliedLead
+  await persist()
+  return patch
+}
 const FILE = 'pi-persona-result.md'
-const TASK = 'pi-persona-file'
+// The model-facing byte ask and the independent hard cap are reported separately: the
+// goal text is not a gate, the hard cap is.
+const MAX_BYTES_ASKED = 200
+const HARD_MAX_BYTES = 1000
+const LITERAL_ACCEPT_LINE = '等待用户接受'
+// The rendered body area only. The aside shows the task description, which may quote the
+// goal text, so a marker read from the whole dialog proves nothing about the file body.
+const ARTIFACT_BODY_TEXT_JS = '(() => { const doc = document.querySelector(".ln-artifact-dialog .ln-artifact-document"); if (!doc) return null; const body = doc.querySelector(".ln-markdown, .ln-artifact-text"); return body ? body.innerText : null })()'
+const ARTIFACT_PREVIEW_SETTLED_JS = '(() => { const doc = document.querySelector(".ln-artifact-dialog .ln-artifact-document"); if (!doc) return false; if (doc.querySelector(".ln-artifact-state[data-state=reading]")) return false; return !!(doc.querySelector(".ln-markdown, .ln-artifact-text") || doc.querySelector(".ln-artifact-state[data-state=error], .ln-artifact-state[data-state=unavailable]")) })()'
+const ARTIFACT_DIALOG_READ_JS = '(() => { const dialog = document.querySelector(".ln-artifact-dialog"); if (!dialog) return null; const doc = dialog.querySelector(".ln-artifact-document"); const failed = doc ? doc.querySelector(".ln-artifact-state[data-state=error], .ln-artifact-state[data-state=unavailable]") : null; const body = doc ? doc.querySelector(".ln-markdown, .ln-artifact-text") : null; return { titleText: dialog.querySelector(".ln-artifact-title")?.textContent.trim() ?? null, settled: { state: failed ? failed.dataset.state : (body ? "ready" : "unknown"), reason: failed ? failed.dataset.reason ?? null : null }, bodyText: body ? body.innerText : null } })()'
 const STUDIO = '.ln-surface-dialog.ln-studio'
 const PERSONA_INPUT = STUDIO + ' textarea[aria-label="Pi Purge 人格提示词"]'
 const PURGE_TRIGGER = STUDIO + ' button[aria-label="Pi Purge 模式"]'
 const FILE_TRIGGER = STUDIO + ' button[aria-label="文件与任务权限"]'
+const WAIT_NAMES = new Set([
+  'login_form', 'app_ready', 'studio_open', 'assistant_selected', 'runtime_controls_ready',
+  'purge_trigger_ready', 'purge_selection_applied', 'file_trigger_ready', 'file_selection_applied',
+  'lead_trigger_ready', 'lead_selection_applied',
+  'permission_confirmation', 'runtime_saved', 'studio_closed', 'work_dialog_open', 'work_dialog_closed',
+  'run_panel_open', 'artifact_row_ready', 'artifact_preview_open', 'artifact_preview_settled'
+])
+
+// Verbatim device paths (`\\?\C:\...`) name the same directory as the plain form.
+function normalizeRoot(value) {
+  if (typeof value !== 'string' || value === '') return null
+  return value.replace(/^\\\\\?\\/u, '').replace(/[\\/]+$/u, '').toLowerCase()
+}
+
+// Five provenance conclusions, all of them hard. Every one fails closed.
+// 1. the target was observed absent at this exact path before the UI submitted;
+// 2. the Run really worked in that same directory;
+// 3. the first write to the target inside this Run/bot/epoch guard log created a new file
+//    under a claim that was already held;
+// Extracted (parameter-only) so `loom-pi-purge-page-scripts.test.mjs` can drive the
+// negatives offline, without a Host, a browser, or a model request.
+function adjudicateSourceProvenance(raw, assert) {
+  const relativePath = raw.relativePath
+  const baseline = raw.baseline ?? {}
+  assert.equal(baseline.exists, false, 'the target file must not exist before the UI submits')
+  assert.equal(baseline.errorCode, 'ENOENT', 'the baseline must observe ENOENT, not an existing file or a permission error')
+  assert.equal(baseline.insideDataDir, true, 'the target path must stay inside the isolated data directory')
+  assert.equal(baseline.relativePath, relativePath)
+  const baselineRoot = normalizeRoot(baseline.executionRoot)
+  const runRoot = normalizeRoot(raw.workspace?.executionRoot)
+  assert.ok(baselineRoot, 'the baseline must record its execution root')
+  assert.ok(runRoot, 'the Run must record its workspace execution root')
+  assert.equal(runRoot, baselineRoot, 'the Run workspace must be the directory the baseline observed')
+  const guard = raw.guard ?? {}
+  assert.equal(guard.epoch, raw.epoch, 'the guard log must belong to this execution epoch')
+  assert.equal(guard.runId, raw.runId, 'the guard log must belong to this Run')
+  assert.equal(guard.botId, raw.botId, 'the guard log must belong to this member')
+  const rows = guard.rows ?? []
+  const writeDecisions = rows.filter(row => row.t === 'decision' && ['write', 'edit'].includes(row.toolName))
+  assert.ok(writeDecisions.every(row => row.relPath === relativePath), 'only the requested work file may be written')
+  const writes = writeDecisions.filter(row => row.relPath === relativePath)
+  assert.ok(writes.length > 0, 'the guard must observe the actual write of the target file')
+  const first = [...writes].sort((left, right) => left.at - right.at)[0]
+  assert.equal(first.toolName, 'write', 'the first write to the target must be a native write')
+  assert.equal(first.decision, 'allow', 'the first write to the target must be allowed')
+  assert.equal(first.reasonCode, 'in_workspace_new_file', 'the first write must create the file, not overwrite one')
+  const claimedAt = Date.parse(raw.claim?.claimedAt ?? '')
+  assert.ok(Number.isFinite(claimedAt), 'the claim must carry a parseable claimedAt')
+  assert.ok(claimedAt <= first.at, 'the claim must precede the first write of the target file')
+  return {
+    before: { executionRoot: baseline.executionRoot, relativePath, observedAt: baseline.observedAt, exists: false, errorCode: baseline.errorCode },
+    workspace: { executionRootRaw: raw.workspace.executionRoot, matchesBaselineRoot: true, isolation: raw.workspace.isolation ?? null },
+    claim: { claimId: raw.claim.claimId, claimedAt: raw.claim.claimedAt, claimedAtMs: claimedAt, epoch: raw.epoch },
+    firstWrite: { toolName: first.toolName, decision: first.decision, reasonCode: first.reasonCode, relPath: first.relPath, at: first.at, atIso: new Date(first.at).toISOString(), guardPath: guard.path ?? null, claimedAtBeforeWrite: true }
+  }
+}
+
+// The archived text is split into whole lines. Only the random persona marker is a
+// content gate; the work nonce and the literal accept line are reported compliance.
+// `exactCopyMet` is therefore true only when the model copied the requested lines.
+function adjudicateContentCompliance(raw, assert) {
+  const text = raw.text
+  assert.equal(typeof text, 'string', 'the archived text must be readable')
+  const lines = text.split(/\r?\n/u).map(line => line.trim())
+  const personaMarkerLine = lines.includes(raw.marker)
+  const workNonceLine = lines.includes(raw.nonce)
+  const literalAcceptLine = lines.includes(raw.literalAccept)
+  const sizeBytes = raw.sizeBytes
+  assert.ok(Number.isInteger(sizeBytes) && sizeBytes >= 0, 'the archive size must be a real byte count')
+  assert.equal(sizeBytes, Buffer.byteLength(text, 'utf8'), 'the archive text must be the exact file bytes')
+  assert.ok(sizeBytes <= raw.hardMaxBytes, 'the delivered file must stay under the hard byte cap')
+  assert.equal(personaMarkerLine, true, 'the archive must carry this round whole-line persona marker')
+  return {
+    personaMarkerLine, workNonceLine, literalAcceptLine, sizeBytes,
+    requestedMaxBytes: raw.requestedMaxBytes, hardMaxBytes: raw.hardMaxBytes,
+    withinRequestedMaxBytes: sizeBytes <= raw.requestedMaxBytes,
+    exactCopyMet: workNonceLine && literalAcceptLine && sizeBytes <= raw.requestedMaxBytes
+  }
+}
+
+// Opening a result must never accept it: PENDING and zero Owner Reviews, read before and
+// after the preview opens.
+function adjudicateCandidateState(raw, assert) {
+  const result = { before: null, after: null, autoAccepted: false }
+  for (const phase of ['before', 'after']) {
+    const state = raw[phase] ?? {}
+    const status = typeof state.acceptanceStatus === 'string' ? state.acceptanceStatus.toLowerCase() : null
+    assert.equal(status, 'pending', 'the candidate must still be PENDING ' + phase + ' the preview')
+    assert.equal(status === 'accepted' || status === 'rejected', false, 'the candidate must never be auto-accepted ' + phase + ' the preview')
+    assert.equal(state.reviewCount, 0, 'no Owner Review may exist ' + phase + ' the preview')
+    result[phase] = { acceptanceStatus: state.acceptanceStatus, reviewCount: state.reviewCount }
+  }
+  return result
+}
+
+// The dialog must show the registered file name and the body area — not the aside — must
+// render this round marker, after the preview reached a terminal state.
+function adjudicatePreviewEvidence(raw, assert) {
+  assert.equal(raw.settled?.state, 'ready', 'the preview must settle on a body, not on loading, error or unavailable')
+  assert.equal(raw.titleText, raw.relativePath, 'the dialog must show the registered artifact file name')
+  assert.equal(typeof raw.bodyText, 'string', 'the rendered body must be readable')
+  assert.equal(raw.bodyText.includes(raw.marker), true, 'the rendered body area must show this round persona marker')
+  return { settledState: raw.settled.state, titleShown: raw.titleText, markerInBody: true, bodyLength: raw.bodyText.length }
+}
+
+// Every record in the chain must point at the same Run, Task, Artifact and Candidate.
+function adjudicateChainBinding(raw, assert) {
+  const { task, claim, candidate, artifact, runId, agentId, relativePath } = raw
+  assert.ok(claim, 'the real Run must hold its own task claim')
+  assert.equal(claim.agentRunId, runId, 'the claim must name this Run')
+  assert.equal(claim.claimantAgentId, agentId, 'the claim must name this member')
+  assert.equal(claim.taskId, task.taskId, 'the claim must name the single Task')
+  assert.equal(candidate.taskId, task.taskId, 'the candidate must reference the single Task')
+  assert.equal(candidate.agentRunId, runId, 'the candidate must reference this Run')
+  assert.ok(Array.isArray(candidate.evidenceIds) && candidate.evidenceIds.includes(artifact.artifactId), 'the candidate must reference the registered artifact')
+  assert.equal(artifact.agentRunId, runId, 'the artifact must be registered by this Run')
+  assert.equal(artifact.taskId, task.taskId, 'the artifact must be bound to the Task')
+  assert.equal(artifact.creatorId, agentId, 'the artifact must be created by the claimed member')
+  assert.equal(artifact.relativePath, relativePath, 'the artifact must register the requested file')
+  return { taskId: task.taskId, claimId: claim.claimId, candidateId: candidate.candidateId, artifactId: artifact.artifactId }
+}
 
 test('production UI saves Pi Append and starts one real file delivery with the frozen persona', {
   timeout: 45 * 60_000, skip: optIn ? false : 'explicit live Pi Purge UI opt-in required'
@@ -41,12 +194,13 @@ test('production UI saves Pi Append and starts one real file delivery with the f
     hostAuthoredPlan: false, hostRegisteredArtifact: false, hostSubmittedCandidate: false,
     ownerReviewRecorded: false, globalSettingsChanged: false, modelRequestsScripted: false,
     providerPromptInspected: false, backendModelIdentityVerified: false,
-    marker, nonce, personaSha256: hash(persona), steps: {}, screenshots: {}, startedAt: new Date().toISOString()
+    marker, nonce, personaSha256: hash(persona), provenance: {}, contentCompliance: null,
+    steps: {}, screenshots: {}, startedAt: new Date().toISOString()
   }
   const secrets = [process.env.LOOM_E4_PROVIDER_KEY].filter(Boolean)
   let prepared, tabId, runId, epoch, missionId, threadId, agentId, latestSnapshot
   let focusHeld = false
-  const receipts = new Map(), guardReceipts = new Map(), bindings = new Map()
+  const receipts = new Map(), guardReceipts = new Map(), guardFiles = new Map(), bindings = new Map()
   const persist = async () => {
     const redacted = redactDeep(report, secrets)
     assert.equal(findSecretLeak(JSON.stringify(redacted), secrets).length, 0)
@@ -63,12 +217,21 @@ test('production UI saves Pi Append and starts one real file delivery with the f
     assert.equal(result.ok, true, 'page read unconfirmed: ' + result.reason)
     return result.value
   }
-  async function waitPage(expression, seconds = 45) {
+  async function waitPage(name, expression, seconds = 45) {
+    assert.equal(WAIT_NAMES.has(name), true, 'page wait must have a fixed diagnostic name')
+    report.waitingFor = name
+    await persist()
     const deadline = Date.now() + seconds * 1000
     while (Date.now() < deadline) {
-      if (await evalValue(expression) === true) return
+      if (await evalValue(expression) === true) {
+        report.lastSatisfiedWait = name
+        report.waitingFor = null
+        await persist()
+        return
+      }
       await pause(600)
     }
+    report.waitTimeout = { name, seconds }
     throw new Error('page_state_timeout')
   }
   async function waitSignal(name) {
@@ -89,19 +252,40 @@ test('production UI saves Pi Append and starts one real file delivery with the f
     click('[data-loom-qa="' + tag + '"]')
   }
   async function choose(trigger, label, tag) {
-    await waitPage('!!document.querySelector(' + JSON.stringify(trigger) + ')')
+    // Every real choice target the fixture drives, declared here so the page
+    // script test can extract and drive this one function unchanged.
+    const waits = {
+      'purge-append': ['purge_trigger_ready', 'purge_selection_applied'],
+      'purge-file-policy': ['file_trigger_ready', 'file_selection_applied'],
+      'purge-lead': ['lead_trigger_ready', 'lead_selection_applied']
+    }[tag]
+    assert.ok(waits, 'unknown choice target: ' + tag)
+    const [readyWait, selectedWait] = waits
+    await waitPage(readyWait, '(() => { const e=document.querySelector(' + JSON.stringify(trigger) + '); return !!e&&!e.disabled&&e.getAttribute("aria-disabled")!=="true"&&e.getClientRects().length>0 })()')
     await evalValue('(() => { document.querySelector(' + JSON.stringify(trigger) + ').scrollIntoView({block:"center"}); return true })()')
-    const opened = ab.abTrustedClick(tabId, trigger, { env: process.env })
-    assert.equal(opened.verdict, 'OK', 'choice trigger input not verified: ' + opened.reason)
-    await waitPage('document.querySelectorAll(' + JSON.stringify(UI.choiceItem) + ').length > 0', 20)
     const actual = label
-    const marked = await evalValue(tagChoiceItemJs(tag, actual))
-    assert.equal(marked?.found, true, 'choice missing: ' + label)
-    const picked = ab.abPick(tabId, '[data-loom-qa="' + tag + '"]', { env: process.env, open: trigger, value: actual })
     report.steps.choiceInputs ??= []
-    report.steps.choiceInputs.push({ name: label, verdict: picked.verdict, reason: picked.reason })
+    const input = { name: label, phase: 'pick_started', opener: 'owned_by_idempotent_pick' }
+    report.steps.choiceInputs.push(input)
+    await persist()
+    const picked = ab.abPick(tabId, radioChoiceSelector(actual), { env: process.env, open: trigger, value: actual })
+    Object.assign(input, { phase: 'pick_returned', verdict: picked.verdict, reason: picked.reason })
+    await persist()
+    let final = picked
+    if (picked.verdict === 'FAILED' && picked.reason === 'pick_not_found') {
+      // A missing option means the toggle never expanded: nothing was picked, so one
+      // bounded repeat of the same opener cannot duplicate a selection. Any other
+      // failure (UNKNOWN included) stays final and is never replayed.
+      input.phase = 'pick_retry_after_missing_option'
+      await persist()
+      final = ab.abPick(tabId, radioChoiceSelector(actual), { env: process.env, open: trigger, value: actual })
+      Object.assign(input, { phase: 'pick_returned_retry', verdict: final.verdict, reason: final.reason, attempts: 2 })
+      await persist()
+    }
     // An uncertain click is never replayed: only the exact controlled trigger proves selection.
-    await waitPage('document.querySelector(' + JSON.stringify(trigger) + ')?.querySelector(":scope > span:not(.ln-avatar)")?.textContent.trim() === ' + JSON.stringify(actual), 20)
+    await waitPage(selectedWait, 'document.querySelector(' + JSON.stringify(trigger) + ')?.querySelector(":scope > span:not(.ln-avatar)")?.textContent.trim() === ' + JSON.stringify(actual), 20)
+    input.phase = 'selection_verified'
+    await persist()
   }
   async function screenshot(name) {
     const path = join(OUT, name + '.png')
@@ -112,6 +296,28 @@ test('production UI saves Pi Append and starts one real file delivery with the f
   function query(sql, ...args) {
     const db = new DatabaseSync(join(prepared.evidence.dataDir, 'rovai.sqlite'), { readOnly: true })
     try { return db.prepare(sql).all(...args) } finally { db.close() }
+  }
+  // The only acceptable baseline: the exact target path is absent (ENOENT) before the UI
+  // submits. An existing file, a permission error or an escaping path all fail closed.
+  async function observeBaselineTarget() {
+    const dataDir = resolve(prepared.evidence.dataDir)
+    const root = resolve(dataDir, 'quick-chat')
+    const target = resolve(root, FILE)
+    const offset = relative(dataDir, target)
+    const insideDataDir = offset !== '' && offset !== '..' && !offset.startsWith('..' + sep) && !isAbsolute(offset)
+    let exists = null, errorCode = null
+    try {
+      await lstat(target)
+      exists = true
+    } catch (error) {
+      exists = false
+      errorCode = error?.code ?? 'unknown'
+    }
+    const record = { executionRoot: root, relativePath: FILE, targetPath: target,
+      observedAt: new Date().toISOString(), exists, errorCode, insideDataDir }
+    report.provenance.before = record
+    await persist()
+    return record
   }
   async function captureNativeEvidence() {
     if (!runId) return
@@ -133,6 +339,15 @@ test('production UI saves Pi Append and starts one real file delivery with the f
         const guardOwnedByRun = entry.name === 'guard.jsonl'
           && rows.some(row => row.t === 'guard_ready' && row.runId === runId && row.botId === agentId)
           && !rows.some(row => row.t === 'guard_ready' && (row.runId !== runId || row.botId !== agentId))
+        if (entry.name === 'guard.jsonl' && guardOwnedByRun) {
+          // The execution epoch is carried by the log directory name `<runId>-<epoch>`, so a
+          // log left over from an older epoch can never stand in for this Run's log.
+          const directory = basename(dirname(path))
+          const prefix = runId + '-'
+          const parsed = directory.startsWith(prefix) ? Number(directory.slice(prefix.length)) : Number.NaN
+          guardFiles.set(path, { path, epoch: Number.isInteger(parsed) ? parsed : null, runId, botId: agentId,
+            rows: rows.map(row => ({ ...row })) })
+        }
         for (const row of rows) {
           if (entry.name === 'guard.jsonl' ? !guardOwnedByRun
             : row.runId !== runId || row.botId !== agentId || row.executionEpoch !== epoch) continue
@@ -169,7 +384,8 @@ test('production UI saves Pi Append and starts one real file delivery with the f
     for (const [name, expected] of Object.entries(proof.webFiles)) {
       assert.equal(hash(await readFile(join(config.uiDirectory, name))), expected, 'pinned UI snapshot changed')
     }
-    prepared = await prepareLivePiHost({ configPath, providerKey: process.env.LOOM_E4_PROVIDER_KEY })
+    prepared = await prepareLivePiHost({ configPath, providerKey: process.env.LOOM_E4_PROVIDER_KEY,
+      timingsPath: join(OUT, 'host-preparation.json') })
     secrets.push(...prepared.secrets)
     assert.equal(prepared.evidence.hostSha256, proof.hostSha256)
     assert.equal(prepared.evidence.helperSha256, proof.helperSha256)
@@ -200,26 +416,26 @@ test('production UI saves Pi Append and starts one real file delivery with the f
     report.tabId = tabId
     report.steps.browserOpen = { verdict: opened.verdict, reason: opened.reason, openedTabId: tabId }
     report.steps.pageIdentity = await confirmOwnedPage(tabId, prepared.origin, { env: process.env })
-    await waitPage('!!document.querySelector(' + JSON.stringify(UI.loginToken) + ')', 60)
+    await waitPage('login_form', '!!document.querySelector(' + JSON.stringify(UI.loginToken) + ')', 60)
     assert.equal(ab.abFill(tabId, UI.loginToken, prepared.adminToken, { env: process.env }).verdict, 'OK')
     click(UI.loginSubmit)
-    await waitPage('!document.querySelector(' + JSON.stringify(UI.loginOverlay) + ') && !!document.querySelector(' + JSON.stringify(UI.appRoot) + ')', 90)
+    await waitPage('app_ready', '!document.querySelector(' + JSON.stringify(UI.loginOverlay) + ') && !!document.querySelector(' + JSON.stringify(UI.appRoot) + ')', 90)
     await stage('save_append_from_ui')
     click('.ln-rail button[aria-label="管理助手"]')
-    await waitPage('!!document.querySelector(' + JSON.stringify(STUDIO) + ')')
+    await waitPage('studio_open', '!!document.querySelector(' + JSON.stringify(STUDIO) + ')')
     await clickText(STUDIO + ' .ln-studio-roster button', target.displayName, 'purge-assistant')
-    await waitPage('document.querySelector(' + JSON.stringify(STUDIO + ' .ln-studio-identity h3') + ')?.textContent.trim() === ' + JSON.stringify(target.displayName))
+    await waitPage('assistant_selected', 'document.querySelector(' + JSON.stringify(STUDIO + ' .ln-studio-identity h3') + ')?.textContent.trim() === ' + JSON.stringify(target.displayName))
     await clickText(STUDIO + ' .ln-studio-tabs button', '运行与权限', 'purge-runtime')
-    await waitPage('!!document.querySelector(' + JSON.stringify(PURGE_TRIGGER) + ')')
+    await waitPage('runtime_controls_ready', '(() => { const e=document.querySelector(' + JSON.stringify(PURGE_TRIGGER) + '); return !!e&&!e.disabled&&e.getAttribute("aria-disabled")!=="true" })()')
     await choose(PURGE_TRIGGER, '追加助手设定', 'purge-append')
     assert.equal(ab.abFill(tabId, PERSONA_INPUT, persona, { env: process.env }).verdict, 'OK')
     await choose(FILE_TRIGGER, '读写文件并处理任务', 'purge-file-policy')
     await screenshot('append-draft')
     await clickText(STUDIO + ' .ln-form-actions button', '保存运行配置', 'purge-save')
-    await waitPage('[...document.querySelectorAll(".ln-surface-title h2")].some(e=>e.textContent.trim()==="确认权限配置")')
+    await waitPage('permission_confirmation', '[...document.querySelectorAll(".ln-surface-title h2")].some(e=>e.textContent.trim()==="确认权限配置")')
     const confirmation = '.ln-surface-dialog.ln-room-dialog'
     await clickText(confirmation + ' .ln-form-actions button', '确认并保存', 'purge-confirm')
-    await waitPage('[...document.querySelectorAll(' + JSON.stringify(STUDIO + ' [role="status"]') + ')].some(e=>e.textContent.includes("已保存，下次运行生效。"))', 60)
+    await waitPage('runtime_saved', '[...document.querySelectorAll(' + JSON.stringify(STUDIO + ' [role="status"]') + ')].some(e=>e.textContent.includes("已保存，下次运行生效。"))', 60)
     const saved = await facts('members.get', { agentId })
     assert.deepEqual(saved.runtimeConfiguration.piPurge, { mode: 'append', persona })
     assert.equal(saved.runtimeConfiguration.permissions.values.loom_file_access, 'workspace_workflow')
@@ -232,23 +448,37 @@ test('production UI saves Pi Append and starts one real file delivery with the f
     report.steps.otherAssistantsUnchanged = true
     await screenshot('append-saved')
     click(STUDIO + ' > header button[aria-label="关闭窗口"]')
-    await waitPage('!document.querySelector(' + JSON.stringify(STUDIO) + ')')
+    await waitPage('studio_closed', '!document.querySelector(' + JSON.stringify(STUDIO) + ')')
 
+    // The tool writes this text verbatim into the Mission description. Four earlier
+    // rounds showed a long briefing gets summarised: the model paraphrased the accept
+    // line, dropped the work nonce, and added its own title and table. So the copy
+    // template is now the last thing in the text, outside any code fence, with no
+    // competing "write a heading/status" wording anywhere in the instruction.
+    // The persona marker is deliberately NOT named here: it must arrive through the
+    // frozen persona, and `goal.includes(marker) === false` is the proof of that.
     const goal = [
-      '这是单助手隔离验收，请你自己在当前这一轮完成，不创建其他运行，不安排其他助手。',
-      '你同时是本工作的主助手和唯一执行者。你的成员ID是 ' + agentId + '。',
-      '先用 rovai_loom 的 loom.status 读取当前工作，再用 loom.plan 创建恰好一个分配给你自己的任务：taskId=' + TASK + '；acceptanceCriteriaVersion=pi-persona-ui-v1；至少一个验收标准要求真实文件已登记且仍待用户接受。',
-      '然后依次 loom.release、loom.claim 认领这个任务。拿到有效认领后，使用原生 write 创建 ' + FILE + '，使用 read 核对正文。',
-      '正文要求：标题“# Pi 助手设定验收”；一整行 ' + nonce + '；一整行“等待用户接受”；并遵守你当前已生效的助手设定。正文控制在1000字节内。',
-      '最后用 loom.evidence 登记该文件并绑定此taskId，再用 loom.submit 提交其artifactId作为evidenceIds。每一步使用实际返回值，不能编造ID。',
-      '完成后停止，保留Candidate待用户接受；不要调用评审或接受，不要用bash、shell、MCP或触碰其他文件。'
+      '隔离验收：只做一件事，把最后几行原样写进 ' + FILE + ' 并登记提交。',
+      '你是主助手也是唯一执行者，成员ID是 ' + agentId + '。',
+      '1) rovai_loom：loom.status → loom.plan（恰好 1 个任务，assigneeAgentId 填 ' + agentId + '）→ loom.release → loom.claim 认领它。',
+      '2) 原生 write 写 ' + FILE + '。',
+      '3) 原生 read 自查：文件必须含下面列出的每一整行；缺任何一行就整份重写。',
+      '4) loom.evidence 以相对路径 ' + FILE + ' 登记并绑定该任务；loom.submit 提交该 artifactId。',
+      '完成后停止，候选待用户接受；不要评审、不要接受、不要用 bash/shell/MCP、不要写其他文件。',
+      '写入文件的全部内容就是下面这几行，逐字复制，顺序不限：不要改字、不要翻译、不要同义替换、不要补任何额外的行。',
+      nonce,
+      '等待用户接受',
+      '你当前已生效的助手设定要求写入的那一整行标记（设定要求的那一行必须原样写入）',
+      '上面这几行之外不要写任何内容；整份文件不超过 ' + MAX_BYTES_ASKED + ' 字节。'
     ].join('\n')
     assert.equal(goal.includes(marker), false)
     report.steps.personaMarkerAbsentFromGoal = true
+    // The nonce stays in the submitted goal: it proves what the UI actually asked for.
+    report.steps.submittedGoalCarriesWorkNonce = goal.split(/\r?\n/u).includes(nonce)
     report.goalSha256 = hash(goal)
     await stage('start_one_work_from_ui')
     click(UI.newConversation)
-    await waitPage('!!document.querySelector(' + JSON.stringify(UI.roomDialog) + ')')
+    await waitPage('work_dialog_open', '!!document.querySelector(' + JSON.stringify(UI.roomDialog) + ')')
     await clickText(UI.roomTabs, TEXT.workMode, 'purge-work-mode')
     for (const row of await evalValue(rosterJs())) {
       if (row.checked && row.name !== target.displayName) {
@@ -264,15 +494,19 @@ test('production UI saves Pi Append and starts one real file delivery with the f
       click('[data-loom-qa="purge-only-member"] input')
     }
     assert.deepEqual((await evalValue(rosterJs())).filter(row=>row.checked).map(row=>row.name), [target.displayName])
-    const leadText = await evalValue('document.querySelector(' + JSON.stringify(UI.leadTrigger) + ')?.querySelector(":scope > span:not(.ln-avatar)")?.textContent.trim()')
-    if (leadText !== target.displayName) await choose(UI.leadTrigger, target.displayName, 'purge-lead')
+    await applyLeadChoice(evalValue, choose, persist, report, target, assert)
     const title = 'Pi 个人设定真实验收 ' + nonce.slice(-8)
     assert.equal(ab.abFill(tabId, UI.workName, title, { env: process.env }).verdict, 'OK')
     assert.equal(ab.abFill(tabId, UI.workGoal, goal, { env: process.env }).verdict, 'OK')
     assert.equal(await evalValue('document.querySelector(' + JSON.stringify(UI.workGoal) + ')?.value === ' + JSON.stringify(goal)), true)
     if (await evalValue('document.querySelector(' + JSON.stringify(UI.startNow) + ')?.checked') !== true) click(UI.startNow)
+    // 1. Source baseline, taken immediately before the one submit that starts the work.
+    const baseline = await observeBaselineTarget()
+    assert.equal(baseline.insideDataDir, true, 'the target path must stay inside the isolated data directory')
+    assert.equal(baseline.exists, false, 'the target file must not exist before the UI submits')
+    assert.equal(baseline.errorCode, 'ENOENT', 'the baseline must observe ENOENT, not an existing file or a permission error')
     click(UI.roomSubmit)
-    await waitPage('!document.querySelector(' + JSON.stringify(UI.roomDialog) + ')', 90)
+    await waitPage('work_dialog_closed', '!document.querySelector(' + JSON.stringify(UI.roomDialog) + ')', 90)
     const missions = await facts('missions.list')
     const picked = pickNewMission(missionsBefore, missions)
     assert.ok(picked.missionId, picked.reason)
@@ -329,32 +563,56 @@ test('production UI saves Pi Append and starts one real file delivery with the f
     const guardReady = [...guardReceipts.values()].find(row => row.t === 'guard_ready')
     assert.ok(guardReady)
     assert.deepEqual([...guardReady.allowedTools].sort(), ['read','write','edit','rovai_loom'].sort())
-    const writes = [...guardReceipts.values()].filter(row => row.t === 'decision' && row.decision === 'allow' && ['write','edit'].includes(row.toolName))
-    assert.ok(writes.some(row => row.toolName === 'write' && row.relPath === FILE), 'the native guard must observe the actual file write')
-    assert.ok(writes.every(row => row.relPath === FILE), 'only the requested work file may be changed')
+    const writeDecisions = [...guardReceipts.values()].filter(row => row.t === 'decision' && ['write','edit'].includes(row.toolName))
+    assert.ok(writeDecisions.some(row => row.toolName === 'write' && row.relPath === FILE), 'the native guard must observe the actual file write')
+    assert.ok(writeDecisions.every(row => row.relPath === FILE), 'only the requested work file may be changed')
     const [tasks, candidates, artifactResult, reviews, claimResult] = await Promise.all([
       facts('loom.tasks.list', { missionId }), facts('loom.candidates.list', { missionId }),
       facts('loom.artifacts.list', { missionId }), facts('loom.reviews.list', { missionId }),
       facts('loom.claims.list', { missionId })
     ])
     const claims = Array.isArray(claimResult) ? claimResult : claimResult.claims
-    const claim = claims.find(row => row.taskId === TASK && row.agentRunId === runId && row.claimantAgentId === agentId)
+    // The task id is whatever loom.plan assigned; the chain is proven by every
+    // record pointing at that same task, not by a fixture-chosen literal.
+    // `assigneeAgentId` is optional in the loom.plan schema, so a plan may leave the
+    // Task unassigned and let the Claim carry execution: the binding proof is the
+    // Claim that names this Run and this member, not the optional plan field.
+    assert.equal(tasks.length, 1, 'this round permits exactly one Task')
+    const task = tasks[0]
+    assert.ok(typeof task.taskId === 'string' && task.taskId.length > 0, 'the Task must have a real id')
+    assert.ok(task.assigneeAgentId === null || task.assigneeAgentId === agentId,
+      'the single Task must never be assigned to another member')
+    const claim = claims.find(row => row.taskId === task.taskId && row.agentRunId === runId && row.claimantAgentId === agentId)
     assert.ok(claim, 'the real Run must hold its own task claim')
-    assert.ok(Date.parse(claim.claimedAt) <= Math.min(...writes.map(row=>row.at)), 'the claim must precede the native file write')
-    report.steps.claimBeforeWrite = { claimId: claim.claimId, fenceGeneration: claim.fenceGeneration, claimedAt: claim.claimedAt }
     const artifacts = Array.isArray(artifactResult) ? artifactResult : artifactResult.artifacts
-    assert.equal(tasks.length, 1); assert.equal(tasks[0].taskId, TASK); assert.equal(tasks[0].assigneeAgentId, agentId)
+    assert.equal(tasks.length, 1); assert.equal(tasks[0].taskId, task.taskId)
+    assert.ok(tasks[0].assigneeAgentId === null || tasks[0].assigneeAgentId === agentId)
+    // The real Task row, not an ID summary: the round has to show who held it and
+    // what state it settled in beside the Claim that this Run actually took.
+    report.task = {
+      taskId: task.taskId, assigneeAgentId: task.assigneeAgentId,
+      status: task.status ?? null, title: task.title ?? null,
+      acceptanceCriteriaVersion: task.acceptanceCriteriaVersion ?? null,
+      revision: task.revision ?? null,
+      claimId: claim.claimId, claimantAgentId: claim.claimantAgentId,
+      claimAgentRunId: claim.agentRunId, claimStatus: claim.status ?? null
+    }
     assert.equal(candidates.length, 1)
     const candidate = candidates[0]
-    assert.equal(candidate.taskId, TASK); assert.equal(candidate.agentRunId, runId)
+    assert.equal(candidate.taskId, task.taskId); assert.equal(candidate.agentRunId, runId)
     assert.equal(String(candidate.acceptanceStatus).toLowerCase(), 'pending')
-    const artifact = artifacts.find(row => candidate.evidenceIds.includes(row.artifactId) && row.relativePath === FILE && row.agentRunId === runId && row.taskId === TASK)
+    const artifact = artifacts.find(row => candidate.evidenceIds.includes(row.artifactId) && row.relativePath === FILE && row.agentRunId === runId && row.taskId === task.taskId)
     assert.ok(artifact, 'candidate must reference this Run task primary file')
-    assert.equal(artifact.creatorId, agentId)
+    report.steps.chainBinding = adjudicateChainBinding({ task, claim, candidate, artifact, runId, agentId, relativePath: FILE }, assert)
     const archive = verifyArchivedArtifact({ registered: artifact, preview: await facts('loom.artifact.preview', { missionId, artifactId: artifact.artifactId }) })
     assert.equal(archive.ok, true, JSON.stringify(archive.reasons))
-    assert.ok(archive.text.includes(marker) && archive.text.includes(nonce) && archive.text.includes('等待用户接受'))
-    const workspaceRow = query("SELECT json_extract(workspace_json,'$.executionRoot') AS executionRoot FROM agent_run WHERE id=?", runId)[0]
+    // 5. Content: only the whole-line persona marker is a gate. The work nonce, the literal
+    //    accept line and the byte ask are measured compliance and reported exactly as observed.
+    report.contentCompliance = adjudicateContentCompliance({
+      text: archive.text, marker, nonce, literalAccept: LITERAL_ACCEPT_LINE,
+      sizeBytes: archive.archiveSizeBytes, requestedMaxBytes: MAX_BYTES_ASKED, hardMaxBytes: HARD_MAX_BYTES
+    }, assert)
+    const workspaceRow = query("SELECT json_extract(workspace_json,'$.executionRoot') AS executionRoot, json_extract(workspace_json,'$.isolation') AS isolation FROM agent_run WHERE id=?", runId)[0]
     assert.ok(workspaceRow?.executionRoot)
     const realWorkspace = await realpath(workspaceRow.executionRoot)
     const filePath = join(realWorkspace, FILE)
@@ -363,26 +621,92 @@ test('production UI saves Pi Append and starts one real file delivery with the f
     assert.ok(offset !== '' && offset !== '..' && !offset.startsWith('..' + sep))
     const bytes = await readFile(fileReal)
     assert.equal(hash(bytes), artifact.sha256)
-    assert.ok(bytes.length <= 1000)
+    assert.ok(bytes.length <= HARD_MAX_BYTES, 'the delivered file must stay under the hard byte cap')
+    assert.equal(report.contentCompliance.sizeBytes, bytes.length, 'the archive size and the workspace size must agree')
     assert.deepEqual(reviews, [])
+    // 2-3. This epoch's guard log, the first write of the target, and the three-way digest.
+    const guardFile = [...guardFiles.values()].find(file => file.epoch === epoch)
+    assert.ok(guardFile, 'the guard log of this execution epoch must exist')
+    const provenance = adjudicateSourceProvenance({
+      relativePath: FILE, epoch, runId, botId: agentId, baseline,
+      workspace: { executionRoot: workspaceRow.executionRoot, isolation: workspaceRow.isolation ?? null },
+      claim: { claimId: claim.claimId, claimedAt: claim.claimedAt },
+      guard: guardFile
+    }, assert)
+    const shas = { workspace: hash(bytes), artifact: artifact.sha256, archive: archive.archiveSha256 }
+    assert.equal(shas.workspace, shas.artifact, 'the workspace bytes and the registration digest must match')
+    assert.equal(shas.artifact, shas.archive, 'the registered digest and the archive digest must match')
+    const personaShas = { savedUi: report.steps.uiSaved.personaSha256, frozenRun: report.frozen.personaSha256, receipt: applied[0].personaSha256 }
+    assert.equal(new Set(Object.values(personaShas)).size, 1, 'the saved, frozen and receipt persona digests must be identical')
+    assert.equal(personaShas.frozenRun, report.personaSha256)
+    report.provenance = { ...provenance, shas: { ...shas, allEqual: true }, persona: { ...personaShas, allEqual: true } }
+    report.steps.claimBeforeWrite = { claimId: provenance.claim.claimId, claimedAt: provenance.claim.claimedAt,
+      firstWriteAt: provenance.firstWrite.atIso, claimedBeforeWrite: provenance.firstWrite.claimedAtBeforeWrite }
     report.steps.nativeApplied = true
-    report.steps.actualFile = { path: fileReal, sizeBytes: bytes.length, sha256: hash(bytes), markerMatchesSavedPersona: true, nonceMatchesUiGoal: true }
-    report.steps.modelAuthoredDelivery = { taskId: TASK, candidateId: candidate.candidateId, artifactId: artifact.artifactId, acceptanceStatus: candidate.acceptanceStatus, verificationStatus: candidate.verificationStatus }
+    report.steps.actualFile = { path: fileReal, sizeBytes: bytes.length, sha256: hash(bytes),
+      personaMarkerLine: report.contentCompliance.personaMarkerLine,
+      workNonceLine: report.contentCompliance.workNonceLine,
+      literalAcceptLine: report.contentCompliance.literalAcceptLine }
+    report.steps.modelAuthoredDelivery = { taskId: task.taskId, candidateId: candidate.candidateId, artifactId: artifact.artifactId, acceptanceStatus: candidate.acceptanceStatus, verificationStatus: candidate.verificationStatus }
     report.artifact = artifact
     report.candidate = candidate
     await persist()
 
-    await waitSignal('preview.allow')
-    click(UI.runEntry)
-    await waitPage('!!document.querySelector(' + JSON.stringify(UI.runDialog) + ')')
-    const rowSelector = '.ln-run-panel[data-mission-id="' + missionId + '"] .ln-run-artifact[data-artifact-id="' + artifact.artifactId + '"] button.ln-run-file'
-    await waitPage('(() => { const rows=document.querySelectorAll(' + JSON.stringify(rowSelector) + '); return rows.length===1&&!rows[0].disabled&&rows[0].getClientRects().length>0 })()', 60)
-    click(rowSelector)
-    await waitPage('!!document.querySelector(' + JSON.stringify(UI.artifactDialog) + ')')
-    await waitPage('document.querySelector(".ln-artifact-document")?.innerText.includes(' + JSON.stringify(marker) + ') === true')
-    assert.equal(await evalValue('document.querySelector(".ln-artifact-document")?.innerText.includes(' + JSON.stringify(nonce) + ')'), true)
-    await screenshot('persona-artifact-preview')
-    assert.deepEqual(await facts('loom.reviews.list', { missionId }), [])
+    // 4. Capture first, adjudicate second. The page, the Mission and the Artifact binding are
+    //    already proven above, so the preview and its screenshot are taken before any content
+    //    verdict: a content failure still leaves the real UI on record.
+    const readCandidateGate = async () => {
+      const candidateRows = await facts('loom.candidates.list', { missionId })
+      const current = candidateRows.find(row => row.candidateId === candidate.candidateId)
+      const reviewRows = await facts('loom.reviews.list', { missionId })
+      return { acceptanceStatus: current?.acceptanceStatus ?? null, reviewCount: reviewRows.length }
+    }
+    const beforeOpen = await readCandidateGate()
+    report.steps.preview = { before: beforeOpen, artifactRowId: artifact.artifactId }
+    assert.equal(String(beforeOpen.acceptanceStatus ?? '').toLowerCase(), 'pending', 'the candidate must be PENDING before the preview opens')
+    assert.equal(beforeOpen.reviewCount, 0, 'no Owner Review may exist before the preview opens')
+    let shown = null
+    try {
+      await waitSignal('preview.allow')
+      click(UI.runEntry)
+      await waitPage('run_panel_open', '!!document.querySelector(' + JSON.stringify(UI.runDialog) + ')')
+      const rowSelector = '.ln-run-panel[data-mission-id="' + missionId + '"] .ln-run-artifact[data-artifact-id="' + artifact.artifactId + '"] button.ln-run-file'
+      await waitPage('artifact_row_ready', '(() => { const rows=document.querySelectorAll(' + JSON.stringify(rowSelector) + '); return rows.length===1&&!rows[0].disabled&&rows[0].getClientRects().length>0 })()', 60)
+      click(rowSelector)
+      await waitPage('artifact_preview_open', '!!document.querySelector(' + JSON.stringify(UI.artifactDialog) + ')')
+      await waitPage('artifact_preview_settled', ARTIFACT_PREVIEW_SETTLED_JS, 90)
+      shown = await evalValue(ARTIFACT_DIALOG_READ_JS)
+      const bodyText = await evalValue(ARTIFACT_BODY_TEXT_JS)
+      if (shown && typeof shown === 'object') shown.bodyText = bodyText
+      await screenshot('persona-artifact-preview')
+      report.screenshots['persona-artifact-preview'].capturedBeforeContentAdjudication = true
+      await stage('preview_captured')
+    } catch (error) {
+      report.previewCaptureUnavailable = { stage: report.waitingFor ?? 'preview_capture',
+        reason: String(error?.message ?? error).slice(0, 300), focusHeld,
+        screenshot: report.screenshots['persona-artifact-preview'] ?? null }
+      if (focusHeld) await screenshot('failed-preview').catch(() => {})
+      await persist()
+      throw error
+    }
+    // The same Candidate is re-read before the body is judged: opening a result must never accept it.
+    const afterOpen = await readCandidateGate()
+    report.steps.preview.after = afterOpen
+    report.provenance.candidate = adjudicateCandidateState({ before: beforeOpen, after: afterOpen }, assert)
+    report.steps.preview.evidence = adjudicatePreviewEvidence({
+      settled: shown?.settled ?? null, titleText: shown?.titleText ?? null,
+      bodyText: shown?.bodyText ?? null, marker, relativePath: FILE
+    }, assert)
+    report.steps.preview.bodyTextSha256 = shown?.bodyText ? hash(shown.bodyText) : null
+    report.provenance.checks = {
+      baselineAbsentBeforeSubmit: report.provenance.before?.errorCode === 'ENOENT',
+      runWorkspaceEqualsBaselineRoot: report.provenance.workspace?.matchesBaselineRoot === true,
+      firstWriteNewFileAfterClaim: report.provenance.firstWrite?.claimedAtBeforeWrite === true,
+      threeWayShaEqual: report.provenance.shas?.allEqual === true,
+      candidatePendingNoOwnerReview: report.provenance.candidate?.autoAccepted === false,
+      personaMarkerLineInArchive: report.contentCompliance.personaMarkerLine
+    }
+    report.exactCopyMet = report.contentCompliance.exactCopyMet
     report.steps.finalUiPreview = true
     report.ownerReviewRecorded = false
     report.status = 'passed-ui-pi-append-real-file-delivery'

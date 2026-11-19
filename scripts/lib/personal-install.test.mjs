@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { setTimeout as delay } from 'node:timers/promises'
+import { verifyRunningHostSchema } from './loom-host-schema.mjs'
 
 const windows = process.platform === 'win32'
 const manager = fileURLToPath(new URL('../manage-loom-personal.ps1', import.meta.url))
@@ -65,10 +66,14 @@ function makePackage(root, letter, contract = { version: 'v1.72', projectionSche
   return directory
 }
 
-function run(action, install, extra = []) {
+function run(action, install, extra = [], options = {}) {
   return spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-File', manager,
     '-Action', action, '-InstallDirectory', install, ...extra],
-  { encoding: 'utf8', timeout: 240_000, windowsHide: true })
+  // Real personal packages contain tens of thousands of pinned runtime files.
+  // Keep every byte/manifest check; give the full install enough time to
+  // inspect that closure. Small synthetic fixtures retain the tighter budget.
+  { encoding: 'utf8', timeout: process.env.LOOM_INSTALL_TEST_KIT ? 600_000 : 240_000, windowsHide: true,
+    env: options.env })
 }
 
 function installPackage(pkg, fixture_) {
@@ -133,6 +138,43 @@ test('declared Hook runtime is complete, bound to its manifest, and checked befo
   assert.notEqual(damaged.status, 0)
   assert.match(damaged.stderr, /Damaged program file: runtime\/dsh-hook-executor\/executor\.mjs/)
   assert.equal(existsSync(f.data), false, 'a rejected package must not start its Server or create data')
+})
+
+test('bundled DSH 0.2 rejects missing files and mismatched manifests before installation or startup', { skip: !windows }, t => {
+  const f = fixture(t)
+  const pkg = makePackage(f.root, 'd')
+  const manifestPath = join(pkg, 'candidate-manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.dshRuntime = { rootVersion: '0.2.0-rc.2', manifestSha256: '0'.repeat(64) }
+  const save = () => writeFileSync(manifestPath, JSON.stringify(manifest))
+  save()
+  const missing = run('Install', f.install, ['-PackageDirectory', pkg])
+  assert.notEqual(missing.status, 0)
+  assert.match(missing.stderr, /DSH runtime is incomplete/)
+  assert.equal(existsSync(f.install), false)
+  for (const relative of ['runtime/pi/node/node.exe', 'runtime/dsh/dsh-runtime-bundle.json',
+    'runtime/dsh/verify.mjs', 'runtime/dsh/package.json', 'runtime/dsh/package-lock.json',
+    'runtime/dsh/node_modules/.bin/dsh.cmd', 'runtime/dsh/THIRD-PARTY-NOTICES.txt']) {
+    const path = join(pkg, relative)
+    const value = relative.endsWith('.json') ? '{}\n' : 'isolated DSH version fixture: ' + relative
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, value)
+    manifest.files[relative] = hash(value)
+  }
+  save()
+  const unbound = run('Install', f.install, ['-PackageDirectory', pkg])
+  assert.notEqual(unbound.status, 0)
+  assert.match(unbound.stderr, /DSH runtime manifest does not match/)
+  assert.equal(existsSync(f.install), false)
+  manifest.dshRuntime.manifestSha256 = manifest.files['runtime/dsh/dsh-runtime-bundle.json']
+  save()
+  installPackage(pkg, f)
+  const installed = join(f.install, 'versions', 'd'.repeat(40))
+  writeFileSync(join(installed, 'runtime/dsh/verify.mjs'), 'unverified tampering')
+  const damaged = run('Start', f.install)
+  assert.notEqual(damaged.status, 0)
+  assert.match(damaged.stderr, /Damaged program file: runtime\/dsh\/verify\.mjs/)
+  assert.equal(existsSync(f.data), false, 'bad DSH must not create personal data')
 })
 
 test('install, upgrade and compatible rollback keep data and both program versions', { skip: !windows }, t => {
@@ -296,59 +338,197 @@ async function stopOwnedTree(child) {
   await new Promise(resolve_ => { if (child.exitCode !== null) resolve_(); else child.once('exit', resolve_) })
 }
 
+// ---------------------------------------------------------------------------
+// Real candidate helpers. The owner's profile, temp directory, installed app
+// data and any inherited LOOM runtime override must never reach the child that
+// installs or starts the package under acceptance.
+// ---------------------------------------------------------------------------
+const OVERRIDES = ['ROVAI_EMBEDDED_PI_ROOT', 'PI_CODING_AGENT_DIR', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'DSH_HOME',
+  'ROVAI_DEEPSEEK_HARNESS_BIN', 'NODE_OPTIONS', 'NODE_PATH', 'LOOM_COMPUTER_PYTHON', 'LOOM_COMPUTER_HELPER',
+  'LOOM_COMPUTER_AGENT_PYTHON', 'LOOM_COMPUTER_AGENT_BRIDGE']
+
+function isolatedEnv(root) {
+  const env = { ...process.env }
+  for (const name of OVERRIDES) delete env[name]
+  const directories = { HOME: join(root, 'isolated-user'), USERPROFILE: join(root, 'isolated-user'),
+    APPDATA: join(root, 'isolated-appdata'), LOCALAPPDATA: join(root, 'isolated-local-data'),
+    TEMP: join(root, 'isolated-temp'), TMP: join(root, 'isolated-temp') }
+  for (const directory of new Set(Object.values(directories))) mkdirSync(directory, { recursive: true })
+  return Object.assign(env, directories)
+}
+
+function tracer(tracePath) {
+  return (stage, detail = {}) => {
+    const entry = { at: new Date().toISOString(), stage, ...detail }
+    if (tracePath) writeFileSync(tracePath, JSON.stringify(entry) + '\n', { flag: 'a' })
+    return entry.at
+  }
+}
+
+// Every stage of the long install is timed, so a later timeout names the step
+// that ran out of budget instead of leaving a removed fixture behind.
+function installReal({ pkg, f, port, env, limitMs, trace }) {
+  return new Promise((settle, fail) => {
+    const startedAt = new Date().toISOString()
+    trace('install-start', { package: pkg, install: f.install, data: f.data, port })
+    const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-File', manager,
+      '-Action', 'Install', '-InstallDirectory', f.install, '-PackageDirectory', pkg,
+      '-DataDirectory', f.data, '-Port', String(port)],
+    { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', part => { stdout += part })
+    child.stderr.on('data', part => { stderr += part })
+    const timeline = { installStartedAt: startedAt }
+    let timedOut = false
+    const deadline = setTimeout(() => {
+      timedOut = true
+      trace('install-deadline-exceeded', { limitMs, ...timeline })
+      spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true })
+    }, limitMs)
+    const poll = setInterval(() => {
+      try {
+        if (!timeline.installDirectoryCreatedAt && existsSync(join(f.install, 'INSTALLER-V1'))) {
+          timeline.installDirectoryCreatedAt = new Date().toISOString()
+          trace('isolated-install-directory-created', { install: f.install })
+        }
+        if (!timeline.incomingCopyAt) {
+          const incoming = readdirSync(f.install).find(name => name.startsWith('.incoming-'))
+          if (incoming) {
+            timeline.incomingCopyAt = new Date().toISOString()
+            trace('incoming-copy-created', { incoming })
+          }
+        }
+        if (!timeline.versionActivatedAt) {
+          const versions = readdirSync(join(f.install, 'versions'))
+          if (versions.length) {
+            timeline.versionActivatedAt = new Date().toISOString()
+            trace('version-directory-activated', { versions })
+          }
+        }
+      } catch { /* the install directory may not exist yet */ }
+    }, 1_000)
+    child.once('error', error => { clearInterval(poll); clearTimeout(deadline); fail(error) })
+    child.once('close', code => {
+      clearInterval(poll)
+      clearTimeout(deadline)
+      timeline.installFinishedAt = new Date().toISOString()
+      timeline.installExitCode = code
+      timeline.installTimedOut = timedOut
+      trace('install-exit', { code, timedOut, ...timeline })
+      settle({ code, timedOut, stdout, stderr, timeline })
+    })
+  })
+}
+
+function listenerFor(port) {
+  // Bind the endpoint under test to the process that really owns it before any
+  // authenticated request is made from this test.
+  const script = `$c = Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue |
+  Select-Object -First 1
+if (-not $c) { 'none|'; exit }
+$p = Get-Process -Id $c.OwningProcess -ErrorAction Stop
+"$($p.Id)|$($p.Path)"`
+  const result = spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
+    { encoding: 'utf8', windowsHide: true, timeout: 30_000 })
+  assert.equal(result.status, 0, 'could not identify the listener on the isolated port: ' + (result.stderr || ''))
+  const [pid, program] = result.stdout.trim().split('|')
+  assert.notEqual(pid, 'none', 'no process listens on the isolated port')
+  return { pid: Number(pid), programPath: program || '' }
+}
+
 test('installed real candidate starts, persists its data and restarts at the same address', {
-  skip: !windows || !process.env.LOOM_INSTALL_TEST_KIT, timeout: 300_000,
+  skip: !windows || !process.env.LOOM_INSTALL_TEST_KIT, timeout: 900_000,
 }, async t => {
   const f = fixture(t, process.env.LOOM_INSTALL_TEST_ROOT)
   const pkg = resolve(process.env.LOOM_INSTALL_TEST_KIT)
   const port = process.env.LOOM_INSTALL_TEST_PORT ? Number(process.env.LOOM_INSTALL_TEST_PORT) : await freePort()
+  const origin = 'http://127.0.0.1:' + port
+  // 64851/64852 belong to the owner's running instances and are never probed.
   assert.notEqual(port, 64851)
-  const installed = run('Install', f.install, ['-PackageDirectory', pkg, '-DataDirectory', f.data, '-Port', String(port)])
-  assert.equal(installed.status, 0, installed.stderr || installed.stdout)
-  assert.equal(existsSync(f.data), false)
-  const commits = state(f.install).current
+  assert.notEqual(port, 64852)
+  const manifest = JSON.parse(readFileSync(join(pkg, 'candidate-manifest.json'), 'utf8'))
+  const env = isolatedEnv(f.root)
+  const trace = tracer(process.env.LOOM_INSTALL_TEST_TRACE)
+  const installed = await installReal({
+    // run-01 stopped at this boundary: it showed the serial closure check used
+    // 384 s of the 600 s budget for the source package alone. Verify-Package now
+    // hashes the closure in parallel (measured: 8 s for 33,845 files / 1.79 GB),
+    // so the plan's own budget is kept rather than enlarged.
+    pkg, f, port, env, limitMs: 600_000, trace
+  })
+  assert.equal(installed.timedOut, false, 'the installer exceeded its 600 s budget: ' +
+    JSON.stringify(installed.timeline))
+  assert.equal(installed.code, 0, (installed.stderr || installed.stdout).slice(-4000))
+  assert.equal(existsSync(f.data), false, 'the installer must leave personal-data creation to the Server')
+  const commit = state(f.install).current
+  assert.equal(commit, manifest.commit)
+  assert.equal(state(f.install).port, port)
+  // The data directory does not exist yet (the installer must not create it),
+  // so compare the recorded absolute path instead of resolving a missing path.
+  assert.equal(state(f.install).dataDirectory.toLowerCase(), f.data.toLowerCase(),
+    'the installer kept a different personal-data directory')
   const managerDigest = hash(readFileSync(manager))
-  assert.equal(hash(readFileSync(join(f.install, 'Manage-Loom.ps1'))), managerDigest)
-  let firstDatabase
+  const installedManagerDigest = hash(readFileSync(join(f.install, 'Manage-Loom.ps1')))
+  // The installer copies the manager that is executing ($PSCommandPath), so the
+  // installed entry point must be the reviewed manager of this tree.
+  assert.equal(installedManagerDigest, managerDigest, 'the installed manager is not the executing manager')
+  // The packaged closure must still be the one the candidate manifest describes,
+  // including the manager shipped inside the version directory.
+  const packagedManagerDigest = hash(readFileSync(join(f.install, 'versions', commit, 'Manage-Loom.ps1')))
+  assert.equal(packagedManagerDigest, manifest.files['Manage-Loom.ps1'],
+    'the packaged manager differs from the candidate manifest entry')
+  assert.equal(existsSync(join(f.install, 'versions', commit, 'candidate-manifest.json')), true)
+  assert.equal(existsSync(join(f.install, 'Start-Loom.cmd')), true)
+  assert.equal(readdirSync(f.install).some(name => name.startsWith('.incoming-')), false,
+    'an incomplete copy was left behind')
+  trace('installed', { commit, port, install: f.install, data: f.data })
+  const launchDirectory = realpathSync.native(join(f.install, 'versions', commit)).toLowerCase()
   let initialToken
-  let firstPaths
+  let firstSentinel
   let savedPreference
   let memberIds
+  const attempts = []
   for (let attempt = 0; attempt < 2; attempt++) {
-    const child = attempt === 0
-      ? spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-File',
-        join(f.install, 'Manage-Loom.ps1'), '-Action', 'Start', '-InstallDirectory', f.install],
-      { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
-      : spawn('cmd.exe', ['/d', '/c', 'Start-Loom.cmd'],
-        { cwd: f.install, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
-    // Do not echo Server output: a terminal may contain a management token.
+    // Both starts use the installed entry point only: the first start must not
+    // bypass Start-Loom.cmd through the repository manager.
+    const child = spawn('cmd.exe', ['/d', '/c', 'Start-Loom.cmd'],
+      { cwd: f.install, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env })
+    // Do not echo Server output: it may contain a management token.
     let bytes = 0
     child.stdout.on('data', part => { bytes += part.length })
     child.stderr.on('data', part => { bytes += part.length })
+    const readyStart = Date.now()
+    trace('launch', { attempt: attempt + 1, entrypoint: 'Start-Loom.cmd', cwd: f.install })
     try {
-      let healthy = false
-      for (let i = 0; i < 200; i++) {
-        assert.equal(child.exitCode, null, 'test-owned Server exited before health was ready')
+      let ready = false
+      while (Date.now() - readyStart < 120_000) {
+        assert.equal(child.exitCode, null, 'test-owned launcher exited before the Host was ready')
         try {
-          const response = await fetch('http://127.0.0.1:' + port + '/', { signal: AbortSignal.timeout(1_000) })
-          healthy = response.ok
-          if (healthy) break
+          const probe = await fetch(origin + '/', { signal: AbortSignal.timeout(1_000) })
+          if (probe.ok) { ready = true; break }
         } catch {}
         await delay(250)
       }
-      assert.equal(healthy, true, 'installed Server did not become healthy')
-      const html = await fetch('http://127.0.0.1:' + port + '/')
-      assert.equal(html.status, 200)
+      assert.equal(ready, true, 'installed Server did not become healthy within 120 s')
+      const readyMs = Date.now() - readyStart
+      trace('healthy', { attempt: attempt + 1, readyMs })
+      const html = await fetch(origin + '/')
+      const httpStatus = html.status
+      assert.equal(httpStatus, 200)
       assert.match(await html.text(), /<html/i)
+      const listener = listenerFor(port)
+      assert.ok(listener.programPath.toLowerCase().startsWith(launchDirectory + '\\'),
+        'the listener on the isolated port is not the installed version: ' + listener.programPath)
       const administratorToken = readFileSync(join(f.data, 'server-token'), 'utf8').trim()
-      const login = await fetch('http://127.0.0.1:' + port + '/api/v1/login', {
+      const login = await fetch(origin + '/api/v1/login', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ protocolVersion: 5, administratorToken }),
       })
       assert.equal(login.status, 200, 'the installed Core must accept its own management identity')
       const session = await login.json()
       const request = async (operation, params = {}) => {
-        const response = await fetch('http://127.0.0.1:' + port + '/api/v1/request', {
+        const response = await fetch(origin + '/api/v1/request', {
           method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + session.token },
           body: JSON.stringify({ operation, params }),
         })
@@ -372,8 +552,13 @@ test('installed real candidate starts, persists its data and restarts at the sam
         assert.equal(preferences.oneClickNewConversationEnabled, true)
         assert.deepEqual(preferences.newConversationDefaults, savedPreference)
       }
-      assert.equal(state(f.install).current, commits)
-      assert.equal(state(f.install).lastStarted, commits)
+      // The database the running Host reports must be this isolated one, at
+      // projection schema 186 with migration 236 already applied.
+      const hostSchema = await verifyRunningHostSchema({
+        request, databasePath: join(f.data, 'rovai.sqlite')
+      })
+      assert.equal(state(f.install).current, commit)
+      assert.equal(state(f.install).lastStarted, commit)
       const files = readdirSync(f.data)
       assert.ok(files.includes('rovai.sqlite'))
       const tokenFile = files.find(name => /token/.test(name))
@@ -381,25 +566,35 @@ test('installed real candidate starts, persists its data and restarts at the sam
       const tokenFingerprint = hash(readFileSync(join(f.data, tokenFile)))
       if (attempt === 0) {
         initialToken = tokenFingerprint
-        firstPaths = { install: f.install, data: f.data, port, commit: commits }
         writeFileSync(join(f.data, 'installer-restart-sentinel'), randomUUID())
-        firstDatabase = readFileSync(join(f.data, 'installer-restart-sentinel'), 'utf8')
-        const locked = run('Rollback', f.install)
+        firstSentinel = readFileSync(join(f.data, 'installer-restart-sentinel'), 'utf8')
+        const locked = run('Rollback', f.install, [], { env })
         assert.notEqual(locked.status, 0, 'active launcher must fence version switches')
       } else {
         assert.equal(tokenFingerprint, initialToken)
-        assert.equal(readFileSync(join(f.data, 'installer-restart-sentinel'), 'utf8'), firstDatabase)
+        assert.equal(readFileSync(join(f.data, 'installer-restart-sentinel'), 'utf8'), firstSentinel)
       }
       assert.ok(bytes > 0)
+      attempts.push({ attempt: attempt + 1, entrypoint: 'Start-Loom.cmd', readyMs, httpStatus,
+        loginStatus: login.status, listener, hostSchema })
+      trace('attempt-verified', { attempt: attempt + 1, httpStatus, loginStatus: login.status,
+        projectionSchema: hostSchema.projectionSchema, latestMigrationVersion: hostSchema.latestMigrationVersion })
     } finally { await stopOwnedTree(child) }
   }
+  trace('passed', { attempts: attempts.length, commit })
   if (process.env.LOOM_INSTALL_TEST_REPORT) {
     writeFileSync(process.env.LOOM_INSTALL_TEST_REPORT, JSON.stringify({
-      status: 'passed', ...firstPaths, installerSha256: managerDigest, starts: 2, productionWebServed: true,
-      sameManagementIdentity: true, persistedDataPreserved: true, persistedPreferencePreserved: true,
-      stableAssistantIdentities: true, realCoreAuthenticated: true, versionSwitchWhileRunningRejected: true,
+      status: 'passed', commit, install: f.install, data: f.data, port,
+      installerSha256: managerDigest, candidateManifestManagerSha256: manifest.files['Manage-Loom.ps1'],
+      installedManagerSha256: installedManagerDigest, packagedManagerSha256: packagedManagerDigest,
+      installedManagerMatchesCandidate: installedManagerDigest === manifest.files['Manage-Loom.ps1'],
+      starts: 2, entrypoint: 'Start-Loom.cmd', attempts,
+      timeline: installed.timeline, productionWebServed: true, sameManagementIdentity: true,
+      persistedDataPreserved: true, persistedPreferencePreserved: true,
+      stableAssistantIdentities: true, realCoreAuthenticated: true,
+      hostSchemaVerified: true, versionSwitchWhileRunningRejected: true,
       shutdown: 'forced stop of exact test-owned process tree; startup recovery exercised',
-      entrypoints: ['PowerShell manager', 'Start-Loom.cmd'], modelRuns: 0,
+      entrypoints: ['Start-Loom.cmd', 'Start-Loom.cmd'], modelRuns: 0,
     }, null, 2))
   }
 })
