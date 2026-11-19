@@ -1,8 +1,76 @@
-import type { AgentProfile, ThreadSnapshot, MissionRecord, LoomTask, LoomCandidate, LoomArtifact, LoomPlan, LoomReview, LoomVerification } from '@contracts'
-export type { AgentProfile, ThreadSnapshot, MissionRecord, LoomTask, LoomCandidate, LoomArtifact, LoomPlan, LoomReview, LoomVerification }
+import type {
+  AgentProfile,
+  LoomArtifact,
+  LoomCandidate,
+  LoomControlSnapshot,
+  LoomPlan,
+  LoomReview,
+  LoomStageReview,
+  LoomTask,
+  LoomVerification,
+  MissionRecord,
+  ThreadSnapshot
+} from '@contracts'
+export type {
+  AgentProfile,
+  LoomArtifact,
+  LoomCandidate,
+  LoomControlSnapshot,
+  LoomPlan,
+  LoomReview,
+  LoomStageReview,
+  LoomTask,
+  LoomVerification,
+  MissionRecord,
+  ThreadSnapshot
+}
 export type ConversationItem = { id: string; title: string; subtitle: string; agentId: string | null; threadId: string | null; missionId: string | null; unread: boolean; updatedAt: string | null }
 export type WorkItem = { task: LoomTask; mission: MissionRecord; candidate: LoomCandidate | null }
-export type WorkBundle = { mission: MissionRecord; plan: LoomPlan | null; tasks: LoomTask[]; candidates: LoomCandidate[]; artifacts: LoomArtifact[]; reviews: LoomReview[]; verifications: LoomVerification[] }
+
+/**
+ * 控制投影为什么还是未知的。每一种都只表示「还没读到事实」：
+ * 不是「没有批准」，不是「没有审查回执」，更不是「在等你」。
+ *
+ * - `not_read`：这份 Bundle 没读过控制投影（缺省字段，不是空结论）。
+ * - `batch_projection`：批量投影不含 control，逐 Mission 的事实没有随批次回来。
+ * - `read_failed`：请求本身失败（传输层或 Host 错误）。
+ * - `invalid`：回执不是本 Mission 的完整快照（错 Mission、缺阶段审查回执等）。
+ */
+export type WorkControlUnknownReason = 'not_read' | 'batch_projection' | 'read_failed' | 'invalid'
+
+/** 「还没读到」的唯一形状；控制与阶段审查两种事实共用它。 */
+export type WorkControlUnknown = { status: 'unknown'; reason: WorkControlUnknownReason; message: string }
+
+/**
+ * 一次控制／阶段审查事实（对应 Core 的 `loom.control.get` 投影，即
+ * `LoomControlSnapshot`：策略 + 阶段审查 + 投递）。
+ *
+ * 只有 `observed` 才能下任何结论。`unknown` 一律不外推——尤其不得把
+ * 候选的 `pending` 验收状态读成「等你」。
+ */
+export type WorkControlFacts =
+  | { status: 'observed'; snapshot: LoomControlSnapshot }
+  | WorkControlUnknown
+
+/** 阶段审查回执集合：与控制事实同一判定，读不到就是 unknown，不是空列表。 */
+export type WorkStageReviewFacts =
+  | { status: 'observed'; stageReviews: readonly LoomStageReview[] }
+  | WorkControlUnknown
+
+export type WorkBundle = {
+  mission: MissionRecord
+  plan: LoomPlan | null
+  tasks: LoomTask[]
+  candidates: LoomCandidate[]
+  artifacts: LoomArtifact[]
+  reviews: LoomReview[]
+  verifications: LoomVerification[]
+  /**
+   * 缺省表示「尚未读取」，不是「没有策略」。右栏取它时走 `workControl(bundle)`
+   * 归一成不带歧义的 unknown。
+   */
+  control?: WorkControlFacts
+}
 export type ArtifactSelection = { artifact: LoomArtifact; candidate: LoomCandidate | null; bundle: WorkBundle }
 export type InspectorTab = 'work' | 'details' | 'capabilities' | 'assets' | 'computer'
 

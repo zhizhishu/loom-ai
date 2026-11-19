@@ -7,6 +7,7 @@ import type {
   LoomCandidate,
   LoomPlan,
   LoomReview,
+  LoomStageReview,
   LoomTask,
   LoomVerification,
   MissionRecord,
@@ -30,7 +31,15 @@ import {
   MAX_LOCAL_COMPOSER_ATTACHMENTS
 } from '../camp-composer-local-store'
 import type { ThreadClient } from '../camp-client'
-import type { ConversationItem, WorkBundle } from './types'
+import { classifyControlSnapshot, LOOM_CONTROL_GET } from './control-service'
+import type {
+  ConversationItem,
+  WorkBundle,
+  WorkControlFacts,
+  WorkControlUnknown,
+  WorkControlUnknownReason,
+  WorkStageReviewFacts
+} from './types'
 
 /** Bounded fan-out for the right pane's all-work projection. */
 export const LOOM_BUNDLE_CONCURRENCY = 4
@@ -210,16 +219,103 @@ export async function readThreadSnapshot(client: Reader, threadId: string): Prom
 
 // ------------------------------------------------------------------ work
 
-/** Every projection this bundle needs is required; a failed read is an error, never an empty list. */
+// -------------------------------------------------- control / stage review
+
+/** 一次 `unknown` 控制事实：只是「还没读到」，不带任何「没有批准／在等你」的含义。 */
+export function unknownWorkControl(
+  reason: WorkControlUnknownReason,
+  message: string
+): WorkControlUnknown {
+  return { status: 'unknown', reason, message }
+}
+
+/**
+ * 回执 → 事实：只有属于本 Mission 且阶段审查回执完整的快照才算 `observed`。
+ * 判定复用 `control-service` 的 `classifyControlSnapshot`（错 Mission 与缺字段都在那里），
+ * 这里只把结果翻译成右栏用的三态事实，不另立第二套规则。
+ */
+export function classifyWorkControl(raw: unknown, missionId: string): WorkControlFacts {
+  const read = classifyControlSnapshot(raw, missionId)
+  if (read.status === 'observed') return { status: 'observed', snapshot: read.snapshot }
+  return unknownWorkControl('invalid', read.message)
+}
+
+/**
+ * 读一个 Mission 的真实控制／阶段审查投影。
+ * 失败不抛：右栏要保留「未知」，而不是把缺读取当成没有策略或等你拍板。
+ */
+async function readWorkControl(client: Reader, mission: MissionRecord): Promise<WorkControlFacts> {
+  const missionId = mission.missionId.trim()
+  if (missionId === '') {
+    return unknownWorkControl('invalid',
+      uiAttribute('「{0}」缺少工作标识，阶段审查事实尚未确认。', mission.title))
+  }
+  let raw: unknown
+  try {
+    raw = await client.request<unknown>(LOOM_CONTROL_GET, { missionId })
+  } catch (error) {
+    return unknownWorkControl('read_failed', readErrorMessage(error,
+      uiAttribute('「{0}」的阶段审查事实读取失败，请重试。', mission.title)))
+  }
+  return classifyWorkControl(raw, missionId)
+}
+
+/** 批量投影没有随批次带回的控制事实：未知，且明确说明是批量口径。 */
+function batchWorkControl(mission: MissionRecord): WorkControlFacts {
+  return unknownWorkControl('batch_projection',
+    uiAttribute('「{0}」的阶段审查事实不在批量投影里，尚未确认。', mission.title))
+}
+
+/** Bundle 上的控制事实；缺省字段同样是「尚未读取」，不是「没有批准」。 */
+export function workControl(bundle: WorkBundle): WorkControlFacts {
+  return bundle.control
+    ?? unknownWorkControl('not_read',
+      uiAttribute('「{0}」的阶段审查事实尚未读取。', bundle.mission.title))
+}
+
+/** 阶段审查回执：控制事实未知时一律未知，绝不退化成空列表。 */
+export function stageReviewFacts(bundle: WorkBundle): WorkStageReviewFacts {
+  const control = workControl(bundle)
+  if (control.status === 'unknown') return control
+  const stageReviews = control.snapshot.stageReviews
+  if (!Array.isArray(stageReviews)) {
+    return unknownWorkControl('invalid',
+      uiAttribute('「{0}」缺少阶段审查回执，审查结论尚未确认。', bundle.mission.title))
+  }
+  return { status: 'observed', stageReviews }
+}
+
+/**
+ * 同一候选的最新阶段审查：按 `reviewedAt` 取最新，平手按回执顺序后写的为准
+ * （与 `acceptance-state` 的 createdAt + 下标规则一致）。没有回执才是 null。
+ */
+export function latestStageReview(
+  stageReviews: readonly LoomStageReview[],
+  candidateId: string
+): LoomStageReview | null {
+  const time = (review: LoomStageReview): number => {
+    const value = Date.parse(review.reviewedAt)
+    return Number.isNaN(value) ? -Infinity : value
+  }
+  return stageReviews
+    .filter(review => review.candidateId === candidateId)
+    .reduce<LoomStageReview | null>((latest, review) =>
+      latest === null || time(review) >= time(latest) ? review : latest, null)
+}
+
+/** Every projection this bundle needs is required; a failed read is an error, never an empty list.
+ * The control projection is the exception: a failed control read keeps the bundle and records an
+ * explicit unknown, because a missing read is not a "no policy" / "waiting for you" answer. */
 export async function readWorkBundle(client: Reader, mission: MissionRecord): Promise<WorkBundle> {
   const { missionId } = mission
-  const [plan, tasks, candidates, reviews, verifications, artifacts] = await Promise.all([
+  const [plan, tasks, candidates, reviews, verifications, artifacts, control] = await Promise.all([
     client.request<LoomPlan | null>('loom.plan.get', { missionId }),
     client.request<LoomTask[]>('loom.tasks.list', { missionId }),
     client.request<LoomCandidate[]>('loom.candidates.list', { missionId }),
     client.request<LoomReview[]>('loom.reviews.list', { missionId }),
     client.request<LoomVerification[]>('loom.verifications.list', { missionId }),
-    client.request<LoomArtifactsListResult | null>('loom.artifacts.list', { missionId })
+    client.request<LoomArtifactsListResult | null>('loom.artifacts.list', { missionId }),
+    readWorkControl(client, mission)
   ])
   const unavailable = uiAttribute('「{0}」的工作数据读取失败，请重试。', mission.title)
   return {
@@ -229,7 +325,8 @@ export async function readWorkBundle(client: Reader, mission: MissionRecord): Pr
     candidates: requireArray(candidates, unavailable),
     reviews: requireArray(reviews, unavailable),
     verifications: requireArray(verifications, unavailable),
-    artifacts: requireArray(artifacts?.artifacts, unavailable)
+    artifacts: requireArray(artifacts?.artifacts, unavailable),
+    control
   }
 }
 
@@ -258,7 +355,10 @@ export async function readWorkBundles(
 
 /** One bounded read-only Core operation per 8 Missions. Older Hosts and
  * partially unavailable Missions use the existing six-source reconciliation,
- * so an unknown contract or broken projection never pretends to be empty. */
+ * so an unknown contract or broken projection never pretends to be empty.
+ * The batch row carries the control projection only when the Host includes it;
+ * otherwise the facts stay unknown instead of being re-read as a second, per-Mission
+ * storm (which is exactly what this batch exists to avoid). */
 export async function readWorkBundlesFast(
   client: Reader, missions: readonly MissionRecord[]
 ): Promise<{ bundles: WorkBundle[]; errors: string[] }> {
@@ -268,7 +368,9 @@ export async function readWorkBundlesFast(
     try {
       const value=await client.request<{bundles: Array<{
         missionId:string; plan:LoomPlan|null; tasks:LoomTask[]; candidates:LoomCandidate[];
-        reviews:LoomReview[]; verifications:LoomVerification[]; artifacts:LoomArtifactsListResult|null
+        reviews:LoomReview[]; verifications:LoomVerification[]; artifacts:LoomArtifactsListResult|null;
+        /** 旧 Host 不返回；返回了就按与普通读取同一套判定收敛。 */
+        control?: unknown
       }>}>('loom.bundles.getMany',{missionIds:group.map(row=>row.missionId)})
       if (!value || !Array.isArray(value.bundles) || value.bundles.length!==group.length) throw Error('LOOM batch projection shape mismatch')
       const verified: WorkBundle[]=[]
@@ -278,7 +380,8 @@ export async function readWorkBundlesFast(
         const error=uiAttribute('「{0}」的工作数据读取失败，请重试。',mission.title)
         verified.push({mission,plan:row.plan??null,tasks:requireArray(row.tasks,error),
           candidates:requireArray(row.candidates,error),reviews:requireArray(row.reviews,error),
-          verifications:requireArray(row.verifications,error),artifacts:requireArray(row.artifacts?.artifacts,error)})
+          verifications:requireArray(row.verifications,error),artifacts:requireArray(row.artifacts?.artifacts,error),
+          control:row.control===undefined?batchWorkControl(mission):classifyWorkControl(row.control,mission.missionId)})
       }
       bundles.push(...verified)
     }catch{
