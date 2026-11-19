@@ -36,4 +36,4 @@
   page shells or CSS. Keep Core security/data/runtime contracts separate from visual styling.
 - Current productization scope, user corrections and verification status: `LOOM-IMPLEMENTATION.md`.
   Runtime/product interface boundaries: `docs/loom/productization-interfaces-2026-11-13.md`.
-- Mindkit project memory: `PROJECT_ID.md` → `TASK.md` → `PROJECT_CONTEXT.md` (local-only); user-facing handoff is `docs/loom/mindkit-handoff-2026-11-13.md`. Do not change the parent `skill-cli` memory files for LOOM-specific work.
+- Mindkit project memory: `PROJECT_ID.md` → `TASK.md` → `PROJECT_CONTEXT.md` (local-only); user-facing handoff is `docs/loom/mindkit-handoff-2026-11-18.md` (reuse-first; read before writing any new module), with history in `docs/loom/mindkit-handoff-2026-11-13.md`. Do not change the parent `skill-cli` memory files for LOOM-specific work.
