@@ -302,10 +302,12 @@ test('1 · the tool reaches exactly the nine LOOM operations through fixed argv 
     assert.ok(Array.isArray(argv), `${operation} must map to argv`)
     assert.equal(argv.length, 2, `${operation} argv is exactly two words`)
     assert.equal(argv[0], 'loom')
-    assert.equal(argv[1], operation.slice('loom.'.length))
+    // The fixed CLI word is the operation suffix with underscores hyphenated (`claim_heartbeat`
+    // reaches `rovai loom claim-heartbeat`), so the assertion still pins the exact word.
+    assert.equal(argv[1], operation.slice('loom.'.length).replace(/_/gu, '-'))
     assert.ok(LOOM_INPUT_KEYS[operation], `${operation} must declare its closed input keys`)
   }
-  // Anything outside the eight has no argv and no input keys.
+  // Anything outside the nine has no argv and no input keys.
   for (const operation of ['loom.workspace.list', 'loom.workspace.run', 'bash', 'thread.message.send', '']) {
     assert.equal(LOOM_OPERATION_ARGV[operation], undefined)
     assert.equal(LOOM_INPUT_KEYS[operation], undefined)

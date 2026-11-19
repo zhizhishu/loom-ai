@@ -148,6 +148,10 @@ fn project_input(operation: &str, input: &Value) -> Result<Value> {
         "loom.release" | "loom.claim" => {
             insert_identifier(&mut projected, "taskId", input.get("taskId"));
         }
+        "loom.claim_heartbeat" => {
+            insert_identifier(&mut projected, "claimId", input.get("claimId"));
+            insert_i64(&mut projected, "fenceGeneration", input.get("fenceGeneration"));
+        }
         "loom.evidence" => {
             insert_identifier(&mut projected, "taskId", input.get("taskId"));
             insert_semantic_text(&mut projected, "relativePath", input.get("relativePath"));
@@ -491,6 +495,14 @@ fn project_result(operation: &str, result: &Value) -> Result<Value> {
         "loom.claim" => {
             insert_identifier(&mut projected, "claimId", result.get("claimId"));
             insert_bool(&mut projected, "replayed", result.get("replayed"));
+        }
+        "loom.claim_heartbeat" => {
+            insert_identifier(&mut projected, "claimId", result.get("claimId"));
+            insert_identifier(&mut projected, "taskId", result.get("taskId"));
+            insert_i64(&mut projected, "fenceGeneration", result.get("fenceGeneration"));
+            insert_identifier(&mut projected, "leaseExpiresAt", result.get("leaseExpiresAt"));
+            insert_identifier(&mut projected, "heartbeatAt", result.get("heartbeatAt"));
+            insert_i64(&mut projected, "extendedSeconds", result.get("extendedSeconds"));
         }
         "loom.evidence" => {
             if let Some(artifact) = result.get("artifact") {

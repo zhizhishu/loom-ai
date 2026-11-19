@@ -5776,15 +5776,14 @@ mod tests {
 
         // A claim of another Mission is not reachable through this Mission at all.
         let other_mission = create_mission(&mut database, "LOOM claim heartbeat other mission");
-        plan_import(&mut database, plan_input(&other_mission)).unwrap();
-        task_release(
-            &mut database,
-            release_input(&other_mission, "task_a"),
-        )
-        .unwrap();
+        let mut other_plan = plan_input(&other_mission);
+        other_plan.tasks = vec![task("task_c", "Task C")];
+        other_plan.dependencies = vec![];
+        plan_import(&mut database, other_plan).unwrap();
+        task_release(&mut database, release_input(&other_mission, "task_c")).unwrap();
         let other = claim_acquire(
             &mut database,
-            claim_input(&other_mission, "task_a", "run_other", "command_other"),
+            claim_input(&other_mission, "task_c", "run_other", "command_other"),
         )
         .unwrap();
         let other_lease = claim_lease(&database, &other.claim_id);

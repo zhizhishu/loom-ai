@@ -893,6 +893,34 @@
       "replayed": false
     }
   },
+  "loom.claim_heartbeat": {
+    "canonicalResult": {
+      "claimId": "lc_example",
+      "missionId": "rvm_example",
+      "planId": "lp_example",
+      "taskId": "t1",
+      "agentRunId": "run_example",
+      "fenceGeneration": 1,
+      "claimedAt": "2026-10-31T00:00:00Z",
+      "previousLeaseExpiresAt": "2026-10-31T00:05:00Z",
+      "leaseExpiresAt": "2026-10-31T00:10:00Z",
+      "heartbeatAt": "2026-10-31T00:05:00Z",
+      "extendedSeconds": 300
+    },
+    "agentOutput": {
+      "claimId": "lc_example",
+      "missionId": "rvm_example",
+      "planId": "lp_example",
+      "taskId": "t1",
+      "agentRunId": "run_example",
+      "fenceGeneration": 1,
+      "claimedAt": "2026-10-31T00:00:00Z",
+      "previousLeaseExpiresAt": "2026-10-31T00:05:00Z",
+      "leaseExpiresAt": "2026-10-31T00:10:00Z",
+      "heartbeatAt": "2026-10-31T00:05:00Z",
+      "extendedSeconds": 300
+    }
+  },
   "loom.evidence": {
     "canonicalResult": {
       "artifact": {

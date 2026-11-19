@@ -1206,6 +1206,7 @@ pub fn projection_identity(operation: &str) -> Result<&'static str> {
         | "loom.plan"
         | "loom.release"
         | "loom.claim"
+        | "loom.claim_heartbeat"
         | "loom.evidence"
         | "loom.submit"
         | "loom.inspect"
