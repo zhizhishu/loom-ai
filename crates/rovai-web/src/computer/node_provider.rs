@@ -30,7 +30,7 @@ use loom_protocol::computer::{
 };
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicU64},
 };
 
 /// One `Computer` per node, keyed by the generation that advertised it.
@@ -91,13 +91,18 @@ impl NodeComputers {
     /// * A late arrival from an already replaced generation is refused instead of
     ///   installed. Overwriting a newer entry with an older one would move the
     ///   epoch backwards and let a number be issued twice.
-    /// * The replaced device is retired before its epoch is inherited. Retirement
-    ///   is the fence: its lease, views and sequence are dropped with the socket,
-    ///   and every later operation on the instance — including one a caller still
-    ///   holds an `Arc` to — fails closed, so nothing can be sent on the new
-    ///   connection under an epoch issued for the old one.
-    /// * The epoch is read from the counter the device publishes, never from its
-    ///   gate, so an input that is still running cannot stall the reconnect.
+    /// * The replaced device is retired before the replacement is built, and the
+    ///   replacement keeps the *same* epoch allocator rather than a sampled value.
+    ///   Retirement is the fence: its lease, views and sequence are dropped with
+    ///   the socket, and every later operation on the instance — including one a
+    ///   caller still holds an `Arc` to — fails closed, so nothing can be sent on
+    ///   the new connection under an epoch issued for the old one. Sharing the
+    ///   allocator is what keeps the epoch unique when retirement cannot take the
+    ///   gate (an input or a takeover is still inside it): a takeover parked there
+    ///   re-checks its retirement and refuses, and any advance it still makes is
+    ///   visible to the replacement.
+    /// * The epoch is allocated by that counter, never read from a gate, so an
+    ///   input that is still running cannot stall the reconnect.
     ///
     /// A concurrent caller that already installed this generation wins, under the
     /// same lock, because replacing it would drop a live lease.
@@ -120,7 +125,7 @@ impl NodeComputers {
         }
         let epoch = match entries.get(node_id) {
             Some(cached) => cached.computer.retire(),
-            None => 0,
+            None => Arc::new(AtomicU64::new(0)),
         };
         let computer = Arc::new(Computer::with_provider(provider, epoch));
         entries.insert(
@@ -352,7 +357,9 @@ fn wire_key(key: KeyName) -> ComputerKeyV1 {    match key {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{ControlBody, EventBody, EventKind, InputBody, ReleaseBody, ViewBody};
+    use super::super::{
+        AcquirePark, ControlBody, EventBody, EventKind, InputBody, ReleaseBody, ViewBody,
+    };
     use super::*;
     use crate::auth::{Session, Sessions};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -835,6 +842,180 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The exact interleaving the review called out: a takeover of the replaced
+    /// device is already inside its gate, so retirement cannot take that gate and
+    /// cannot advance the epoch behind it. The takeover must be refused instead of
+    /// handing out a number the replacement would hand out again — and because both
+    /// devices allocate from one counter, even an advance it slipped past its own
+    /// refusal could not repeat the replacement's epoch.
+    #[test]
+    fn a_takeover_holding_the_gate_cannot_reissue_the_replacement_epoch() {
+        let (sessions, session) = fixture_parts();
+        let device = Arc::new(FakeDevice::new());
+        let provider: Arc<dyn Provider> = device.clone();
+        let computers = NodeComputers::new();
+        let first = computers.install("node-1", 7, provider.clone()).unwrap();
+        let view = open_view(&first, &sessions, &session, &device.device);
+        let (_, epoch) = take(&first, &sessions, &session, &device.device, &view);
+        assert_eq!(epoch, 1);
+
+        // Park a second takeover of the replaced device inside its gate, exactly
+        // where it allocates its epoch.
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        first.park_next_acquire(AcquirePark::BeforeRetirementCheck, entered_tx, proceed_rx);
+        let parked = {
+            let (computer, sessions, session, view, device_id) = (
+                first.clone(),
+                sessions.clone(),
+                session.clone(),
+                view.clone(),
+                device.device.id.clone(),
+            );
+            std::thread::spawn(move || {
+                computer.acquire(
+                    &sessions,
+                    &session,
+                    ControlBody {
+                        view_id: view,
+                        device_id,
+                        consent: true,
+                        ttl_seconds: 30,
+                    },
+                )
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the parked takeover never took the replaced gate");
+
+        // The reconnect now arrives while that gate is held: `retire` cannot lock
+        // it, so it inherits the published epoch instead of inventing an advance.
+        let second = computers.install("node-1", 8, provider.clone()).unwrap();
+        assert_eq!(
+            second.epoch(),
+            epoch,
+            "the reconnect must inherit the epoch the old socket published"
+        );
+
+        // The parked takeover is fenced closed; it issues nothing.
+        proceed_tx.send(()).unwrap();
+        assert_eq!(
+            parked.join().unwrap().unwrap_err(),
+            "computer_unavailable",
+            "a takeover that held the replaced gate must not issue an epoch"
+        );
+
+        // The replacement's first takeover is the next epoch, not a repeat, and
+        // both devices read that from the same allocator.
+        let fresh = open_view(&second, &sessions, &session, &device.device);
+        let (fresh_control, next) = take(&second, &sessions, &session, &device.device, &fresh);
+        assert_eq!(next, epoch + 1);
+        assert_eq!(second.epoch(), next);
+        assert_eq!(
+            first.epoch(),
+            next,
+            "the replaced device must observe the epoch the replacement allocated"
+        );
+
+        // Nothing was delivered by the fenced device, and the live one still works.
+        assert_eq!(device.inputs.load(Ordering::SeqCst), 0);
+        let accepted = InputBody {
+            view_id: fresh.clone(),
+            ..click(&fresh_control, next, 1)
+        };
+        assert!(second.input(&sessions, &session, accepted).is_ok());
+        assert_eq!(device.inputs.load(Ordering::SeqCst), 1);
+    }
+
+    /// The second half of the same window: a takeover that already passed its
+    /// retirement re-check, parked immediately before it allocates. Retirement cannot
+    /// take the gate here either, so the epoch it hands to the replacement is the
+    /// published one — and the epoch the parked takeover then allocates must be a
+    /// number the replacement can never issue again. Only a shared allocator gives
+    /// that; a copied counter would let both devices issue the same value.
+    #[test]
+    fn an_epoch_allocated_while_the_gate_was_held_is_never_issued_twice() {
+        let (sessions, session) = fixture_parts();
+        let device = Arc::new(FakeDevice::new());
+        let provider: Arc<dyn Provider> = device.clone();
+        let computers = NodeComputers::new();
+        let first = computers.install("node-1", 7, provider.clone()).unwrap();
+        let view = open_view(&first, &sessions, &session, &device.device);
+        let (_, epoch) = take(&first, &sessions, &session, &device.device, &view);
+        assert_eq!(epoch, 1);
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        first.park_next_acquire(AcquirePark::BeforeAllocation, entered_tx, proceed_rx);
+        let parked = {
+            let (computer, sessions, session, view, device_id) = (
+                first.clone(),
+                sessions.clone(),
+                session.clone(),
+                view.clone(),
+                device.device.id.clone(),
+            );
+            std::thread::spawn(move || {
+                computer.acquire(
+                    &sessions,
+                    &session,
+                    ControlBody {
+                        view_id: view,
+                        device_id,
+                        consent: true,
+                        ttl_seconds: 30,
+                    },
+                )
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the parked takeover never reached its allocation");
+
+        // The reconnect arrives with that gate held: it inherits the published
+        // epoch and the replacement issues the next one.
+        let second = computers.install("node-1", 8, provider.clone()).unwrap();
+        assert_eq!(second.epoch(), epoch);
+        let fresh = open_view(&second, &sessions, &session, &device.device);
+        let (fresh_control, taken) = take(&second, &sessions, &session, &device.device, &fresh);
+        assert_eq!(taken, epoch + 1);
+
+        // Let the parked takeover allocate. It consumes the next epoch and is then
+        // refused, because the device it belongs to is already fenced.
+        proceed_tx.send(()).unwrap();
+        assert_eq!(
+            parked.join().unwrap().unwrap_err(),
+            "computer_unavailable",
+            "a takeover that outlived its device must not hand out a lease"
+        );
+
+        // Both devices see the same allocator, so the consumed number is burned:
+        // the replacement's next takeover is strictly above what it already issued.
+        assert_eq!(second.epoch(), taken + 1);
+        assert_eq!(first.epoch(), taken + 1);
+        let left = second
+            .release_control(
+                &sessions,
+                &session,
+                ReleaseBody {
+                    view_id: fresh.clone(),
+                    control_id: fresh_control,
+                    generation: taken,
+                },
+            )
+            .unwrap();
+        let after_handback = left["generation"].as_u64().unwrap();
+        let (_, retaken) = take(&second, &sessions, &session, &device.device, &fresh);
+        assert_eq!(retaken, after_handback + 1);
+        assert!(
+            retaken > taken,
+            "an epoch was issued twice across a held gate"
+        );
+        // Nothing was delivered while the device was fenced.
+        assert_eq!(device.inputs.load(Ordering::SeqCst), 0);
     }
 
     #[test]
