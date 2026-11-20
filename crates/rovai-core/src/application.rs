@@ -457,7 +457,7 @@ fn runtime_blocker_is_refreshable(code: &str) -> bool {
 /// This is not a shortcut around the scheduler: the seam only owns the plumbing (the `Core`, the
 /// output channel and candidate selection), so the test drives the real
 /// `Core::dispatch_agent_run_candidate` and then inspects the database by reopening it.
-#[cfg(test)]
+#[cfg(all(test, feature = "extended-tests"))] // needs `tests::test_core_for_database`, gated the same way
 pub(crate) async fn dispatch_queued_run_for_test(
     directory: &Path,
     database: Database,
@@ -474,7 +474,7 @@ pub(crate) async fn dispatch_queued_run_for_test(
 /// the same kind as the Core itself: it decides nothing about the dispatch, it only lets the real
 /// scheduler reach the same steps it reaches in production. A test installs a launcher whose
 /// `start` never settles, so the Run's own claim is the last thing the step does.
-#[cfg(test)]
+#[cfg(all(test, feature = "extended-tests"))] // needs `tests::test_core_for_database`, gated the same way
 pub(crate) async fn dispatch_queued_run_with_remote_launcher_for_test(
     directory: &Path,
     database: Database,

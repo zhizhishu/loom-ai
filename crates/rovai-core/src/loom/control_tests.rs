@@ -3328,6 +3328,7 @@ fn a_run_that_already_started_is_never_a_dispatch_failure() {
 /// a Run to wait, so the wait has to be decided before the Runtime is prepared. This drives the real
 /// scheduler step — not the claim helper — and proves the Run is never failed: it stays `queued`
 /// with its Delivery still `claimed`, and that very same Run starts once the device is back.
+#[cfg(feature = "extended-tests")] // builds a full test Core (`application::tests`), which only exists under extended-tests
 #[tokio::test]
 async fn a_loom_dispatch_waits_for_the_device_before_the_runtime_is_prepared() {
     let mut database = fixture();
@@ -3473,8 +3474,10 @@ async fn a_loom_dispatch_waits_for_the_device_before_the_runtime_is_prepared() {
 /// A remote process transport that is installed but never starts anything: the claim of a real
 /// remote Run is the last thing a scheduler step does, so this keeps the Run at the state the
 /// dispatch reached instead of letting a launch settle it.
+#[cfg(feature = "extended-tests")] // builds a full test Core (`application::tests`), which only exists under extended-tests
 struct NeverStartingRemoteLauncher;
 
+#[cfg(feature = "extended-tests")] // builds a full test Core (`application::tests`), which only exists under extended-tests
 impl crate::remote_process::RemoteProcessLauncher for NeverStartingRemoteLauncher {
     fn start(
         &self,
@@ -3491,6 +3494,7 @@ impl crate::remote_process::RemoteProcessLauncher for NeverStartingRemoteLaunche
 /// queued Run — materialised by the real Delivery claim with the real bundle capture — and proves
 /// the Run keeps its identity, its Delivery and its target across the outage, then starts on the
 /// same facts once the Node reports the harness again.
+#[cfg(feature = "extended-tests")] // builds a full test Core (`application::tests`), which only exists under extended-tests
 #[tokio::test]
 async fn a_remote_queued_run_waits_for_its_harness_instead_of_being_rejected() {
     let mut database = fixture();
