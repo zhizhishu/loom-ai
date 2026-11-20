@@ -886,23 +886,42 @@ pub fn stage_review_record(
         ));
     }
 
-    // Only the Run this Candidate's review was actually bound to may answer it, and it must be the
-    // binding of *this* authorization. A dispatch the platform wrote under an authorization the
-    // Owner has since replaced named a Run for an older grant: re-labeling that Run with the new
-    // revision does not make the standing grant ask it. A Run the platform asked to review one
-    // delivery stays bound to that delivery, so it cannot re-aim itself at a rework nobody asked it
-    // about. Only a Run the control plane never asked anything at all is a human/Lead request, and
-    // there the trusted Run above (assigned reviewer, not a producer, outside the producing
-    // session) is the observer that was asked.
+    // Independent observer first: the reviewing Run has to stand outside the Agent session that
+    // produced this Task's deliveries. A verdict written from the producing session, or from a Run
+    // that continues (or is continued by) a producing Run, is the producer judging itself through a
+    // second agent identity — the upstream `factoryCheckIndependent` session/ancestry fence, with no
+    // question exemptions here because LOOM has no accepted-answer continuation. This is decided
+    // before the request: a shared session is disqualifying on its own, and the refusal names the
+    // identity violation instead of what the ledger happens to hold.
+    ensure_reviewer_session_is_independent(
+        &transaction,
+        &plan_id,
+        &task_id,
+        &producer_run_id,
+        &RunSession {
+            run_id: trusted_run_id.clone(),
+            conversation_id: run.conversation_id,
+            native_installation_id: run.native_installation_id,
+            native_session_id: run.native_session_id,
+            predecessor_run_id: run.predecessor_run_id,
+        },
+    )?;
+
+    // A verdict answers one persisted review request, and nothing else: the REVIEW dispatch of *this*
+    // Candidate, of *this* stage and of *this* standing authorization, whose Delivery this very Run
+    // claimed. The reviewer assignment is not a request — an assigned reviewer that is busy with
+    // another Task was asked nothing. A missing ledger row is not a human/Lead request either: the
+    // Host queues every independent stage, so when no dispatch exists nobody was asked, and the Run
+    // that would like to judge is not an observer the Owner's grant appointed. A dispatch written
+    // under an authorization the Owner has since replaced named a Run for a grant that no longer
+    // stands: re-labeling it with the new revision does not make the standing grant ask it.
     match review_source(
         &transaction,
         &plan_id,
         &task_id,
         &candidate_id,
         policy_revision,
-        &trusted_run_id,
     )? {
-        ReviewSource::NotDispatched => {}
         ReviewSource::DispatchedTo(dispatched_run_id) if dispatched_run_id == trusted_run_id => {}
         ReviewSource::DispatchedTo(dispatched_run_id) => {
             return Err(LoomCommandError::rejection(
@@ -928,35 +947,15 @@ pub fn stage_review_record(
                 ),
             ));
         }
-        ReviewSource::BoundElsewhere(binding) => {
+        ReviewSource::NeverRequested => {
             return Err(LoomCommandError::rejection(
                 LOOM_STAGE_REVIEW_SOURCE_UNBOUND,
                 format!(
-                    "agent run {trusted_run_id} was dispatched to review candidate {} of task {} under authorization revision {}; it is not the observer this Candidate's review asked for",
-                    binding.candidate_id, binding.task_id, binding.policy_revision
+                    "no review of candidate {candidate_id} was ever dispatched, so nothing asked agent run {trusted_run_id} to judge it; a verdict answers the request the control plane made, not an assignment"
                 ),
             ));
         }
     }
-
-    // Independent observer: the reviewing Run has to stand outside the Agent session that produced
-    // this Task's deliveries. A verdict written from the producing session, or from a Run that
-    // continues (or is continued by) a producing Run, is the producer judging itself through a
-    // second agent identity — the upstream `factoryCheckIndependent` session/ancestry fence, with
-    // no question exemptions here because LOOM has no accepted-answer continuation.
-    ensure_reviewer_session_is_independent(
-        &transaction,
-        &plan_id,
-        &task_id,
-        &producer_run_id,
-        &RunSession {
-            run_id: trusted_run_id.clone(),
-            conversation_id: run.conversation_id,
-            native_installation_id: run.native_installation_id,
-            native_session_id: run.native_session_id,
-            predecessor_run_id: run.predecessor_run_id,
-        },
-    )?;
 
     // The manifest is whatever the Core can prove about the stored Candidate right now.
     let current_manifest = candidate_manifest_hash(&transaction, &candidate_id)?;
@@ -1561,35 +1560,22 @@ fn agent_of_run(connection: &Connection, agent_run_id: &str) -> Result<Option<St
         .optional()?)
 }
 
-/// The source a Candidate's review is bound to, derived from the persisted dispatch ledger.
+/// The review request a Candidate's verdict is allowed to answer, derived only from the persisted
+/// dispatch ledger.
 #[derive(Debug, PartialEq, Eq)]
 enum ReviewSource {
-    /// No review dispatch of this Candidate exists under any authorization *and* the asking Run was
-    /// never dispatched to review anything else in this Plan, so this is a human or Lead request:
-    /// the trusted Run the Host resolved is the observer it asked.
-    NotDispatched,
-    /// The standing authorization dispatched the review and this Run claimed its Delivery: only it
-    /// may answer.
+    /// The standing authorization dispatched the review of this Candidate and this Run claimed its
+    /// Delivery: the only Run that may answer.
     DispatchedTo(String),
     /// The standing authorization dispatched the review but no Run claimed the Delivery yet:
     /// nobody was asked.
     Unclaimed,
     /// The newest review dispatch of this Candidate belongs to an authorization the Owner has since
-    /// replaced, so the standing grant has not asked any Run. Its claimed Run — the one the old
-    /// grant asked — cannot answer under the new revision.
+    /// replaced, so the standing grant has not asked any Run.
     SupersededAuthorization(i64),
-    /// This Candidate's review was never dispatched, but the Run asking already holds a review
-    /// dispatch of another delivery: the platform asked that Run for something else, and pointing it
-    /// at a newer Candidate does not make the standing grant ask it for this one.
-    BoundElsewhere(ReviewBinding),
-}
-
-/// The review request one Run was dispatched to answer, as the ledger recorded it.
-#[derive(Debug, PartialEq, Eq)]
-struct ReviewBinding {
-    task_id: String,
-    candidate_id: String,
-    policy_revision: i64,
+    /// No review of this Candidate was dispatched under any authorization, so no Run was asked to
+    /// judge it. The reviewer assignment alone is a role, not a request.
+    NeverRequested,
 }
 
 /// Which Run, under which authorization, the platform bound this Candidate's review to.
@@ -1598,19 +1584,15 @@ struct ReviewBinding {
 /// carries at most one such dispatch per grant. Reading the newest dispatch of the Candidate is what
 /// makes a re-approved grant observable: a Run named by an older grant stays bound to that grant.
 ///
-/// The Candidate-scoped read alone is not enough, because the Candidate is named by the payload: a
-/// rework that nobody has dispatched yet would look like "this Candidate was never dispatched" to
-/// every Run in the Plan, including the Run the platform asked to review the *previous* delivery.
-/// So when this Candidate carries no dispatch, the asking Run's own dispatch is what decides: a Run
-/// the platform asked to review something else cannot answer, and only a Run the control plane never
-/// asked at all is left to the human/Lead path.
+/// The request is read from the Candidate the verdict names, never from the asking Run's own wishes:
+/// a dispatch of some *other* Candidate (a previous delivery, or another Task) is not this request,
+/// and an absent row is not a request either.
 fn review_source(
     connection: &Connection,
     plan_id: &str,
     task_id: &str,
     candidate_id: &str,
     policy_revision: i64,
-    trusted_run_id: &str,
 ) -> Result<ReviewSource> {
     let newest: Option<(i64, Option<String>)> = connection
         .query_row(
@@ -1626,49 +1608,15 @@ fn review_source(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    if let Some(newest) = newest {
-        return Ok(match newest {
-            (dispatched_revision, _) if dispatched_revision != policy_revision => {
-                ReviewSource::SupersededAuthorization(dispatched_revision)
-            }
-            (_, Some(run_id)) => ReviewSource::DispatchedTo(run_id),
-            (_, None) => ReviewSource::Unclaimed,
-        });
+    let Some((dispatched_revision, claimed_run_id)) = newest else {
+        return Ok(ReviewSource::NeverRequested);
+    };
+    if dispatched_revision != policy_revision {
+        return Ok(ReviewSource::SupersededAuthorization(dispatched_revision));
     }
-    // This Candidate carries no review dispatch, so the Run asking has to prove it was never asked
-    // to review something else. A dispatch whose identity is not exactly this request is what the
-    // platform asked it for, and re-labelling the payload cannot turn that into this one.
-    let bound_elsewhere: Option<ReviewBinding> = connection
-        .query_row(
-            "SELECT dispatch.task_id, COALESCE(dispatch.candidate_id,''),
-                    dispatch.policy_revision
-             FROM loom_control_dispatch dispatch
-             JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
-             WHERE dispatch.plan_id=?1 AND dispatch.kind='REVIEW'
-               AND delivery.claimed_agent_run_id=?2
-               AND NOT (dispatch.task_id=?3 AND COALESCE(dispatch.candidate_id,'')=?4
-                        AND dispatch.policy_revision=?5)
-             ORDER BY dispatch.created_at DESC, dispatch.dispatch_id DESC
-             LIMIT 1",
-            params![
-                plan_id,
-                trusted_run_id,
-                task_id,
-                candidate_id,
-                policy_revision
-            ],
-            |row| {
-                Ok(ReviewBinding {
-                    task_id: row.get(0)?,
-                    candidate_id: row.get(1)?,
-                    policy_revision: row.get(2)?,
-                })
-            },
-        )
-        .optional()?;
-    Ok(match bound_elsewhere {
-        Some(binding) => ReviewSource::BoundElsewhere(binding),
-        None => ReviewSource::NotDispatched,
+    Ok(match claimed_run_id {
+        Some(run_id) => ReviewSource::DispatchedTo(run_id),
+        None => ReviewSource::Unclaimed,
     })
 }
 
