@@ -675,6 +675,28 @@ describe('renewable browser authentication', () => {
     const loginsBody = fetcher.mock.calls.filter(([url]) => String(url).endsWith('/login')).map(([, options]) => JSON.parse(String(options?.body)))
     expect(loginsBody[1]).toMatchObject({ administratorToken: loginsBody[0].administratorToken, editor: { clientId: identity.clientId, proof: identity.editorProof } })
   })
+  it('names the paired node when the page authorizes an assistant to control its desktop', async () => {
+    const bodies: { path: string; body: Record<string, unknown> }[] = []
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (url, init) => {
+      const path = String(url).replace('http://127.0.0.1:4317', '')
+      if (path.endsWith('/login')) return Response.json({ protocolVersion: 5, token: 'a'.repeat(64), clientId: 'd'.repeat(64), editorProof: 'e'.repeat(64), ownerId: 'local_user', channels: 'desktop' })
+      bodies.push({ path, body: JSON.parse(String(init?.body ?? '{}')) })
+      return Response.json({ grantId: 'g'.repeat(64), assistantId: 'agent-a', deviceId: 'sha256:node', scope: 'control', nodeId: 'node_a', serverId: null, expiresAt: 1, validForSeconds: 1, state: 'active' })
+    })
+    const client = new ConsoleClient('http://127.0.0.1:4317', fetcher)
+    await client.login('b'.repeat(64))
+    const remote = client.workbench.remoteComputer?.('node_a')
+    expect(remote?.agents).toBeDefined()
+    await remote!.agents!.grant({ assistantId: 'agent-a', deviceId: 'sha256:node', scope: 'control', expectedConfigDigest: 'f'.repeat(64), ttlSeconds: 300 })
+    // The device lives on the node while the consent and the standing grant live on the Host,
+    // so the grant request must name the node instead of letting the Host guess it.
+    expect(bodies.filter(entry => entry.path === '/api/v1/computer/agents/grant')).toEqual([
+      { path: '/api/v1/computer/agents/grant', body: expect.objectContaining({ nodeId: 'node_a', deviceId: 'sha256:node', consent: true, assistantId: 'agent-a', scope: 'control' }) }
+    ])
+    expect(bodies.map(entry => entry.path)).not.toContain('/api/v1/computer/agents/grant-placeholder')
+    client.clear()
+  })
+
   it('opens a fresh browser editor from durable auth and preserves each tab draft through reload and logout', async () => {
     const now = 1_800_000_000_000
     const timing = { serverTime: now, expiresAt: now + 30 * day, renewalWindowSeconds: 604800 }

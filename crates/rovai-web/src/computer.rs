@@ -1914,7 +1914,7 @@ fn frame_response(frame: Frame, seq: u64, view_id: Option<&str>) -> Response {
     response
 }
 
-async fn blocking<T, F>(computer: &Computer, work: F) -> Result<T, &'static str>
+pub(crate) async fn blocking<T, F>(computer: &Computer, work: F) -> Result<T, &'static str>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, &'static str> + Send + 'static,

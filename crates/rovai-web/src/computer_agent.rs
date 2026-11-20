@@ -141,6 +141,7 @@ fn http_status(code: &'static str) -> StatusCode {
         }
         "computer_agent_control_held"
         | "computer_agent_device_mismatch"
+        | "computer_agent_device_unavailable"
         | "computer_agent_view_unavailable"
         | "computer_agent_request_replayed"
         | "computer_agent_grant_conflict"
@@ -442,6 +443,11 @@ pub(crate) struct GrantBody {
     pub assistant_id: String,
     pub scope: String,
     pub device_id: String,
+    /// The paired node that owns `device_id`. Absent means the local screen. The page names
+    /// it explicitly so a device id can never be resolved by guessing which node happens to
+    /// report it.
+    #[serde(default)]
+    pub node_id: Option<String>,
     /// The digest the UI showed the user before this click. Required: the Host never
     /// silently adopts a newer configuration than the one that was reviewed.
     pub expected_config_digest: String,
@@ -507,6 +513,9 @@ pub(crate) fn public_grant(grant: &Grant, now: u64) -> Value {
         "grantId": grant.id,
         "assistantId": grant.authority.bot_id,
         "deviceId": grant.authority.device_id,
+        // Additive: the paired node that owns this device, or null for the local screen. The
+        // page needs it to show which machine a standing grant covers.
+        "nodeId": grant.node_id,
         "runtime": grant.authority.runtime,
         "scope": grant.authority.permission.label(),
         "serverId": grant.server_id(),
@@ -546,6 +555,13 @@ pub(crate) struct Grant {
     id: String,
     owner: Arc<Session>,
     owner_sessions: Arc<Sessions>,
+    /// The physical device this grant covers. It is the local screen or the desktop of one
+    /// paired node, resolved once at consent time from Host state; no request body can
+    /// replace it, and every view, capture, input and retire call goes through it.
+    target: Arc<Computer>,
+    /// The paired node that owns [`Grant::target`], or `None` for the local screen. Recorded
+    /// so a revocation, the sweep and the report name the same device the user reviewed.
+    node_id: Option<String>,
     /// The identity this grant was minted for. Every tool call is re-authorized against
     /// it, and nothing in a request body can supply or widen it.
     authority: Authority,
@@ -1360,7 +1376,7 @@ impl AgentGrants {
 
     /// Retire every grant that is revoked or expired. The map lock is released before any
     /// fence or Core call, so this can never deadlock against a tool call.
-    async fn retire_due(&self, computer: &Arc<Computer>, now: u64) {
+    async fn retire_due(&self, now: u64) {
         let due: Vec<Arc<Grant>> = {
             let Ok(grants) = self.grants.lock() else {
                 return;
@@ -1381,7 +1397,7 @@ impl AgentGrants {
         };
         for grant in due {
             // Retained while the cleanup is unconfirmed, so the next sweep retries it.
-            if retire(computer, &self.mcp, &grant).await.is_ok() {
+            if retire(&grant.target, &self.mcp, &grant).await.is_ok() {
                 self.forget(&grant.digest);
             }
         }
@@ -1536,7 +1552,7 @@ async fn cleanup_mcp(mcp: &Arc<dyn McpOps>, grant: &Grant) -> Result<(), &'stati
 /// keeps showing it and `retire_due` retries it. Forgetting it would erase the only record
 /// of a server that may still exist.
 async fn try_retire(state: &WebState, grant: &Arc<Grant>) -> Result<(), &'static str> {
-    match retire(&state.computer, &state.agents.mcp, grant).await {
+    match retire(&grant.target, &state.agents.mcp, grant).await {
         Ok(()) => {
             state.agents.forget(&grant.digest);
             Ok(())
@@ -1591,6 +1607,71 @@ fn fence(computer: &Computer, grant: &Grant) -> bool {
     fenced
 }
 
+/// Resolve the device a grant is being minted for.
+///
+/// The page names either the local screen or one paired node. A node is resolved through
+/// the authenticated node registry (`Hub`), so a caller can never name a URL, a host or a
+/// port, and a node that has not advertised the computer transport is refused. The device
+/// id the browser reviewed must be the device's own id: it is echoed back through
+/// [`public_grant`] and every later tool call is fenced against the same computer, so a
+/// consent answered for one screen can never drive another.
+async fn resolve_target(
+    state: &WebState,
+    session: &Arc<Session>,
+    node_id: Option<&str>,
+    device_id: &str,
+) -> Result<(Arc<Computer>, String, Option<String>), &'static str> {
+    let Some(node_id) = node_id.filter(|id| !id.is_empty()) else {
+        let status = state
+            .computer
+            .status(&state.sessions, session)
+            .map_err(agent_computer_code)?;
+        let local = status["device"]["deviceId"].as_str().unwrap_or_default();
+        if local.is_empty() {
+            return Err("computer_agent_view_unavailable");
+        }
+        if device_id != local {
+            return Err("computer_agent_device_mismatch");
+        }
+        return Ok((state.computer.clone(), local.to_owned(), None));
+    };
+    let node_id = node_key(node_id)?;
+    let target = state
+        .node_computers
+        .for_node(&state.nodes, node_id)
+        .await
+        .map_err(|_| "computer_agent_device_unavailable")?;
+    let seen = Arc::clone(&target);
+    let sessions = state.sessions.clone();
+    let session = session.clone();
+    let status = computer::blocking(&target, move || seen.status(&sessions, &session))
+        .await
+        .map_err(|_| "computer_agent_device_unavailable")?;
+    let remote = status["device"]["deviceId"].as_str().unwrap_or_default();
+    if remote.is_empty() {
+        return Err("computer_agent_device_unavailable");
+    }
+    if device_id != remote {
+        return Err("computer_agent_device_mismatch");
+    }
+    Ok((target, remote.to_owned(), Some(node_id.to_owned())))
+}
+
+/// The registry key of a paired node. It is an opaque id, never a URL, a host or a path, so
+/// the shape is validated before it can reach the node registry.
+fn node_key(node_id: &str) -> Result<&str, &'static str> {
+    let trimmed = node_id.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 80
+        || !trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err("computer_agent_device_unavailable");
+    }
+    Ok(trimmed)
+}
+
 // ------------------------------------------------------------------ handlers
 
 pub(crate) async fn grant(
@@ -1615,18 +1696,22 @@ pub(crate) async fn grant(
     if !state.sessions.is_live(&session) {
         return reject("session_required");
     }
-    agents.retire_due(&state.computer, wall_clock()).await;
-    let status = match state.computer.status(&state.sessions, &session) {
-        Ok(status) => status,
-        Err(code) => return reject(agent_computer_code(code)),
+    agents.retire_due(wall_clock()).await;
+    // The reviewed device, resolved before anything is minted: the local screen, or the
+    // desktop of the one paired node the page named. A node that is unknown, offline or
+    // without a desktop has no device and is refused rather than falling back to the local
+    // screen, so the consent review can never be answered by a different machine.
+    let (target, device_id, node_id) = match resolve_target(
+        &state,
+        &session,
+        body.node_id.as_deref(),
+        &body.device_id,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(code) => return reject(code),
     };
-    let device_id = status["device"]["deviceId"].as_str().unwrap_or_default();
-    if device_id.is_empty() {
-        return reject("computer_agent_view_unavailable");
-    }
-    if body.device_id != device_id {
-        return reject("computer_agent_device_mismatch");
-    }
     let transport_origin = match state.network.public_origin() {
         Some(origin) => origin.to_owned(),
         None => match state.network.addresses() {
@@ -1747,7 +1832,7 @@ pub(crate) async fn grant(
         owner_id: owner.clone(),
         bot_id: body.assistant_id.clone(),
         runtime: assistant.adapter.clone(),
-        device_id: device_id.to_owned(),
+        device_id: device_id.clone(),
         permission: scope,
         policy_version: body.expected_config_digest.clone(),
     };
@@ -1769,6 +1854,8 @@ pub(crate) async fn grant(
         id: grant_id.clone(),
         owner: session.clone(),
         owner_sessions: state.sessions.clone(),
+        target: target.clone(),
+        node_id: node_id.clone(),
         authority,
         created_server_id: Mutex::new(String::new()),
         transport_origin,
@@ -1803,7 +1890,7 @@ pub(crate) async fn grant(
             if let Err(code) = admit_pending(&pending, &state.sessions) {
                 // The user logged out or the grant expired while Core was working: the
                 // server that already exists must be cleaned up, not published.
-                let cleanup = retire(&state.computer, &agents.mcp, &pending).await;
+                let cleanup = retire(&pending.target, &agents.mcp, &pending).await;
                 agents.forget(&pending.digest);
                 let _ = std::fs::remove_file(&token_path);
                 if cleanup.is_err() {
@@ -1815,6 +1902,8 @@ pub(crate) async fn grant(
                 id: pending.id.clone(),
                 owner: pending.owner.clone(),
                 owner_sessions: pending.owner_sessions.clone(),
+                target: pending.target.clone(),
+                node_id: pending.node_id.clone(),
                 authority: pending.authority.clone(),
                 created_server_id: Mutex::new(server_id),
                 transport_origin: pending.transport_origin.clone(),
@@ -1843,7 +1932,7 @@ pub(crate) async fn grant(
             // This reservation was never published, so no browser ever held its id: it is
             // dropped either way, because a stuck reservation would occupy a slot and
             // block the user's retry with `grant_conflict`.
-            let cleanup = retire(&state.computer, &agents.mcp, &pending).await;
+            let cleanup = retire(&pending.target, &agents.mcp, &pending).await;
             agents.forget(&pending.digest);
             let _ = std::fs::remove_file(&token_path);
             if code == "computer_agent_cleanup_unconfirmed" || cleanup.is_err() {
@@ -1909,7 +1998,7 @@ pub(crate) async fn list(
     Extension(session): Extension<Arc<Session>>,
 ) -> Response {
     let now = wall_clock();
-    state.agents.retire_due(&state.computer, now).await;
+    state.agents.retire_due(now).await;
     let owned: Vec<Value> = state
         .agents
         .owned(&session.client_id, now)
@@ -1937,7 +2026,7 @@ pub(crate) async fn revoke(
         return reject("computer_agent_grant_unknown_for_owner");
     };
     let grant_id = grant.id.clone();
-    match retire(&state.computer, &state.agents.mcp, &grant).await {
+    match retire(&grant.target, &state.agents.mcp, &grant).await {
         Ok(()) => {
             state.agents.forget(&grant.digest);
             Json(json!({"revoked": true, "grantId": grant_id})).into_response()
@@ -2002,7 +2091,7 @@ pub(crate) async fn rpc(
         return rpc_error(&body.request_id, code);
     }
     // Housekeeping is cheap because it only walks already-due grants.
-    state.agents.retire_due(&state.computer, now).await;
+    state.agents.retire_due(now).await;
 
     // Current member state, not the stamp recorded at grant time: a runtime switch, a
     // removed member or a new execution target revokes this grant before any OS call. This
@@ -2044,13 +2133,13 @@ pub(crate) async fn rpc(
         Err(code) => return rpc_error(&body.request_id, code),
     }
 
-    let computer = state.computer.clone();
+    let computer = grant.target.clone();
     let browser = state.sessions.clone();
     let task = grant.clone();
     let request_id = body.request_id.clone();
     let call_id = request_id.clone();
     let arguments = body.arguments.clone();
-    let permit = match state.computer.try_job() {
+    let permit = match grant.target.try_job() {
         Ok(permit) => permit,
         Err(code) => return rpc_error(&request_id, code),
     };
@@ -2676,6 +2765,8 @@ mod tests {
             id: "g".repeat(64),
             owner: owner.clone(),
             owner_sessions: browser.clone(),
+            target: Arc::new(Computer::from_env()),
+            node_id: None,
             authority: fixture_authority(owner, Scope::Control),
             created_server_id: Mutex::new("server-abc12345".to_owned()),
             transport_origin: "http://127.0.0.1:8443".to_owned(),
@@ -3889,6 +3980,144 @@ mod tests {
         assert_eq!(counters(), healthy, "no refused call may reach the device");
     }
 
+    /// A node id is an opaque registry key, never a URL/host/path a request could steer.
+    #[test]
+    fn a_node_device_key_is_an_opaque_bounded_id() {
+        assert_eq!(node_key("node-a_01").ok(), Some("node-a_01"));
+        for refused in [
+            "",
+            "   ",
+            "http://10.0.0.2:9000",
+            "/var/run/desktop",
+            "node/a",
+            "node:a",
+            &"n".repeat(81),
+        ] {
+            assert_eq!(
+                node_key(refused).err(),
+                Some("computer_agent_device_unavailable"),
+                "{refused}"
+            );
+        }
+    }
+
+    /// A grant the page minted for one paired node's desktop drives exactly that device.
+    ///
+    /// The capture and the two inputs reach the node provider, the local provider is never
+    /// touched, the standing grant reports the node it covers, and the revocation fences the
+    /// node: a later call is refused as revoked and neither provider sees another call. This
+    /// is the admission the browser uses when the user authorizes a remote screen instead of
+    /// the Host's own.
+    #[test]
+    fn a_grant_bound_to_a_paired_node_drives_only_that_node() {
+        fn device(id: &str) -> (Arc<Computer>, Arc<BlockingProvider>) {
+            let (entered, _entered_rx) = mpsc::channel();
+            let (_proceed_tx, proceed) = mpsc::channel::<()>();
+            let mut provider = BlockingProvider::new(entered, proceed);
+            Arc::get_mut(&mut provider).unwrap().device.id = id.to_owned();
+            let clock = Arc::new(AtomicU64::new(1_800_000_000_000));
+            let computer = Arc::new(Computer::with_test_provider(provider.clone(), {
+                let clock = clock.clone();
+                Arc::new(move || clock.load(Ordering::SeqCst))
+            }));
+            (computer, provider)
+        }
+
+        let (local, local_provider) = device("sha256:local-screen");
+        let (node, node_provider) = device("sha256:node-screen");
+        let (sessions, owner, _token) = browser();
+        let mut grant = grant_for(&sessions, &owner, wall_clock() + 60_000, false);
+        {
+            let fixture = Arc::get_mut(&mut grant).unwrap();
+            fixture.target = node.clone();
+            fixture.node_id = Some("node-a".to_owned());
+            fixture.authority.device_id = "sha256:node-screen".to_owned();
+        }
+        assert_eq!(public_grant(&grant, wall_clock())["nodeId"], json!("node-a"));
+        // The grant's own device is the resolved computer, not a name a caller supplies.
+        assert_eq!(
+            grant.target.status(&grant.sessions, &grant.session).unwrap()["device"]
+                ["deviceId"],
+            json!("sha256:node-screen")
+        );
+
+        let shot = run_tool(
+            &grant.target,
+            &sessions,
+            &grant,
+            Tool::Screenshot,
+            "node-shot-1",
+            json!({}),
+        )
+        .ok()
+        .expect("a node-bound grant must capture the node's screen");
+        assert!(shot["pngBase64"].as_str().is_some_and(|png| !png.is_empty()));
+        for (tool, request_id) in [
+            (Tool::Key, "node-key-1"),
+            (Tool::Text, "node-text-1"),
+        ] {
+            let arguments = if tool == Tool::Key {
+                json!({"key": "enter"})
+            } else {
+                json!({"text": "hello"})
+            };
+            run_tool(
+                &grant.target,
+                &sessions,
+                &grant,
+                tool,
+                request_id,
+                arguments,
+            )
+            .ok()
+            .expect("a control grant must type on the node");
+        }
+        assert_eq!(node_provider.captures.load(Ordering::SeqCst), 1);
+        assert_eq!(node_provider.inputs.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            local_provider.captures.load(Ordering::SeqCst),
+            0,
+            "the local screen must never be captured for a node grant"
+        );
+        assert_eq!(
+            local_provider.inputs.load(Ordering::SeqCst),
+            0,
+            "no synthetic input may reach the local screen"
+        );
+
+        // The revocation fences the node, not the local screen, and the grant stops.
+        let fake = FakeMcp::new();
+        fake.present(true, &["assistant-1"], "");
+        let grants = AgentGrants::for_test(fake.clone());
+        grants.reserve(grant.clone()).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(async { retire(&grant.target, &grants.mcp, &grant).await })
+            .expect("a node grant must retire through its own device");
+        assert!(grant.revoked.load(Ordering::Acquire));
+        let refused = run_tool(
+            &grant.target,
+            &sessions,
+            &grant,
+            Tool::Key,
+            "node-key-2",
+            json!({"key": "enter"}),
+        )
+        .err()
+        .expect("a revoked node grant must be refused");
+        assert_eq!(refused.code, "computer_agent_grant_revoked");
+        assert_eq!(node_provider.inputs.load(Ordering::SeqCst), 2);
+        assert_eq!(local_provider.inputs.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            local.status(&sessions, &owner).unwrap()["device"]["deviceId"],
+            json!("sha256:local-screen"),
+            "the local screen keeps its own identity"
+        );
+    }
+
     #[test]
     fn logout_retires_the_mcp_entry_as_well_as_the_tool_path() {
         let fake = FakeMcp::new();
@@ -3898,14 +4127,13 @@ mod tests {
         let (sessions, owner, _token) = browser();
         let grant = grant_for(&sessions, &owner, wall_clock() + 300_000, false);
         grants.reserve(grant.clone()).unwrap();
-        let computer = idle_computer();
         // Nothing is expired or explicitly revoked; only the browser session goes away.
         sessions.rotate(&crate::new_token().unwrap()).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        runtime.block_on(async { grants.retire_due(&computer, wall_clock()).await });
+        runtime.block_on(async { grants.retire_due(wall_clock()).await });
         assert!(fake.names().contains(&"set_enabled"));
         assert!(fake.names().contains(&"delete"));
         assert!(!grant.sessions.is_live(&grant.session));

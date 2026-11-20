@@ -1158,8 +1158,16 @@ export class ConsoleClient {
   #remoteComputer(nodeId: string): ComputerPort {
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(nodeId)) throw new Error('执行节点身份无效。')
     const base = `computer/nodes/${nodeId}` as const
-    // No Agent grant port here: remote Agent tooling has a separate admission gate.
+    // Agent tooling for a remote desktop is authorized on the Host (the consent, the
+    // standing grant and its MCP server all live there) while the device stays on the node.
+    // The grant therefore names the node explicitly instead of letting the Host guess which
+    // machine a device id belongs to.
     return {
+      agents: {
+        list: () => this.#workbenchJson('computer/agents/list', {}),
+        grant: input => this.#workbenchJson('computer/agents/grant', { ...input, nodeId, consent: true }),
+        revoke: grantId => this.#workbenchJson('computer/agents/revoke', { grantId })
+      },
       status: () => this.#workbenchJson(base, {}),
       startView: deviceId => this.#workbenchJson(`${base}/view`, { deviceId, consent:true }),
       frame: (viewId, signal) => this.#computerFrame(viewId,signal,`${base}/frame`),

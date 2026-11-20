@@ -48,6 +48,8 @@ export type ComputerFrame = { blob: Blob; bounds: ScreenBounds; width: number; h
 export type ComputerLeaseIdentity = { viewId: string; controlId: string; generation: number }
 export type ComputerAgentGrant = {
   grantId: string; assistantId: string; deviceId: string; scope: 'view' | 'control'
+  /** The paired node that owns `deviceId`, or null when the grant covers this computer. */
+  nodeId?: string | null
   serverId: string | null; expiresAt: number; validForSeconds: number
   state: 'active' | 'expired' | 'revoked' | 'owner_session_closed'
 }
@@ -57,7 +59,7 @@ export type ComputerAgentGrants = {
 }
 export interface ComputerAgentPort {
   list(): Promise<ComputerAgentGrants>
-  grant(input: { assistantId: string; deviceId: string; scope: 'view' | 'control'; expectedConfigDigest: string; ttlSeconds: number }): Promise<ComputerAgentGrant>
+  grant(input: { assistantId: string; deviceId: string; scope: 'view' | 'control'; expectedConfigDigest: string; ttlSeconds: number; nodeId?: string }): Promise<ComputerAgentGrant>
   revoke(grantId: string): Promise<{ revoked: boolean; grantId: string }>
 }
 export interface ComputerPort {
