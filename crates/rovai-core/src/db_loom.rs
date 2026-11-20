@@ -1504,6 +1504,13 @@ fn recovery_sql() -> String {
             progress_at TEXT,
             observed_at TEXT NOT NULL,
             next_at TEXT NOT NULL,
+            -- The upstream watchdog state that lives on the Attempt output rather than in the
+            -- `task_watchdog` receipt (`factory_attempts.output->'watchdog'`): the reason the
+            -- Task was held, and the instant its stop was requested. A `wait` receipt refreshes
+            -- `observed_at` but must not move either of them, or the five-minute stop window
+            -- would restart on every observation and never time out.
+            reason_code TEXT CHECK(reason_code IS NULL OR length(reason_code) BETWEEN 1 AND 120),
+            stopped_at TEXT,
             PRIMARY KEY(task_id, attempt_id, request_epoch),
             FOREIGN KEY(task_id) REFERENCES {TASK_TABLE}(task_id) ON DELETE CASCADE
         );
@@ -1541,7 +1548,7 @@ fn recovery_schema_objects(
 /// in the same order, the same primary key and cascade, both real indexes over the columns
 /// their names promise, and the real budget trigger body.
 ///
-/// Counting ten columns or looking for object names is not enough. Renaming `next_at` keeps the
+/// Counting the columns or looking for object names is not enough. Renaming `next_at` keeps the
 /// count while `defers` can no longer read the stored backoff, and a trigger called
 /// `loom_task_recovery_budget_never_shrinks` whose body is `SELECT 1` keeps the name while
 /// refunding a spent budget. The comparison therefore runs this module's own SQL in a scratch
@@ -1556,7 +1563,7 @@ fn recovery_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
     let declared: i64 = connection.query_row(
         "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name IN
              ('task_id','attempt_id','request_epoch','action','tries','recovery_tries',
-              'blocked','progress_at','observed_at','next_at')",
+              'blocked','progress_at','observed_at','next_at','reason_code','stopped_at')",
         [RECOVERY_TABLE],
         |row| row.get(0),
     )?;
@@ -1567,8 +1574,8 @@ fn recovery_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
     )?;
     let holds =
         |name: &str, expected_sql: &str| trigger_sql_matches(connection, name, expected_sql);
-    Ok(declared == 10
-        && total == 10
+    Ok(declared == 12
+        && total == 12
         && holds(
             "loom_task_recovery_budget_never_shrinks",
             &format!(
@@ -1645,15 +1652,14 @@ pub(super) fn downgrade_recovery_ledger_for_test(connection: &Connection) {
 }
 
 /// One persisted watchdog receipt: the upstream `task_watchdog` event's `request` and
-/// `result` in one row. `request_epoch` is the Task's source Event the receipt is bound to,
-/// `attempt_id` is the Attempt that observed it, and `tries`/`recovery_tries`/`next_at` are
-/// the durable budget and backoff that must survive a restart.
-// The M5 watchdog sweep is the consumer, and its LOOM wiring lands next; until then the
-// receipt API is exercised only by the migration tests, so the dead-code lint is expected
-// rather than a sign that the port is unused (same posture as `loom::watchdog`).
-#[allow(dead_code)]
+/// `result` in one row, together with the Attempt's own watchdog state. `request_epoch` is the
+/// Task's source Event the receipt is bound to, `attempt_id` is the Attempt that observed it,
+/// and `tries`/`recovery_tries`/`next_at` are the durable budget and backoff that must survive
+/// a restart. `reason_code`/`stopped_at` are the upstream `attempt.output.watchdog` pair:
+/// which hold this Attempt applied and when it asked its executor to stop.
+// The M5-C watchdog sweep is the consumer; the migration tests also exercise this API.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct LoomRecoveryReceipt {
+pub(crate) struct LoomRecoveryReceipt {
     pub task_id: String,
     pub attempt_id: String,
     pub request_epoch: String,
@@ -1664,13 +1670,14 @@ pub(super) struct LoomRecoveryReceipt {
     pub progress_at: Option<String>,
     pub observed_at: String,
     pub next_at: String,
+    pub reason_code: Option<String>,
+    pub stopped_at: Option<String>,
 }
 
-#[allow(dead_code)]
 impl LoomRecoveryReceipt {
     /// Upstream: a receipt whose `nextAt` is still in the future defers a new observation.
     /// An unreadable instant is not "long past": it simply stops deferring, never aborts.
-    pub(super) fn defers(&self, now: DateTime<Utc>) -> bool {
+    pub(crate) fn defers(&self, now: DateTime<Utc>) -> bool {
         DateTime::parse_from_rfc3339(&self.next_at).is_ok_and(|next| next > now)
     }
 }
@@ -1678,8 +1685,7 @@ impl LoomRecoveryReceipt {
 /// Upstream `tries = action === 'stalled' ? 0 : (previous?.result?.tries ?? 0) + 1`.
 /// A `stalled` receipt resets the Attempt counter because the stop itself is a new
 /// observation, while every other action spends one more try of the same Attempt.
-#[allow(dead_code)]
-pub(super) fn next_watchdog_tries(previous: Option<i64>, action: &str) -> i64 {
+pub(crate) fn next_watchdog_tries(previous: Option<i64>, action: &str) -> i64 {
     if action == "stalled" {
         0
     } else {
@@ -1689,15 +1695,13 @@ pub(super) fn next_watchdog_tries(previous: Option<i64>, action: &str) -> i64 {
 
 /// Upstream `recoveryTries = (previous?.result?.recoveryTries ?? 0) + (action ===
 /// 'recover_stall' ? 1 : 0)`: only an actual replay spends the automatic recovery budget.
-#[allow(dead_code)]
-pub(super) fn next_recovery_tries(previous: Option<i64>, action: &str) -> i64 {
+pub(crate) fn next_recovery_tries(previous: Option<i64>, action: &str) -> i64 {
     previous.unwrap_or(0) + i64::from(action == "recover_stall")
 }
 
 /// Upstream `nextAt = now + Math.min(15, 2 ** tries) * 60_000`: minutes 1, 2, 4, 8, then a
 /// 15-minute ceiling, so a retry storm can never exceed one observation per 15 minutes.
-#[allow(dead_code)]
-pub(super) fn watchdog_next_at(now: DateTime<Utc>, tries: i64) -> DateTime<Utc> {
+pub(crate) fn watchdog_next_at(now: DateTime<Utc>, tries: i64) -> DateTime<Utc> {
     let minutes = (1_i64 << tries.clamp(0, 4)).min(15);
     now + chrono::Duration::minutes(minutes)
 }
@@ -1709,8 +1713,7 @@ pub(super) const WATCHDOG_WAIT_MINUTES: i64 = 5;
 
 /// Upstream `nextAt = now + (task.status === 'blocked' ? 60_000 : 5 * 60_000)` for `wait`:
 /// a progressing or human-owned Task is simply re-observed later.
-#[allow(dead_code)]
-pub(super) fn watchdog_wait_next_at(now: DateTime<Utc>, blocked: bool) -> DateTime<Utc> {
+pub(crate) fn watchdog_wait_next_at(now: DateTime<Utc>, blocked: bool) -> DateTime<Utc> {
     let minutes = if blocked {
         WATCHDOG_WAIT_BLOCKED_MINUTES
     } else {
@@ -1721,14 +1724,12 @@ pub(super) fn watchdog_wait_next_at(now: DateTime<Utc>, blocked: bool) -> DateTi
 
 /// Upstream `exhausted = tries > WATCHDOG_MAX_RECOVERIES || (action === 'recover_stall' &&
 /// budget.count >= WATCHDOG_MAX_RECOVERIES)`, with the budget summed over the epoch.
-#[allow(dead_code)]
-pub(super) fn recovery_exhausted(tries: i64, action: &str, budget: i64) -> bool {
+pub(crate) fn recovery_exhausted(tries: i64, action: &str, budget: i64) -> bool {
     let max = crate::loom::watchdog::WATCHDOG_MAX_RECOVERIES;
     tries > max || (action == "recover_stall" && budget >= max)
 }
 
-#[allow(dead_code)]
-pub(super) fn recovery_receipt(
+pub(crate) fn recovery_receipt(
     connection: &Connection,
     task_id: &str,
     attempt_id: &str,
@@ -1737,7 +1738,8 @@ pub(super) fn recovery_receipt(
     connection
         .query_row(
             "SELECT task_id,attempt_id,request_epoch,action,tries,recovery_tries,blocked,
-                    progress_at,observed_at,next_at FROM loom_task_recovery
+                    progress_at,observed_at,next_at,reason_code,stopped_at
+             FROM loom_task_recovery
              WHERE task_id=?1 AND attempt_id=?2 AND request_epoch=?3",
             params![task_id, attempt_id, request_epoch],
             |row| {
@@ -1752,6 +1754,8 @@ pub(super) fn recovery_receipt(
                     progress_at: row.get(7)?,
                     observed_at: row.get(8)?,
                     next_at: row.get(9)?,
+                    reason_code: row.get(10)?,
+                    stopped_at: row.get(11)?,
                 })
             },
         )
@@ -1760,8 +1764,7 @@ pub(super) fn recovery_receipt(
 
 /// The spent automatic-recovery budget of one Task and source Event, summed across its
 /// Attempts exactly like the upstream budget query.
-#[allow(dead_code)]
-pub(super) fn recovery_budget(
+pub(crate) fn recovery_budget(
     connection: &Connection,
     task_id: &str,
     request_epoch: &str,
@@ -1772,6 +1775,27 @@ pub(super) fn recovery_budget(
         params![task_id, request_epoch],
         |row| row.get(0),
     )
+}
+
+/// One watchdog observation of one Attempt: everything the ledger has to persist about a single
+/// pass. The `wait` branch spends nothing and keeps the previous `action`/`tries`/
+/// `recoveryTries`; a blocked observation also carries the Attempt's watchdog state
+/// (`reasonCode`/`stoppedAt`), while a non-blocked one leaves whatever an earlier hold recorded
+/// alone.
+pub(crate) struct WatchdogObservation<'a> {
+    pub task_id: &'a str,
+    pub attempt_id: &'a str,
+    pub request_epoch: &'a str,
+    pub action: &'a str,
+    pub blocked: bool,
+    pub progress_at: Option<&'a str>,
+    /// The upstream `reasonCode` of the hold this observation applied, when it applied one.
+    pub reason_code: Option<&'a str>,
+    /// The instant the stop was requested. Only the observation that first requests it states it;
+    /// a later escalation (`stop_timeout`) keeps the stored one, so the five-minute window is
+    /// measured from the real request.
+    pub stopped_at: Option<&'a str>,
+    pub now: DateTime<Utc>,
 }
 
 /// Observe one Task once: read the durable previous receipt, derive `tries`,
@@ -1786,7 +1810,7 @@ pub(super) fn recovery_budget(
 /// decision's `blocked` result. A wait therefore never consumes the budget and never rewrites a
 /// recorded `stalled`/`reconcile` action, exactly like the upstream `ON CONFLICT` result merge.
 #[allow(dead_code)]
-pub(super) fn record_watchdog_recovery(
+pub(crate) fn record_watchdog_recovery(
     connection: &Connection,
     task_id: &str,
     attempt_id: &str,
@@ -1796,6 +1820,37 @@ pub(super) fn record_watchdog_recovery(
     progress_at: Option<&str>,
     now: DateTime<Utc>,
 ) -> rusqlite::Result<LoomRecoveryReceipt> {
+    record_watchdog_observation(
+        connection,
+        WatchdogObservation {
+            task_id,
+            attempt_id,
+            request_epoch,
+            action,
+            blocked,
+            progress_at,
+            reason_code: None,
+            stopped_at: None,
+            now,
+        },
+    )
+}
+
+pub(crate) fn record_watchdog_observation(
+    connection: &Connection,
+    observation: WatchdogObservation<'_>,
+) -> rusqlite::Result<LoomRecoveryReceipt> {
+    let WatchdogObservation {
+        task_id,
+        attempt_id,
+        request_epoch,
+        action,
+        blocked,
+        progress_at,
+        reason_code,
+        stopped_at,
+        now,
+    } = observation;
     let previous = recovery_receipt(connection, task_id, attempt_id, request_epoch)?;
     let waiting = action == "wait";
     // Upstream `action: previous?.result?.action ?? 'wait'`.
@@ -1822,6 +1877,12 @@ pub(super) fn record_watchdog_recovery(
     } else {
         watchdog_next_at(now, tries)
     };
+    // Upstream `attempt.output = output || {watchdog: {...}}`: only an observation that applies a
+    // hold rewrites the Attempt's watchdog state, so a plain wait or a reconcile keeps it.
+    let previous_reason = previous
+        .as_ref()
+        .and_then(|prior| prior.reason_code.clone());
+    let previous_stopped_at = previous.as_ref().and_then(|prior| prior.stopped_at.clone());
     let receipt = LoomRecoveryReceipt {
         task_id: task_id.to_string(),
         attempt_id: attempt_id.to_string(),
@@ -1833,16 +1894,19 @@ pub(super) fn record_watchdog_recovery(
         progress_at: progress_at.map(str::to_string),
         observed_at: now.to_rfc3339(),
         next_at: next_at.to_rfc3339(),
+        reason_code: reason_code.map(str::to_string).or(previous_reason),
+        stopped_at: stopped_at.map(str::to_string).or(previous_stopped_at),
     };
     connection.execute(
         "INSERT INTO loom_task_recovery(task_id,attempt_id,request_epoch,action,tries,
-                recovery_tries,blocked,progress_at,observed_at,next_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                recovery_tries,blocked,progress_at,observed_at,next_at,reason_code,stopped_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
          ON CONFLICT(task_id,attempt_id,request_epoch) DO UPDATE SET
              action=excluded.action,tries=excluded.tries,
              recovery_tries=excluded.recovery_tries,blocked=excluded.blocked,
              progress_at=excluded.progress_at,observed_at=excluded.observed_at,
-             next_at=excluded.next_at",
+             next_at=excluded.next_at,reason_code=excluded.reason_code,
+             stopped_at=excluded.stopped_at",
         params![
             receipt.task_id,
             receipt.attempt_id,
@@ -1854,6 +1918,8 @@ pub(super) fn record_watchdog_recovery(
             receipt.progress_at,
             receipt.observed_at,
             receipt.next_at,
+            receipt.reason_code,
+            receipt.stopped_at,
         ],
     )?;
     Ok(receipt)

@@ -24,7 +24,7 @@ use crate::command::{ActorRef, CommandEnvelope};
 use crate::db::{Database, TestDatabaseOpenMode};
 use crate::mission::{CreateMissionCommand, MissionService};
 use crate::test_support::OwnedTestDatabase;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 const OWNER: &str = "local_user";
 const PRODUCER_AGENT: &str = "agent_1";
@@ -3694,5 +3694,924 @@ async fn a_remote_queued_run_waits_for_its_harness_instead_of_being_rejected() {
         dispatch_events(&database, "task_a"),
         vec![failure_fact("loom.dispatch_harness_unavailable")],
         "assertion the_remote_outage_keeps_its_single_fact_after_recovery"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Watchdog boundary (M5-C): the M3 decision table wired to this tick, with the durable recovery
+// ledger (M5-B) as its only memory.
+//
+// The fixtures are the real product paths — `plan_import`, a real approval, `admit_due_dispatches`,
+// the real Delivery claim and the real Run admission — so a passing case proves what a restarted
+// Core would see, not what a test-only scheduler stub would.
+// ---------------------------------------------------------------------------------------------
+
+/// A fixed instant for the watchdog cases: the whole table is judged against an explicit clock, so
+/// no case ever sleeps or reads the wall clock.
+fn at(seconds: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(seconds, 0).unwrap()
+}
+
+/// One Task whose real Delivery produced a real Run, with every persisted progress fact moved back to
+/// `progress_at` so the watchdog has a stalled Task to judge.
+struct DispatchedTask {
+    mission_id: String,
+    plan_id: String,
+    camp_id: String,
+    installation_id: String,
+    dispatch_id: String,
+    run_id: String,
+    progress_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl DispatchedTask {
+    fn epoch(&self, database: &OwnedTestDatabase) -> String {
+        database
+            .connection()
+            .query_row(
+                "SELECT dedupe_key FROM loom_control_dispatch WHERE dispatch_id=?1",
+                [&self.dispatch_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+}
+
+/// The real shape the watchdog watches: one Task, one admitted Dispatch, one claimed Delivery, one
+/// running Run. `stall_for` backdates the persisted progress of the Task, its Attempt and its Run —
+/// and nothing else — so the pass has to decide from those facts alone.
+fn dispatched_running_task(
+    database: &mut OwnedTestDatabase,
+    title: &str,
+    command_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    stall_for: chrono::Duration,
+) -> DispatchedTask {
+    let (mission_id, plan_id) = dispatchable_plan(
+        database,
+        title,
+        command_id,
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(database, &mission_id);
+    let installation_id = installation_of(database, PRODUCER_AGENT);
+    assert_eq!(
+        control::admit_due_dispatches_at(database, now)
+            .unwrap()
+            .admitted,
+        1,
+        "assertion the_approved_task_reserves_its_delivery"
+    );
+    let claimed = claim_mission_lane(database, &camp_id, 1);
+    assert_eq!(claimed.len(), 1, "assertion the_delivery_produces_one_run");
+    let run_id = claimed[0].clone();
+    let (dispatch_id, run_of_dispatch) = dispatch_and_run(database, "task_a");
+    assert_eq!(
+        run_of_dispatch.as_deref(),
+        Some(run_id.as_str()),
+        "assertion the_run_belongs_to_this_dispatch"
+    );
+    let started = claim_the_run(database, &camp_id, &run_id);
+    assert_eq!(
+        started.result.status,
+        crate::command::CommandResultStatus::Accepted,
+        "assertion the_queued_run_starts: {:?}",
+        started.result
+    );
+    let progress_at = now - stall_for;
+    backdate_progress(database, &plan_id, &dispatch_id, &run_id, progress_at);
+    DispatchedTask {
+        mission_id,
+        plan_id,
+        camp_id,
+        installation_id,
+        dispatch_id,
+        run_id,
+        progress_at,
+    }
+}
+
+/// Move every persisted *progress* fact of one Task back to `progress_at`. Lease and heartbeat
+/// timestamps are deliberately left at their current values (and renewed by the heartbeat case
+/// below), because they are exactly the facts that must not count as progress.
+fn backdate_progress(
+    database: &OwnedTestDatabase,
+    plan_id: &str,
+    dispatch_id: &str,
+    run_id: &str,
+    progress_at: chrono::DateTime<chrono::Utc>,
+) {
+    let progress_at = progress_at.to_rfc3339();
+    database
+        .connection()
+        .execute(
+            "UPDATE loom_task SET updated_at=?1 WHERE plan_id=?2 AND task_id='task_a'",
+            params![&progress_at, plan_id],
+        )
+        .unwrap();
+    // The Dispatch ledger row itself is immutable (only its status, reason and `updated_at` may
+    // move), and its own instants are not progress facts in the first place: the Attempt's start is
+    // the claim and the Run's `started_at`.
+    let _ = dispatch_id;
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_run SET started_at=?1 WHERE id=?2",
+            params![&progress_at, run_id],
+        )
+        .unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE loom_claim SET claimed_at=?1 WHERE plan_id=?2 AND task_id='task_a'",
+            params![&progress_at, plan_id],
+        )
+        .unwrap();
+}
+
+fn tick_at(
+    database: &mut OwnedTestDatabase,
+    at: chrono::DateTime<chrono::Utc>,
+) -> control::LoomTickOutcome {
+    control::admit_due_dispatches_at(database, at).unwrap()
+}
+
+fn watchdog_hold(database: &OwnedTestDatabase, plan_id: &str) -> Option<String> {
+    database
+        .connection()
+        .query_row(
+            "SELECT blocked_reason FROM loom_task WHERE plan_id=?1 AND task_id='task_a'",
+            [plan_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+}
+
+/// The persisted watchdog receipt of one Attempt and epoch:
+/// `(action, tries, recoveryTries, blocked, reasonCode, stoppedAt)`.
+fn watchdog_receipt(
+    database: &OwnedTestDatabase,
+    attempt_id: &str,
+    request_epoch: &str,
+) -> Option<(String, i64, i64, bool, Option<String>, Option<String>)> {
+    database
+        .connection()
+        .query_row(
+            "SELECT action, tries, recovery_tries, blocked, reason_code, stopped_at
+             FROM loom_task_recovery WHERE task_id='task_a' AND attempt_id=?1
+               AND request_epoch=?2",
+            params![attempt_id, request_epoch],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, i64>(3)? == 1,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .unwrap()
+}
+
+fn next_at(database: &OwnedTestDatabase, attempt_id: &str, request_epoch: &str) -> Option<String> {
+    database
+        .connection()
+        .query_row(
+            "SELECT next_at FROM loom_task_recovery WHERE task_id='task_a'
+               AND attempt_id=?1 AND request_epoch=?2",
+            params![attempt_id, request_epoch],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
+}
+
+fn run_cancel_requested(database: &OwnedTestDatabase, run_id: &str) -> Option<String> {
+    database
+        .connection()
+        .query_row(
+            "SELECT cancel_requested_at FROM agent_run WHERE id=?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// The durable watchdog facts of one Task, in write order: `(event type, reasonCode)`.
+fn watchdog_events(database: &Database, task_id: &str) -> Vec<(String, Option<String>)> {
+    let mut statement = database
+        .connection()
+        .prepare(
+            "SELECT event_type, payload_json FROM event_log
+             WHERE entity_type='loom_task' AND entity_id=?1
+               AND event_type LIKE 'loom.watchdog%'
+             ORDER BY global_sequence, id",
+        )
+        .unwrap();
+    statement
+        .query_map([task_id], |row| {
+            let payload: String = row.get(1)?;
+            let reason = serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .and_then(|payload| {
+                    payload["reasonCode"]
+                        .as_str()
+                        .map(std::string::ToString::to_string)
+                });
+            Ok((row.get(0)?, reason))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+/// The watchdog's own hold, once per reason: a repeated observation of the same hold stores nothing.
+fn watchdog_hold_fact(database: &Database, task_id: &str, reason_code: &str) -> i64 {
+    count(
+        database,
+        &format!(
+            "SELECT COUNT(*) FROM event_log WHERE entity_type='loom_task'
+               AND entity_id='{task_id}' AND event_type='loom.watchdog_blocked'
+               AND payload_json->>'reasonCode'='{reason_code}'"
+        ),
+    )
+}
+
+/// Acknowledged stop: the Executor settled the Run the way a real Runtime does, so the Run is
+/// terminal and `activeRun` is false.
+fn acknowledge_stop(database: &OwnedTestDatabase, run_id: &str, at: chrono::DateTime<chrono::Utc>) {
+    let at = at.to_rfc3339();
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_run SET status='failed', wait_reason=NULL, wait_deadline_at=NULL,
+                                 ended_at=?1, updated_at=?1, cancel_acknowledged_at=?1
+             WHERE id=?2",
+            params![&at, run_id],
+        )
+        .unwrap();
+}
+
+/// The claims of `task_a` that still hold it. The real Run admission
+/// (`claim_the_run` → `preclaim_loom_dispatch_tasks`) is what writes the claim, so an open claim here
+/// is exactly the fence a dead executor leaves behind.
+fn is_watchdog_hold_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "loom.watchdog.task_stalled"
+            | "loom.watchdog.external_effect_uncertain"
+            | "loom.watchdog.stop_unacknowledged"
+            | "loom.watchdog.recovery_exhausted"
+    )
+}
+
+fn open_claims(database: &OwnedTestDatabase) -> i64 {
+    count(
+        database,
+        "SELECT COUNT(*) FROM loom_claim WHERE task_id='task_a' AND released_at IS NULL",
+    )
+}
+
+/// Progress boundary, ported from the upstream rule that a lease or heartbeat is not progress:
+/// "Tool results, checkpoints, candidates and stage transitions are the persisted progress".
+/// A hung executor that keeps renewing its lease is stopped at the stage window; the same window
+/// does not fire for a Task that really advanced.
+#[test]
+fn watchdog_progress_is_persisted_work_never_a_heartbeat() {
+    let now = at(1_800_000_000);
+    let mut database = fixture();
+    let task = dispatched_running_task(
+        &mut database,
+        "watchdog heartbeat",
+        "command_approve_heartbeat",
+        now,
+        chrono::Duration::minutes(30),
+    );
+    let epoch = task.epoch(&database);
+
+    // The executor renews its lease and bumps the Run row, but writes no progress at all.
+    let heartbeat = (now + chrono::Duration::minutes(14)).to_rfc3339();
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_run SET execution_lease_owner='loom-dispatch-test',
+                                 execution_lease_expires_at=?1, updated_at=?1
+             WHERE id=?2",
+            params![&heartbeat, &task.run_id],
+        )
+        .unwrap();
+
+    // 44 minutes into a 45-minute execute window: nothing to repair yet, and the receipt is a wait.
+    let early = tick_at(&mut database, now + chrono::Duration::minutes(14));
+    assert_eq!(
+        (
+            early.scanned,
+            early.blocked,
+            early.recovered,
+            early.deferred,
+        ),
+        (1, 0, 0, 0),
+        "assertion a_task_inside_its_stage_window_is_only_observed"
+    );
+    assert_eq!(
+        watchdog_hold(&database, &task.plan_id),
+        None,
+        "assertion a_heartbeating_task_that_still_progressed_is_not_held"
+    );
+    assert_eq!(
+        watchdog_receipt(&database, &task.dispatch_id, &epoch).map(|receipt| receipt.0),
+        Some("wait".into()),
+        "assertion the_observation_is_recorded_as_a_wait"
+    );
+
+    // The wait receipt that was just stored is the backoff the next pass honours: one minute later
+    // the window is open, but the recorded `nextAt` is not — nothing is judged and nothing is spent.
+    let deferred = tick_at(&mut database, now + chrono::Duration::minutes(15));
+    assert_eq!(
+        (deferred.blocked, deferred.recovered, deferred.deferred),
+        (0, 0, 1),
+        "assertion the_recorded_backoff_defers_the_next_judgement"
+    );
+
+    // The same Task, judged on the same persisted facts once that backoff elapsed, is stalled — the
+    // renewed lease and the bumped Run row change nothing.
+    let stalled = tick_at(&mut database, now + chrono::Duration::minutes(19));
+    assert_eq!(
+        (stalled.blocked, stalled.recovered),
+        (1, 0),
+        "assertion a_heartbeat_never_extends_the_progress_window"
+    );
+    assert_eq!(
+        watchdog_hold(&database, &task.plan_id).as_deref(),
+        Some("loom.watchdog.task_stalled"),
+        "assertion the_stalled_task_is_held_with_the_watchdog_reason"
+    );
+    assert!(
+        run_cancel_requested(&database, &task.run_id).is_some(),
+        "assertion the_stalled_executor_is_asked_to_stop"
+    );
+    assert_eq!(
+        watchdog_receipt(&database, &task.dispatch_id, &epoch),
+        Some((
+            "stalled".into(),
+            0,
+            0,
+            true,
+            Some("task_stalled".into()),
+            Some((now + chrono::Duration::minutes(19)).to_rfc3339()),
+        )),
+        "assertion the_stall_receipt_records_the_upstream_reason_and_stop_instant"
+    );
+    assert_eq!(
+        watchdog_hold_fact(&database, "task_a", "task_stalled"),
+        1,
+        "assertion the_hold_is_one_durable_fact"
+    );
+
+    // Real progress — a Task row that moved — does not stall. Same clock, same Run, other fact.
+    let mut second = fixture();
+    let progressed = dispatched_running_task(
+        &mut second,
+        "watchdog real progress",
+        "command_approve_progress",
+        now,
+        chrono::Duration::minutes(44),
+    );
+    let progressed_epoch = progressed.epoch(&second);
+    assert_eq!(
+        tick_at(&mut second, now).blocked,
+        0,
+        "assertion a_task_that_really_advanced_is_not_stalled"
+    );
+    assert_eq!(
+        watchdog_hold(&second, &progressed.plan_id),
+        None,
+        "assertion real_progress_keeps_the_task_runnable"
+    );
+    assert_eq!(
+        watchdog_receipt(&second, &progressed.dispatch_id, &progressed_epoch)
+            .map(|receipt| receipt.0),
+        Some("wait".into()),
+        "assertion the_progressed_task_is_left_on_a_wait_receipt"
+    );
+}
+
+/// Human-control boundary: an explicit pause and a Run waiting for input are owned by their own
+/// paths. The watchdog must neither stop them nor hold them, however stale their progress looks.
+#[test]
+fn watchdog_never_kills_a_waiting_input_or_a_paused_task() {
+    let now = at(1_800_000_000);
+    let mut database = fixture();
+    let task = dispatched_running_task(
+        &mut database,
+        "watchdog human control",
+        "command_approve_waiting",
+        now,
+        chrono::Duration::hours(10),
+    );
+    let epoch = task.epoch(&database);
+
+    // The Run is waiting for an input a human owns (`waiting`), not running.
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_run SET status='waiting', wait_reason='input',
+                                 started_at=?1, updated_at=?2
+             WHERE id=?3",
+            params![
+                at(1_799_000_000).to_rfc3339(),
+                now.to_rfc3339(),
+                &task.run_id
+            ],
+        )
+        .unwrap();
+    let waiting = tick_at(&mut database, now);
+    assert_eq!(
+        (waiting.blocked, waiting.recovered),
+        (0, 0),
+        "assertion a_run_waiting_for_input_is_never_repaired_by_the_watchdog"
+    );
+    assert_eq!(
+        run_cancel_requested(&database, &task.run_id),
+        None,
+        "assertion a_waiting_run_is_never_asked_to_stop"
+    );
+    assert_eq!(
+        watchdog_hold(&database, &task.plan_id),
+        None,
+        "assertion a_waiting_run_never_parks_its_task"
+    );
+    assert_eq!(
+        watchdog_receipt(&database, &task.dispatch_id, &epoch).map(|receipt| receipt.0),
+        Some("wait".into()),
+        "assertion the_input_wait_is_left_on_a_wait_receipt"
+    );
+    assert!(
+        watchdog_events(&database, "task_a").is_empty(),
+        "assertion an_input_wait_writes_no_watchdog_fact"
+    );
+
+    // The Owner pauses the automation: the human path owns the Task from then on.
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_run SET status='running', wait_reason=NULL WHERE id=?1",
+            [&task.run_id],
+        )
+        .unwrap();
+    let revision: i64 = database
+        .connection()
+        .query_row(
+            "SELECT revision FROM loom_control_policy WHERE plan_id=?1",
+            [&task.plan_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    control::pause(
+        &mut database,
+        OWNER,
+        pause_input(&task.mission_id, "command_pause_watchdog", revision, true),
+    )
+    .unwrap();
+    let paused = tick_at(&mut database, now + chrono::Duration::hours(1));
+    assert_eq!(
+        (paused.scanned, paused.blocked, paused.recovered),
+        (0, 0, 0),
+        "assertion a_paused_approval_is_not_scanned_at_all"
+    );
+    assert_eq!(
+        run_cancel_requested(&database, &task.run_id),
+        None,
+        "assertion pausing_the_approval_never_stops_the_task"
+    );
+    assert_eq!(
+        watchdog_hold(&database, &task.plan_id),
+        None,
+        "assertion pausing_the_approval_never_parks_the_task"
+    );
+    assert_eq!(
+        watchdog_receipt(&database, &task.dispatch_id, &epoch).map(|receipt| receipt.0),
+        Some("wait".into()),
+        "assertion the_pause_writes_no_new_receipt_for_the_task"
+    );
+}
+
+/// Stop-window boundary, ported from the upstream `stop_timeout` branch: a stop the old executor
+/// never acknowledged is not a licence to start another worker. Between the stop request and its
+/// acknowledgement the pass waits; after five minutes without one it holds the Task with
+/// `stop_unacknowledged`, and no later pass ever replays it.
+#[test]
+fn watchdog_never_redispatches_a_task_whose_old_executor_never_stopped() {
+    let now = at(1_800_000_000);
+    let mut database = fixture();
+    let task = dispatched_running_task(
+        &mut database,
+        "watchdog unacknowledged stop",
+        "command_approve_unacked",
+        now,
+        chrono::Duration::minutes(50),
+    );
+    let epoch = task.epoch(&database);
+
+    let stalled = tick_at(&mut database, now);
+    assert_eq!(
+        stalled.blocked, 1,
+        "assertion the_stale_executor_is_stopped"
+    );
+    assert_eq!(
+        watchdog_hold(&database, &task.plan_id).as_deref(),
+        Some("loom.watchdog.task_stalled"),
+        "assertion the_stalled_task_is_held_before_its_stop_is_acknowledged"
+    );
+    let (dispatches, runs, deliveries) = (
+        count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+        count(&database, "SELECT COUNT(*) FROM agent_run"),
+        loom_deliveries(&database),
+    );
+
+    // One minute of recorded backoff later the executor still has not stopped: wait, never replay.
+    let within_window = tick_at(&mut database, now + chrono::Duration::minutes(2));
+    assert_eq!(
+        (within_window.blocked, within_window.recovered),
+        (0, 0),
+        "assertion an_unacknowledged_stop_is_waited_out"
+    );
+    assert_eq!(
+        watchdog_receipt(&database, &task.dispatch_id, &epoch)
+            .map(|receipt| (receipt.0, receipt.4)),
+        Some(("stalled".into(), Some("task_stalled".into()))),
+        "assertion a_wait_never_rewrites_the_recorded_stall"
+    );
+
+    // Five minutes after the stop was requested: the window is over and the Task is held for a
+    // human. Still no second Dispatch, Delivery or Run.
+    let timed_out = tick_at(&mut database, now + chrono::Duration::minutes(6));
+    assert_eq!(
+        (timed_out.blocked, timed_out.recovered),
+        (1, 0),
+        "assertion the_expired_stop_window_holds_the_task"
+    );
+    assert_eq!(
+        watchdog_hold(&database, &task.plan_id).as_deref(),
+        Some("loom.watchdog.stop_unacknowledged"),
+        "assertion the_unacknowledged_stop_is_named"
+    );
+    assert_eq!(
+        watchdog_receipt(&database, &task.dispatch_id, &epoch)
+            .map(|receipt| (receipt.0, receipt.4, receipt.5)),
+        Some((
+            "stop_timeout".into(),
+            Some("stop_unacknowledged".into()),
+            // The window is measured from the original request, so a later escalation keeps it.
+            Some(now.to_rfc3339()),
+        )),
+        "assertion the_stop_timeout_keeps_the_first_stop_instant"
+    );
+    for tick in 0..3 {
+        assert_eq!(
+            tick_at(&mut database, now + chrono::Duration::minutes(20 + tick)).recovered,
+            0,
+            "assertion a_stop_timeout_is_never_replayed (tick {tick})"
+        );
+    }
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            count(&database, "SELECT COUNT(*) FROM agent_run"),
+            loom_deliveries(&database),
+        ),
+        (dispatches, runs, deliveries),
+        "assertion no_pass_mints_a_second_dispatch_delivery_or_run"
+    );
+    assert!(
+        control::dispatch_block_reason(
+            database.connection(),
+            &task.dispatch_id,
+            &(now + chrono::Duration::minutes(30)).to_rfc3339(),
+        )
+        .unwrap()
+        .is_some(),
+        "assertion the_pre_run_recheck_refuses_the_held_task"
+    );
+    assert_eq!(
+        watchdog_events(&database, "task_a"),
+        vec![
+            ("loom.watchdog_blocked".into(), Some("task_stalled".into())),
+            (
+                "loom.watchdog_blocked".into(),
+                Some("stop_unacknowledged".into())
+            ),
+        ],
+        "assertion each_hold_is_one_durable_fact"
+    );
+}
+
+/// Recovery boundary, ported from the upstream `recover_stall` branch and the ledger it spends: the
+/// Task is handed back only once the old Run is demonstrably terminal, the claim fence is released,
+/// the reason is cleared, and the recorded budget is what bounds the next attempt.
+#[test]
+fn watchdog_recovers_only_after_the_old_run_ended_and_the_budget_allows_it() {
+    let now = at(1_800_000_000);
+    let mut database = fixture();
+    let task = dispatched_running_task(
+        &mut database,
+        "watchdog recovery",
+        "command_approve_recovery",
+        now,
+        chrono::Duration::minutes(50),
+    );
+    let epoch = task.epoch(&database);
+    assert_eq!(
+        open_claims(&database),
+        1,
+        "assertion the_run_holds_the_task_through_a_real_claim"
+    );
+
+    assert_eq!(
+        tick_at(&mut database, now).blocked,
+        1,
+        "assertion the_stale_executor_is_stopped_first"
+    );
+    assert_eq!(
+        open_claims(&database),
+        1,
+        "assertion the_claim_fence_survives_before_the_stop_is_acknowledged"
+    );
+
+    // The executor acknowledges: the Run is terminal, so the Task may be handed back.
+    acknowledge_stop(&database, &task.run_id, now + chrono::Duration::minutes(1));
+    let recovered = tick_at(&mut database, now + chrono::Duration::minutes(2));
+    assert_eq!(
+        (recovered.recovered, recovered.blocked),
+        (1, 0),
+        "assertion a_confirmed_stop_hands_the_task_back"
+    );
+    // The watchdog releases its *own* hold; whether the event may run again is the dispatch lane's
+    // verdict, and for an execution that ended without its successor fact that verdict is the
+    // module's own "previous outcome unknown". What matters here is that no watchdog reason is left
+    // behind — the Task is no longer held by the watchdog.
+    let hold_after_hand_back = watchdog_hold(&database, &task.plan_id);
+    assert!(
+        !hold_after_hand_back
+            .as_deref()
+            .is_some_and(is_watchdog_hold_reason),
+        "assertion the_hand_back_clears_the_watchdog_reason: {hold_after_hand_back:?}"
+    );
+    assert_eq!(
+        open_claims(&database),
+        0,
+        "assertion the_dead_runs_claim_fence_is_released_before_any_replay"
+    );
+    assert_eq!(
+        watchdog_receipt(&database, &task.dispatch_id, &epoch)
+            .map(|receipt| (receipt.0, receipt.2, receipt.3, receipt.4)),
+        Some((
+            "recover_stall".into(),
+            1,
+            false,
+            Some("task_stalled".into())
+        )),
+        "assertion the_recovery_spends_exactly_one_recovery_try"
+    );
+    assert_eq!(
+        watchdog_events(&database, "task_a"),
+        vec![
+            ("loom.watchdog_blocked".into(), Some("task_stalled".into())),
+            ("loom.watchdog_recovered".into(), None),
+        ],
+        "assertion the_hand_back_is_a_durable_fact"
+    );
+    // The event this epoch already owns is not minted twice: recovery resumes the work, it never
+    // duplicates the ledger row, the Delivery or the Run.
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database),
+            count(&database, "SELECT COUNT(*) FROM agent_run"),
+        ),
+        (1, 1, 1),
+        "assertion a_recovery_mints_no_second_dispatch_delivery_or_run"
+    );
+
+    // Exhaustion: the epoch's recorded spend is what bounds automatic recovery. With three tries
+    // already spent, the same observation is held instead of handed back.
+    let mut spent = fixture();
+    let bounded = dispatched_running_task(
+        &mut spent,
+        "watchdog budget",
+        "command_approve_budget",
+        now,
+        chrono::Duration::minutes(50),
+    );
+    let bounded_epoch = bounded.epoch(&spent);
+    assert_eq!(
+        open_claims(&spent),
+        1,
+        "assertion the_bounded_run_holds_the_task_through_a_real_claim"
+    );
+    for spent_tries in 0..3 {
+        crate::db::record_watchdog_observation(
+            spent.connection(),
+            crate::db::WatchdogObservation {
+                task_id: "task_a",
+                attempt_id: &bounded.dispatch_id,
+                request_epoch: &bounded_epoch,
+                action: "recover_stall",
+                blocked: false,
+                progress_at: None,
+                reason_code: None,
+                stopped_at: None,
+                now: now - chrono::Duration::minutes(10 - spent_tries),
+            },
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        tick_at(&mut spent, now).blocked,
+        1,
+        "assertion the_stale_executor_of_the_spent_epoch_is_still_stopped"
+    );
+    acknowledge_stop(&spent, &bounded.run_id, now + chrono::Duration::minutes(1));
+    let exhausted = tick_at(&mut spent, now + chrono::Duration::minutes(2));
+    assert_eq!(
+        (exhausted.recovered, exhausted.blocked),
+        (0, 1),
+        "assertion an_exhausted_recovery_budget_blocks_instead_of_replaying"
+    );
+    assert_eq!(
+        watchdog_hold(&spent, &bounded.plan_id).as_deref(),
+        Some("loom.watchdog.recovery_exhausted"),
+        "assertion the_exhausted_budget_is_named"
+    );
+    assert_eq!(
+        watchdog_receipt(&spent, &bounded.dispatch_id, &bounded_epoch)
+            .map(|receipt| (receipt.0, receipt.4)),
+        Some(("recover_stall".into(), Some("recovery_exhausted".into()))),
+        "assertion the_exhausted_observation_records_its_reason"
+    );
+    assert_eq!(
+        open_claims(&spent),
+        1,
+        "assertion an_exhausted_budget_never_releases_the_claim_fence"
+    );
+    for tick in 0..3 {
+        assert_eq!(
+            tick_at(&mut spent, now + chrono::Duration::minutes(30 + tick)).recovered,
+            0,
+            "assertion an_exhausted_task_is_never_recovered_again (tick {tick})"
+        );
+    }
+}
+
+/// External-effect boundary, ported from upstream `if (value.uncertainEffect) return
+/// 'external_effect'`: an action that may already have committed is reconciled, never replayed.
+/// LOOM's external effects are the Remote Workspace operations of one Run, so an unsettled request
+/// holds the Task for as long as its receipt is unknown — even after the Run itself ended.
+#[test]
+fn watchdog_never_replays_an_uncertain_external_effect() {
+    let now = at(1_800_000_000);
+    let mut database = fixture();
+    let task = dispatched_running_task(
+        &mut database,
+        "watchdog uncertain effect",
+        "command_approve_uncertain",
+        now,
+        chrono::Duration::minutes(50),
+    );
+    let epoch = task.epoch(&database);
+    assert_eq!(
+        open_claims(&database),
+        1,
+        "assertion the_run_holds_the_task_through_a_real_claim"
+    );
+    database
+        .connection()
+        .execute(
+            "INSERT INTO workspace_rpc_requests(request_id,run_id,owner_node_id,fingerprint,
+                    online_generation,dispatch_json,state,last_seq,output_bytes,omitted_bytes,
+                    accepted_seen,created_at)
+             VALUES('request_uncertain',?1,'node_one','fingerprint_one',1,'{}',7,0,0,0,0,?2)",
+            params![&task.run_id, now.to_rfc3339()],
+        )
+        .unwrap();
+
+    let held = tick_at(&mut database, now);
+    assert_eq!(
+        held.blocked, 1,
+        "assertion an_uncertain_external_effect_holds_the_task"
+    );
+    assert_eq!(
+        watchdog_hold(&database, &task.plan_id).as_deref(),
+        Some("loom.watchdog.external_effect_uncertain"),
+        "assertion the_uncertain_receipt_is_named"
+    );
+    assert!(
+        run_cancel_requested(&database, &task.run_id).is_some(),
+        "assertion an_uncertain_effect_is_never_left_running"
+    );
+    assert_eq!(
+        watchdog_receipt(&database, &task.dispatch_id, &epoch),
+        Some((
+            "external_effect".into(),
+            1,
+            0,
+            true,
+            Some("external_effect_uncertain".into()),
+            Some(now.to_rfc3339()),
+        )),
+        "assertion the_external_effect_receipt_spends_no_recovery_budget"
+    );
+
+    // The Run ends while the receipt stays unknown: the Task is still not replayed. A later pass may
+    // observe the hold again — that is the bounded scan doing its job — but it never recovers it, and
+    // it never names a recovery action.
+    acknowledge_stop(&database, &task.run_id, now + chrono::Duration::minutes(1));
+    for tick in 0..3 {
+        let outcome = tick_at(&mut database, now + chrono::Duration::minutes(10 + tick));
+        assert_eq!(
+            outcome.recovered, 0,
+            "assertion an_uncertain_effect_is_never_replayed (tick {tick})"
+        );
+        assert_eq!(
+            watchdog_receipt(&database, &task.dispatch_id, &epoch).map(|receipt| receipt.0),
+            Some("external_effect".into()),
+            "assertion an_uncertain_effect_never_becomes_a_recovery (tick {tick})"
+        );
+    }
+    assert_eq!(
+        watchdog_hold(&database, &task.plan_id).as_deref(),
+        Some("loom.watchdog.external_effect_uncertain"),
+        "assertion the_hold_outlives_the_run_until_the_effect_is_reconciled"
+    );
+    assert_eq!(
+        open_claims(&database),
+        1,
+        "assertion an_uncertain_effect_never_releases_the_claim_fence"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database),
+            count(&database, "SELECT COUNT(*) FROM agent_run"),
+        ),
+        (1, 1, 1),
+        "assertion an_uncertain_effect_mints_no_second_dispatch_delivery_or_run"
+    );
+    assert!(
+        control::dispatch_block_reason(
+            database.connection(),
+            &task.dispatch_id,
+            &(now + chrono::Duration::minutes(20)).to_rfc3339(),
+        )
+        .unwrap()
+        .is_some(),
+        "assertion the_pre_run_recheck_refuses_an_uncertain_effect"
+    );
+}
+
+/// Wiring boundary: the tick the scheduler actually calls runs the sweep. This drives
+/// `admit_due_dispatches` — the same entry point the Core's delivery pass uses — with no test
+/// clock, so the decision is made against the real instant and the real ledger.
+#[test]
+fn the_dispatch_tick_runs_the_watchdog_against_the_real_clock() {
+    let mut database = fixture();
+    let now = chrono::Utc::now();
+    let task = dispatched_running_task(
+        &mut database,
+        "watchdog tick wiring",
+        "command_approve_wiring",
+        now,
+        chrono::Duration::minutes(50),
+    );
+    let epoch = task.epoch(&database);
+
+    // Admission alone reports nothing to admit: the ledger already owns this event. The sweep still
+    // has to run, because a stalled Task is not a dispatch question.
+    let admitted = control::admit_due_dispatches(&mut database).unwrap();
+    assert_eq!(
+        admitted, 0,
+        "assertion the_tick_does_not_admit_the_event_that_is_already_out"
+    );
+    assert_eq!(
+        watchdog_hold(&database, &task.plan_id).as_deref(),
+        Some("loom.watchdog.task_stalled"),
+        "assertion the_public_tick_runs_the_watchdog_sweep"
+    );
+    assert_eq!(
+        watchdog_receipt(&database, &task.dispatch_id, &epoch).map(|receipt| receipt.0),
+        Some("stalled".into()),
+        "assertion the_public_tick_persists_the_receipt_in_the_same_transaction"
+    );
+    assert!(
+        next_at(&database, &task.dispatch_id, &epoch).is_some(),
+        "assertion the_public_tick_records_the_backoff_it_will_honour"
+    );
+    assert!(
+        !task.installation_id.is_empty() && !task.camp_id.is_empty(),
+        "assertion the_fixture_is_a_real_mission_on_a_real_installation"
     );
 }

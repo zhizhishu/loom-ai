@@ -124,6 +124,15 @@ pub(crate) use run_continuation::assert_legacy_request_upgrade;
 #[cfg(all(test, feature = "extended-tests"))]
 pub(crate) use steer::assert_legacy_upgrade as assert_legacy_steer_upgrade;
 
+/// The watchdog recovery ledger is the durable budget, backoff and hold state of one Task
+/// Attempt. Its owner stays `db::loom` (that module owns the migration), but the sweep that has
+/// to read and spend it lives in `loom::control`, so the ledger API is re-exported instead of
+/// being reachable only from inside this module.
+pub(crate) use self::loom::{
+    LoomRecoveryReceipt, WatchdogObservation, next_watchdog_tries, record_watchdog_observation,
+    recovery_budget, recovery_exhausted, recovery_receipt,
+};
+
 #[cfg(all(test, feature = "slow-tests"))]
 pub(crate) fn upgrade_message_mentions_fixture(database: &mut Database) {
     // Restore the current schema through the production upgrade chain while the

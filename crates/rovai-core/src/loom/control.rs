@@ -32,7 +32,7 @@ use crate::db::Database;
 #[path = "dispatch.rs"]
 mod dispatch;
 pub use dispatch::admit_due_dispatches;
-pub(crate) use dispatch::dispatch_block_reason;
+pub(crate) use dispatch::{LoomTickOutcome, admit_due_dispatches_at, dispatch_block_reason};
 
 /// Only the real Owner may grant or pause the authority. There is no other identity that can
 /// approve unattended work, so a stolen or forged payload cannot become an approval.
