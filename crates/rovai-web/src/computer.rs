@@ -15,6 +15,25 @@
 //!   call all happen while one gate mutex is held. `release`/`view/stop` take the
 //!   same gate, so their return is a barrier: after it, no queued input belonging
 //!   to an older lease generation can still execute.
+//! * The boundary between a person and the agent is one exclusive lease per
+//!   physical device. Taking it is a takeover: it is refused while another
+//!   client holds a live lease, it advances the epoch (the generation every
+//!   input is fenced against) exactly once, and it stays bounded by the same
+//!   five-minute control ceiling that no refresh can extend. Handing the device
+//!   back clears the holder and advances the epoch exactly once too, so an input
+//!   admitted for the outgoing holder can never execute after the handback.
+//! * A device reached over a paired node keeps its epoch across reconnects even
+//!   though every lease, view and sequence is dropped with the replaced socket:
+//!   the replaced instance is retired first, so a caller that still holds it
+//!   fails closed instead of reaching the new connection, and the epoch never
+//!   runs backwards, so an epoch issued before a reconnect can never be issued
+//!   again after it. The epoch is not copied into the replacement: both devices
+//!   allocate from the *same* counter, so a takeover that already held the old
+//!   gate when the reconnect happened still cannot hand out a number the
+//!   replacement will hand out again.
+//! * Reading the epoch and retiring a device never wait for the input gate: the
+//!   epoch is a shared atomic allocator, so a reconnect cannot stall on an input
+//!   that is still running.
 //! * Nothing about a session, a frame or an input event is persisted or logged.
 
 use crate::auth::{Session, Sessions};
@@ -30,7 +49,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard, TryLockError},
+    sync::{
+        Arc, Mutex, MutexGuard, TryLockError,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Semaphore;
@@ -47,6 +69,13 @@ pub(crate) const CONTROL_TTL_DEFAULT_MS: u64 = 30_000;
 /// Longest single control TTL a client may request.
 pub(crate) const CONTROL_TTL_MAX_MS: u64 = 60_000;
 /// Absolute control ceiling. Heartbeats refresh the TTL, never this deadline.
+///
+/// This is the five-minute lease a takeover is bounded by: the upstream takeover
+/// branch grants five minutes and lets a refresh reset it to another five, while
+/// this Host grants at most `CONTROL_TTL_MAX_MS` per request and refuses to pass
+/// `CONTROL_TOTAL_MAX_MS` from the takeover itself. The takeover lease is
+/// therefore never longer than upstream's and can be shorter, which is the
+/// deliberate, stricter half of that branch.
 pub(crate) const CONTROL_TOTAL_MAX_MS: u64 = 300_000;
 /// A controller that neither heartbeats nor inputs for this long loses control.
 pub(crate) const INPUT_IDLE_DEADMAN_MS: u64 = 15_000;
@@ -617,6 +646,16 @@ pub(crate) struct Computer {
     provider: Arc<dyn Provider>,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     gate: Mutex<Gate>,
+    /// The epoch allocator, shared with every replacement of this physical device.
+    /// It is read by whichever device is being replaced — which must never wait for
+    /// an input that still holds a gate — and advanced with `fetch_add`, so two
+    /// devices that both reach an advance allocate distinct values even while they
+    /// hold two different gates. It only ever moves forward.
+    epoch: Arc<AtomicU64>,
+    /// Set when a replacement connection took over this physical device. Every
+    /// operation on a retired instance fails closed, so no request that still
+    /// holds it can reach the provider of a newer connection.
+    retired: AtomicBool,
     captures: Arc<Semaphore>,
     /// True when the device belongs to a paired node rather than this process.
     /// `supported()` is then a fact about the node's advertised capability, not
@@ -625,6 +664,27 @@ pub(crate) struct Computer {
     /// Bounds how many blocking sections may run at once, so an authenticated burst
     /// cannot flood the blocking pool. It never changes OS linearization.
     jobs: Arc<Semaphore>,
+    /// Test-only parking point inside the takeover gate, so a retirement can be
+    /// made to land in the exact window between "this takeover has the gate" and
+    /// "this takeover allocates its epoch".
+    #[cfg(test)]
+    acquire_hold: Mutex<Option<AcquireHold>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcquirePark {
+    /// Inside the gate, before the retirement re-check.
+    BeforeRetirementCheck,
+    /// After the retirement re-check, immediately before the epoch allocation.
+    BeforeAllocation,
+}
+
+#[cfg(test)]
+pub(crate) struct AcquireHold {
+    stage: AcquirePark,
+    pub(crate) entered: std::sync::mpsc::Sender<()>,
+    pub(crate) proceed: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 impl Computer {
@@ -641,9 +701,13 @@ impl Computer {
             provider,
             clock: Arc::new(wall_clock),
             gate: Mutex::new(Gate::default()),
+            epoch: Arc::new(AtomicU64::new(0)),
+            retired: AtomicBool::new(false),
             captures: Arc::new(Semaphore::new(1)),
             remote: false,
             jobs: Arc::new(Semaphore::new(MAX_JOBS)),
+            #[cfg(test)]
+            acquire_hold: Mutex::new(None),
         }
     }
 
@@ -651,16 +715,123 @@ impl Computer {
     /// local helper, so `config` stays `None` and `supported()` rests on the
     /// node's advertised capability alone. The caller only reaches this after
     /// the node proved it with a successful metadata probe.
-    pub(crate) fn with_provider(provider: Arc<dyn Provider>) -> Self {
+    ///
+    /// `epoch` is the counter of the device this one replaces, and the replacement
+    /// keeps using it rather than copying a value out of it: a first install starts
+    /// at zero, a reconnect shares the allocator of the device it replaces. No
+    /// lease, view or input sequence is inherited — a lease held against a replaced
+    /// socket must be refused, not remembered — but the counter never runs
+    /// backwards and never hands the same number to two devices, so an epoch the
+    /// previous device already issued is never issued again.
+    pub(crate) fn with_provider(provider: Arc<dyn Provider>, epoch: Arc<AtomicU64>) -> Self {
         Self {
             config: None,
             provider,
             clock: Arc::new(wall_clock),
-            gate: Mutex::new(Gate::default()),
+            gate: Mutex::new(Gate {
+                generation: epoch.load(Ordering::SeqCst),
+                ..Gate::default()
+            }),
+            epoch,
+            retired: AtomicBool::new(false),
             captures: Arc::new(Semaphore::new(1)),
             remote: true,
             jobs: Arc::new(Semaphore::new(MAX_JOBS)),
+            #[cfg(test)]
+            acquire_hold: Mutex::new(None),
         }
+    }
+
+    /// The epoch this device has reached: the value of the allocator shared with
+    /// every replacement of this physical device. It is a counter load, never a gate
+    /// read, because a reconnect must not wait for an input that is still holding the
+    /// gate.
+    ///
+    /// Test-only observability: production only hands the allocator to a replacement
+    /// (`retire`) and never samples this device's value, precisely so a sampled value
+    /// can never go stale.
+    #[cfg(test)]
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Allocate the next epoch. `fetch_add` on the shared counter is what makes the
+    /// allocator, not the gate, the single issuer: two devices of the same physical
+    /// machine can hold two different gates at the same time (the replaced one was
+    /// already inside its gate when the reconnect arrived), and each allocated value
+    /// is still unique and strictly increasing.
+    fn next_epoch(&self) -> u64 {
+        self.epoch.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
+    }
+
+    /// Retire this device because a newer connection now owns the same physical
+    /// machine, and hand the replacement its epoch allocator.
+    ///
+    /// Retirement is the fence, not the replacement: every later operation fails
+    /// closed through [`Computer::gate`], so a caller that still holds this `Arc`
+    /// can never reach the provider — and therefore never reach the socket of the
+    /// connection that replaced it. The lease, the views and the input sequence
+    /// are dropped with the old connection; only the allocator is carried forward.
+    /// Nothing here waits for the gate: an input that already holds it finishes
+    /// against the device it was admitted for, which the retirement has already
+    /// fenced off from every new admission.
+    ///
+    /// The allocator itself is handed over rather than a sampled value: retirement
+    /// cannot always take the gate (an input, or a takeover, may be inside it), and
+    /// a value sampled here would be stale the moment that takeover advances the
+    /// epoch. Sharing it keeps both devices on one strictly increasing sequence.
+    pub(crate) fn retire(&self) -> Arc<AtomicU64> {
+        self.retired.store(true, Ordering::SeqCst);
+        // Best effort, and deliberately `try_lock`: revoking the lease and
+        // advancing the epoch are worth doing, but an input still running must not
+        // delay the replacement. Nothing depends on this branch succeeding: the
+        // retirement flag already fences every later operation, a takeover that is
+        // parked inside the gate re-checks it before allocating, and the allocator
+        // is shared, so a miss cannot produce a duplicate epoch.
+        if let Ok(mut gate) = self.gate.try_lock() {
+            gate.views.clear();
+            self.expire_control(&mut gate);
+        }
+        self.epoch.clone()
+    }
+
+    fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::SeqCst)
+    }
+
+    /// Queues the next [`Computer::acquire`] inside its gate at `stage`. Tests use
+    /// it to place a reconnect in the exact windows the review called out;
+    /// production code never parks.
+    #[cfg(test)]
+    pub(crate) fn park_next_acquire(
+        &self,
+        stage: AcquirePark,
+        entered: std::sync::mpsc::Sender<()>,
+        proceed: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.acquire_hold.lock().unwrap() = Some(AcquireHold {
+            stage,
+            entered,
+            proceed: Mutex::new(proceed),
+        });
+    }
+
+    #[cfg(test)]
+    fn park_acquire(&self, stage: AcquirePark) {
+        {
+            let armed = self.acquire_hold.lock().unwrap();
+            if armed.as_ref().map(|hold| hold.stage) != Some(stage) {
+                return;
+            }
+        }
+        let hold = self
+            .acquire_hold
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the stage was armed under the same lock");
+        let _ = hold.entered.send(());
+        let _ = hold.proceed.lock().unwrap().recv();
     }
 
     #[cfg(test)]
@@ -686,9 +857,13 @@ impl Computer {
             provider,
             clock,
             gate: Mutex::new(Gate::default()),
+            epoch: Arc::new(AtomicU64::new(0)),
+            retired: AtomicBool::new(false),
             captures: Arc::new(Semaphore::new(1)),
             remote: false,
             jobs: Arc::new(Semaphore::new(MAX_JOBS)),
+            #[cfg(test)]
+            acquire_hold: Mutex::new(None),
         }
     }
 
@@ -732,13 +907,31 @@ impl Computer {
     }
 
     fn gate(&self) -> Result<MutexGuard<'_, Gate>, &'static str> {
+        // A retired device is fenced before anyone waits for the gate, and again
+        // after the wait: a retirement that happened while this caller queued must
+        // still refuse the operation.
+        if self.is_retired() {
+            return Err("computer_unavailable");
+        }
         let deadline = std::time::Instant::now() + Duration::from_millis(GATE_DEADLINE_MS);
         loop {
+            // A retirement that happened while this caller queued refuses it here
+            // instead of making it wait out the gate deadline for a device that is
+            // already fenced.
+            if self.is_retired() {
+                return Err("computer_unavailable");
+            }
             match self.gate.try_lock() {
-                Ok(guard) => return Ok(guard),
-            // A poisoned gate means the in-memory lease state is untrustworthy.
-            // Fail closed instead of adopting unknown state.
-            Err(TryLockError::Poisoned(_)) => return Err("computer_unavailable"),
+                Ok(guard) => {
+                    return if self.is_retired() {
+                        Err("computer_unavailable")
+                    } else {
+                        Ok(guard)
+                    };
+                }
+                // A poisoned gate means the in-memory lease state is untrustworthy.
+                // Fail closed instead of adopting unknown state.
+                Err(TryLockError::Poisoned(_)) => return Err("computer_unavailable"),
                 Err(TryLockError::WouldBlock) => {}
             }
             if std::time::Instant::now() >= deadline {
@@ -762,10 +955,14 @@ impl Computer {
     }
 
     /// Drop the controller and invalidate its generation so any input still
-    /// queued behind the gate is rejected.
-    fn expire_control(gate: &mut Gate) {
+    /// queued behind the gate is rejected. Every path that revokes a lease
+    /// without granting a new one (handback, view stop, expiry, a failed input)
+    /// goes through here, so a revocation always advances the epoch — and the
+    /// advance is published while the gate is held, so the counter a replacement
+    /// reads can never lag the epoch that was issued.
+    fn expire_control(&self, gate: &mut Gate) {
         if gate.control.take().is_some() {
-            gate.generation = gate.generation.wrapping_add(1);
+            gate.generation = self.next_epoch();
         }
     }
 
@@ -1026,6 +1223,18 @@ impl Computer {
         Ok(captured)
     }
 
+    /// Take control of the physical device: the takeover boundary.
+    ///
+    /// * Exclusive. A live lease held by any other client is refused with
+    ///   `computer_control_held`; a second session never displaces the holder.
+    ///   Taking over again while holding is a fresh takeover by the same holder
+    ///   and replaces the lease, exactly as the upstream takeover branch does.
+    /// * Epoch-bearing. The grant allocates the next epoch, whether the previous
+    ///   lease had lapsed, been handed back or never existed. Every input is
+    ///   fenced against that value, so an input admitted for an earlier holder
+    ///   can never execute after this one.
+    /// * Bounded by the five-minute ceiling (`CONTROL_TOTAL_MAX_MS`), which a
+    ///   heartbeat or input can refresh the TTL toward but never extend.
     pub(crate) fn acquire(
         &self,
         sessions: &Sessions,
@@ -1041,6 +1250,15 @@ impl Computer {
         }
         let device = self.device()?;
         let mut gate = self.gate()?;
+        #[cfg(test)]
+        self.park_acquire(AcquirePark::BeforeRetirementCheck);
+        // The gate was acquired before any retirement could be observed from the
+        // outside; a retirement that happened while this takeover waited for it
+        // (`retire` uses `try_lock`, so it never overtakes this caller) must still
+        // refuse the takeover rather than issue an epoch for a replaced device.
+        if self.is_retired() {
+            return Err("computer_unavailable");
+        }
         // Clock sampled after the gate, immediately before the admission test.
         let now = self.now();
         if !sessions.is_live(session) {
@@ -1055,7 +1273,11 @@ impl Computer {
             .as_ref()
             .is_some_and(|control| !control_alive(&gate, control, now));
         if dead {
-            Self::expire_control(&mut gate);
+            // Not `expire_control`: the grant below is the one and only epoch
+            // advance this transition performs, so a takeover of a lapsed lease
+            // moves the epoch by exactly one and the value the client reads is
+            // the value that fences it.
+            gate.control = None;
         }
         if let Some(control) = &gate.control {
             if control.client_id != session.client_id {
@@ -1077,8 +1299,17 @@ impl Computer {
             requested.clamp(1000, CONTROL_TTL_MAX_MS)
         };
         let id = crate::new_token().map_err(|_| "computer_busy")?;
-        let generation = gate.generation.wrapping_add(1);
+        #[cfg(test)]
+        self.park_acquire(AcquirePark::BeforeAllocation);
+        let generation = self.next_epoch();
         gate.generation = generation;
+        // A retirement that landed between the re-check above and this allocation
+        // consumed a number instead of issuing a lease: the shared allocator keeps
+        // it from being handed out again, and the caller is refused because this
+        // device is already fenced.
+        if self.is_retired() {
+            return Err("computer_unavailable");
+        }
         gate.control = Some(Control {
             id: id.clone(),
             client_id: session.client_id.clone(),
@@ -1135,7 +1366,7 @@ impl Computer {
         }
         let expired = !control_alive(&gate, control, now);
         if expired {
-            Self::expire_control(&mut gate);
+            self.expire_control(&mut gate);
             // A heartbeat never revives a dead lease; the client must acquire
             // again, which is a new explicit consent and a new generation.
             return Err("computer_lease_expired");
@@ -1155,6 +1386,14 @@ impl Computer {
         }))
     }
 
+    /// Hand the device back: the handback boundary.
+    ///
+    /// Only the holder can hand back, and only with the lease identity it was
+    /// given. The handback clears the holder and advances the epoch once, so the
+    /// barrier it returns from rejects every input that was admitted for the
+    /// outgoing holder. Releasing the lease is not the same claim as releasing
+    /// the physical device: that second claim is reported only when the device
+    /// confirmed it drained (see the body below).
     pub(crate) fn release_control(
         &self,
         sessions: &Sessions,
@@ -1179,7 +1418,7 @@ impl Computer {
         if control.generation != body.generation {
             return Err("computer_input_stale");
         }
-        Self::expire_control(&mut gate);
+        self.expire_control(&mut gate);
         let generation = gate.generation;
         // Releasing the lease is the barrier this call promises: any input still
         // queued behind the gate now sees a newer generation and is rejected.
@@ -1219,7 +1458,7 @@ impl Computer {
             .as_ref()
             .is_some_and(|control| control.view_id == body.view_id);
         if detached {
-            Self::expire_control(&mut gate);
+            self.expire_control(&mut gate);
             // The local generation is fenced either way, so no further input can
             // be admitted. Physical release is a separate claim: it is reported
             // only when the device proved it drained, never assumed.
@@ -1278,15 +1517,19 @@ impl Computer {
                 "computer_control_required"
             });
         };
+        if control.generation != body.generation {
+            // The epoch is decided before the lease identity: an input admitted for
+            // a superseded epoch is stale whoever holds the device now, so a holder
+            // that took over after a handback never inherits the old client's
+            // queued input as if it were its own missing lease.
+            return Err("computer_input_stale");
+        }
         if control.client_id != session.client_id || control.id != body.control_id {
             return Err("computer_control_required");
         }
-        if control.generation != body.generation {
-            return Err("computer_input_stale");
-        }
         let expired = !control_alive(&gate, control, now);
         if expired {
-            Self::expire_control(&mut gate);
+            self.expire_control(&mut gate);
             return Err("computer_lease_expired");
         }
         let bounds = match gate.views.get(&body.view_id) {
@@ -1313,7 +1556,7 @@ impl Computer {
         // release/stop cannot return before this input has finished.
         if let Err(failure) = self.provider.input(&command) {
             // Unknown side effect: revoke the lease now. Never auto resend.
-            Self::expire_control(&mut gate);
+            self.expire_control(&mut gate);
             return Err(failure.input_code());
         }
         Ok(json!({
@@ -2034,9 +2277,11 @@ mod tests {
         failure: Mutex<Option<Failure>>,
         capture_failure: Mutex<Option<Failure>>,
         input_failure: Mutex<Option<Failure>>,
+        release_failure: Mutex<Option<Failure>>,
         inputs: Mutex<Vec<InputCommand>>,
         infos: AtomicU64,
         captures: AtomicU64,
+        releases: AtomicU64,
         gate_entered: Option<Mutex<mpsc::Sender<()>>>,
         gate_proceed: Option<Mutex<mpsc::Receiver<()>>>,
     }
@@ -2058,9 +2303,11 @@ mod tests {
                 failure: Mutex::new(None),
                 capture_failure: Mutex::new(None),
                 input_failure: Mutex::new(None),
+                release_failure: Mutex::new(None),
                 inputs: Mutex::new(Vec::new()),
                 infos: AtomicU64::new(0),
                 captures: AtomicU64::new(0),
+                releases: AtomicU64::new(0),
                 gate_entered: None,
                 gate_proceed: None,
             }
@@ -2114,8 +2361,14 @@ mod tests {
             Ok(())
         }
         fn release(&self) -> Result<(), Failure> {
-            // The mock is an in-process device: a completed release is real here.
-            Ok(())
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            // A device that cannot prove it drained reports exactly that; the
+            // mock never invents a confirmation it was not told to give.
+            self.release_failure
+                .lock()
+                .unwrap()
+                .clone()
+                .map_or(Ok(()), Err)
         }
     }
 
@@ -2159,10 +2412,13 @@ mod tests {
             self.now.fetch_add(milliseconds, Ordering::SeqCst);
         }
         fn view(&self) -> String {
+            self.view_as(&self.session)
+        }
+        fn view_as(&self, session: &Arc<Session>) -> String {
             self.computer
                 .start_view(
                     &self.sessions,
-                    &self.session,
+                    session,
                     ViewBody {
                         consent: true,
                         device_id: self.mock.device.id.clone(),
@@ -2174,23 +2430,48 @@ mod tests {
                 .to_owned()
         }
         fn control(&self, view: &str) -> (String, u64) {
-            let value = self
-                .computer
-                .acquire(
-                    &self.sessions,
-                    &self.session,
-                    ControlBody {
-                        view_id: view.to_owned(),
-                        device_id: self.mock.device.id.clone(),
-                        consent: true,
-                        ttl_seconds: 30,
-                    },
-                )
-                .unwrap();
+            let value = self.acquire_as(&self.session, view, 30).unwrap();
             (
                 value["controlId"].as_str().unwrap().to_owned(),
                 value["generation"].as_u64().unwrap(),
             )
+        }
+        /// One takeover attempt by a named session, so exclusivity and the epoch
+        /// are observable without a second fixture.
+        fn acquire_as(
+            &self,
+            session: &Arc<Session>,
+            view: &str,
+            ttl_seconds: u32,
+        ) -> Result<Value, &'static str> {
+            self.computer.acquire(
+                &self.sessions,
+                session,
+                ControlBody {
+                    view_id: view.to_owned(),
+                    device_id: self.mock.device.id.clone(),
+                    consent: true,
+                    ttl_seconds,
+                },
+            )
+        }
+        fn handback(&self, session: &Arc<Session>, view: &str, control: &str, epoch: u64) -> Result<Value, &'static str> {
+            self.computer.release_control(
+                &self.sessions,
+                session,
+                ReleaseBody {
+                    view_id: view.to_owned(),
+                    control_id: control.to_owned(),
+                    generation: epoch,
+                },
+            )
+        }
+        fn second_session(&self) -> Arc<Session> {
+            self.sessions
+                .login(&self.token)
+                .ok()
+                .expect("second browser session must be issued")
+                .1
         }
         fn click(&self, view: &str, control: &str, generation: u64, seq: u64) -> InputBody {
             InputBody {
@@ -2522,6 +2803,199 @@ mod tests {
                 .unwrap_err(),
             "computer_view_unknown"
         );
+    }
+
+    #[test]
+    fn a_takeover_is_exclusive_and_advances_the_epoch_exactly_once() {
+        let fixture = fixture();
+        let view = fixture.view();
+        // A takeover of a free device is the first transition: epoch 1.
+        let (holder, epoch) = fixture.control(&view);
+        assert_eq!(epoch, 1, "a takeover of a free device advances the epoch once");
+        let other = fixture.second_session();
+        let other_view = fixture.view_as(&other);
+        // Exclusivity: a live lease is never displaced, and the loser gains
+        // nothing by holding a view of the same physical device.
+        assert_eq!(
+            fixture.acquire_as(&other, &other_view, 30).unwrap_err(),
+            "computer_control_held"
+        );
+        assert_eq!(
+            fixture
+                .computer
+                .input(&fixture.sessions, &other, fixture.click(&other_view, &holder, epoch, 1))
+                .unwrap_err(),
+            "computer_control_required"
+        );
+        // A heartbeat is the renewal that does *not* open a new epoch: the lease
+        // and its generation are kept.
+        let renewed = fixture
+            .computer
+            .heartbeat(
+                &fixture.sessions,
+                &fixture.session,
+                HeartbeatBody {
+                    view_id: view.clone(),
+                    control_id: holder.clone(),
+                    generation: epoch,
+                    consent: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(renewed["generation"].as_u64().unwrap(), epoch);
+        assert_eq!(renewed["controlId"].as_str().unwrap(), holder);
+        // The lease lapses at the idle deadman. The takeover that follows is one
+        // transition, so it advances the epoch by exactly one, not two.
+        fixture.tick(INPUT_IDLE_DEADMAN_MS + 1);
+        let taken = fixture.acquire_as(&other, &other_view, 30).unwrap();
+        let next_epoch = taken["generation"].as_u64().unwrap();
+        assert_eq!(
+            next_epoch,
+            epoch + 1,
+            "a takeover of a lapsed lease advances the epoch exactly once"
+        );
+        let next_holder = taken["controlId"].as_str().unwrap().to_owned();
+        // The lapsed holder can no longer execute, and cannot hand back a lease
+        // it no longer holds.
+        assert_eq!(
+            fixture
+                .computer
+                .input(&fixture.sessions, &fixture.session, fixture.click(&view, &holder, epoch, 2))
+                .unwrap_err(),
+            "computer_input_stale"
+        );
+        assert_eq!(
+            fixture.handback(&fixture.session, &view, &holder, epoch).unwrap_err(),
+            "computer_control_required"
+        );
+        assert_eq!(fixture.mock.inputs.lock().unwrap().len(), 0);
+        // Handback advances the epoch once and fences the outgoing holder.
+        let handed = fixture
+            .handback(&other, &other_view, &next_holder, next_epoch)
+            .unwrap();
+        assert_eq!(handed["released"], json!(true));
+        let after_handback = handed["generation"].as_u64().unwrap();
+        assert_eq!(after_handback, next_epoch + 1);
+        assert_eq!(
+            fixture
+                .computer
+                .input(&fixture.sessions, &other, fixture.click(&other_view, &next_holder, next_epoch, 1))
+                .unwrap_err(),
+            "computer_input_stale"
+        );
+        // Only after the handback may the original session take the device again,
+        // and that takeover continues the same epoch sequence.
+        let retaken = fixture.acquire_as(&fixture.session, &view, 600).unwrap();
+        assert_eq!(retaken["generation"].as_u64().unwrap(), after_handback + 1);
+        // The takeover lease is bounded by the five-minute ceiling: a longer
+        // request is clamped per call and the total deadline never moves.
+        let server_time = retaken["serverTime"].as_u64().unwrap();
+        assert_eq!(
+            retaken["expiresAt"].as_u64().unwrap() - server_time,
+            CONTROL_TTL_MAX_MS
+        );
+        assert_eq!(
+            retaken["totalDeadline"].as_u64().unwrap() - server_time,
+            CONTROL_TOTAL_MAX_MS
+        );
+        assert_eq!(CONTROL_TOTAL_MAX_MS, 5 * 60_000);
+        // Even repeated heartbeats cannot pass the ceiling that lease promises:
+        // each is clamped per call and, near the deadline, clamped to it.
+        let mut value = retaken.clone();
+        for _ in 0..21 {
+            fixture.tick(INPUT_IDLE_DEADMAN_MS - 1_000);
+            value = fixture
+                .computer
+                .heartbeat(
+                    &fixture.sessions,
+                    &fixture.session,
+                    HeartbeatBody {
+                        view_id: view.clone(),
+                        control_id: retaken["controlId"].as_str().unwrap().to_owned(),
+                        generation: retaken["generation"].as_u64().unwrap(),
+                        consent: true,
+                    },
+                )
+                .unwrap();
+            assert!(
+                value["expiresAt"].as_u64().unwrap() <= value["totalDeadline"].as_u64().unwrap()
+            );
+            // The five-minute deadline is a property of the takeover and never
+            // moves with a refresh.
+            assert_eq!(
+                value["totalDeadline"].as_u64().unwrap(),
+                retaken["totalDeadline"].as_u64().unwrap()
+            );
+        }
+        assert_eq!(
+            value["expiresAt"].as_u64().unwrap(),
+            value["totalDeadline"].as_u64().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_release_the_device_does_not_confirm_is_never_reported_as_a_release() {
+        let fixture = fixture();
+        let view = fixture.view();
+        let (control, epoch) = fixture.control(&view);
+        *fixture.mock.release_failure.lock().unwrap() = Some(Failure::Unconfirmed);
+        let value = fixture
+            .handback(&fixture.session, &view, &control, epoch)
+            .unwrap();
+        // The two claims stay separate: the lease is gone, the physical release
+        // is not claimed.
+        assert_eq!(value["released"], json!(false));
+        assert_eq!(value["confirmed"], json!(false));
+        assert_eq!(value["reason"], json!("computer_release_unconfirmed"));
+        assert_eq!(fixture.mock.releases.load(Ordering::SeqCst), 1);
+        // The fence is still the barrier: the handback consumed the epoch, so the
+        // outgoing holder cannot execute anything while the device's real state
+        // is unknown.
+        assert_eq!(value["generation"].as_u64().unwrap(), epoch + 1);
+        assert_eq!(
+            fixture
+                .computer
+                .input(&fixture.sessions, &fixture.session, fixture.click(&view, &control, epoch, 1))
+                .unwrap_err(),
+            "computer_input_stale"
+        );
+        assert_eq!(fixture.mock.inputs.lock().unwrap().len(), 0);
+        // A takeover may follow, but it is a new epoch and never a retroactive
+        // confirmation of the release that was not observed.
+        let taken = fixture.acquire_as(&fixture.session, &view, 30).unwrap();
+        assert_eq!(taken["generation"].as_u64().unwrap(), epoch + 2);
+        // Stopping the view reports the same unconfirmed release instead of
+        // folding it into a clean stop.
+        let (control, epoch) = (
+            taken["controlId"].as_str().unwrap().to_owned(),
+            taken["generation"].as_u64().unwrap(),
+        );
+        let stopped = fixture
+            .computer
+            .stop_view(
+                &fixture.sessions,
+                &fixture.session,
+                StopBody {
+                    view_id: view.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped["controlRevoked"], json!(true));
+        assert_eq!(stopped["confirmed"], json!(false));
+        assert_eq!(stopped["reason"], json!("computer_release_unconfirmed"));
+        assert_eq!(stopped["generation"].as_u64().unwrap(), epoch + 1);
+        assert_eq!(fixture.mock.releases.load(Ordering::SeqCst), 2);
+        assert_ne!(control, String::new());
+        // A device that is simply unavailable says so: the reason is its own code.
+        *fixture.mock.release_failure.lock().unwrap() = Some(Failure::Unavailable);
+        let view = fixture.view();
+        let (control, epoch) = fixture.control(&view);
+        let value = fixture
+            .handback(&fixture.session, &view, &control, epoch)
+            .unwrap();
+        assert_eq!(value["released"], json!(false));
+        assert_eq!(value["confirmed"], json!(false));
+        assert_eq!(value["reason"], json!("computer_unsupported"));
     }
 
     #[test]
@@ -2895,8 +3369,11 @@ mod tests {
             provider: Arc::new(UnavailableProvider),
             clock: Arc::new(wall_clock),
             gate: Mutex::new(Gate::default()),
+            epoch: Arc::new(AtomicU64::new(0)),
+            retired: AtomicBool::new(false),
             captures: Arc::new(Semaphore::new(1)),
             jobs: Arc::new(Semaphore::new(MAX_JOBS)),
+            acquire_hold: Mutex::new(None),
         };
         assert!(!computer.supported());
         assert_eq!(computer.report()["configured"], json!(false));
