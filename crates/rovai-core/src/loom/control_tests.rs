@@ -18,9 +18,10 @@ use super::{
     LoomPlanImportTask, LoomReviewRecordInput, LoomReviewVerdict, LoomTaskReleaseInput,
     candidate_record, claim_acquire, plan_import, review_record, task_release,
 };
+use crate::agent_profile::AdapterKind;
 use crate::collaboration::ProjectBindingKind;
 use crate::command::{ActorRef, CommandEnvelope};
-use crate::db::Database;
+use crate::db::{Database, TestDatabaseOpenMode};
 use crate::mission::{CreateMissionCommand, MissionService};
 use crate::test_support::OwnedTestDatabase;
 use rusqlite::params;
@@ -30,6 +31,8 @@ const PRODUCER_AGENT: &str = "agent_1";
 const REVIEWER_AGENT: &str = "agent_2";
 const PRODUCER_RUN: &str = "run_producer";
 const REVIEWER_RUN: &str = "run_reviewer";
+/// A second executor of the same Camp, so a pass can hand work to two Recipients at once.
+const SECOND_PRODUCER_AGENT: &str = "agent_3";
 const FUTURE_EXPIRY: &str = "2099-01-01T00:00:00Z";
 
 fn fixture() -> OwnedTestDatabase {
@@ -49,9 +52,20 @@ fn command<P>(payload: P) -> CommandEnvelope<P> {
     }
 }
 
-/// A real Mission with two members, so the producer and the reviewer are both present, active
-/// members of the same Camp without either of them being invented by the test.
+/// A real Mission with the two members every control test works with, so the producer and the
+/// reviewer are both present, active members of the same Camp without either of them being invented
+/// by the test.
 fn create_mission(database: &mut OwnedTestDatabase, title: &str) -> String {
+    create_mission_with_members(database, title, &[PRODUCER_AGENT, REVIEWER_AGENT])
+}
+
+/// The same real Mission command, with the Camp membership stated explicitly so a test that needs a
+/// second executor gets a real membership instead of a hand-written row.
+fn create_mission_with_members(
+    database: &mut OwnedTestDatabase,
+    title: &str,
+    members: &[&str],
+) -> String {
     let workspace = database
         .directory()
         .join(format!("loom-control-{}", uuid::Uuid::new_v4().simple()));
@@ -66,7 +80,7 @@ fn create_mission(database: &mut OwnedTestDatabase, title: &str) -> String {
                 description_content: None,
                 project_path: workspace.to_string_lossy().into_owned(),
                 project_binding_kind: ProjectBindingKind::Directory,
-                member_agent_ids: vec![PRODUCER_AGENT.into(), REVIEWER_AGENT.into()],
+                member_agent_ids: members.iter().map(|member| (*member).to_string()).collect(),
                 default_lead_agent_id: PRODUCER_AGENT.into(),
                 tags: vec![],
                 source_attachments: vec![],
@@ -74,28 +88,22 @@ fn create_mission(database: &mut OwnedTestDatabase, title: &str) -> String {
         )
         .unwrap();
     // The reviewer rule requires a *present* profile, not merely a Camp membership row, so the
-    // fixture states that precondition — and asserts both members really exist, so a template
+    // fixture states that precondition — and asserts every member really exists, so a template
     // without the reviewer profile fails loudly here instead of quietly weakening the rule under
     // test.
-    database
-        .connection()
-        .execute_batch(
-            "UPDATE agent_profile SET profile_status='present'
-             WHERE id IN ('agent_1','agent_2')",
-        )
-        .unwrap();
-    let present_members: i64 = database
-        .connection()
-        .query_row(
-            "SELECT COUNT(*) FROM agent_profile WHERE id IN ('agent_1','agent_2')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        present_members, 2,
-        "assertion the_fixture_carries_both_member_profiles_the_reviewer_rule_needs"
-    );
+    for member in members {
+        let updated = database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET profile_status='present' WHERE id=?1",
+                [member],
+            )
+            .unwrap();
+        assert_eq!(
+            updated, 1,
+            "assertion the_fixture_carries_the_member_profiles_the_reviewer_rule_needs"
+        );
+    }
     created.result.payload["missionId"]
         .as_str()
         .expect("mission creation must return a missionId")
@@ -322,7 +330,7 @@ fn acceptance_status(database: &OwnedTestDatabase, candidate_id: &str) -> String
         .unwrap()
 }
 
-fn count(database: &OwnedTestDatabase, sql: &str) -> i64 {
+fn count(database: &Database, sql: &str) -> i64 {
     database
         .connection()
         .query_row(sql, [], |row| row.get(0))
@@ -1401,5 +1409,2290 @@ fn control_facts_survive_a_database_reopen() {
     assert_eq!(
         snapshot.stage_reviews[0].manifest_hash, manifest,
         "assertion the_reopened_verdict_still_binds_the_same_manifest"
+    );
+}
+
+/// The `blocked_reason` this module persists for one Task, or `None` when it carries none.
+fn task_blocked_reason(database: &Database, plan_id: &str, task_id: &str) -> Option<String> {
+    database
+        .connection()
+        .query_row(
+            "SELECT blocked_reason FROM loom_task WHERE plan_id=?1 AND task_id=?2",
+            params![plan_id, task_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// The row counter of one Task: the module's own reasons only ever advance it by a real write, so
+/// an unchanged value proves that a pass wrote nothing at all.
+fn task_row_revision(database: &OwnedTestDatabase, plan_id: &str, task_id: &str) -> i64 {
+    database
+        .connection()
+        .query_row(
+            "SELECT revision FROM loom_task WHERE plan_id=?1 AND task_id=?2",
+            params![plan_id, task_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// The runtime installation one Agent is bound to — the facts that decide disabled/offline/harness.
+fn installation_of(database: &OwnedTestDatabase, agent_id: &str) -> String {
+    database
+        .connection()
+        .query_row(
+            "SELECT default_runtime_installation_id FROM agent_profile WHERE id=?1",
+            [agent_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+        .unwrap_or_else(|| panic!("agent {agent_id} must be bound to a runtime installation"))
+}
+
+/// Deliveries the control plane created: the handoff lane and nothing else.
+fn loom_deliveries(database: &Database) -> i64 {
+    count(
+        database,
+        "SELECT COUNT(*) FROM camp_message_delivery WHERE message_id IN
+             (SELECT id FROM camp_message WHERE author_id='loom-control-scheduler')",
+    )
+}
+
+/// The one shape an EXECUTE dispatch may take: a Plan whose `task_a` is READY, explicitly assigned
+/// and inside an approved policy. `extra_tasks` add further READY Tasks of the same Plan with the
+/// assignee they name, so a single pass can hand work to two Recipients at once without inventing a
+/// dependency edge the Plan never declared.
+fn dispatchable_plan(
+    database: &mut OwnedTestDatabase,
+    title: &str,
+    command_id: &str,
+    members: &[&str],
+    extra_tasks: &[(&str, &str)],
+) -> (String, String) {
+    let mission_id = create_mission_with_members(database, title, members);
+    plan_import(database, plan_input(&mission_id)).unwrap();
+    let plan_id: String = database
+        .connection()
+        .query_row("SELECT plan_id FROM loom_plan WHERE mission_id=?1", [&mission_id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE loom_task SET status='READY', assignee_agent_id=?1
+             WHERE plan_id=?2 AND task_id='task_a'",
+            params![PRODUCER_AGENT, &plan_id],
+        )
+        .unwrap();
+    let mut scoped = vec!["task_a".to_string()];
+    for (task_id, assignee) in extra_tasks {
+        database
+            .connection()
+            .execute(
+                "INSERT INTO loom_task(task_id,plan_id,title,description,assignee_agent_id,status,
+                                       acceptance_criteria_json,created_at,updated_at,revision)
+                 SELECT ?1,plan_id,?1,'A second dispatchable task',?2,'READY',
+                        acceptance_criteria_json,created_at,updated_at,revision
+                 FROM loom_task WHERE plan_id=?3 AND task_id='task_a'",
+                params![task_id, assignee, &plan_id],
+            )
+            .unwrap();
+        scoped.push((*task_id).to_string());
+    }
+    let mut policy = policy_input(&mission_id, command_id, REVIEWER_AGENT);
+    policy.task_ids = scoped.clone();
+    policy.reviewers = scoped
+        .iter()
+        .map(|task_id| LoomReviewerAssignment {
+            task_id: task_id.clone(),
+            reviewer_agent_id: REVIEWER_AGENT.into(),
+        })
+        .collect();
+    control::configure(database, OWNER, policy).unwrap();
+    (mission_id, plan_id)
+}
+
+/// The stable identity of the EXECUTE event of one Task, written the same way the scheduler writes
+/// it: a JSON array, so a part can never run into its neighbour.
+fn execute_event_key(plan_id: &str, task_id: &str) -> String {
+    serde_json::to_string(&["EXECUTE", plan_id, task_id]).unwrap()
+}
+
+/// The durable dispatch facts this module recorded for one Task, in write order:
+/// `(event type, reason code)`. A recovery fact carries no reason.
+fn dispatch_events(database: &Database, task_id: &str) -> Vec<(String, Option<String>)> {
+    let mut statement = database
+        .connection()
+        .prepare(
+            "SELECT event_type, json_extract(payload_json, '$.reasonCode') FROM event_log
+             WHERE entity_type='loom_task' AND entity_id=?1
+               AND event_type IN ('loom.dispatch_failed','loom.dispatch_recovered')
+             ORDER BY id",
+        )
+        .unwrap();
+    statement
+        .query_map([task_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+fn failure_fact(reason: &str) -> (String, Option<String>) {
+    ("loom.dispatch_failed".to_string(), Some(reason.to_string()))
+}
+
+fn recovered_fact() -> (String, Option<String>) {
+    ("loom.dispatch_recovered".to_string(), None)
+}
+
+/// Point one member at a remote Node and give that Node the selected harness: a real
+/// `member_execution_target` row, a ready `mission_workspace` on that Node and a reported CLI.
+/// Returns the workspace id.
+fn select_remote_node(
+    database: &OwnedTestDatabase,
+    camp_id: &str,
+    member_id: &str,
+    node_id: &str,
+    adapter_kind: AdapterKind,
+    heartbeat: &str,
+) -> String {
+    let connection = database.connection();
+    let mission_id: String = connection
+        .query_row(
+            "SELECT id FROM mission WHERE camp_id=?1",
+            [camp_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let workspace_id = format!("workspace_{node_id}");
+    let root = format!("/fixture/{node_id}/worktree");
+    connection
+        .execute(
+            "INSERT INTO execution_node(node_id,display_name,role,os,arch,token_digest,paired_at,
+                                        revoked_at,last_heartbeat)
+             VALUES(?1,'Remote Node','remote',NULL,NULL,?2,?3,NULL,?3)",
+            params![node_id, "a".repeat(64), heartbeat],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO execution_node_cli(node_id,adapter_kind,path,version,path_present,
+                                            reported_at,installation_identity,
+                                            installation_generation)
+             VALUES(?1,?2,?3,'9.9.9',1,?4,?5,1)",
+            params![
+                node_id,
+                adapter_kind.as_str(),
+                format!("{root}/{}", adapter_kind.as_str()),
+                heartbeat,
+                format!("sha256:{}", "b".repeat(64))
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO mission_workspace(id,mission_id,camp_id,execution_host_id,
+                                           source_directory,repository_root,git_common_dir,
+                                           worktree_path,working_directory,base_branch,branch,
+                                           base_sha,preparation_token,preparation_kind,generation,
+                                           state,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?5,?6,?5,?5,'main','rovai/mission/remote','base',
+                    'loom-remote-preparation','create',1,'ready',?7,?7)",
+            params![
+                workspace_id,
+                mission_id,
+                camp_id,
+                node_id,
+                root,
+                format!("{root}/.git"),
+                heartbeat
+            ],
+        )
+        .unwrap();
+    let defaults = crate::agent_profile::member_runtime_defaults(adapter_kind);
+    let selection = serde_json::json!({
+        "nodeId": node_id,
+        "workspaceId": workspace_id,
+        "workspaceRoot": root,
+        "adapterKind": adapter_kind.as_str(),
+        "model": defaults.model,
+        "permissions": defaults.permissions,
+    });
+    connection
+        .execute(
+            "INSERT INTO member_execution_target(member_id,revision,node_id,selection_json,
+                                                 updated_at)
+             VALUES(?1,1,?2,?3,?4)",
+            params![member_id, node_id, selection.to_string(), heartbeat],
+        )
+        .unwrap();
+    workspace_id
+}
+
+/// The prepared Mission workspace the real scheduler hands to a claim, so a Mission lane is claimed
+/// exactly as production claims it instead of being deferred as unprepared. Captured immediately
+/// before each claim, because the fence is the workspace the claim will re-prove.
+fn mission_batch_workspaces(
+    database: &mut OwnedTestDatabase,
+    camp_id: &str,
+) -> crate::delivery_queue::BatchWorkspaces {
+    let project_path: String = database
+        .connection()
+        .query_row(
+            "SELECT project_path FROM camp WHERE id=?1",
+            [camp_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let workspace = crate::runtime::AgentRunWorkspace {
+        execution_root: project_path.clone(),
+        access: "write".into(),
+        isolation: "git_worktree".into(),
+    };
+    let fact = serde_json::json!({
+        "workingDirectory": project_path,
+        "branch": "rovai/mission/fixture",
+    });
+    let prepared =
+        crate::delivery_queue::capture_prepared_batch_workspace(database, camp_id, workspace, fact)
+            .unwrap();
+    crate::delivery_queue::BatchWorkspaces::from([(camp_id.to_string(), Ok(prepared))])
+}
+
+fn claim_mission_lane(database: &mut OwnedTestDatabase, camp_id: &str, limit: i64) -> Vec<String> {
+    let workspaces = mission_batch_workspaces(database, camp_id);
+    crate::delivery_queue::claim_waiting_delivery_batches_with_workspaces(
+        database,
+        limit,
+        &workspaces,
+    )
+    .unwrap()
+}
+
+/// The Run's own admission, exactly as the scheduler performs it: the same command, the same system
+/// actor and the same frozen workspace facts. A queued Run that the control plane blocks must be
+/// rejected here, not merely described.
+fn claim_the_run(
+    database: &mut OwnedTestDatabase,
+    camp_id: &str,
+    run_id: &str,
+) -> crate::command::CommandExecution {
+    let version: i64 = database
+        .connection()
+        .query_row(
+            "SELECT version FROM agent_run WHERE id=?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    crate::runtime::ExecutionRuntimeService::default()
+        .claim_agent_run(
+            database,
+            &CommandEnvelope {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                actor: ActorRef::System {
+                    component_id: "agent-run-scheduler".into(),
+                },
+                camp_id: Some(camp_id.to_string()),
+                expected_versions: vec![],
+                execution_epoch: None,
+                payload: crate::runtime::ClaimAgentRunCommand {
+                    agent_run_id: run_id.to_string(),
+                    expected_version: version,
+                    lease_owner: "loom-dispatch-test".into(),
+                    lease_seconds: 60,
+                    workspace: None,
+                    starting_git_observation: None,
+                },
+            },
+        )
+        .unwrap()
+}
+
+/// The dispatch row the control plane wrote for one Task, and the Run its Delivery produced.
+fn dispatch_and_run(database: &OwnedTestDatabase, task_id: &str) -> (String, Option<String>) {
+    database
+        .connection()
+        .query_row(
+            "SELECT dispatch.dispatch_id, delivery.claimed_agent_run_id
+             FROM loom_control_dispatch dispatch
+             JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+             WHERE dispatch.task_id=?1 ORDER BY dispatch.created_at, dispatch.dispatch_id LIMIT 1",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+fn run_status(database: &Database, run_id: &str) -> String {
+    database
+        .connection()
+        .query_row(
+            "SELECT status FROM agent_run WHERE id=?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// Failure-vocabulary boundary, ported from Mikka
+/// `lib/factory/dispatch-recovery.ts:factoryDispatchFailureReason`: the reason names the first fact
+/// that makes the recipient unusable, in the order switch → presence → harness, and the same
+/// vocabulary is what the pre-run recheck hands to the wrapper.
+#[test]
+fn dispatch_failure_reason_follows_the_disabled_offline_harness_order() {
+    let mut database = fixture();
+    let (mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch failure vocabulary",
+        "command_approve_vocabulary",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    let installation_id = installation_of(&database, PRODUCER_AGENT);
+
+    // Every fact is broken at once, so only the *order* of the ladder can decide what is recorded.
+    database
+        .connection()
+        .execute_batch(&format!(
+            "UPDATE camp_member SET status='left' WHERE camp_id='{camp_id}' AND agent_id='{PRODUCER_AGENT}';
+             UPDATE adapter_installation SET path_state='path_missing' WHERE id='{installation_id}';
+             UPDATE agent_profile SET selected_runtime_adapter_kind='claude-code-cli'
+             WHERE id='{PRODUCER_AGENT}';"
+        ))
+        .unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion a_switched_off_recipient_is_never_dispatched"
+    );
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
+        Some("loom.dispatch_recipient_disabled"),
+        "assertion the_switch_outranks_presence_and_the_harness"
+    );
+
+    // The switch comes back but the runtime is still gone and the harness still does not match:
+    // presence is the next fact the ladder asks, so it wins over the harness.
+    database
+        .connection()
+        .execute_batch(&format!(
+            "UPDATE camp_member SET status='active' WHERE camp_id='{camp_id}' AND agent_id='{PRODUCER_AGENT}';
+             UPDATE agent_profile SET profile_status='away' WHERE id='{PRODUCER_AGENT}';"
+        ))
+        .unwrap();
+    assert_eq!(control::admit_due_dispatches(&mut database).unwrap(), 0);
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
+        Some("loom.dispatch_recipient_offline"),
+        "assertion presence_outranks_the_harness_even_when_the_profile_is_merely_away"
+    );
+
+    // A present member, but the runtime it is bound to cannot be reached: still presence. This
+    // Recipient is addressable, so the approved work is reserved instead of being forgotten.
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_profile SET profile_status='present' WHERE id=?1",
+            [PRODUCER_AGENT],
+        )
+        .unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion an_addressable_recipient_whose_device_is_gone_reserves_the_work"
+    );
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
+        Some("loom.dispatch_recipient_offline"),
+        "assertion an_unreachable_runtime_outranks_the_harness_it_would_run"
+    );
+    assert_eq!(
+        (
+            count(
+                &database,
+                "SELECT COUNT(*) FROM loom_control_dispatch WHERE task_id='task_a'"
+            ),
+            loom_deliveries(&database)
+        ),
+        (1, 1),
+        "assertion the_reserved_work_is_one_ledger_row_and_one_waiting_delivery"
+    );
+
+    // The reserved-Delivery recheck is the same rule set, so it names the same fact.
+    database
+        .connection()
+        .execute(
+            "INSERT INTO loom_control_dispatch(dispatch_id,plan_id,task_id,kind,candidate_id,
+                                               policy_revision,recipient_agent_id,delivery_id,
+                                               status,reason,dedupe_key,created_at,updated_at)
+             VALUES('dispatch_reserved',?1,'task_a','EXECUTE',NULL,1,?2,NULL,'WAITING',NULL,
+                    '[\\\"EXECUTE\\\",\\\"reserved\\\",\\\"task_a\\\"]','2026-08-31','2026-08-31')",
+            params![&plan_id, PRODUCER_AGENT],
+        )
+        .unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    assert_eq!(
+        control::dispatch_block_reason(database.connection(), "dispatch_reserved", &now)
+            .unwrap()
+            .as_deref(),
+        Some("loom.dispatch_recipient_offline"),
+        "assertion the_prerun_recheck_reports_the_same_presence_fact"
+    );
+
+    // Reachable again, but the harness the Agent must run is not the one installed there.
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET path_state='valid' WHERE id=?1",
+            [&installation_id],
+        )
+        .unwrap();
+    assert_eq!(control::admit_due_dispatches(&mut database).unwrap(), 0);
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
+        Some("loom.dispatch_harness_unavailable"),
+        "assertion a_reachable_recipient_with_the_wrong_harness_is_reported_as_the_harness"
+    );
+    assert_eq!(
+        control::dispatch_block_reason(database.connection(), "dispatch_reserved", &now)
+            .unwrap()
+            .as_deref(),
+        Some("loom.dispatch_harness_unavailable"),
+        "assertion the_prerun_recheck_follows_the_same_ladder"
+    );
+
+    // The last fact is repaired. The stored probe of that installation is stale at the same time:
+    // a probe result is not an admission fact, so it cannot keep a launchable Runtime out.
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_profile SET selected_runtime_adapter_kind='codex-cli' WHERE id=?1",
+            [PRODUCER_AGENT],
+        )
+        .unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_capability_snapshot SET probe_status='light_failed'
+             WHERE installation_id=?1",
+            [&installation_id],
+        )
+        .unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion a_repaired_recipient_resumes_its_reservation_instead_of_a_second_dispatch"
+    );
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a"),
+        None,
+        "assertion a_successful_admission_clears_the_failure_vocabulary"
+    );
+    assert_eq!(
+        (
+            count(
+                &database,
+                "SELECT COUNT(*) FROM loom_control_dispatch WHERE task_id='task_a'"
+            ),
+            loom_deliveries(&database)
+        ),
+        (2, 1),
+        "assertion the_repaired_recipient_still_owns_one_reservation_and_one_delivery"
+    );
+    assert_eq!(
+        control::dispatch_block_reason(database.connection(), "dispatch_reserved", &now).unwrap(),
+        None,
+        "assertion the_prerun_recheck_passes_once_every_fact_is_repaired"
+    );
+}
+
+/// Presence is launch intent, not a probe: Core's own admission starts a Runtime that is merely
+/// `light_ready`, `installed_unverified`, or has no capability snapshot yet, so dispatch must not be
+/// stricter than the execution path it feeds.
+#[test]
+fn dispatch_does_not_require_a_fresh_ready_probe() {
+    for probe in [
+        Some("light_ready"),
+        Some("light_failed"),
+        Some("installed_unverified"),
+        None,
+    ] {
+        let mut database = fixture();
+        let (_mission_id, plan_id) = dispatchable_plan(
+            &mut database,
+            "dispatch probe independence",
+            "command_approve_probe_independence",
+            &[PRODUCER_AGENT, REVIEWER_AGENT],
+            &[],
+        );
+        let installation_id = installation_of(&database, PRODUCER_AGENT);
+        match probe {
+            Some(status) => {
+                database
+                    .connection()
+                    .execute(
+                        "UPDATE adapter_capability_snapshot SET probe_status=?1
+                         WHERE installation_id=?2",
+                        params![status, &installation_id],
+                    )
+                    .unwrap();
+            }
+            None => {
+                database
+                    .connection()
+                    .execute(
+                        "DELETE FROM adapter_capability_snapshot WHERE installation_id=?1",
+                        [&installation_id],
+                    )
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            control::admit_due_dispatches(&mut database).unwrap(),
+            1,
+            "assertion a_{probe:?}_probe_does_not_block_a_launchable_installation"
+        );
+        assert_eq!(
+            task_blocked_reason(&database, &plan_id, "task_a"),
+            None,
+            "assertion no_failure_is_recorded_for_a_launchable_installation"
+        );
+        assert_eq!(
+            dispatch_events(&database, "task_a"),
+            vec![],
+            "assertion a_launchable_installation_writes_no_failure_fact"
+        );
+    }
+}
+
+/// Dedupe boundary: one recorded failure per reason, so repeated ticks cannot turn one unavailable
+/// recipient into a stream of events, and a verdict that changes and changes back is not recorded
+/// twice. Recovery resumes the *same* event identity instead of minting a second Delivery.
+#[test]
+fn a_dispatch_failure_is_recorded_once_and_recovery_resumes_the_same_event() {
+    let mut database = fixture();
+    let (mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch failure dedupe",
+        "command_approve_dedupe",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    let installation_id = installation_of(&database, PRODUCER_AGENT);
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET path_state='path_missing' WHERE id=?1",
+            [&installation_id],
+        )
+        .unwrap();
+
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion an_unreachable_device_still_reserves_the_approved_work"
+    );
+    let recorded_revision = task_row_revision(&database, &plan_id, "task_a");
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
+        Some("loom.dispatch_recipient_offline"),
+        "assertion the_first_unreachable_pass_records_the_presence_fact"
+    );
+    let offline_fact = failure_fact("loom.dispatch_recipient_offline");
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![offline_fact.clone()],
+        "assertion the_first_unreachable_pass_writes_exactly_one_failure_fact"
+    );
+
+    // A repeated tick re-derives the same conclusion. It must not write a second copy of it.
+    for _ in 0..3 {
+        assert_eq!(
+            control::admit_due_dispatches(&mut database).unwrap(),
+            0,
+            "assertion a_repeated_tick_admits_nothing_while_the_recipient_is_unreachable"
+        );
+    }
+    assert_eq!(
+        task_row_revision(&database, &plan_id, "task_a"),
+        recorded_revision,
+        "assertion a_repeated_tick_writes_no_second_current_state_reason"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![offline_fact.clone()],
+        "assertion a_repeated_tick_writes_no_second_failure_fact"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database)
+        ),
+        (1, 1),
+        "assertion the_reservation_is_one_ledger_row_and_one_waiting_delivery"
+    );
+
+    // Switched off while the offline fact is already on record: the switch is a different fact and
+    // is recorded once, on top of — not instead of — the earlier one.
+    database
+        .connection()
+        .execute(
+            "UPDATE camp_member SET status='left' WHERE camp_id=?1 AND agent_id=?2",
+            params![&camp_id, PRODUCER_AGENT],
+        )
+        .unwrap();
+    assert_eq!(control::admit_due_dispatches(&mut database).unwrap(), 0);
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
+        Some("loom.dispatch_recipient_disabled"),
+        "assertion the_switch_replaces_only_the_current_state_mirror"
+    );
+    let disabled_fact = failure_fact("loom.dispatch_recipient_disabled");
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![offline_fact.clone(), disabled_fact.clone()],
+        "assertion one_fact_row_per_event_and_reason_instead_of_one_mutable_slot"
+    );
+
+    // The switch comes back but the runtime is still gone: the earlier offline judgement is not
+    // recorded a second time, because it is keyed by event and reason.
+    database
+        .connection()
+        .execute(
+            "UPDATE camp_member SET status='active' WHERE camp_id=?1 AND agent_id=?2",
+            params![&camp_id, PRODUCER_AGENT],
+        )
+        .unwrap();
+    assert_eq!(control::admit_due_dispatches(&mut database).unwrap(), 0);
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![offline_fact.clone(), disabled_fact.clone()],
+        "assertion an_offline_disabled_offline_round_trip_keeps_one_offline_fact"
+    );
+
+    // The runtime is back: exactly one recovery fact, and the same Task is handed out under the
+    // identity it always had, so the Delivery that finally starts is the one the failed passes
+    // named — not a new copy of it.
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET path_state='valid' WHERE id=?1",
+            [&installation_id],
+        )
+        .unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion recovery_resumes_the_reservation_instead_of_minting_a_second_dispatch"
+    );
+    let (dedupe_key, delivery_id): (String, Option<String>) = database
+        .connection()
+        .query_row(
+            "SELECT dedupe_key, delivery_id FROM loom_control_dispatch WHERE task_id='task_a'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        dedupe_key,
+        execute_event_key(&plan_id, "task_a"),
+        "assertion recovery_reuses_the_same_event_identity_the_failed_passes_named"
+    );
+    assert!(
+        delivery_id.is_some(),
+        "assertion the_resumed_event_is_bound_to_a_real_delivery"
+    );
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a"),
+        None,
+        "assertion recovery_clears_the_current_state_reason"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![
+            offline_fact.clone(),
+            disabled_fact.clone(),
+            recovered_fact()
+        ],
+        "assertion recovery_records_one_recovery_fact_after_the_failures"
+    );
+
+    for _ in 0..2 {
+        assert_eq!(
+            control::admit_due_dispatches(&mut database).unwrap(),
+            0,
+            "assertion a_resumed_event_is_never_dispatched_twice"
+        );
+    }
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database)
+        ),
+        (1, 1),
+        "assertion recovery_leaves_exactly_one_ledger_row_and_one_delivery"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a").len(),
+        3,
+        "assertion recovery_never_rewrites_or_deletes_the_failure_history"
+    );
+
+    // The facts are storage, not process state: a reopened database still sees them and still
+    // refuses to mint a second Delivery.
+    let directory = database.directory().to_path_buf();
+    database.close();
+    let mut reopened = Database::open(&directory).expect("the reopened database must be admitted");
+    assert_eq!(
+        dispatch_events(&reopened, "task_a"),
+        vec![offline_fact, disabled_fact, recovered_fact()],
+        "assertion the_dispatch_facts_survive_a_reopen"
+    );
+    assert_eq!(
+        control::admit_due_dispatches(&mut reopened).unwrap(),
+        0,
+        "assertion a_reopened_database_never_redispatches_the_same_event"
+    );
+    assert_eq!(
+        (
+            count(&reopened, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            count(
+                &reopened,
+                "SELECT COUNT(*) FROM camp_message_delivery WHERE message_id IN
+                     (SELECT id FROM camp_message WHERE author_id='loom-control-scheduler')"
+            )
+        ),
+        (1, 1),
+        "assertion a_reopened_database_keeps_one_ledger_row_and_one_delivery"
+    );
+}
+
+/// Recovery boundary: the Delivery is the queued work — Core creates the Run from it at claim time —
+/// so "the same queued Run continues" means this exact row survives the outage and is the one the
+/// real claim materialises. A recipient that is unreachable cannot start it, and recovery starts the
+/// same Delivery instead of minting a second one.
+#[test]
+fn an_unreachable_recipient_holds_the_reserved_delivery_and_the_same_queued_run_continues() {
+    let mut database = fixture();
+    let (mission_id, _plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch recovery keeps the queued run",
+        "command_approve_recovery",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_reachable_plan_reserves_its_first_delivery"
+    );
+    let (dispatch_id, delivery_id): (String, String) = database
+        .connection()
+        .query_row(
+            "SELECT dispatch_id, delivery_id FROM loom_control_dispatch",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let (message_id, queue_sequence): (String, i64) = database
+        .connection()
+        .query_row(
+            "SELECT message_id, queue_sequence FROM camp_message_delivery WHERE id=?1",
+            [&delivery_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    // The recipient drops out after the reservation. The real claim asks the control plane before
+    // it starts anything, so this exact Delivery waits and no Run is created.
+    let installation_id = installation_of(&database, PRODUCER_AGENT);
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET path_state='path_missing' WHERE id=?1",
+            [&installation_id],
+        )
+        .unwrap();
+    assert!(
+        claim_mission_lane(&mut database, &camp_id, 1).is_empty(),
+        "assertion an_unreachable_recipient_cannot_claim_the_reserved_delivery"
+    );
+    assert_eq!(
+        count(&database, "SELECT COUNT(*) FROM agent_run"),
+        0,
+        "assertion the_blocked_claim_starts_no_run"
+    );
+    let (waiting_status, unclaimed, same_message): (String, bool, bool) = database
+        .connection()
+        .query_row(
+            "SELECT status, claimed_agent_run_id IS NULL, message_id=?2
+             FROM camp_message_delivery WHERE id=?1",
+            params![&delivery_id, &message_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (waiting_status.as_str(), unclaimed, same_message),
+        ("waiting", true, true),
+        "assertion the_queued_delivery_is_untouched_while_it_waits"
+    );
+
+    // A pass during the outage records the failure fact once and, the reservation already standing,
+    // admits no second dispatch.
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion waiting_for_the_recipient_is_not_a_second_dispatch"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![failure_fact("loom.dispatch_recipient_offline")],
+        "assertion the_reserved_work_records_its_presence_fact_once"
+    );
+
+    // The recipient comes back. The recovery pass records the recovery fact; the claim then
+    // materialises the Run from this very Delivery.
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET path_state='valid' WHERE id=?1",
+            [&installation_id],
+        )
+        .unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion the_recovery_pass_resumes_the_reservation_instead_of_dispatching_again"
+    );
+    let claimed = claim_mission_lane(&mut database, &camp_id, 1);
+    assert_eq!(
+        claimed.len(),
+        1,
+        "assertion the_recovered_recipient_claims_the_same_queued_work"
+    );
+    let run_id = claimed[0].clone();
+    let (claimed_run, claimed_status, same_message, same_sequence, same_dispatch): (
+        Option<String>,
+        String,
+        bool,
+        bool,
+        bool,
+    ) = database
+        .connection()
+        .query_row(
+            "SELECT delivery.claimed_agent_run_id, delivery.status, delivery.message_id=?2,
+                    delivery.queue_sequence=?3,
+                    EXISTS(SELECT 1 FROM loom_control_dispatch WHERE dispatch_id=?4)
+             FROM camp_message_delivery AS delivery WHERE delivery.id=?1",
+            params![&delivery_id, &message_id, queue_sequence, &dispatch_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        (claimed_run.as_deref(), claimed_status.as_str()),
+        (Some(run_id.as_str()), "claimed"),
+        "assertion the_same_reserved_delivery_started_the_recovered_run"
+    );
+    assert_eq!(
+        (same_message, same_sequence, same_dispatch),
+        (true, true, true),
+        "assertion the_same_queued_work_continues_after_recovery"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database),
+            count(&database, "SELECT COUNT(*) FROM agent_run")
+        ),
+        (1, 1, 1),
+        "assertion recovery_adds_no_second_ledger_row_no_second_delivery_and_no_second_run"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![
+            failure_fact("loom.dispatch_recipient_offline"),
+            recovered_fact()
+        ],
+        "assertion the_reserved_work_records_exactly_one_recovery_fact"
+    );
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion a_tick_after_the_recovery_never_dispatches_the_same_event_again"
+    );
+}
+
+/// Presence boundary, ported from the upstream device vocabulary: when a member explicitly selected
+/// a remote Node, that Node is the device — its heartbeat is presence and its catalog is the
+/// harness. The local installation of that Agent is not the device and must not be consulted.
+#[test]
+fn a_remote_recipient_is_judged_by_its_node_and_recovers_when_the_node_heartbeats() {
+    let mut database = fixture();
+    let (mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch remote device",
+        "command_approve_remote_device",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    let stale = (chrono::Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339();
+    select_remote_node(
+        &database,
+        &camp_id,
+        PRODUCER_AGENT,
+        "node_remote",
+        AdapterKind::CodexCli,
+        &stale,
+    );
+    // The Agent's local installation is still present, enabled and launchable. A stale Node must
+    // still decide, because the Node is where the work would run.
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion a_stale_node_reserves_the_work_without_starting_it"
+    );
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
+        Some("loom.dispatch_recipient_offline"),
+        "assertion a_stale_node_heartbeat_is_reported_as_presence"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![failure_fact("loom.dispatch_recipient_offline")],
+        "assertion the_stale_node_writes_one_presence_fact"
+    );
+
+    // A fresh heartbeat is presence; the Node reporting no usable installation of the selected
+    // harness is the harness step.
+    let fresh = chrono::Utc::now().to_rfc3339();
+    database
+        .connection()
+        .execute(
+            "UPDATE execution_node SET last_heartbeat=?1 WHERE node_id='node_remote'",
+            [&fresh],
+        )
+        .unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE execution_node_cli SET path_present=0
+             WHERE node_id='node_remote' AND adapter_kind='codex-cli'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(control::admit_due_dispatches(&mut database).unwrap(), 0);
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
+        Some("loom.dispatch_harness_unavailable"),
+        "assertion a_reachable_node_without_the_selected_harness_is_reported_as_the_harness"
+    );
+
+    // The Node reports the harness again: the same Task is dispatched, and the ladder's history is
+    // kept as three facts rather than one mutable slot.
+    database
+        .connection()
+        .execute(
+            "UPDATE execution_node_cli SET path_present=1
+             WHERE node_id='node_remote' AND adapter_kind='codex-cli'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion the_recovered_remote_node_resumes_its_reservation"
+    );
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a"),
+        None,
+        "assertion the_recovered_remote_node_carries_no_current_failure"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![
+            failure_fact("loom.dispatch_recipient_offline"),
+            failure_fact("loom.dispatch_harness_unavailable"),
+            recovered_fact()
+        ],
+        "assertion the_remote_ladder_records_each_fact_once_and_keeps_history"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database)
+        ),
+        (1, 1),
+        "assertion the_remote_recovery_mints_one_delivery"
+    );
+}
+
+/// Concurrency boundary, ported from the upstream rule that a heartbeat which commits while the
+/// dispatch write waits for the lock must be observed: the availability of every recipient is read
+/// inside the writing transaction, so a pass never records a failure from facts it can no longer
+/// see — whichever side wins the lock, the repaired facts are the ones judged.
+#[test]
+fn recipients_that_come_back_while_the_pass_waits_for_the_lock_are_dispatched_once() {
+    let mut database = fixture();
+    let (mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch concurrent recovery",
+        "command_approve_concurrent",
+        &[PRODUCER_AGENT, REVIEWER_AGENT, SECOND_PRODUCER_AGENT],
+        &[("task_second", SECOND_PRODUCER_AGENT)],
+    );
+    let _ = &mission_id;
+    let installation_id = installation_of(&database, PRODUCER_AGENT);
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET path_state='path_missing' WHERE id=?1",
+            [&installation_id],
+        )
+        .unwrap();
+    database
+        .connection()
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(
+        count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+        0,
+        "assertion no_pass_has_looked_at_these_recipients_yet"
+    );
+
+    // A second connection repairs the runtime and holds the write lock. The pass is started while
+    // that lock is held, so a read taken before it would see the stale `path_missing`.
+    let directory = database.directory().to_path_buf();
+    let repaired_installation = installation_id.clone();
+    let (locked, lock_held) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let mut holder =
+            Database::open_verified_test_clone(&directory, TestDatabaseOpenMode::ProductionLike)
+                .unwrap();
+        holder
+            .connection()
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let transaction = holder
+            .connection_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE adapter_installation SET path_state='valid' WHERE id=?1",
+                [&repaired_installation],
+            )
+            .unwrap();
+        locked.send(()).unwrap();
+        released.recv().unwrap();
+        transaction.commit().unwrap();
+    });
+    lock_held.recv().unwrap();
+
+    let admitted = std::thread::scope(|scope| {
+        let pass = scope.spawn(|| control::admit_due_dispatches(&mut database).unwrap());
+        release.send(()).unwrap();
+        pass.join().unwrap()
+    });
+    holder.join().unwrap();
+
+    assert_eq!(
+        admitted, 2,
+        "assertion a_pass_never_dispatches_from_a_stale_reading_of_the_device"
+    );
+    for task_id in ["task_a", "task_second"] {
+        assert_eq!(
+            task_blocked_reason(&database, &plan_id, task_id),
+            None,
+            "assertion the_recovered_recipient_carries_no_stale_failure_record"
+        );
+        assert_eq!(
+            dispatch_events(&database, task_id),
+            vec![],
+            "assertion the_waited_pass_records_no_stale_failure_and_no_recovery"
+        );
+        assert_eq!(
+            control::admit_due_dispatches(&mut database).unwrap(),
+            0,
+            "assertion a_tick_after_the_recovery_never_dispatches_the_same_event_again"
+        );
+    }
+    let keys: Vec<String> = {
+        let mut statement = database
+            .connection()
+            .prepare("SELECT dedupe_key FROM loom_control_dispatch ORDER BY dedupe_key")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let mut expected = vec![
+        execute_event_key(&plan_id, "task_a"),
+        execute_event_key(&plan_id, "task_second"),
+    ];
+    expected.sort();
+    assert_eq!(
+        keys, expected,
+        "assertion each_recovered_recipient_owns_exactly_one_event_identity"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database)
+        ),
+        (2, 2),
+        "assertion concurrent_recovery_creates_no_duplicate_delivery"
+    );
+}
+
+/// Single-dispatch boundary, ported from upstream's concurrent `deviceOnline` race: two independent
+/// connections admitting the same queued work at the same instant must produce one Dispatch and one
+/// Delivery. The write transaction serialises them and the ledger's dedupe key is what the second
+/// pass sees, so neither one can mint a second copy.
+#[test]
+fn concurrent_passes_admit_the_same_queued_work_exactly_once() {
+    let mut database = fixture();
+    let (_mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch concurrent passes",
+        "command_approve_two_passes",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let directory = database.directory().to_path_buf();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let results: Vec<usize> = std::thread::scope(|scope| {
+        let mut passes = Vec::new();
+        for _ in 0..2 {
+            let directory = directory.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            passes.push(scope.spawn(move || {
+                let mut pass = Database::open_verified_test_clone(
+                    &directory,
+                    TestDatabaseOpenMode::ProductionLike,
+                )
+                .unwrap();
+                pass.connection()
+                    .busy_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                barrier.wait();
+                control::admit_due_dispatches(&mut pass).unwrap()
+            }));
+        }
+        barrier.wait();
+        passes
+            .into_iter()
+            .map(|pass| pass.join().unwrap())
+            .collect()
+    });
+    assert_eq!(
+        results.iter().sum::<usize>(),
+        1,
+        "assertion two_concurrent_passes_admit_the_same_event_exactly_once: {results:?}"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database)
+        ),
+        (1, 1),
+        "assertion concurrent_passes_leave_one_ledger_row_and_one_delivery"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![],
+        "assertion a_successful_race_writes_no_failure_fact"
+    );
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion a_tick_after_the_race_dispatches_nothing_again"
+    );
+    let _ = plan_id;
+}
+
+/// Recovery boundary for work that was never handed out: the first pass already found the device
+/// gone, so nothing but the failure fact existed before. The approved work must still be a pending
+/// item the *existing* Delivery scheduler and recovery timer can find, and it must resume without
+/// anybody calling the LOOM pass by hand.
+#[test]
+fn a_reserved_dispatch_is_found_and_resumed_by_the_delivery_recovery_timer() {
+    let mut database = fixture();
+    let (mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch recovery timer",
+        "command_approve_recovery_timer",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    let installation_id = installation_of(&database, PRODUCER_AGENT);
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET path_state='path_missing' WHERE id=?1",
+            [&installation_id],
+        )
+        .unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_first_unreachable_pass_reserves_the_approved_work"
+    );
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
+        Some("loom.dispatch_recipient_offline"),
+        "assertion the_reserved_work_records_the_presence_fact"
+    );
+    // The one gate the batch scheduler reads before it looks at anything: a waiting Delivery and an
+    // unsettled dispatch row. Without this, a device that comes back would never be noticed.
+    assert!(
+        crate::delivery_queue::has_pending_delivery_batch_work(&database).unwrap(),
+        "assertion the_reservation_is_pending_work_the_scheduler_can_see"
+    );
+    assert!(
+        crate::delivery_queue::next_delivery_recovery_due(&database)
+            .unwrap()
+            .is_some(),
+        "assertion the_recovery_timer_has_a_deadline_for_the_reservation"
+    );
+
+    // Still gone: the timer's own pass starts nothing.
+    let workspaces = mission_batch_workspaces(&mut database, &camp_id);
+    let offline_pass =
+        crate::delivery_queue::run_delivery_recovery_pass(&mut database, 1, &workspaces, None)
+            .unwrap();
+    assert!(
+        offline_pass.claimed_agent_run_ids.is_empty(),
+        "assertion an_unreachable_device_starts_no_run"
+    );
+    assert_eq!(
+        count(&database, "SELECT COUNT(*) FROM agent_run"),
+        0,
+        "assertion the_blocked_lane_materialises_no_run"
+    );
+
+    // The device comes back. Nothing calls `admit_due_dispatches` here: the production claim sweep
+    // of the recovery timer is what resumes the reserved work.
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET path_state='valid' WHERE id=?1",
+            [&installation_id],
+        )
+        .unwrap();
+    let recovered_pass =
+        crate::delivery_queue::run_delivery_recovery_pass(&mut database, 1, &workspaces, None)
+            .unwrap();
+    assert_eq!(
+        recovered_pass.claimed_agent_run_ids.len(),
+        1,
+        "assertion the_recovery_timer_resumes_the_reserved_work_by_itself"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database),
+            count(&database, "SELECT COUNT(*) FROM agent_run")
+        ),
+        (1, 1, 1),
+        "assertion automatic_recovery_adds_no_second_ledger_row_delivery_or_run"
+    );
+    // `blocked_reason` is only the mirror of the current state: the next ordinary pass finds the
+    // reservation reachable, records exactly one recovery fact and clears it. Nothing is dispatched
+    // again, because the queued Run already exists.
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion the_resumed_work_is_never_dispatched_a_second_time"
+    );
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a"),
+        None,
+        "assertion the_resumed_work_carries_no_current_failure"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![
+            failure_fact("loom.dispatch_recipient_offline"),
+            recovered_fact()
+        ],
+        "assertion the_resumed_work_records_one_recovery_fact"
+    );
+}
+
+/// Freeze boundary: a queued Run keeps the device it was frozen to. A member who later points their
+/// settings at another (here unreachable) device changes the *next* Run only; the claim of this Run
+/// must still be judged by the target it already carries.
+#[test]
+fn a_queued_run_is_judged_by_its_frozen_device_not_by_a_later_member_switch() {
+    let mut database = fixture();
+    let (mission_id, _plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch frozen device",
+        "command_approve_frozen_device",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    let frozen_installation = installation_of(&database, PRODUCER_AGENT);
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_reachable_plan_reserves_its_delivery"
+    );
+    let claimed = claim_mission_lane(&mut database, &camp_id, 1);
+    assert_eq!(claimed.len(), 1, "assertion the_delivery_produces_one_run");
+    let run_id = claimed[0].clone();
+    let (dispatch_id, run_of_delivery) = dispatch_and_run(&database, "task_a");
+    assert_eq!(
+        run_of_delivery.as_deref(),
+        Some(run_id.as_str()),
+        "assertion the_run_belongs_to_this_dispatch"
+    );
+    let frozen_of_run: String = database
+        .connection()
+        .query_row(
+            "SELECT runtime_installation_id FROM agent_run WHERE id=?1",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        frozen_of_run, frozen_installation,
+        "assertion the_run_froze_the_installation_it_started_on"
+    );
+
+    // The member now points their own settings at a second, unreachable installation.
+    database
+        .connection()
+        .execute(
+            "INSERT INTO adapter_installation(id,adapter_kind,executable_path,command_name,
+                                              installation_class,source,auth_scope,enabled,
+                                              generation,path_state,version,created_at,updated_at)
+             VALUES('adapter-test-other','codex-cli','/nonexistent/codex','codex',
+                    'managed_default','custom','test-user-other',1,1,'path_missing',1,?1,?1)",
+            [chrono::Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_profile SET default_runtime_installation_id='adapter-test-other'
+             WHERE id=?1",
+            [PRODUCER_AGENT],
+        )
+        .unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    assert_eq!(
+        control::dispatch_block_reason(database.connection(), &dispatch_id, &now).unwrap(),
+        None,
+        "assertion the_queued_run_is_not_blocked_by_the_new_member_setting"
+    );
+    let claim = claim_the_run(&mut database, &camp_id, &run_id);
+    assert_eq!(
+        claim.result.status,
+        crate::command::CommandResultStatus::Accepted,
+        "assertion the_queued_run_starts_on_the_device_it_was_frozen_to: {:?}",
+        claim.result
+    );
+    assert_eq!(
+        run_status(&database, &run_id),
+        "running",
+        "assertion the_frozen_run_actually_started"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![],
+        "assertion a_frozen_run_that_can_start_records_no_failure"
+    );
+}
+
+/// Queued-Run boundary: the Delivery claim materialises the Run, so after that the outage happens in
+/// front of the Run's own admission. Its failure and recovery are facts, recorded once, and the same
+/// queued Run is the one that finally starts.
+#[test]
+fn a_queued_run_records_its_outage_once_and_the_same_run_starts_after_recovery() {
+    let mut database = fixture();
+    let (mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch queued run outage",
+        "command_approve_queued_run",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    let installation_id = installation_of(&database, PRODUCER_AGENT);
+    assert_eq!(control::admit_due_dispatches(&mut database).unwrap(), 1);
+    let claimed = claim_mission_lane(&mut database, &camp_id, 1);
+    assert_eq!(claimed.len(), 1, "assertion the_delivery_produces_one_run");
+    let run_id = claimed[0].clone();
+    assert_eq!(
+        run_status(&database, &run_id),
+        "queued",
+        "assertion the_materialised_run_waits_queued"
+    );
+
+    // The device disappears while the Run is still queued: the admission is refused, and the
+    // refusal is the same recorded fact the scheduler writes for unstarted work.
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET path_state='path_missing' WHERE id=?1",
+            [&installation_id],
+        )
+        .unwrap();
+    for tick in 0..3 {
+        assert_eq!(
+            control::admit_due_dispatches(&mut database).unwrap(),
+            0,
+            "assertion a_queued_run_never_mints_a_second_dispatch (tick {tick})"
+        );
+    }
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
+        Some("loom.dispatch_recipient_offline"),
+        "assertion the_queued_run_outage_is_reported_as_presence"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![failure_fact("loom.dispatch_recipient_offline")],
+        "assertion the_queued_run_outage_is_recorded_exactly_once"
+    );
+    let refused = claim_the_run(&mut database, &camp_id, &run_id);
+    assert_eq!(
+        refused.result.code, "agent_run.loom_control_blocked",
+        "assertion the_outage_blocks_the_run_admission: {:?}",
+        refused.result
+    );
+    assert_eq!(
+        run_status(&database, &run_id),
+        "queued",
+        "assertion the_refused_run_stays_queued"
+    );
+
+    // The device is back: one recovery fact, and this very Run — the same identity, the same single
+    // Delivery — is the one that starts.
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET path_state='valid' WHERE id=?1",
+            [&installation_id],
+        )
+        .unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion recovery_resumes_the_queued_run_instead_of_dispatching_again"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![
+            failure_fact("loom.dispatch_recipient_offline"),
+            recovered_fact()
+        ],
+        "assertion the_queued_run_records_one_recovery_fact"
+    );
+    let started = claim_the_run(&mut database, &camp_id, &run_id);
+    assert_eq!(
+        started.result.status,
+        crate::command::CommandResultStatus::Accepted,
+        "assertion the_same_queued_run_starts_after_recovery: {:?}",
+        started.result
+    );
+    assert_eq!(
+        run_status(&database, &run_id),
+        "running",
+        "assertion the_recovered_run_is_the_one_running"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database),
+            count(&database, "SELECT COUNT(*) FROM agent_run")
+        ),
+        (1, 1, 1),
+        "assertion recovery_adds_no_second_ledger_row_delivery_or_run"
+    );
+}
+
+/// Priority boundary for the remote half of the ladder: a Node that is both unreachable and missing
+/// the harness is an *unreachable device*, never a harness problem — presence is judged first, and
+/// the catalog owner's own ordering cannot override that.
+#[test]
+fn an_unreachable_remote_node_outranks_its_missing_harness() {
+    let mut database = fixture();
+    let (mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch remote priority",
+        "command_approve_remote_priority",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    let stale = (chrono::Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339();
+    select_remote_node(
+        &database,
+        &camp_id,
+        PRODUCER_AGENT,
+        "node_remote",
+        AdapterKind::CodexCli,
+        &stale,
+    );
+    // Every fact is broken at once: the heartbeat is stale *and* the Node reports no usable CLI.
+    database
+        .connection()
+        .execute(
+            "UPDATE execution_node_cli SET path_present=0
+             WHERE node_id='node_remote' AND adapter_kind='codex-cli'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_unreachable_node_still_reserves_the_work"
+    );
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
+        Some("loom.dispatch_recipient_offline"),
+        "assertion presence_outranks_the_harness_a_stale_node_cannot_be_trusted_to_report"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![failure_fact("loom.dispatch_recipient_offline")],
+        "assertion only_the_presence_fact_is_recorded"
+    );
+
+    // A fresh heartbeat with the same missing CLI is a harness problem, because the device is now
+    // reachable and only its harness is missing.
+    let fresh = chrono::Utc::now().to_rfc3339();
+    database
+        .connection()
+        .execute(
+            "UPDATE execution_node SET last_heartbeat=?1 WHERE node_id='node_remote'",
+            [&fresh],
+        )
+        .unwrap();
+    assert_eq!(control::admit_due_dispatches(&mut database).unwrap(), 0);
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
+        Some("loom.dispatch_harness_unavailable"),
+        "assertion a_reachable_node_is_judged_on_its_harness"
+    );
+}
+
+/// Launch-intent boundary: Core admits a live Command Host by its installation identity even when
+/// the disk entry has moved, and only the cold branch resolves that entry. Dispatch must not be
+/// stricter than the launch it feeds, so a Command installation that is enabled but no longer
+/// resolves on this host is still a device the work can start on.
+#[test]
+fn a_live_command_host_is_a_device_even_when_its_entry_moved() {
+    let mut database = fixture();
+    let (_mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch command host",
+        "command_approve_command_host",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    database
+        .connection()
+        .execute(
+            "INSERT INTO adapter_installation(id,adapter_kind,executable_path,command_name,
+                                              installation_class,source,auth_scope,enabled,
+                                              generation,path_state,version,created_at,updated_at)
+             VALUES('adapter-test-command','command-code-cli','/moved/command-code','command-code',
+                    'managed_default','custom','test-user',1,1,'path_missing',1,?1,?1)",
+            [chrono::Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_profile
+             SET selected_runtime_adapter_kind='command-code-cli',
+                 default_runtime_installation_id='adapter-test-command'
+             WHERE id=?1",
+            [PRODUCER_AGENT],
+        )
+        .unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion a_live_command_host_is_never_blocked_by_a_moved_entry"
+    );
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a"),
+        None,
+        "assertion the_command_host_carries_no_failure"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![],
+        "assertion a_live_command_host_writes_no_failure_fact"
+    );
+
+    // The same installation switched off is still the switch, not a moved entry.
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET enabled=0 WHERE id='adapter-test-command'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(control::admit_due_dispatches(&mut database).unwrap(), 0);
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
+        Some("loom.dispatch_recipient_offline"),
+        "assertion a_disabled_installation_is_unreachable_even_for_a_command_host"
+    );
+}
+
+/// Admission-order boundary: "the device is gone" is an answer about an event that is otherwise
+/// admissible, never a licence to skip the identity rules. A Candidate whose producer Run cannot be
+/// resolved can never be reviewed, so a REVIEW that is also unreachable must not reserve a Delivery
+/// for it: that Delivery would consume the budget, block the lane and never start, even after the
+/// reviewer's device comes back. The device state must make no difference to the outcome.
+#[test]
+fn an_unreachable_device_cannot_reserve_work_the_identity_rules_refuse() {
+    let mut database = fixture();
+    let mission_id = create_mission(&mut database, "dispatch identity before device");
+    plan_import(&mut database, plan_input(&mission_id)).unwrap();
+    let plan_id: String = database
+        .connection()
+        .query_row(
+            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+            [&mission_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let camp_id = camp_of(&database, &mission_id);
+    seed_run(&database, &camp_id, PRODUCER_AGENT, PRODUCER_RUN);
+    seed_run(&database, &camp_id, REVIEWER_AGENT, REVIEWER_RUN);
+    control::configure(
+        &mut database,
+        OWNER,
+        policy_input(
+            &mission_id,
+            "command_approve_identity_first",
+            REVIEWER_AGENT,
+        ),
+    )
+    .unwrap();
+    // The delivery names a producing Run that no longer exists, so the self-review guard can never
+    // be discharged for this Candidate.
+    let (candidate_id, _manifest) =
+        submitted_candidate(&mut database, &mission_id, "run_producer_gone");
+    assert_eq!(
+        task_state(&database, &mission_id, "task_a"),
+        "IN_REVIEW",
+        "assertion the_candidate_is_waiting_for_its_review"
+    );
+    assert_eq!(
+        count(
+            &database,
+            "SELECT COUNT(*) FROM loom_candidate
+             WHERE candidate_id='run_producer_gone' OR candidate_id<>'run_producer_gone'"
+        ),
+        1,
+        "assertion exactly_one_candidate_is_under_review"
+    );
+    let reviewer_installation = installation_of(&database, REVIEWER_AGENT);
+
+    // The reviewer's device is gone at the same time as the producer identity is broken.
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET path_state='path_missing' WHERE id=?1",
+            [&reviewer_installation],
+        )
+        .unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion a_gone_device_cannot_admit_an_event_the_identity_rules_refuse"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database)
+        ),
+        (0, 0),
+        "assertion the_refused_event_reserves_no_ledger_row_and_no_delivery"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![],
+        "assertion an_identity_refusal_is_not_a_device_failure_fact"
+    );
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a"),
+        None,
+        "assertion an_identity_refusal_writes_no_availability_mirror"
+    );
+
+    // The device comes back. The identity judgement is what refuses the event, so the outcome is
+    // the same — the earlier refusal was never a device verdict that could be forgotten.
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET path_state='valid' WHERE id=?1",
+            [&reviewer_installation],
+        )
+        .unwrap();
+    for tick in 0..2 {
+        assert_eq!(
+            control::admit_due_dispatches(&mut database).unwrap(),
+            0,
+            "assertion a_reachable_device_still_cannot_reserve_an_unreviewable_event (tick {tick})"
+        );
+    }
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database)
+        ),
+        (0, 0),
+        "assertion recovery_does_not_reserve_what_the_identity_rules_never_admitted"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![],
+        "assertion no_failure_or_recovery_fact_is_invented_for_a_refused_event"
+    );
+    assert!(
+        !candidate_id.is_empty(),
+        "assertion the_refused_review_names_the_candidate_it_could_not_hand_out"
+    );
+}
+
+/// Started-Run boundary, ported from upstream `recordFactoryDispatchFailure`, which returns `null`
+/// for anything that is not still `queued`, and from
+/// `dispatch-recovery.db.test.ts`'s "a claimed run is not a dispatch failure". Once a Run has
+/// started, a device that disappears is an execution problem, not a dispatch problem: the LOOM
+/// layer must not write `loom.dispatch_failed` or `loom.dispatch_recovered` for it, must not park
+/// the Task with an availability reason, and must leave the claimed Delivery alone.
+#[test]
+fn a_run_that_already_started_is_never_a_dispatch_failure() {
+    let mut database = fixture();
+    let (mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch started run",
+        "command_approve_started_run",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    let installation_id = installation_of(&database, PRODUCER_AGENT);
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_reachable_plan_reserves_its_delivery"
+    );
+    let claimed = claim_mission_lane(&mut database, &camp_id, 1);
+    assert_eq!(claimed.len(), 1, "assertion the_delivery_produces_one_run");
+    let run_id = claimed[0].clone();
+    let (dispatch_id, run_of_dispatch) = dispatch_and_run(&database, "task_a");
+    assert_eq!(
+        run_of_dispatch.as_deref(),
+        Some(run_id.as_str()),
+        "assertion the_run_belongs_to_this_dispatch"
+    );
+    let started = claim_the_run(&mut database, &camp_id, &run_id);
+    assert_eq!(
+        started.result.status,
+        crate::command::CommandResultStatus::Accepted,
+        "assertion the_queued_run_starts_while_its_device_is_present: {:?}",
+        started.result
+    );
+    assert_eq!(
+        run_status(&database, &run_id),
+        "running",
+        "assertion the_run_is_running_before_the_device_disappears"
+    );
+
+    // The device disappears after the Run started.
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET path_state='path_missing' WHERE id=?1",
+            [&installation_id],
+        )
+        .unwrap();
+    for tick in 0..3 {
+        assert_eq!(
+            control::admit_due_dispatches(&mut database).unwrap(),
+            0,
+            "assertion a_started_run_is_never_dispatched_again (tick {tick})"
+        );
+    }
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![],
+        "assertion a_running_run_records_no_dispatch_failure_and_no_dispatch_recovery"
+    );
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a"),
+        None,
+        "assertion a_running_run_is_not_parked_with_an_availability_reason"
+    );
+    let now = chrono::Utc::now().to_rfc3339();
+    let reason = control::dispatch_block_reason(database.connection(), &dispatch_id, &now).unwrap();
+    assert!(
+        !matches!(
+            reason.as_deref(),
+            Some("loom.dispatch_recipient_disabled")
+                | Some("loom.dispatch_recipient_offline")
+                | Some("loom.dispatch_harness_unavailable")
+        ),
+        "assertion a_running_run_is_no_longer_judged_by_its_device: {reason:?}"
+    );
+    let (delivery_status, ledger_status): (String, String) = database
+        .connection()
+        .query_row(
+            "SELECT delivery.status, dispatch.status
+             FROM loom_control_dispatch dispatch
+             JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+             WHERE dispatch.dispatch_id=?1",
+            [&dispatch_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (delivery_status.as_str(), ledger_status.as_str()),
+        ("claimed", "DISPATCHED"),
+        "assertion the_started_work_keeps_its_claimed_delivery"
+    );
+
+    // A Run that already ended without writing its successor fact proves nothing either: the
+    // ledger stays pending, and the ended Run is still not a dispatch failure.
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_run SET status='succeeded', ended_at=?2 WHERE id=?1",
+            params![&run_id, chrono::Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+    for tick in 0..3 {
+        assert_eq!(
+            control::admit_due_dispatches(&mut database).unwrap(),
+            0,
+            "assertion an_unproved_finished_run_is_never_dispatched_again (tick {tick})"
+        );
+    }
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![],
+        "assertion an_ended_run_that_proved_nothing_is_not_a_dispatch_failure"
+    );
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a"),
+        None,
+        "assertion an_ended_run_is_not_parked_with_an_availability_reason"
+    );
+    let ledger_after_end: String = database
+        .connection()
+        .query_row(
+            "SELECT status FROM loom_control_dispatch WHERE dispatch_id=?1",
+            [&dispatch_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        ledger_after_end, "DISPATCHED",
+        "assertion an_unproved_outcome_is_never_read_as_a_settled_dispatch"
+    );
+}
+
+/// Production launch order, ported from the review's remaining blocker: `dispatch_agent_run_candidate`
+/// prepares the Runtime *before* the claim asks the control plane, and Core's preparation answers a
+/// disabled installation with a terminal dispatch rejection. The control plane only ever wants such
+/// a Run to wait, so the wait has to be decided before the Runtime is prepared. This drives the real
+/// scheduler step — not the claim helper — and proves the Run is never failed: it stays `queued`
+/// with its Delivery still `claimed`, and that very same Run starts once the device is back.
+#[tokio::test]
+async fn a_loom_dispatch_waits_for_the_device_before_the_runtime_is_prepared() {
+    let mut database = fixture();
+    let (mission_id, _plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch production order",
+        "command_approve_production_order",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    // Production validates the Mission project directory before it prepares anything, so the
+    // fixture states that precondition instead of relying on a path that only a Project would have.
+    let project_path: String = database
+        .connection()
+        .query_row(
+            "SELECT project_path FROM camp WHERE id=?1",
+            [&camp_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    std::fs::create_dir_all(&project_path).unwrap();
+    let installation_id = installation_of(&database, PRODUCER_AGENT);
+
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_approved_work_is_reserved"
+    );
+    let claimed = claim_mission_lane(&mut database, &camp_id, 1);
+    assert_eq!(
+        claimed.len(),
+        1,
+        "assertion the_reservation_materialises_one_run"
+    );
+    let run_id = claimed[0].clone();
+    assert_eq!(
+        run_status(&database, &run_id),
+        "queued",
+        "assertion the_materialised_run_waits_queued"
+    );
+
+    // The device disappears after the Run was materialised but before the scheduler prepared it.
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET enabled=0 WHERE id=?1",
+            [&installation_id],
+        )
+        .unwrap();
+
+    let directory = database.directory().to_path_buf();
+    database.close();
+    let database = Database::open(&directory).expect("the fixture database must reopen");
+    crate::application::dispatch_queued_run_for_test(&directory, database, &run_id)
+        .await
+        .expect("one scheduler step must be runnable");
+
+    // Nothing started and nothing failed: an unavailable device is a wait, never a terminal answer.
+    let database = Database::open(&directory).expect("the fixture database must reopen");
+    assert_eq!(
+        run_status(&database, &run_id),
+        "queued",
+        "assertion an_unavailable_device_leaves_the_run_queued"
+    );
+    let (delivery_status, delivery_run, dispatch_status): (String, Option<String>, String) =
+        database
+            .connection()
+            .query_row(
+                "SELECT delivery.status, delivery.claimed_agent_run_id, dispatch.status
+                 FROM loom_control_dispatch AS dispatch
+                 JOIN camp_message_delivery AS delivery ON delivery.id = dispatch.delivery_id
+                 WHERE dispatch.task_id='task_a'
+                 ORDER BY dispatch.created_at, dispatch.dispatch_id LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+    assert_eq!(
+        (
+            delivery_status.as_str(),
+            delivery_run.as_deref(),
+            dispatch_status.as_str()
+        ),
+        ("claimed", Some(run_id.as_str()), "DISPATCHED"),
+        "assertion the_queued_run_keeps_its_claimed_delivery_and_pending_dispatch"
+    );
+    let terminal: i64 = database
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM event_log
+             WHERE entity_type='agent_run' AND entity_id=?1
+               AND event_type IN ('agent_run.failed','agent_run.dispatch_rejected')",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        terminal, 0,
+        "assertion preparation_never_rejects_a_waiting_loom_dispatch"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database),
+            count(&database, "SELECT COUNT(*) FROM agent_run")
+        ),
+        (1, 1, 1),
+        "assertion waiting_starts_nothing_and_mints_nothing"
+    );
+
+    // The device comes back: the same scheduler step starts this very Run, once.
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET enabled=1 WHERE id=?1",
+            [&installation_id],
+        )
+        .unwrap();
+    drop(database);
+    let database = Database::open(&directory).expect("the fixture database must reopen");
+    crate::application::dispatch_queued_run_for_test(&directory, database, &run_id)
+        .await
+        .expect("the recovered scheduler step must be runnable");
+
+    let database = Database::open(&directory).expect("the fixture database must reopen");
+    assert_eq!(
+        run_status(&database, &run_id),
+        "running",
+        "assertion the_same_run_starts_once_the_device_is_back"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database),
+            count(&database, "SELECT COUNT(*) FROM agent_run")
+        ),
+        (1, 1, 1),
+        "assertion recovery_adds_no_second_ledger_row_delivery_or_run"
+    );
+}
+
+/// A remote process transport that is installed but never starts anything: the claim of a real
+/// remote Run is the last thing a scheduler step does, so this keeps the Run at the state the
+/// dispatch reached instead of letting a launch settle it.
+struct NeverStartingRemoteLauncher;
+
+impl crate::remote_process::RemoteProcessLauncher for NeverStartingRemoteLauncher {
+    fn start(
+        &self,
+        _launch: crate::remote_process::ScopedRemoteLaunch,
+    ) -> crate::remote_process::RemoteFuture<'_, crate::remote_process::RemoteProcess> {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// Remote boundary of the same production order: a Node is the device, and its harness is reported
+/// in the catalog the dispatch re-validates *before* the Runtime is prepared. A Node that stops
+/// reporting its harness therefore has to be a wait, not the terminal rejection Core's own remote
+/// target revalidation would answer with. This drives the real scheduler step on a real remote
+/// queued Run — materialised by the real Delivery claim with the real bundle capture — and proves
+/// the Run keeps its identity, its Delivery and its target across the outage, then starts on the
+/// same facts once the Node reports the harness again.
+#[tokio::test]
+async fn a_remote_queued_run_waits_for_its_harness_instead_of_being_rejected() {
+    let mut database = fixture();
+    let (mission_id, _plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch remote wait",
+        "command_approve_remote_wait",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    let fresh = chrono::Utc::now().to_rfc3339();
+    select_remote_node(
+        &database,
+        &camp_id,
+        PRODUCER_AGENT,
+        "node_remote",
+        AdapterKind::CodexCli,
+        &fresh,
+    );
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_reachable_node_reserves_the_approved_work"
+    );
+
+    // The real claim materialises the Run and freezes its Node, workspace and bundle source.
+    let directory = database.directory().to_path_buf();
+    let store = crate::mcp::McpConfigStore::new(directory.join("fixture-mcp.json"));
+    let context = crate::remote_bundle_owner::RemoteBundleCaptureContext {
+        data_dir: &directory,
+        mcp_store: &store,
+    };
+    let claimed = crate::delivery_queue::claim_waiting_delivery_batches_with_sources(
+        &mut database,
+        1,
+        &Default::default(),
+        Some(&context),
+    )
+    .expect("the real remote claim must materialise the queued Run");
+    assert_eq!(
+        claimed.len(),
+        1,
+        "assertion the_reserved_delivery_materialises_one_run"
+    );
+    let run_id = claimed[0].clone();
+    assert_eq!(
+        run_status(&database, &run_id),
+        "queued",
+        "assertion the_materialised_remote_run_waits_queued"
+    );
+    let frozen = crate::remote_execution::load_run_target(database.connection(), &run_id)
+        .expect("the frozen target must be readable")
+        .expect("a remote claim must freeze its Node target");
+    assert_eq!(
+        frozen.target.node_id, "node_remote",
+        "assertion the_run_is_frozen_to_the_selected_node"
+    );
+    let (dispatch_id, delivery_id): (String, String) = database
+        .connection()
+        .query_row(
+            "SELECT dispatch_id, delivery_id FROM loom_control_dispatch WHERE task_id='task_a'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    // The Node stops reporting the harness it will run. Core's own remote target revalidation
+    // answers that with a code, and a dispatch must not turn that code into a failed Run.
+    database
+        .connection()
+        .execute(
+            "UPDATE execution_node_cli SET path_present=0
+             WHERE node_id='node_remote' AND adapter_kind='codex-cli'",
+            [],
+        )
+        .unwrap();
+
+    database.close();
+    let database = Database::open(&directory).expect("the fixture database must reopen");
+    crate::application::dispatch_queued_run_for_test(&directory, database, &run_id)
+        .await
+        .expect("one scheduler step must be runnable");
+
+    let mut database = Database::open(&directory).expect("the fixture database must reopen");
+    assert_eq!(
+        run_status(&database, &run_id),
+        "queued",
+        "assertion a_node_that_stopped_reporting_its_harness_leaves_the_run_queued"
+    );
+    let (delivery_status, delivery_run, dispatch_status): (String, Option<String>, String) =
+        database
+            .connection()
+            .query_row(
+                "SELECT delivery.status, delivery.claimed_agent_run_id, dispatch.status
+                 FROM loom_control_dispatch AS dispatch
+                 JOIN camp_message_delivery AS delivery ON delivery.id = dispatch.delivery_id
+                 WHERE dispatch.dispatch_id=?1",
+                [&dispatch_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+    assert_eq!(
+        (
+            delivery_status.as_str(),
+            delivery_run.as_deref(),
+            dispatch_status.as_str()
+        ),
+        ("claimed", Some(run_id.as_str()), "DISPATCHED"),
+        "assertion the_remote_run_keeps_its_claimed_delivery_and_pending_dispatch"
+    );
+    let terminal: i64 = database
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM event_log
+             WHERE entity_type='agent_run' AND entity_id=?1
+               AND event_type IN ('agent_run.failed','agent_run.dispatch_rejected')",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        terminal, 0,
+        "assertion a_missing_remote_harness_never_terminally_rejects_the_run"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database),
+            count(&database, "SELECT COUNT(*) FROM agent_run")
+        ),
+        (1, 1, 1),
+        "assertion waiting_for_a_remote_harness_starts_and_mints_nothing"
+    );
+    let (delivery_row, ledger_row): (String, String) = database
+        .connection()
+        .query_row(
+            "SELECT delivery.id, dispatch.delivery_id
+             FROM loom_control_dispatch AS dispatch
+             JOIN camp_message_delivery AS delivery ON delivery.id = dispatch.delivery_id
+             WHERE dispatch.dispatch_id=?1",
+            [&dispatch_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (delivery_row.as_str(), ledger_row.as_str()),
+        (delivery_id.as_str(), delivery_id.as_str()),
+        "assertion the_waiting_remote_run_keeps_the_reservation_it_started_with"
+    );
+    // The ordinary pass of the same control plane records the outage of the reserved work, once,
+    // without admitting a second dispatch of it.
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion waiting_for_the_remote_harness_is_not_a_second_dispatch"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![failure_fact("loom.dispatch_harness_unavailable")],
+        "assertion the_remote_outage_is_recorded_as_the_harness_fact_once"
+    );
+
+    // The Node reports the harness again: the same Run is the one the scheduler claims, on the Node
+    // and Delivery it already had.
+    database
+        .connection()
+        .execute(
+            "UPDATE execution_node_cli SET path_present=1
+             WHERE node_id='node_remote' AND adapter_kind='codex-cli'",
+            [],
+        )
+        .unwrap();
+    drop(database);
+    let database = Database::open(&directory).expect("the fixture database must reopen");
+    crate::application::dispatch_queued_run_with_remote_launcher_for_test(
+        &directory,
+        database,
+        &run_id,
+        Some(std::sync::Arc::new(NeverStartingRemoteLauncher)),
+    )
+    .await
+    .expect("the recovered scheduler step must be runnable");
+
+    let database = Database::open(&directory).expect("the fixture database must reopen");
+    assert_eq!(
+        run_status(&database, &run_id),
+        "running",
+        "assertion the_same_remote_run_starts_once_the_harness_is_reported"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database),
+            count(&database, "SELECT COUNT(*) FROM agent_run")
+        ),
+        (1, 1, 1),
+        "assertion remote_recovery_adds_no_second_ledger_row_delivery_or_run"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![failure_fact("loom.dispatch_harness_unavailable")],
+        "assertion the_remote_outage_keeps_its_single_fact_after_recovery"
     );
 }

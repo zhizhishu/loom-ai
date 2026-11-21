@@ -451,6 +451,103 @@ fn runtime_blocker_is_refreshable(code: &str) -> bool {
     )
 }
 
+/// Test seam: run the production scheduler step for one queued Run in a Core built around facts a
+/// test already owns.
+///
+/// This is not a shortcut around the scheduler: the seam only owns the plumbing (the `Core`, the
+/// output channel and candidate selection), so the test drives the real
+/// `Core::dispatch_agent_run_candidate` and then inspects the database by reopening it.
+#[cfg(test)]
+pub(crate) async fn dispatch_queued_run_for_test(
+    directory: &Path,
+    database: Database,
+    agent_run_id: &str,
+) -> Result<()> {
+    dispatch_queued_run_with_remote_launcher_for_test(directory, database, agent_run_id, None).await
+}
+
+/// The same scheduler step, with the remote process transport a real remote Run needs installed on
+/// the Core first.
+///
+/// A remote Run cannot be prepared without an installed launcher at all (`prepare_runtime_for_
+/// dispatch` answers a missing transport with a terminal rejection), so the launcher is plumbing of
+/// the same kind as the Core itself: it decides nothing about the dispatch, it only lets the real
+/// scheduler reach the same steps it reaches in production. A test installs a launcher whose
+/// `start` never settles, so the Run's own claim is the last thing the step does.
+#[cfg(test)]
+pub(crate) async fn dispatch_queued_run_with_remote_launcher_for_test(
+    directory: &Path,
+    database: Database,
+    agent_run_id: &str,
+    launcher: Option<Arc<dyn crate::remote_process::RemoteProcessLauncher>>,
+) -> Result<()> {
+    let core = Arc::new(tests::test_core_for_database(directory, database)?);
+    if let Some(launcher) = launcher {
+        core.remote_runtime_services
+            .install_launcher(launcher)
+            .map_err(|error| {
+                anyhow::anyhow!("the remote process launcher could not be installed: {error}")
+            })?;
+    }
+    let (output, _output_rx) = mpsc::unbounded_channel();
+    let candidate = {
+        let database = core.database.lock().await;
+        ExecutionRuntimeService::default().load_dispatchable_agent_run(&database, agent_run_id)?
+    };
+    let Some(candidate) = candidate else {
+        // Not a dispatch candidate (already started, or no longer queued): the scheduler would not
+        // look at it either.
+        return Ok(());
+    };
+    core.dispatch_agent_run_candidate(candidate, output).await;
+    Ok(())
+}
+
+/// A Core feature-gate set with every subsystem ready, for a Core a test builds itself.
+#[cfg(test)]
+fn ready_subsystems_for_test() -> CoreSubsystems {
+    let subsystems = CoreSubsystems::new();
+    for entry in subsystems.snapshot() {
+        subsystems.finish(&entry.id, Ok(()));
+    }
+    subsystems
+}
+
+/// Why a queued Run must keep waiting for the LOOM control plane instead of being dispatched, or
+/// `None` when its dispatch may start now.
+///
+/// Every later step answers a device that is merely gone with a terminal dispatch rejection — the
+/// remote target revalidation and the Runtime preparation both do — so the Run would be `failed`
+/// and its Task stranded, although the control plane only ever wanted that Run to wait for the
+/// device. This asks the same ledger question before any of those steps — a `WAITING` or
+/// `DISPATCHED` dispatch of this Run, judged by the same owner the claim uses, on the target the
+/// Run is frozen to — and `Some(_)` means "do not dispatch yet", never "failed".
+fn loom_dispatch_wait_reason(
+    connection: &rusqlite::Connection,
+    agent_run_id: &str,
+    now: &str,
+) -> Result<Option<String>> {
+    if !crate::remote_execution::authority_table_available(connection, "loom_control_dispatch")? {
+        return Ok(None);
+    }
+    let dispatch_id: Option<String> = connection
+        .query_row(
+            "SELECT dispatch.dispatch_id
+             FROM camp_message_delivery AS delivery
+             JOIN loom_control_dispatch AS dispatch ON dispatch.delivery_id = delivery.id
+             WHERE delivery.claimed_agent_run_id = ?1
+               AND dispatch.status IN ('WAITING','DISPATCHED')
+             ORDER BY delivery.queue_sequence LIMIT 1",
+            [agent_run_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(dispatch_id) = dispatch_id else {
+        return Ok(None);
+    };
+    rovai_core::loom::control::dispatch_block_reason(connection, &dispatch_id, now)
+}
+
 fn canonical_runtime_path(path: &Path) -> PathBuf {
     runtime_visible_path(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
 }
@@ -14262,7 +14359,7 @@ impl Core {
         Ok(())
     }
 
-    async fn dispatch_agent_run_candidate(
+    pub(crate) async fn dispatch_agent_run_candidate(
         self: &Arc<Self>,
         mut candidate: rovai_core::runtime::QueuedAgentRunCandidate,
         output: mpsc::UnboundedSender<String>,
@@ -14324,6 +14421,39 @@ impl Core {
                 return;
             }
             Ok(None) => {}
+        }
+        // A LOOM dispatch the control plane still holds back must not be dispatched at all: every
+        // step below answers an unavailable device with a terminal rejection — the remote target
+        // revalidation reports a Node that stopped reporting its harness as
+        // `remote_target_unavailable`, and Runtime preparation reports a disabled installation the
+        // same way — and either one fails this Run and strands its Task although the control plane
+        // only wants it to wait. The judgement is therefore the first thing this dispatch asks,
+        // before anything can answer terminally, and `Some(_)` means "do not start this Run yet",
+        // never "failed". The Run stays queued, its Delivery stays claimed and the pending Dispatch
+        // row keeps the Delivery recovery timer armed, so this very Run is dispatched again once
+        // the device is back. An already materialised Run is judged by the target it was frozen to,
+        // so the device that is waited for is the device that will run the work.
+        let loom_wait = {
+            let database = self.database.lock().await;
+            loom_dispatch_wait_reason(
+                database.connection(),
+                &candidate.agent_run_id,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+        };
+        match loom_wait {
+            Ok(Some(reason)) => {
+                eprintln!(
+                    "deferring LOOM dispatch for AgentRun {}: {reason}",
+                    candidate.agent_run_id
+                );
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "failed to judge the LOOM dispatch of AgentRun {}: {error:#}",
+                candidate.agent_run_id
+            ),
         }
         let Some(launch_permit) = self.planned_shutdown.enter_launch().await else {
             return;
@@ -29573,20 +29703,19 @@ mod tests {
         assert!(!deferrals.should_defer_at(runtime_kind, RuntimeCheckTrigger::Execution, now));
     }
 
-    #[cfg(all(feature = "slow-tests", any(target_os = "macos", windows)))]
-    pub(super) fn runtime_resolution_test_core(root: &Path) -> Result<Core> {
-        let data_dir = root.join("data");
-        let skill_library_root = root.join("skills");
-        let runtime_camp_files_root = root.join("runtime-files");
-        rovai_core::platform::prepare_private_directory(&data_dir)?;
-        rovai_core::platform::prepare_private_directory(&skill_library_root)?;
-        let attachment_views =
-            ThreadAttachmentViewStore::for_isolated_test_root(&runtime_camp_files_root)?;
-        let database = Database::open_with_runtime_camp_files_root(
-            &data_dir,
-            attachment_views.root(),
-            attachment_views.root_identity_digest(),
-        )?;
+    /// The Core the Core-level tests run in, around facts the test already owns.
+    ///
+    /// `root` is where this Core keeps its Skills, MCP config and Runtime state; `attachment_views`
+    /// is the Camp Attachment View store of the root the database was opened against, so receipts
+    /// keep binding the same physical root.
+    #[cfg(test)]
+    fn test_core_from_parts(
+        root: &Path,
+        data_dir: PathBuf,
+        skill_library_root: PathBuf,
+        attachment_views: ThreadAttachmentViewStore,
+        database: Database,
+    ) -> Result<Core> {
         let skill_library = SkillLibraryService::new(skill_library_root)?;
         let mcp_config = McpConfigStore::new(root.join("mcp.json"));
         let mcp_projection = McpProjectionService::new(&data_dir);
@@ -29616,7 +29745,7 @@ mod tests {
             database: Arc::new(Mutex::new(database)),
             pasted_text_operations: Mutex::new(()),
             automation_scheduler_control: RwLock::new(None),
-            subsystems: CoreSubsystems::ready_for_test(),
+            subsystems: ready_subsystems_for_test(),
             subsystem_initialization: Mutex::new(SubsystemInitialization::default()),
             removed_skill_project_roots: RemovedSkillProjectRoots::default(),
             startup_pending_camp_ids: Vec::new(),
@@ -29812,6 +29941,46 @@ mod tests {
                 crate::remote_runtime_services::RemoteRuntimeServices::default(),
             ),
         })
+    }
+
+    #[cfg(all(feature = "slow-tests", any(target_os = "macos", windows)))]
+    pub(super) fn runtime_resolution_test_core(root: &Path) -> Result<Core> {
+        let data_dir = root.join("data");
+        let skill_library_root = root.join("skills");
+        let runtime_camp_files_root = root.join("runtime-files");
+        rovai_core::platform::prepare_private_directory(&data_dir)?;
+        rovai_core::platform::prepare_private_directory(&skill_library_root)?;
+        let attachment_views =
+            ThreadAttachmentViewStore::for_isolated_test_root(&runtime_camp_files_root)?;
+        let database = Database::open_with_runtime_camp_files_root(
+            &data_dir,
+            attachment_views.root(),
+            attachment_views.root_identity_digest(),
+        )?;
+        test_core_from_parts(
+            root,
+            data_dir,
+            skill_library_root,
+            attachment_views,
+            database,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_core_for_database(directory: &Path, database: Database) -> Result<Core> {
+        let attachment_views =
+            ThreadAttachmentViewStore::for_isolated_test_root(&directory.join("runtime-files"))?;
+        let data_dir = directory.join("core-data");
+        let skill_library_root = directory.join("core-skills");
+        rovai_core::platform::prepare_private_directory(&data_dir)?;
+        rovai_core::platform::prepare_private_directory(&skill_library_root)?;
+        test_core_from_parts(
+            directory,
+            data_dir,
+            skill_library_root,
+            attachment_views,
+            database,
+        )
     }
 
     // Owns launch-time version completion from Core's cache to the frozen
