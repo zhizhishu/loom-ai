@@ -5,18 +5,20 @@ import { realpath } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-export const CURRENT_HOST_SCHEMA = 186
-export const CURRENT_HOST_MIGRATION = 236
+export const CURRENT_HOST_SCHEMA = 187
+export const CURRENT_HOST_MIGRATION = 237
 const ARTIFACT_VERSION_MIGRATION = 235
+const LOCAL_HOOK_MIGRATION = 236
+const RECOVERY_LEDGER_MIGRATION = 237
 
 export async function verifyRunningHostSchema ({ request, databasePath,
   expectedProjectionSchema = CURRENT_HOST_SCHEMA, expectedMigrationVersion = CURRENT_HOST_MIGRATION }) {
   const evidence = { source: 'running-host-health-and-read-only-database', readOnly: true,
     expectedProjectionSchema, expectedMigrationVersion, verified: false }
   try {
-    assert.ok((expectedProjectionSchema === 185 && expectedMigrationVersion === 235)
-      || (expectedProjectionSchema === 186 && expectedMigrationVersion === 236),
-      'this acceptance requires a supported projection/migration pair (185/235 or 186/236)')
+    assert.ok((expectedProjectionSchema === 186 && expectedMigrationVersion === 236)
+      || (expectedProjectionSchema === 187 && expectedMigrationVersion === 237),
+      'this acceptance requires a supported projection/migration pair (186/236 or 187/237)')
     assert.ok(typeof databasePath === 'string' && isAbsolute(databasePath),
       'the isolated Host database path must be explicitly selected')
     const health = await request('health.check', {})
@@ -37,8 +39,10 @@ export async function verifyRunningHostSchema ({ request, databasePath,
       ).get()
       const receipt = database.prepare('SELECT MAX(version) AS latest FROM schema_migration').get()
       const migration = database.prepare('SELECT version FROM schema_migration WHERE version = ?').get(ARTIFACT_VERSION_MIGRATION)
-      const localHook = database.prepare('SELECT version FROM schema_migration WHERE version = ?').get(CURRENT_HOST_MIGRATION)
-      evidence.localHookMigrationPresent = localHook?.version === CURRENT_HOST_MIGRATION
+      const localHook = database.prepare('SELECT version FROM schema_migration WHERE version = ?').get(LOCAL_HOOK_MIGRATION)
+      const recoveryLedger = database.prepare('SELECT version FROM schema_migration WHERE version = ?').get(RECOVERY_LEDGER_MIGRATION)
+      evidence.localHookMigrationPresent = localHook?.version === LOCAL_HOOK_MIGRATION
+      evidence.recoveryLedgerMigrationPresent = recoveryLedger?.version === RECOVERY_LEDGER_MIGRATION
       evidence.contractVersion = marker?.contract_version ?? null
       evidence.projectionSchema = marker?.projection_schema_version ?? null
       evidence.classifierVersion = marker?.classifier_version ?? null
@@ -50,8 +54,10 @@ export async function verifyRunningHostSchema ({ request, databasePath,
       assert.equal(evidence.latestMigrationVersion, expectedMigrationVersion,
         'the running Host migration history differs from the current source')
       assert.equal(evidence.artifactVersionMigrationPresent, true, 'the artifact-version migration is absent')
+      assert.equal(evidence.localHookMigrationPresent, true, 'the local Hook migration is absent')
       if (expectedProjectionSchema === CURRENT_HOST_SCHEMA) {
-        assert.equal(evidence.localHookMigrationPresent, true, 'the local Hook migration is absent')
+        assert.equal(evidence.recoveryLedgerMigrationPresent, true,
+          'the LOOM recovery ledger migration is absent')
       }
       evidence.verified = true
       database.exec('COMMIT')

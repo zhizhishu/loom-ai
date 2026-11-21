@@ -18,8 +18,17 @@ pub(super) fn migrate(database: &mut Database) -> Result<()> {
         "local Hook schema invalid"
     );
     anyhow::ensure!(
-        matches!(classify_database_contract(&tx)?,
-        DatabaseContractClassification::Current(ref marker) if marker.projection_schema_version==186),
+        // 186 is only Current while nothing newer exists; a later migration must leave this
+        // receipt admissible as a supported source instead of pinning Current.
+        match classify_database_contract(&tx)? {
+            DatabaseContractClassification::Current(ref marker) => {
+                marker.projection_schema_version == 186
+            }
+            DatabaseContractClassification::SupportedMigrationSource(ref marker) => {
+                marker.projection_schema_version == 186
+            }
+            DatabaseContractClassification::Unknown(_) => false,
+        },
         "local Hook schema admission failed"
     );
     tx.commit()?;
@@ -42,7 +51,7 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
             "DROP TABLE agent_run_local_hook_event; DROP TABLE agent_run_local_hook;
         DELETE FROM schema_migration WHERE version=236;
         UPDATE rovai_data_contract SET projection_schema_version=185
-        WHERE singleton=1 AND projection_schema_version=186;",
+        WHERE singleton=1 AND projection_schema_version IN (186,187);",
         )
         .unwrap();
 }
@@ -89,9 +98,12 @@ mod tests {
                 .unwrap(),
             0
         );
+        // 237 is the newest projection, so a database that stops at this block is an
+        // admitted upgrade source rather than Current.
         assert!(matches!(
             classify_database_contract(db.connection()).unwrap(),
-            DatabaseContractClassification::Current(_)
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 186
         ));
         assert_eq!(
             db.connection()
