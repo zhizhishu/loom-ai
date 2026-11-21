@@ -19,6 +19,24 @@ Trust rules enforced here, not in the model's prompt:
 
 A `401`/`403`/`404` from the Host means the grant is gone: the bridge answers that calls
 fail and exits non-zero so no further attempts are made.
+
+Pi toolchain (ported from Mikka `packages/daemon/src/computer/driver.mjs@d59c85cb`):
+
+* This process is the MCP server Pi's managed extension spawns. It is started with
+  `inheritEnv: false` and exactly the environment the reviewed definition carries, so
+  nothing here may depend on `PATH`, `HOME` or a locale.
+* Authority identity is the one the Host derived and minted the definition for
+  (`LOOM_COMPUTER_AGENT_RUNTIME`/`SUBJECT`/`SCOPE`). A definition minted for the disabled
+  `claude-code-cli` runtime, or one with a missing or malformed identity, refuses to start
+  at all — the same fail-closed shape as Mikka's `Invalid desktop lease` guard.
+* Captures and synthetic input keep independent authorization. A `view` grant exposes and
+  accepts only `screenshot`; a `control` grant exposes the four input tools too. An input
+  call on a view grant is refused here, before any request leaves the process, so the
+  narrower grant fails closed even if the Host were unreachable.
+* The tool surface is the same closed five Mikka's driver exposes, mapped one to one:
+  `get_desktop_state`->`screenshot`, `click`->`mouse_click`, `type_text`->`text`,
+  `press_key`->`key`, `scroll`->`wheel`. Mikka's recording tools and its `step` wording
+  have no LOOM counterpart and are not exposed.
 """
 
 import json
@@ -32,6 +50,17 @@ MAX_TEXT_CODEPOINTS = 2048
 RPC_PATH = "/api/v1/computer-agent/rpc"
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 DEFAULT_TIMEOUT_SECONDS = 20
+
+# The runtimes whose MCP projection can reach this bridge, kept identical to the Host's
+# `RUNTIMES` (crates/rovai-web/src/computer_agent.rs). `claude-code-cli` is refused by
+# product policy and is deliberately absent rather than merely gated.
+RUNTIMES = ("pi", "codex-cli", "deepseek-harness")
+DISABLED_RUNTIMES = frozenset({"claude-code-cli"})
+RUNTIME_ENV = "LOOM_COMPUTER_AGENT_RUNTIME"
+SUBJECT_ENV = "LOOM_COMPUTER_AGENT_SUBJECT"
+SCOPE_ENV = "LOOM_COMPUTER_AGENT_SCOPE"
+# Bounded like Mikka's lease identity: non-empty, no NUL, at most 128 characters.
+MAX_SUBJECT_LENGTH = 128
 
 TOOLS = (
     {
@@ -108,6 +137,13 @@ TOOLS = (
 TOOL_NAMES = frozenset(tool["name"] for tool in TOOLS)
 SCHEMA_PROPERTIES = {
     tool["name"]: frozenset(tool["inputSchema"]["properties"]) for tool in TOOLS
+}
+# Independent authorization: the capture scope is exactly `screenshot`, the control scope
+# adds the four synthetic-input tools. Order follows TOOLS, which is what `tools/list`
+# returns.
+SCOPE_TOOLS = {
+    "view": frozenset({"screenshot"}),
+    "control": frozenset(tool["name"] for tool in TOOLS),
 }
 
 
@@ -188,17 +224,64 @@ def call_body(request_id, tool, arguments, digest):
     }
 
 
+def read_authority(environment):
+    """The reviewed authority this definition was minted for.
+
+    Ported from the identity checks Mikka's driver applies before it spawns a driver
+    invocation (`driver.mjs`: a non-empty, at-most-128-character `botId`/`ownerId` with no
+    NUL, or the desktop lease is invalid). LOOM adds the runtime, which is where the Claude
+    refusal lives: `claude-code-cli` is disabled by product policy, so a definition minted
+    for it may not start even if it exists in a configuration.
+    """
+    runtime = (environment.get(RUNTIME_ENV) or "").strip()
+    if runtime in DISABLED_RUNTIMES:
+        raise BridgeError("runtime_disabled", fatal=True)
+    if runtime not in RUNTIMES:
+        raise BridgeError("runtime_unsupported", fatal=True)
+    subject = environment.get(SUBJECT_ENV) or ""
+    if not subject or len(subject) > MAX_SUBJECT_LENGTH or "\0" in subject:
+        raise BridgeError("authority_unavailable", fatal=True)
+    scope = (environment.get(SCOPE_ENV) or "").strip()
+    if scope not in SCOPE_TOOLS:
+        raise BridgeError("authority_unavailable", fatal=True)
+    return {"runtime": runtime, "subject": subject, "scope": scope}
+
+
+def configure_stdio():
+    """Pin the line protocol to UTF-8 JSON lines.
+
+    Pi's managed extension spawns this bridge with `inheritEnv: false`, so no locale is
+    inherited. The protocol must not depend on one.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="strict", newline="\n")
+        except (AttributeError, ValueError):  # pragma: no cover - exotic streams
+            continue
+
+
 class Bridge:
-    def __init__(self, endpoint, origin, token, timeout, digest, opener=None):
+    def __init__(self, endpoint, origin, token, timeout, digest, *, scope, opener=None):
         self.endpoint = endpoint
         self.origin = origin
         self.token = token
         self.timeout = timeout
         self.digest = digest
+        # There is no default: the caller must state which permission this grant carries,
+        # so a missing scope can never widen the surface.
+        self.scope = scope
         self.fatal = False
         self.opener = opener or urllib.request.build_opener(
             NoRedirect(), urllib.request.ProxyHandler({})
         )
+
+    def tools(self):
+        """Exactly the tools this grant's scope exposes, in declaration order."""
+        allowed = SCOPE_TOOLS[self.scope]
+        return [tool for tool in TOOLS if tool["name"] in allowed]
+
+    def allows(self, tool):
+        return tool in SCOPE_TOOLS[self.scope]
 
     def call(self, request_id, tool, arguments):
         body = json.dumps(call_body(request_id, tool, arguments, self.digest)).encode("utf-8")
@@ -300,7 +383,7 @@ def handle(bridge, message):
     if method == "ping":
         return {"jsonrpc": "2.0", "id": request_id, "result": {}}
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": list(TOOLS)}}
+        return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": bridge.tools()}}
     if method == "tools/call":
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
         tool = params.get("name")
@@ -310,6 +393,14 @@ def handle(bridge, message):
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": tool_error("unsupported_tool"),
+            }
+        if not bridge.allows(tool):
+            # Refused before any request leaves the process: a capture grant can never be
+            # widened by the model calling an input tool.
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": tool_error("scope_denied"),
             }
         try:
             return {
@@ -349,6 +440,7 @@ def read_token(path):
 
 
 def main():
+    configure_stdio()
     endpoint = os.environ.get("LOOM_COMPUTER_AGENT_ENDPOINT", "")
     origin = os.environ.get("LOOM_COMPUTER_AGENT_ORIGIN", "")
     token_path = os.environ.get("LOOM_COMPUTER_AGENT_TOKEN_FILE", "")
@@ -361,13 +453,15 @@ def main():
             raise BridgeError("token_unavailable", fatal=True)
         if not digest or len(digest) > 128:
             raise BridgeError("digest_unavailable", fatal=True)
+        authority = read_authority(os.environ)
         endpoint, origin = validate_endpoint(endpoint, origin)
         token = read_token(token_path)
     except BridgeError as failure:
         # Fail closed without ever printing the token or the path.
         sys.stderr.write(json.dumps({"bridge": "unavailable", "reason": failure.message}) + "\n")
         return 2
-    bridge = Bridge(endpoint, origin, token, timeout, digest)
+    # The runtime was admitted above; only the permission decides the exposed surface.
+    bridge = Bridge(endpoint, origin, token, timeout, digest, scope=authority["scope"])
     for line in sys.stdin.buffer:
         if len(line) > MAX_LINE_BYTES:
             sys.stdout.write(
