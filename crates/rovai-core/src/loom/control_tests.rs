@@ -24,13 +24,17 @@ use crate::command::{ActorRef, CommandEnvelope};
 use crate::db::{Database, TestDatabaseOpenMode};
 use crate::mission::{CreateMissionCommand, MissionService};
 use crate::test_support::OwnedTestDatabase;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 const OWNER: &str = "local_user";
 const PRODUCER_AGENT: &str = "agent_1";
 const REVIEWER_AGENT: &str = "agent_2";
 const PRODUCER_RUN: &str = "run_producer";
 const REVIEWER_RUN: &str = "run_reviewer";
+/// A reviewer who never took part in the delivery or its session: the independent observer a stage
+/// verdict is actually meant to come from.
+const INDEPENDENT_REVIEWER_AGENT: &str = "agent_4";
+const INDEPENDENT_REVIEWER_RUN: &str = "run_independent_reviewer";
 /// A second executor of the same Camp, so a pass can hand work to two Recipients at once.
 const SECOND_PRODUCER_AGENT: &str = "agent_3";
 const FUTURE_EXPIRY: &str = "2099-01-01T00:00:00Z";
@@ -217,9 +221,11 @@ fn rejection_code(error: &anyhow::Error) -> &'static str {
 fn camp_of(database: &OwnedTestDatabase, mission_id: &str) -> String {
     database
         .connection()
-        .query_row("SELECT camp_id FROM mission WHERE id=?1", [mission_id], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT camp_id FROM mission WHERE id=?1",
+            [mission_id],
+            |row| row.get(0),
+        )
         .unwrap()
 }
 
@@ -228,16 +234,41 @@ fn camp_of(database: &OwnedTestDatabase, mission_id: &str) -> String {
 /// credible because this row exists: `stage_review_record` resolves the agent through it and
 /// refuses a run that is not `running` and not cancelled.
 fn seed_run(database: &OwnedTestDatabase, camp_id: &str, agent_id: &str, run_id: &str) {
-    let conversation_id = format!("conversation_{run_id}");
+    // The real schema keeps exactly one conversation per (Camp, Agent), so a second Run of the same
+    // Agent executes in the session that Agent already has. A fixture that minted a private
+    // conversation per Run would hide the session-sharing rules the product actually enforces.
+    let existing: Option<String> = database
+        .connection()
+        .query_row(
+            "SELECT id FROM conversation WHERE camp_id=?1 AND agent_id=?2",
+            params![camp_id, agent_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    let conversation_id = match existing {
+        Some(conversation_id) => conversation_id,
+        None => {
+            let conversation_id = format!("conversation_{run_id}");
+            database
+                .connection()
+                .execute(
+                    "INSERT INTO conversation(id,camp_id,agent_id,created_at,updated_at)
+                     VALUES(?1,?2,?3,'2026-08-31','2026-08-31')",
+                    params![&conversation_id, camp_id, agent_id],
+                )
+                .unwrap();
+            conversation_id
+        }
+    };
     let turn_id = format!("turn_{run_id}");
     database
         .connection()
-        .execute_batch(&format!(
-            "INSERT INTO conversation(id,camp_id,agent_id,created_at,updated_at)
-             VALUES('{conversation_id}','{camp_id}','{agent_id}','2026-08-31','2026-08-31');
-             INSERT INTO camp_turn(id,camp_id,trigger_type,trigger_id,status,created_at,updated_at)
-             VALUES('{turn_id}','{camp_id}','system_event','{run_id}','running','2026-08-31','2026-08-31');"
-        ))
+        .execute(
+            "INSERT INTO camp_turn(id,camp_id,trigger_type,trigger_id,status,created_at,updated_at)
+             VALUES(?1,?2,'system_event',?3,'running','2026-08-31','2026-08-31')",
+            params![&turn_id, camp_id, run_id],
+        )
         .unwrap();
     // A non-batch Run must leave direct camp/anchor/tail fields NULL. Its Camp is resolved
     // through `camp_turn`, as read by `COALESCE(run.camp_id, turn.camp_id)`.
@@ -254,6 +285,103 @@ fn seed_run(database: &OwnedTestDatabase, camp_id: &str, agent_id: &str, run_id:
              VALUES(?1,?2,?3,0,0,?1,'initial','test','required','{}','{}','running',?1,
                     'qoder-cli',1,'2026-08-31','2026-08-31','2026-08-31')",
             params![run_id, turn_id, conversation_id],
+        )
+        .unwrap();
+}
+
+/// The conversation one seeded Run executes in, read the way the product reads it.
+fn conversation_of(database: &OwnedTestDatabase, run_id: &str) -> String {
+    database
+        .connection()
+        .query_row(
+            "SELECT conversation_id FROM agent_run WHERE id=?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// The Native Session one seeded Run executes in, with the installation that owns it: the pair the
+/// schema keeps unique and the product uses as the session identity. `installation_id` is optional
+/// because a conversation can carry a Native Session before its owner is known.
+fn set_native_session(
+    database: &OwnedTestDatabase,
+    run_id: &str,
+    installation_id: Option<&str>,
+    native_session_id: &str,
+) {
+    // The conversation's installation is a real reference, so the installation has to exist — the
+    // same row a discovered Runtime installation would leave behind. A custom installation is
+    // unique by (kind, executable path, auth scope), so each seeded installation gets its own path.
+    if let Some(installation_id) = installation_id {
+        let executable_path = format!("/opt/qoder/{installation_id}");
+        database
+            .connection()
+            .execute(
+                "INSERT OR IGNORE INTO adapter_installation(
+                     id,adapter_kind,executable_path,command_name,installation_class,source,
+                     auth_scope,enabled,generation,path_state,version,created_at,updated_at)
+                 VALUES(?1,'qoder-cli',?2,'qoder','custom','manual','user',1,1,
+                        'valid',1,'2026-08-31','2026-08-31')",
+                params![installation_id, executable_path],
+            )
+            .unwrap();
+    }
+    let updated = database
+        .connection()
+        .execute(
+            "UPDATE conversation SET native_adapter_installation_id=?1, native_session_id=?2
+             WHERE id = (SELECT conversation_id FROM agent_run WHERE id=?3)",
+            params![installation_id, native_session_id, run_id],
+        )
+        .unwrap();
+    assert_eq!(
+        updated, 1,
+        "assertion the_fixture_bound_the_native_session_this_case_is_about"
+    );
+}
+
+/// A delivered Run that has already finished: the schema keeps one *active* Run per session, so a
+/// history Run is a finished one, exactly as the product leaves it after its Candidate is recorded.
+fn finish_run(database: &OwnedTestDatabase, run_id: &str) {
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_run SET status='succeeded', ended_at='2026-08-31' WHERE id=?1",
+            [run_id],
+        )
+        .unwrap();
+}
+
+/// The open claim one Run already holds on a Task, as the delivery lane wrote it when it admitted
+/// that Run to execution. A test that continues a real dispatched delivery reads the claim it
+/// already owns instead of asking for a second one.
+fn open_claim_of(
+    database: &OwnedTestDatabase,
+    plan_id: &str,
+    task_id: &str,
+    run_id: &str,
+) -> (String, i64) {
+    database
+        .connection()
+        .query_row(
+            "SELECT claim_id, fence_generation FROM loom_claim
+             WHERE plan_id=?1 AND task_id=?2 AND agent_run_id=?3 AND released_at IS NULL",
+            params![plan_id, task_id, run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+/// A continuation edge between two Runs: `successor` continues `predecessor`'s thread.
+fn set_predecessor(database: &OwnedTestDatabase, successor: &str, predecessor: Option<&str>) {
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_run SET predecessor_agent_run_id=?1,
+                    start_reason=CASE WHEN ?1 IS NULL THEN 'initial' ELSE 'rework' END
+             WHERE id=?2",
+            params![predecessor, successor],
         )
         .unwrap();
 }
@@ -301,9 +429,79 @@ fn submitted_candidate(
         },
     )
     .unwrap();
-    let manifest = control::candidate_manifest_hash(database.connection(), &candidate.candidate_id)
-        .unwrap();
+    let manifest =
+        control::candidate_manifest_hash(database.connection(), &candidate.candidate_id).unwrap();
     (candidate.candidate_id, manifest)
+}
+
+/// The Run the platform bound this Candidate's review to, read from the dispatch ledger: the Run that
+/// claimed the REVIEW Delivery of this exact Candidate.
+fn review_run_of(database: &OwnedTestDatabase, candidate_id: &str) -> Option<String> {
+    database
+        .connection()
+        .query_row(
+            "SELECT delivery.claimed_agent_run_id
+             FROM loom_control_dispatch dispatch
+             JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+             WHERE dispatch.kind='REVIEW' AND dispatch.candidate_id=?1
+             ORDER BY dispatch.created_at DESC, dispatch.dispatch_id DESC
+             LIMIT 1",
+            [candidate_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
+        .flatten()
+}
+
+/// Hand the review of the latest Candidate to its assigned reviewer through the real scheduler and
+/// claim it through the real delivery lane. The Run this returns is the one the ledger names, so it
+/// is the only observer a stage verdict may come from: an assignment is a role, not a request.
+
+fn dispatched_review_run(
+    database: &mut OwnedTestDatabase,
+    camp_id: &str,
+    candidate_id: &str,
+) -> String {
+    assert_eq!(
+        control::admit_due_dispatches(database).unwrap(),
+        1,
+        "assertion the_delivered_candidate_is_handed_to_its_reviewer"
+    );
+    let mut runs = claim_mission_lane(database, camp_id, 1);
+    assert_eq!(
+        runs.len(),
+        1,
+        "assertion the_review_delivery_materialises_exactly_one_run"
+    );
+    let run_id = runs.pop().unwrap();
+    claim_the_run(database, camp_id, &run_id);
+    assert_eq!(
+        review_run_of(database, candidate_id).as_deref(),
+        Some(run_id.as_str()),
+        "assertion the_ledger_bound_the_review_to_the_run_that_claimed_it"
+    );
+    run_id
+}
+
+/// The Agent that executes one Run, read the way the product reads it.
+fn run_agent(database: &OwnedTestDatabase, run_id: &str) -> String {
+    database
+        .connection()
+        .query_row(
+            "SELECT conversation.agent_id FROM agent_run
+             JOIN conversation ON conversation.id = agent_run.conversation_id
+             WHERE agent_run.id=?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// The seeded fixture configures a Runtime for the producer, the reviewer and the second executor
+/// only; the independent observer needs one too before the platform can hand it a Delivery at all.
+fn configure_observer_runtime(database: &OwnedTestDatabase) {
+    crate::agent_profile::configure_test_runtime(database, &[INDEPENDENT_REVIEWER_AGENT]);
 }
 
 fn task_state(database: &OwnedTestDatabase, mission_id: &str, task_id: &str) -> String {
@@ -471,7 +669,11 @@ fn control_commands_separate_the_row_revision_from_the_authorization() {
     .unwrap();
     let policy = approved.policy.expect("an approval must produce a policy");
     assert_eq!(
-        (policy.revision, policy.authorization_revision, policy.approved_by.as_str()),
+        (
+            policy.revision,
+            policy.authorization_revision,
+            policy.approved_by.as_str()
+        ),
         (1, 1, OWNER),
         "assertion the_first_approval_starts_at_revision_one_and_authorization_one"
     );
@@ -519,7 +721,11 @@ fn control_commands_separate_the_row_revision_from_the_authorization() {
     .unwrap();
     let policy = paused.policy.expect("pausing keeps the policy");
     assert_eq!(
-        (policy.revision, policy.authorization_revision, policy.paused),
+        (
+            policy.revision,
+            policy.authorization_revision,
+            policy.paused
+        ),
         (2, 1, true),
         "assertion pausing_advances_the_row_revision_but_not_the_authorization"
     );
@@ -559,17 +765,24 @@ fn control_commands_separate_the_row_revision_from_the_authorization() {
     .unwrap();
     let policy = resumed.policy.expect("resuming keeps the policy");
     assert_eq!(
-        (policy.revision, policy.authorization_revision, policy.paused),
+        (
+            policy.revision,
+            policy.authorization_revision,
+            policy.paused
+        ),
         (3, 1, false),
         "assertion resuming_reuses_the_standing_authorization"
     );
 
-    // Resume spent the same grant, so the verdict written against authorization 1 still lands.
+    // Resume spent the same grant, so the platform hands the review out again and the verdict
+    // written against authorization 1 still lands — from the Run the Delivery asked.
+    finish_run(&database, REVIEWER_RUN);
+    let reviewer_run = dispatched_review_run(&mut database, &camp_id, &candidate_id);
     let recorded = control::stage_review_record(
         &mut database,
         &mission_id,
         REVIEWER_AGENT,
-        REVIEWER_RUN,
+        &reviewer_run,
         "command_stage_after_resume",
         stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Pass),
     )
@@ -593,9 +806,14 @@ fn control_commands_separate_the_row_revision_from_the_authorization() {
         &mut database,
         &mission_id,
         REVIEWER_AGENT,
-        REVIEWER_RUN,
+        &reviewer_run,
         "command_stage_stale_authorization",
-        stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::RequestChanges),
+        stage_input(
+            &candidate_id,
+            1,
+            &manifest,
+            LoomStageVerdict::RequestChanges,
+        ),
     )
     .unwrap_err();
     assert_eq!(
@@ -678,6 +896,102 @@ fn stage_review_refuses_untrusted_reviewers_and_unresolvable_producers() {
     );
 }
 
+/// Self-review boundary with a real, resolvable producer: the Run that delivered the Candidate
+/// cannot judge it, and a later live Run of the same Agent cannot judge it either — that is the
+/// same author behind another identity. Both refusals happen before any shared-session reasoning,
+/// so the code names the actual violation, and neither writes a verdict. An independent reviewer
+/// under a new grant still passes, so the fence is not a blanket refusal.
+#[test]
+fn stage_review_refuses_the_producer_and_a_later_run_of_its_agent() {
+    let mut database = fixture();
+    let mission_id = create_mission(&mut database, "control self review");
+    plan_import(&mut database, plan_input(&mission_id)).unwrap();
+    let camp_id = camp_of(&database, &mission_id);
+    seed_run(&database, &camp_id, PRODUCER_AGENT, PRODUCER_RUN);
+    seed_run(&database, &camp_id, REVIEWER_AGENT, REVIEWER_RUN);
+    // The producer is also the assigned reviewer here, so nothing but the self-review rule stands
+    // between it and its own delivery.
+    control::configure(
+        &mut database,
+        OWNER,
+        policy_input(&mission_id, "command_approve_self_review", PRODUCER_AGENT),
+    )
+    .unwrap();
+    let (candidate_id, manifest) = submitted_candidate(&mut database, &mission_id, PRODUCER_RUN);
+
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        PRODUCER_AGENT,
+        PRODUCER_RUN,
+        "command_stage_producer_itself",
+        stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_CONTROL_REVIEWER_SELF",
+        "assertion the_run_that_produced_the_candidate_cannot_review_it"
+    );
+
+    // The producing Run ends and its Agent starts another Run in the same session: still the same
+    // author, still not an observer.
+    finish_run(&database, PRODUCER_RUN);
+    seed_run(&database, &camp_id, PRODUCER_AGENT, "run_producer_later");
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        PRODUCER_AGENT,
+        "run_producer_later",
+        "command_stage_producer_later_run",
+        stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_CONTROL_REVIEWER_SELF",
+        "assertion a_later_run_of_the_producing_agent_cannot_review_its_own_delivery"
+    );
+    assert_eq!(
+        count(&database, "SELECT COUNT(*) FROM loom_stage_review"),
+        0,
+        "assertion neither_self_review_attempt_writes_a_verdict"
+    );
+
+    // A different Agent, under a fresh grant, is a real observer: the platform hands that Agent the
+    // review and the Run that claimed it passes.
+    let mut independent =
+        policy_input(&mission_id, "command_approve_real_observer", REVIEWER_AGENT);
+    independent.expected_revision = 1;
+    control::configure(&mut database, OWNER, independent).unwrap();
+    finish_run(&database, REVIEWER_RUN);
+    let reviewer_run = dispatched_review_run(&mut database, &camp_id, &candidate_id);
+    let recorded = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        &reviewer_run,
+        "command_stage_real_observer",
+        stage_input(&candidate_id, 2, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            recorded.review.reviewer_agent_run_id.as_str(),
+            recorded.task_status,
+            acceptance_status(&database, &candidate_id),
+            count(&database, "SELECT COUNT(*) FROM loom_review"),
+        ),
+        (
+            reviewer_run.as_str(),
+            super::LoomTaskStatus::InReview,
+            "PENDING".to_string(),
+            0,
+        ),
+        "assertion an_independent_pass_is_accepted_and_the_owner_still_decides"
+    );
+}
+
 /// Evidence boundary: the manifest is the Core's own document over the stored Candidate, its
 /// criteria text and its artifacts, and a pass has to answer every criterion exactly once.
 #[test]
@@ -695,12 +1009,16 @@ fn stage_review_binds_the_core_manifest_and_a_complete_verdict() {
     )
     .unwrap();
     let (candidate_id, manifest) = submitted_candidate(&mut database, &mission_id, PRODUCER_RUN);
+    // The platform asks for the review; every refusal below has to come from the observer that was
+    // actually asked, so each case is answered by the Run that claimed the review Delivery.
+    finish_run(&database, REVIEWER_RUN);
+    let reviewer_run = dispatched_review_run(&mut database, &camp_id, &candidate_id);
 
     let error = control::stage_review_record(
         &mut database,
         &mission_id,
         REVIEWER_AGENT,
-        REVIEWER_RUN,
+        &reviewer_run,
         "command_stage_manifest",
         stage_input(
             &candidate_id,
@@ -722,7 +1040,7 @@ fn stage_review_binds_the_core_manifest_and_a_complete_verdict() {
         &mut database,
         &mission_id,
         REVIEWER_AGENT,
-        REVIEWER_RUN,
+        &reviewer_run,
         "command_stage_partial",
         partial,
     )
@@ -742,7 +1060,7 @@ fn stage_review_binds_the_core_manifest_and_a_complete_verdict() {
         &mut database,
         &mission_id,
         REVIEWER_AGENT,
-        REVIEWER_RUN,
+        &reviewer_run,
         "command_stage_unsatisfied",
         unsatisfied,
     )
@@ -760,7 +1078,7 @@ fn stage_review_binds_the_core_manifest_and_a_complete_verdict() {
         &mut database,
         &mission_id,
         REVIEWER_AGENT,
-        REVIEWER_RUN,
+        &reviewer_run,
         "command_stage_foreign_evidence",
         foreign_evidence,
     )
@@ -780,7 +1098,7 @@ fn stage_review_binds_the_core_manifest_and_a_complete_verdict() {
                 &mut database,
                 &mission_id,
                 REVIEWER_AGENT,
-                REVIEWER_RUN,
+                &reviewer_run,
                 "command_stage_duplicate_evidence",
                 duplicate_evidence,
             )
@@ -798,7 +1116,7 @@ fn stage_review_binds_the_core_manifest_and_a_complete_verdict() {
                 &mut database,
                 &mission_id,
                 REVIEWER_AGENT,
-                REVIEWER_RUN,
+                &reviewer_run,
                 "command_stage_uppercase_manifest",
                 uppercase_manifest,
             )
@@ -816,7 +1134,7 @@ fn stage_review_binds_the_core_manifest_and_a_complete_verdict() {
                 &mut database,
                 &mission_id,
                 REVIEWER_AGENT,
-                REVIEWER_RUN,
+                &reviewer_run,
                 "command_stage_long_reason",
                 long_reason,
             )
@@ -849,12 +1167,14 @@ fn pass_ends_the_internal_stage_without_accepting_the_candidate() {
     )
     .unwrap();
     let (candidate_id, manifest) = submitted_candidate(&mut database, &mission_id, PRODUCER_RUN);
+    finish_run(&database, REVIEWER_RUN);
+    let reviewer_run = dispatched_review_run(&mut database, &camp_id, &candidate_id);
 
     let recorded = control::stage_review_record(
         &mut database,
         &mission_id,
         REVIEWER_AGENT,
-        REVIEWER_RUN,
+        &reviewer_run,
         "command_stage_pass",
         stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Pass),
     )
@@ -892,7 +1212,7 @@ fn pass_ends_the_internal_stage_without_accepting_the_candidate() {
         &mut database,
         &mission_id,
         REVIEWER_AGENT,
-        REVIEWER_RUN,
+        &reviewer_run,
         "command_stage_pass",
         stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Pass),
     )
@@ -905,9 +1225,14 @@ fn pass_ends_the_internal_stage_without_accepting_the_candidate() {
         &mut database,
         &mission_id,
         REVIEWER_AGENT,
-        REVIEWER_RUN,
+        &reviewer_run,
         "command_stage_pass",
-        stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::RequestChanges),
+        stage_input(
+            &candidate_id,
+            1,
+            &manifest,
+            LoomStageVerdict::RequestChanges,
+        ),
     )
     .unwrap_err();
     assert_eq!(
@@ -941,6 +1266,8 @@ fn request_changes_returns_the_task_for_a_new_chained_candidate() {
     let (first_candidate_id, manifest) =
         submitted_candidate(&mut database, &mission_id, PRODUCER_RUN);
 
+    finish_run(&database, REVIEWER_RUN);
+    let reviewer_run = dispatched_review_run(&mut database, &camp_id, &first_candidate_id);
     let mut request_changes = stage_input(
         &first_candidate_id,
         1,
@@ -955,7 +1282,7 @@ fn request_changes_returns_the_task_for_a_new_chained_candidate() {
         &mut database,
         &mission_id,
         REVIEWER_AGENT,
-        REVIEWER_RUN,
+        &reviewer_run,
         "command_stage_request_changes",
         request_changes,
     )
@@ -1078,13 +1405,15 @@ fn blocked_parks_the_task_with_the_reviewer_reason() {
     .unwrap();
     let (candidate_id, manifest) = submitted_candidate(&mut database, &mission_id, PRODUCER_RUN);
 
+    finish_run(&database, REVIEWER_RUN);
+    let reviewer_run = dispatched_review_run(&mut database, &camp_id, &candidate_id);
     let mut blocked = stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Blocked);
     blocked.reason = "the delivery needs a decision nobody has made".into();
     let recorded = control::stage_review_record(
         &mut database,
         &mission_id,
         REVIEWER_AGENT,
-        REVIEWER_RUN,
+        &reviewer_run,
         "command_stage_blocked",
         blocked,
     )
@@ -1118,6 +1447,1807 @@ fn blocked_parks_the_task_with_the_reviewer_reason() {
     );
 }
 
+/// Independence boundary, ported from Mikka `lib/factory/check-independence.ts`: the Run that
+/// judges a delivery has to be an observer outside the session that produced it. A review Run that
+/// continues the producing Run — or that the producing Run continues — is one working thread
+/// judging itself through a second identity, so it is refused; an observer in its own session is
+/// accepted and binds the Candidate, the producer, the stage and the authorization it judged.
+#[test]
+fn stage_review_needs_an_observer_outside_the_production_session() {
+    let mut database = fixture();
+    configure_observer_runtime(&database);
+    let mission_id = create_mission_with_members(
+        &mut database,
+        "control independent review",
+        &[PRODUCER_AGENT, REVIEWER_AGENT, INDEPENDENT_REVIEWER_AGENT],
+    );
+    plan_import(&mut database, plan_input(&mission_id)).unwrap();
+    let camp_id = camp_of(&database, &mission_id);
+    seed_run(&database, &camp_id, PRODUCER_AGENT, PRODUCER_RUN);
+    seed_run(&database, &camp_id, REVIEWER_AGENT, REVIEWER_RUN);
+    seed_run(
+        &database,
+        &camp_id,
+        INDEPENDENT_REVIEWER_AGENT,
+        INDEPENDENT_REVIEWER_RUN,
+    );
+    control::configure(
+        &mut database,
+        OWNER,
+        policy_input(&mission_id, "command_approve_observer", REVIEWER_AGENT),
+    )
+    .unwrap();
+    let (candidate_id, manifest) = submitted_candidate(&mut database, &mission_id, PRODUCER_RUN);
+    // The independent observer really is a different Agent in a different session.
+    assert_ne!(
+        conversation_of(&database, PRODUCER_RUN),
+        conversation_of(&database, INDEPENDENT_REVIEWER_RUN),
+        "assertion the_fixture_keeps_the_independent_observer_in_its_own_session"
+    );
+    // The reviewing Run continues the producing Run: the verdict would come from the producing
+    // thread under another agent identity. A shared session disqualifies the observer on its own, so
+    // this is refused before any request for a verdict — and the refusal must not touch the ledger.
+    set_predecessor(&database, REVIEWER_RUN, Some(PRODUCER_RUN));
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        REVIEWER_RUN,
+        "command_stage_reviewer_continues_producer",
+        stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_STAGE_REVIEWER_SESSION_SHARED",
+        "assertion a_reviewer_run_that_continues_the_producer_cannot_judge_its_own_thread"
+    );
+    set_predecessor(&database, REVIEWER_RUN, None);
+
+    // The producing Run continues the reviewing Run: the reviewer stands inside the producer's
+    // ancestry, so the delivery was built on the reviewer's own earlier thread.
+    set_predecessor(&database, PRODUCER_RUN, Some(REVIEWER_RUN));
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        REVIEWER_RUN,
+        "command_stage_producer_continues_reviewer",
+        stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_STAGE_REVIEWER_SESSION_SHARED",
+        "assertion a_reviewer_run_inside_the_producers_ancestry_cannot_judge_it"
+    );
+    set_predecessor(&database, PRODUCER_RUN, None);
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_stage_review"),
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+        ),
+        (0, 0),
+        "assertion a_shared_session_refusal_writes_neither_a_verdict_nor_a_request"
+    );
+
+    // A new approval names the independent observer: the platform hands that Agent the review, and
+    // the Run that claimed it lands the verdict under the new grant.
+    let mut independent = policy_input(
+        &mission_id,
+        "command_approve_independent_observer",
+        INDEPENDENT_REVIEWER_AGENT,
+    );
+    independent.expected_revision = 1;
+    let approved = control::configure(&mut database, OWNER, independent).unwrap();
+    assert_eq!(
+        approved
+            .policy
+            .as_ref()
+            .map(|policy| policy.authorization_revision),
+        Some(2),
+        "assertion the_new_approval_is_the_authorization_the_observer_reviews_under"
+    );
+    finish_run(&database, INDEPENDENT_REVIEWER_RUN);
+    let independent_run = dispatched_review_run(&mut database, &camp_id, &candidate_id);
+    assert_eq!(
+        run_agent(&database, &independent_run),
+        INDEPENDENT_REVIEWER_AGENT,
+        "assertion the_new_grant_asked_the_independent_observer"
+    );
+    let recorded = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        INDEPENDENT_REVIEWER_AGENT,
+        &independent_run,
+        "command_stage_independent_pass",
+        stage_input(&candidate_id, 2, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            recorded.review.candidate_id.as_str(),
+            recorded.review.reviewer_agent_run_id.as_str(),
+            recorded.review.policy_revision,
+            recorded.review.manifest_hash.as_str(),
+            recorded.task_status,
+        ),
+        (
+            candidate_id.as_str(),
+            independent_run.as_str(),
+            2,
+            manifest.as_str(),
+            super::LoomTaskStatus::InReview,
+        ),
+        "assertion an_independent_verdict_binds_the_candidate_run_stage_and_authorization"
+    );
+    assert_eq!(
+        (
+            acceptance_status(&database, &candidate_id),
+            count(&database, "SELECT COUNT(*) FROM loom_review"),
+        ),
+        ("PENDING".to_string(), 0),
+        "assertion even_an_independent_pass_is_not_the_owners_acceptance"
+    );
+}
+
+/// Session-history boundary: a reviewer cannot judge a Task whose earlier version was produced in
+/// the very session they still work in — a review that would ratify its own earlier delivery under
+/// a second identity. The same test proves the other direction of the same fence: the stale
+/// Candidate is refused, a second verdict on one Candidate under one grant is refused, and none of
+/// those refusals — nor an explicit `blocked` — erases the work that was delivered.
+#[test]
+fn stage_review_history_and_rejections_keep_the_delivered_work() {
+    let mut database = fixture();
+    configure_observer_runtime(&database);
+    let mission_id = create_mission_with_members(
+        &mut database,
+        "control independent review history",
+        &[PRODUCER_AGENT, REVIEWER_AGENT, INDEPENDENT_REVIEWER_AGENT],
+    );
+    plan_import(&mut database, plan_input(&mission_id)).unwrap();
+    let camp_id = camp_of(&database, &mission_id);
+    // The reviewer's Agent already delivered the first version of this Task in its own session,
+    // and that Run is finished: one session keeps one active Run.
+    seed_run(&database, &camp_id, REVIEWER_AGENT, "run_reviewer_delivery");
+    finish_run(&database, "run_reviewer_delivery");
+    // The first version is reviewed by the other agent, so the Task reaches a second delivery.
+    control::configure(
+        &mut database,
+        OWNER,
+        policy_input(
+            &mission_id,
+            "command_approve_first_observer",
+            PRODUCER_AGENT,
+        ),
+    )
+    .unwrap();
+    task_release(
+        &mut database,
+        LoomTaskReleaseInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_a".into(),
+        },
+    )
+    .unwrap();
+    let first_claim = claim_acquire(
+        &mut database,
+        LoomClaimAcquireInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: "run_reviewer_delivery".into(),
+            claimant_agent_id: Some(REVIEWER_AGENT.into()),
+            command_id: "command_claim_first_version".into(),
+            lease_seconds: None,
+        },
+    )
+    .unwrap();
+    let first_candidate = candidate_record(
+        &mut database,
+        LoomCandidateRecordInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: "run_reviewer_delivery".into(),
+            claim_id: first_claim.claim_id,
+            fence_generation: first_claim.fence_generation,
+            command_id: "command_candidate_first_version".into(),
+            content_hash: "sha256:first-version".into(),
+            evidence_ids: vec![],
+            acceptance_criteria_version: "ac-v1".into(),
+            previous_candidate_id: None,
+        },
+    )
+    .unwrap();
+    let first_candidate_id = first_candidate.candidate_id;
+    let first_manifest =
+        control::candidate_manifest_hash(database.connection(), &first_candidate_id).unwrap();
+    let mut request_changes = stage_input(
+        &first_candidate_id,
+        1,
+        &first_manifest,
+        LoomStageVerdict::RequestChanges,
+    );
+    request_changes.reason = "the first version needs a rewrite".into();
+    request_changes.criteria_results[1].satisfied = false;
+    // The platform asks the other agent for the verdict, and the Run that claimed that review is the
+    // one that writes it.
+    let first_review_run = dispatched_review_run(&mut database, &camp_id, &first_candidate_id);
+    assert_eq!(
+        run_agent(&database, &first_review_run),
+        PRODUCER_AGENT,
+        "assertion the_first_grant_asked_the_other_agent"
+    );
+    control::stage_review_record(
+        &mut database,
+        &mission_id,
+        PRODUCER_AGENT,
+        &first_review_run,
+        "command_stage_first_version_changes",
+        request_changes,
+    )
+    .unwrap();
+    finish_run(&database, &first_review_run);
+
+    // A new approval hands the rework to the other agent, so the second version comes from a
+    // different session while the reviewer stays the agent that built the first one.
+    let mut second_policy = policy_input(
+        &mission_id,
+        "command_approve_rework_observer",
+        REVIEWER_AGENT,
+    );
+    second_policy.expected_revision = 1;
+    control::configure(&mut database, OWNER, second_policy).unwrap();
+    // The rework is delivered by the producer's own Run, which starts after the first review Run
+    // ended: one session keeps one active Run.
+    seed_run(&database, &camp_id, PRODUCER_AGENT, PRODUCER_RUN);
+    // The reviewer's own Agent is live again in the session that already delivered the first version.
+    seed_run(&database, &camp_id, REVIEWER_AGENT, REVIEWER_RUN);
+    let second_claim = claim_acquire(
+        &mut database,
+        LoomClaimAcquireInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: PRODUCER_RUN.into(),
+            claimant_agent_id: Some(PRODUCER_AGENT.into()),
+            command_id: "command_claim_second_version".into(),
+            lease_seconds: None,
+        },
+    )
+    .unwrap();
+    let second_candidate = candidate_record(
+        &mut database,
+        LoomCandidateRecordInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: PRODUCER_RUN.into(),
+            claim_id: second_claim.claim_id,
+            fence_generation: second_claim.fence_generation,
+            command_id: "command_candidate_second_version".into(),
+            content_hash: "sha256:second-version".into(),
+            evidence_ids: vec![],
+            acceptance_criteria_version: "ac-v1".into(),
+            previous_candidate_id: Some(first_candidate_id.clone()),
+        },
+    )
+    .unwrap();
+    let second_candidate_id = second_candidate.candidate_id;
+    let second_manifest =
+        control::candidate_manifest_hash(database.connection(), &second_candidate_id).unwrap();
+
+    // The reviewer's own session built the first version of this Task, so it cannot judge the second
+    // one either — not even as the assigned reviewer of this grant. The shared session is refused
+    // before any request, so nothing is written to the dispatch ledger and the later grant can still
+    // ask a clean observer.
+    assert_eq!(
+        conversation_of(&database, REVIEWER_RUN),
+        conversation_of(&database, "run_reviewer_delivery"),
+        "assertion both_reviewer_runs_work_in_the_one_session_their_agent_owns"
+    );
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        REVIEWER_RUN,
+        "command_stage_shared_session_history",
+        stage_input(
+            &second_candidate_id,
+            2,
+            &second_manifest,
+            LoomStageVerdict::Pass,
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_STAGE_REVIEWER_SESSION_SHARED",
+        "assertion a_reviewer_whose_session_delivered_an_earlier_version_cannot_judge_this_task"
+    );
+
+    // The superseded first version is old news: only the latest Candidate may be judged.
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        REVIEWER_RUN,
+        "command_stage_stale_candidate",
+        stage_input(
+            &first_candidate_id,
+            2,
+            &first_manifest,
+            LoomStageVerdict::Pass,
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_STAGE_CANDIDATE_STALE",
+        "assertion a_superseded_candidate_cannot_be_stage_reviewed"
+    );
+    assert_eq!(
+        count(&database, "SELECT COUNT(*) FROM loom_stage_review"),
+        1,
+        "assertion neither_refusal_writes_a_second_verdict"
+    );
+
+    // An independent observer answers the standing grant, once.
+    let mut independent = policy_input(
+        &mission_id,
+        "command_approve_independent_observer",
+        INDEPENDENT_REVIEWER_AGENT,
+    );
+    independent.expected_revision = 2;
+    let approved = control::configure(&mut database, OWNER, independent).unwrap();
+    assert_eq!(
+        approved
+            .policy
+            .as_ref()
+            .map(|policy| policy.authorization_revision),
+        Some(3),
+        "assertion the_independent_observer_reviews_under_the_third_authorization"
+    );
+    finish_run(&database, REVIEWER_RUN);
+    let independent_run = dispatched_review_run(&mut database, &camp_id, &second_candidate_id);
+    let recorded = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        INDEPENDENT_REVIEWER_AGENT,
+        &independent_run,
+        "command_stage_independent_pass",
+        stage_input(
+            &second_candidate_id,
+            3,
+            &second_manifest,
+            LoomStageVerdict::Pass,
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        recorded.task_status,
+        super::LoomTaskStatus::InReview,
+        "assertion an_independent_pass_keeps_the_task_in_review_for_the_owner"
+    );
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        INDEPENDENT_REVIEWER_AGENT,
+        &independent_run,
+        "command_stage_second_verdict",
+        stage_input(
+            &second_candidate_id,
+            3,
+            &second_manifest,
+            LoomStageVerdict::RequestChanges,
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_STAGE_REVIEW_EXISTS",
+        "assertion one_candidate_carries_one_stage_verdict_per_grant"
+    );
+
+    // A final `blocked` under a fresh grant stops the Task without touching what was delivered.
+    let mut stopped = policy_input(
+        &mission_id,
+        "command_approve_stopping_observer",
+        INDEPENDENT_REVIEWER_AGENT,
+    );
+    stopped.expected_revision = 3;
+    control::configure(&mut database, OWNER, stopped).unwrap();
+    let mut blocked = stage_input(
+        &second_candidate_id,
+        4,
+        &second_manifest,
+        LoomStageVerdict::Blocked,
+    );
+    blocked.reason = "the owner has to decide what to do next".into();
+    finish_run(&database, &independent_run);
+    let blocked_run = dispatched_review_run(&mut database, &camp_id, &second_candidate_id);
+    let recorded = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        INDEPENDENT_REVIEWER_AGENT,
+        &blocked_run,
+        "command_stage_blocked_after_pass",
+        blocked,
+    )
+    .unwrap();
+    assert_eq!(
+        recorded.task_status,
+        super::LoomTaskStatus::Blocked,
+        "assertion the_fresh_grant_parks_the_task"
+    );
+
+    // Everything that was delivered is still there: both versions, their chain, their content, and
+    // the refusal that asked for the rework. A rejection is a stage verdict, not an erasure.
+    let stored: Vec<(String, String, String, Option<String>)> = {
+        let mut statement = database
+            .connection()
+            .prepare(
+                "SELECT candidate_id, content_hash, acceptance_status, previous_candidate_id
+                 FROM loom_candidate ORDER BY created_at, rowid",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        stored,
+        vec![
+            (
+                first_candidate_id.clone(),
+                "sha256:first-version".to_string(),
+                "PENDING".to_string(),
+                None
+            ),
+            (
+                second_candidate_id.clone(),
+                "sha256:second-version".to_string(),
+                "PENDING".to_string(),
+                Some(first_candidate_id.clone())
+            ),
+        ],
+        "assertion no_rejection_erases_a_delivered_candidate_its_content_or_its_chain"
+    );
+    let verdicts: Vec<(String, String)> = {
+        let mut statement = database
+            .connection()
+            .prepare(
+                "SELECT candidate_id, verdict FROM loom_stage_review ORDER BY reviewed_at, rowid",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        verdicts,
+        vec![
+            (first_candidate_id.clone(), "REQUEST_CHANGES".to_string()),
+            (second_candidate_id.clone(), "PASS".to_string()),
+            (second_candidate_id.clone(), "BLOCKED".to_string()),
+        ],
+        "assertion every_stage_verdict_is_kept_alongside_the_work_it_judged"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_claim"),
+            count(
+                &database,
+                "SELECT COUNT(*) FROM loom_claim WHERE released_at IS NULL"
+            ),
+            count(&database, "SELECT COUNT(*) FROM loom_review"),
+        ),
+        (2, 0, 0),
+        "assertion claims_are_released_never_deleted_and_no_rejection_forges_the_owners_review"
+    );
+}
+
+/// Source boundary, aligned with Mikka's `assertFrozenDispatch`: when the platform dispatched the
+/// review of a Candidate, the Delivery's claimed Run is the only observer the authorization asked.
+/// An unclaimed Delivery asked nobody, and a different live Run of the same assigned agent is not
+/// that observer — while the dispatched Run answers with the verdict bound to its own identity.
+#[test]
+fn stage_review_answers_only_the_run_its_review_was_dispatched_to() {
+    let mut database = fixture();
+    let (mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "control review source",
+        "command_approve_review_source",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    // A second live Run of the assigned reviewer: live, of the right agent, and still not the Run
+    // the review was handed to.
+    seed_run(&database, &camp_id, REVIEWER_AGENT, REVIEWER_RUN);
+
+    // The producer delivers through the real dispatch/claim path.
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_approved_execution_is_reserved"
+    );
+    let producer_run = claim_mission_lane(&mut database, &camp_id, 1)
+        .pop()
+        .expect("the reserved delivery must materialise one run");
+    claim_the_run(&mut database, &camp_id, &producer_run);
+    // The delivery lane already claimed the Task for this very Run, so the delivery continues on
+    // that claim instead of asking for a second one.
+    let (claim_id, fence_generation) = open_claim_of(&database, &plan_id, "task_a", &producer_run);
+    let candidate = candidate_record(
+        &mut database,
+        LoomCandidateRecordInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: producer_run.clone(),
+            claim_id,
+            fence_generation,
+            command_id: "command_candidate_source".into(),
+            content_hash: "sha256:dispatched-review".into(),
+            evidence_ids: vec![],
+            acceptance_criteria_version: "ac-v1".into(),
+            previous_candidate_id: None,
+        },
+    )
+    .unwrap();
+    let candidate_id = candidate.candidate_id;
+    let manifest = control::candidate_manifest_hash(database.connection(), &candidate_id).unwrap();
+
+    // The platform now dispatches the review itself, while the reviewer Agent is still busy with an
+    // unrelated Run of its own: the review Delivery waits, and that unrelated Run is not the
+    // observer the authorization asked.
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_delivered_task_is_handed_to_its_reviewer"
+    );
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        REVIEWER_RUN,
+        "command_stage_unclaimed_review",
+        stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_STAGE_REVIEW_SOURCE_UNBOUND",
+        "assertion a_review_delivery_nobody_claimed_cannot_be_answered"
+    );
+
+    // That unrelated Run ends, the review Delivery materialises its own Run, and that Run answers.
+    finish_run(&database, REVIEWER_RUN);
+    let reviewer_run = claim_mission_lane(&mut database, &camp_id, 1)
+        .pop()
+        .expect("the review delivery must materialise one run");
+    claim_the_run(&mut database, &camp_id, &reviewer_run);
+    let recorded = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        &reviewer_run,
+        "command_stage_dispatched_review",
+        stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            recorded.review.reviewer_agent_run_id.as_str(),
+            recorded.review.task_id.as_str(),
+            recorded.review.candidate_id.as_str(),
+            recorded.review.verdict,
+        ),
+        (
+            reviewer_run.as_str(),
+            "task_a",
+            candidate_id.as_str(),
+            LoomStageVerdict::Pass,
+        ),
+        "assertion the_dispatched_run_answers_and_the_verdict_names_it"
+    );
+    assert_eq!(
+        (
+            task_state(&database, &mission_id, "task_a"),
+            acceptance_status(&database, &candidate_id),
+            count(&database, "SELECT COUNT(*) FROM loom_review"),
+        ),
+        ("IN_REVIEW".to_string(), "PENDING".to_string(), 0),
+        "assertion a_dispatched_pass_still_waits_for_the_owners_acceptance"
+    );
+
+    // The dispatched reviewer finishes after writing its verdict, as a real review Run does.
+    finish_run(&database, &reviewer_run);
+
+    // A later Run of the same Agent cannot stand in for the Run the dispatch named either: the new
+    // grant dispatches the review again, that Delivery's Run ends without a verdict, and the Run
+    // that starts in the same session afterwards is not the observer that was asked.
+    let mut reapproved = policy_input(
+        &mission_id,
+        "command_approve_second_review_grant",
+        REVIEWER_AGENT,
+    );
+    reapproved.expected_revision = 1;
+    control::configure(&mut database, OWNER, reapproved).unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_new_grant_dispatches_the_review_again"
+    );
+    let replaced_run = claim_mission_lane(&mut database, &camp_id, 1)
+        .pop()
+        .expect("the second review delivery must materialise one run");
+    claim_the_run(&mut database, &camp_id, &replaced_run);
+    finish_run(&database, &replaced_run);
+    seed_run(
+        &database,
+        &camp_id,
+        REVIEWER_AGENT,
+        "run_reviewer_replacement",
+    );
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        "run_reviewer_replacement",
+        "command_stage_replacement_reviewer",
+        stage_input(
+            &candidate_id,
+            2,
+            &manifest,
+            LoomStageVerdict::RequestChanges,
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_STAGE_REVIEW_SOURCE_UNBOUND",
+        "assertion a_later_run_of_the_same_agent_cannot_replace_the_dispatched_observer"
+    );
+    assert_eq!(
+        count(&database, "SELECT COUNT(*) FROM loom_stage_review"),
+        1,
+        "assertion no_replacement_observer_writes_a_verdict"
+    );
+}
+
+/// Source boundary, the strict direction: a reviewer assignment is a role, not a request. The Run of
+/// the assigned reviewer that is busy with another Task of the same Plan, and a live Run nobody asked
+/// for anything at all, both leave the Candidate unjudged: the Host queues every independent stage, so
+/// a missing ledger row is nobody's request and is not a human/Lead request either. Only the Run that
+/// claimed the platform's REVIEW Delivery may answer, and its pass still waits for the Owner.
+#[test]
+fn stage_review_answers_no_assignment_and_no_absent_request() {
+    let mut database = fixture();
+    let mission_id = create_mission(&mut database, "control review request");
+    plan_import(&mut database, plan_input(&mission_id)).unwrap();
+    let plan_id: String = database
+        .connection()
+        .query_row(
+            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+            [&mission_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let camp_id = camp_of(&database, &mission_id);
+    // A Task of this Plan that the assigned reviewer is really executing. It is outside the Owner's
+    // automation scope, which is exactly why the scheduler never hands it out: the reviewer earned
+    // this claim as an executor, not as a reviewer.
+    database
+        .connection()
+        .execute(
+            "INSERT INTO loom_task(task_id,plan_id,title,description,assignee_agent_id,status,
+                                   acceptance_criteria_json,created_at,updated_at,revision)
+             SELECT 'task_c',plan_id,'Task C','A task the reviewer executes',?1,'READY',
+                    acceptance_criteria_json,created_at,updated_at,revision
+             FROM loom_task WHERE plan_id=?2 AND task_id='task_a'",
+            params![REVIEWER_AGENT, &plan_id],
+        )
+        .unwrap();
+    seed_run(&database, &camp_id, PRODUCER_AGENT, PRODUCER_RUN);
+    seed_run(&database, &camp_id, REVIEWER_AGENT, "run_busy_reviewer");
+    control::configure(
+        &mut database,
+        OWNER,
+        policy_input(
+            &mission_id,
+            "command_approve_review_request",
+            REVIEWER_AGENT,
+        ),
+    )
+    .unwrap();
+    claim_acquire(
+        &mut database,
+        LoomClaimAcquireInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_c".into(),
+            agent_run_id: "run_busy_reviewer".into(),
+            claimant_agent_id: Some(REVIEWER_AGENT.into()),
+            command_id: "command_claim_other_task".into(),
+            lease_seconds: None,
+        },
+    )
+    .unwrap();
+    let (candidate_id, manifest) = submitted_candidate(&mut database, &mission_id, PRODUCER_RUN);
+
+    // The reviewer's Run is executing another Task of this Plan. Nobody asked it to review this
+    // Candidate, so the verdict it would like to write is not an observation the Owner's grant
+    // appointed — the assignment is not a request.
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        "run_busy_reviewer",
+        "command_stage_busy_reviewer",
+        stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_STAGE_REVIEW_SOURCE_UNBOUND",
+        "assertion a_run_executing_another_task_was_never_asked_to_review"
+    );
+
+    // A live Run nobody asked for anything is refused the same way: there is no request to answer.
+    finish_run(&database, "run_busy_reviewer");
+    seed_run(&database, &camp_id, REVIEWER_AGENT, "run_unasked_reviewer");
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        "run_unasked_reviewer",
+        "command_stage_unasked_reviewer",
+        stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_STAGE_REVIEW_SOURCE_UNBOUND",
+        "assertion a_live_run_nobody_asked_cannot_volunteer_a_verdict"
+    );
+    assert_eq!(
+        (
+            task_state(&database, &mission_id, "task_a"),
+            acceptance_status(&database, &candidate_id),
+            count(&database, "SELECT COUNT(*) FROM loom_stage_review"),
+            count(&database, "SELECT COUNT(*) FROM loom_review"),
+        ),
+        ("IN_REVIEW".to_string(), "PENDING".to_string(), 0, 0),
+        "assertion neither_unrequested_verdict_writes_a_stage_or_an_owner_decision"
+    );
+
+    // The platform's own request is the only source: its Delivery goes to the assigned reviewer, the
+    // Run that claimed it writes the verdict, and the Owner still decides.
+    finish_run(&database, "run_unasked_reviewer");
+    let reviewer_run = dispatched_review_run(&mut database, &camp_id, &candidate_id);
+    let recorded = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        &reviewer_run,
+        "command_stage_requested_review",
+        stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            recorded.review.reviewer_agent_run_id.as_str(),
+            recorded.review.policy_revision,
+            recorded.task_status,
+            acceptance_status(&database, &candidate_id),
+            count(&database, "SELECT COUNT(*) FROM loom_review"),
+        ),
+        (
+            reviewer_run.as_str(),
+            1,
+            super::LoomTaskStatus::InReview,
+            "PENDING".to_string(),
+            0,
+        ),
+        "assertion the_dispatched_review_is_the_only_source_and_the_owner_still_decides"
+    );
+}
+
+/// Grant boundary: the source binding is the *standing* authorization's dispatch, not merely the
+/// revision number a caller quotes. A Run the platform asked under revision 1 cannot answer under a
+/// revision 2 the Owner approved later, even before revision 2 has dispatched anything: the old
+/// grant is gone, and re-labeling the old Run does not make the new grant ask it.
+#[test]
+fn stage_review_of_a_reapproved_grant_needs_its_own_review_dispatch() {
+    let mut database = fixture();
+    let (mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "control review grant",
+        "command_approve_review_grant",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_approved_execution_is_reserved"
+    );
+    let producer_run = claim_mission_lane(&mut database, &camp_id, 1)
+        .pop()
+        .expect("the reserved delivery must materialise one run");
+    claim_the_run(&mut database, &camp_id, &producer_run);
+    let (claim_id, fence_generation) = open_claim_of(&database, &plan_id, "task_a", &producer_run);
+    let candidate = candidate_record(
+        &mut database,
+        LoomCandidateRecordInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: producer_run.clone(),
+            claim_id,
+            fence_generation,
+            command_id: "command_candidate_review_grant".into(),
+            content_hash: "sha256:reapproved-grant".into(),
+            evidence_ids: vec![],
+            acceptance_criteria_version: "ac-v1".into(),
+            previous_candidate_id: None,
+        },
+    )
+    .unwrap();
+    let candidate_id = candidate.candidate_id;
+    let manifest = control::candidate_manifest_hash(database.connection(), &candidate_id).unwrap();
+
+    // Revision 1 dispatches the review, and its Run claims the Delivery.
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_first_grant_dispatches_the_review"
+    );
+    let review_run = claim_mission_lane(&mut database, &camp_id, 1)
+        .pop()
+        .expect("the review delivery must materialise one run");
+    claim_the_run(&mut database, &camp_id, &review_run);
+
+    // The Owner replaces the grant while that Run is still working. Nothing has been dispatched
+    // under revision 2 yet, so the old Run quoting revision 2 is exactly the laundering case.
+    let mut reapproved = policy_input(
+        &mission_id,
+        "command_approve_review_grant_again",
+        REVIEWER_AGENT,
+    );
+    reapproved.expected_revision = 1;
+    let approved = control::configure(&mut database, OWNER, reapproved).unwrap();
+    assert_eq!(
+        approved
+            .policy
+            .as_ref()
+            .map(|policy| policy.authorization_revision),
+        Some(2),
+        "assertion the_reapproval_is_the_standing_grant"
+    );
+    assert_eq!(
+        count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+        2,
+        "assertion the_new_grant_has_dispatched_no_review_yet"
+    );
+
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        &review_run,
+        "command_stage_old_dispatch_new_grant",
+        stage_input(&candidate_id, 2, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_STAGE_REVIEW_SOURCE_UNBOUND",
+        "assertion a_run_the_replaced_grant_asked_cannot_answer_the_new_grant"
+    );
+    // The old revision is just as stale in the other direction: it is no longer the grant.
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        &review_run,
+        "command_stage_old_dispatch_old_grant",
+        stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_CONTROL_REVISION_CONFLICT",
+        "assertion the_replaced_grant_cannot_be_quoted_back_either"
+    );
+    let ledger: Vec<(String, i64, Option<String>)> = {
+        let mut statement = database
+            .connection()
+            .prepare(
+                "SELECT dispatch.kind, dispatch.policy_revision, delivery.claimed_agent_run_id
+                 FROM loom_control_dispatch dispatch
+                 LEFT JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+                 WHERE dispatch.task_id='task_a'
+                 ORDER BY dispatch.created_at, dispatch.dispatch_id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        ledger,
+        vec![
+            ("EXECUTE".to_string(), 1, Some(producer_run.clone())),
+            ("REVIEW".to_string(), 1, Some(review_run.clone())),
+        ],
+        "assertion the_only_dispatched_review_belongs_to_the_replaced_grant"
+    );
+    assert_eq!(
+        count(&database, "SELECT COUNT(*) FROM loom_stage_review"),
+        0,
+        "assertion the_laundered_grant_writes_no_verdict"
+    );
+}
+
+/// Convergence boundary: a review the platform already asked for and nobody answered must never be a
+/// dead end. When the Owner replaces the grant while that request is still unanswered, the request becomes
+/// unanswerable — a verdict has to be written under the standing revision, and the request's own
+/// binding names the replaced one — so the standing grant has to be able to ask somebody else. The
+/// dead request is neither erased nor counted as a verdict: the Candidate keeps its history, stays
+/// `PENDING`, and no Owner review is written by the new verdict.
+#[test]
+fn stage_review_a_replaced_grant_can_ask_again_after_its_request_went_unanswered() {
+    let mut database = fixture();
+    configure_observer_runtime(&database);
+    let (mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "control review superseded request",
+        "command_approve_review_superseded",
+        &[PRODUCER_AGENT, REVIEWER_AGENT, INDEPENDENT_REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+
+    // The producer delivers through the real dispatch/claim path, then the platform asks the
+    // assigned reviewer and that Delivery materialises a Run.
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_approved_execution_is_reserved"
+    );
+    let producer_run = claim_mission_lane(&mut database, &camp_id, 1)
+        .pop()
+        .expect("the reserved delivery must materialise one run");
+    claim_the_run(&mut database, &camp_id, &producer_run);
+    let (claim_id, fence_generation) = open_claim_of(&database, &plan_id, "task_a", &producer_run);
+    let candidate = candidate_record(
+        &mut database,
+        LoomCandidateRecordInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: producer_run.clone(),
+            claim_id,
+            fence_generation,
+            command_id: "command_candidate_superseded_request".into(),
+            content_hash: "sha256:superseded-request".into(),
+            evidence_ids: vec![],
+            acceptance_criteria_version: "ac-v1".into(),
+            previous_candidate_id: None,
+        },
+    )
+    .unwrap();
+    let candidate_id = candidate.candidate_id;
+    let manifest = control::candidate_manifest_hash(database.connection(), &candidate_id).unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_delivered_task_is_handed_to_its_reviewer"
+    );
+    let unanswered_run = claim_mission_lane(&mut database, &camp_id, 1)
+        .pop()
+        .expect("the review delivery must materialise one run");
+    claim_the_run(&mut database, &camp_id, &unanswered_run);
+    assert_eq!(
+        review_run_of(&database, &candidate_id).as_deref(),
+        Some(unanswered_run.as_str()),
+        "assertion the_first_grant_asked_the_run_that_claimed_its_review"
+    );
+
+    // The Owner replaces the grant while the request is still unanswered: a new reviewer is named.
+    let mut reapproved = policy_input(
+        &mission_id,
+        "command_approve_review_superseded_again",
+        INDEPENDENT_REVIEWER_AGENT,
+    );
+    reapproved.expected_revision = 1;
+    let approved = control::configure(&mut database, OWNER, reapproved).unwrap();
+    assert_eq!(
+        approved
+            .policy
+            .as_ref()
+            .map(|policy| policy.authorization_revision),
+        Some(2),
+        "assertion the_reapproval_is_the_standing_grant"
+    );
+
+    // The replaced grant's Run is no longer the approved reviewer, so it cannot answer under the
+    // standing grant — and the refusal writes no verdict.
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        &unanswered_run,
+        "command_stage_unanswered_request_new_grant",
+        stage_input(&candidate_id, 2, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_CONTROL_REVIEWER_INVALID",
+        "assertion a_run_asked_by_the_replaced_grant_cannot_answer_the_standing_one"
+    );
+    assert_eq!(
+        count(&database, "SELECT COUNT(*) FROM loom_stage_review"),
+        0,
+        "assertion the_unanswered_request_writes_no_verdict"
+    );
+
+    // The dead request does not park the Candidate: the standing grant asks the Agent it names, and
+    // that Run answers under its own authorization.
+    let observer_run = dispatched_review_run(&mut database, &camp_id, &candidate_id);
+    assert_eq!(
+        run_agent(&database, &observer_run),
+        INDEPENDENT_REVIEWER_AGENT,
+        "assertion the_standing_grant_asked_the_observer_it_names"
+    );
+    let recorded = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        INDEPENDENT_REVIEWER_AGENT,
+        &observer_run,
+        "command_stage_unanswered_request_replacement",
+        stage_input(&candidate_id, 2, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            recorded.review.policy_revision,
+            recorded.review.reviewer_agent_run_id.as_str(),
+            recorded.task_status,
+        ),
+        (2, observer_run.as_str(), super::LoomTaskStatus::InReview),
+        "assertion the_replacement_verdict_binds_the_standing_grant_and_its_run"
+    );
+    assert_eq!(
+        (
+            acceptance_status(&database, &candidate_id),
+            count(&database, "SELECT COUNT(*) FROM loom_review"),
+            count(&database, "SELECT COUNT(*) FROM loom_stage_review"),
+        ),
+        ("PENDING".to_string(), 0, 1),
+        "assertion the_replacement_pass_leaves_the_delivery_and_the_owner_decision_alone"
+    );
+
+    // Both requests stay in the ledger: the unanswered one is history, not something to erase.
+    let ledger: Vec<(String, i64, Option<String>)> = {
+        let mut statement = database
+            .connection()
+            .prepare(
+                "SELECT dispatch.kind, dispatch.policy_revision, delivery.claimed_agent_run_id
+                 FROM loom_control_dispatch dispatch
+                 LEFT JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+                 WHERE dispatch.task_id='task_a'
+                 ORDER BY dispatch.created_at, dispatch.dispatch_id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        ledger,
+        vec![
+            ("EXECUTE".to_string(), 1, Some(producer_run.clone())),
+            ("REVIEW".to_string(), 1, Some(unanswered_run.clone())),
+            ("REVIEW".to_string(), 2, Some(observer_run.clone())),
+        ],
+        "assertion the_unanswered_request_is_kept_beside_the_replacement_it_enabled"
+    );
+}
+
+/// Dispatch boundary, ported from Mikka `lib/factory/automatic-dispatch.ts`: the automatic dispatch
+/// never chooses the role that judges a delivery. Who reviews is the Owner's assignment, and the
+/// request is written for exactly that Agent; the independence of the reviewer's session is
+/// `lib/factory/check-independence.ts`'s rule, applied where a reviewing Run exists. So an
+/// assignment naming an Agent whose session already delivered the Task is honoured as a role and
+/// then refused by the verdict fence, and the convergence path is a new authorization naming an
+/// outside Agent — never a forged verdict and never a silently rewritten assignment. Nothing
+/// delivered is erased and the Owner still decides.
+#[test]
+fn stage_review_independence_is_judged_at_the_verdict_not_by_the_assignment() {
+    let mut database = fixture();
+    configure_observer_runtime(&database);
+    let mission_id = create_mission_with_members(
+        &mut database,
+        "control review dispatch fence",
+        &[PRODUCER_AGENT, REVIEWER_AGENT, INDEPENDENT_REVIEWER_AGENT],
+    );
+    plan_import(&mut database, plan_input(&mission_id)).unwrap();
+    let plan_id: String = database
+        .connection()
+        .query_row(
+            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+            [&mission_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let camp_id = camp_of(&database, &mission_id);
+    // The reviewer's own session delivers the first version of the Task; the other Agent reviews it
+    // and asks for a rewrite.
+    seed_run(&database, &camp_id, REVIEWER_AGENT, "run_reviewer_delivery");
+    finish_run(&database, "run_reviewer_delivery");
+    control::configure(
+        &mut database,
+        OWNER,
+        policy_input(
+            &mission_id,
+            "command_approve_first_review_observer",
+            PRODUCER_AGENT,
+        ),
+    )
+    .unwrap();
+    task_release(
+        &mut database,
+        LoomTaskReleaseInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_a".into(),
+        },
+    )
+    .unwrap();
+    let first_claim = claim_acquire(
+        &mut database,
+        LoomClaimAcquireInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: "run_reviewer_delivery".into(),
+            claimant_agent_id: Some(REVIEWER_AGENT.into()),
+            command_id: "command_claim_first_version_dispatch_fence".into(),
+            lease_seconds: None,
+        },
+    )
+    .unwrap();
+    let first = candidate_record(
+        &mut database,
+        LoomCandidateRecordInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: "run_reviewer_delivery".into(),
+            claim_id: first_claim.claim_id,
+            fence_generation: first_claim.fence_generation,
+            command_id: "command_candidate_first_version_dispatch_fence".into(),
+            content_hash: "sha256:dispatch-fence-first".into(),
+            evidence_ids: vec![],
+            acceptance_criteria_version: "ac-v1".into(),
+            previous_candidate_id: None,
+        },
+    )
+    .unwrap();
+    let first_candidate_id = first.candidate_id;
+    let first_manifest =
+        control::candidate_manifest_hash(database.connection(), &first_candidate_id).unwrap();
+    let first_review_run = dispatched_review_run(&mut database, &camp_id, &first_candidate_id);
+    assert_eq!(
+        run_agent(&database, &first_review_run),
+        PRODUCER_AGENT,
+        "assertion the_first_grant_asked_the_agent_that_did_not_deliver_it"
+    );
+    let mut request_changes = stage_input(
+        &first_candidate_id,
+        1,
+        &first_manifest,
+        LoomStageVerdict::RequestChanges,
+    );
+    request_changes.reason = "the first version needs a rewrite".into();
+    request_changes.criteria_results[1].satisfied = false;
+    control::stage_review_record(
+        &mut database,
+        &mission_id,
+        PRODUCER_AGENT,
+        &first_review_run,
+        "command_stage_first_version_dispatch_fence",
+        request_changes,
+    )
+    .unwrap();
+    finish_run(&database, &first_review_run);
+
+    // A new approval names the Agent whose session delivered the first version as the reviewer, and
+    // the rework is delivered by the other Agent: the Task now has a Candidate nobody has reviewed
+    // and an assignment that could never answer it.
+    let mut second_grant = policy_input(
+        &mission_id,
+        "command_approve_shared_session_reviewer",
+        REVIEWER_AGENT,
+    );
+    second_grant.expected_revision = 1;
+    control::configure(&mut database, OWNER, second_grant).unwrap();
+    seed_run(&database, &camp_id, PRODUCER_AGENT, PRODUCER_RUN);
+    let rework_claim = claim_acquire(
+        &mut database,
+        LoomClaimAcquireInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: PRODUCER_RUN.into(),
+            claimant_agent_id: Some(PRODUCER_AGENT.into()),
+            command_id: "command_claim_dispatch_fence_rework".into(),
+            lease_seconds: None,
+        },
+    )
+    .unwrap();
+    let second = candidate_record(
+        &mut database,
+        LoomCandidateRecordInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: PRODUCER_RUN.into(),
+            claim_id: rework_claim.claim_id,
+            fence_generation: rework_claim.fence_generation,
+            command_id: "command_candidate_dispatch_fence_rework".into(),
+            content_hash: "sha256:dispatch-fence-second".into(),
+            evidence_ids: vec![],
+            acceptance_criteria_version: "ac-v1".into(),
+            previous_candidate_id: Some(first_candidate_id.clone()),
+        },
+    )
+    .unwrap();
+    let second_candidate_id = second.candidate_id;
+    let second_manifest =
+        control::candidate_manifest_hash(database.connection(), &second_candidate_id).unwrap();
+
+    // An assignment is a role, not an independence judgement: the scheduler writes the request for
+    // the Agent the Owner named and the delivery lane claims it, exactly as upstream queues every
+    // stage for its assigned recipient and leaves the check's independence to `check-independence`.
+    let shared_review_run = dispatched_review_run(&mut database, &camp_id, &second_candidate_id);
+    assert_eq!(
+        run_agent(&database, &shared_review_run),
+        REVIEWER_AGENT,
+        "assertion the_request_goes_to_the_agent_the_owner_named"
+    );
+    // The verdict from that session is refused by the independence fence itself, which is the only
+    // place able to judge it: by then a reviewing Run exists and its session can be compared.
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        &shared_review_run,
+        "command_stage_shared_session_reviewer",
+        stage_input(&second_candidate_id, 2, &second_manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_STAGE_REVIEWER_SESSION_SHARED",
+        "assertion the_independence_fence_refuses_the_shared_session_verdict"
+    );
+    // The refusal fabricates nothing: no verdict is written, the Candidate stays the Owner's to
+    // accept, and the unanswered request stays in the ledger under the grant that wrote it.
+    assert_eq!(
+        (
+            acceptance_status(&database, &second_candidate_id),
+            count(&database, "SELECT COUNT(*) FROM loom_stage_review"),
+            count(&database, "SELECT COUNT(*) FROM loom_review"),
+        ),
+        ("PENDING".to_string(), 1, 0),
+        "assertion the_refused_verdict_writes_no_verdict_and_no_user_acceptance"
+    );
+    // While that grant stands the Task waits, and a second pass must not write a second copy of the
+    // same request: the unanswered request keeps its own revision.
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion the_unanswered_request_is_not_handed_out_twice"
+    );
+    assert_eq!(
+        count(
+            &database,
+            &format!(
+                "SELECT COUNT(*) FROM loom_control_dispatch
+                 WHERE plan_id='{plan_id}' AND task_id='task_a' AND kind='REVIEW'
+                   AND candidate_id='{second_candidate_id}' AND policy_revision=2"
+            ),
+        ),
+        1,
+        "assertion the_unanswered_request_stays_the_single_request_of_its_grant"
+    );
+
+    // The convergence path is a new authorization, not a forged verdict: an outside Agent is a
+    // different session, so its request is an event of its own revision and the platform hands it
+    // the review, while the stale request stays history in the ledger.
+    let mut observer = policy_input(
+        &mission_id,
+        "command_approve_dispatch_fence_observer",
+        INDEPENDENT_REVIEWER_AGENT,
+    );
+    observer.expected_revision = 2;
+    control::configure(&mut database, OWNER, observer).unwrap();
+    let observer_run = dispatched_review_run(&mut database, &camp_id, &second_candidate_id);
+    assert_eq!(
+        run_agent(&database, &observer_run),
+        INDEPENDENT_REVIEWER_AGENT,
+        "assertion the_new_grant_asked_the_outside_agent"
+    );
+    let recorded = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        INDEPENDENT_REVIEWER_AGENT,
+        &observer_run,
+        "command_stage_dispatch_fence_observer",
+        stage_input(&second_candidate_id, 3, &second_manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            recorded.review.policy_revision,
+            recorded.review.candidate_id.as_str(),
+            recorded.task_status,
+            acceptance_status(&database, &second_candidate_id),
+            count(&database, "SELECT COUNT(*) FROM loom_review"),
+            count(&database, "SELECT COUNT(*) FROM loom_stage_review"),
+        ),
+        (
+            3,
+            second_candidate_id.as_str(),
+            super::LoomTaskStatus::InReview,
+            "PENDING".to_string(),
+            0,
+            2,
+        ),
+        "assertion the_outside_verdict_lands_and_the_owner_still_decides"
+    );
+}
+
+/// Native Session identity: a session is the (installation, id) pair the schema keeps unique. Two
+/// installations that both report `session-1` are separate sessions and their Runs are independent
+/// observers. When the owner of an equal id is unknown, no distinct session can be proven, so the
+/// reviewer is refused. Same installation with a different id is independent again.
+///
+/// The schema's unique native-binding index keeps the identical pair out of two conversations, so
+/// the reachable cross-conversation shapes are exactly these: equal id with two owners, equal id
+/// with one owner, and one owner with two ids. Same-conversation sharing is judged by the
+/// conversation identity itself.
+#[test]
+fn stage_review_compares_a_native_session_with_its_installation() {
+    let mut database = fixture();
+    configure_observer_runtime(&database);
+    let mission_id = create_mission_with_members(
+        &mut database,
+        "control native session",
+        &[PRODUCER_AGENT, REVIEWER_AGENT, INDEPENDENT_REVIEWER_AGENT],
+    );
+    plan_import(&mut database, plan_input(&mission_id)).unwrap();
+    let camp_id = camp_of(&database, &mission_id);
+    seed_run(&database, &camp_id, PRODUCER_AGENT, PRODUCER_RUN);
+    seed_run(
+        &database,
+        &camp_id,
+        INDEPENDENT_REVIEWER_AGENT,
+        INDEPENDENT_REVIEWER_RUN,
+    );
+    control::configure(
+        &mut database,
+        OWNER,
+        policy_input(
+            &mission_id,
+            "command_approve_native_observer",
+            INDEPENDENT_REVIEWER_AGENT,
+        ),
+    )
+    .unwrap();
+    let (candidate_id, manifest) = submitted_candidate(&mut database, &mission_id, PRODUCER_RUN);
+    set_native_session(
+        &database,
+        PRODUCER_RUN,
+        Some("installation_producer"),
+        "session-1",
+    );
+
+    // Two installations, one id string each: two Native Sessions, so a real independent verdict.
+    // The observer's Native Session belongs to its conversation, so it is set on the Run the review
+    // Delivery produced — the identity of the session, not of one process.
+    finish_run(&database, INDEPENDENT_REVIEWER_RUN);
+    let first_observer_run = dispatched_review_run(&mut database, &camp_id, &candidate_id);
+    set_native_session(
+        &database,
+        &first_observer_run,
+        Some("installation_reviewer"),
+        "session-1",
+    );
+    let recorded = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        INDEPENDENT_REVIEWER_AGENT,
+        &first_observer_run,
+        "command_stage_separate_installations",
+        stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap();
+    assert_eq!(
+        recorded.review.reviewer_agent_run_id, first_observer_run,
+        "assertion two_installations_reporting_one_id_string_are_two_sessions"
+    );
+
+    // The reviewer now reports the producer's id with no owner recorded: an equal id whose owner
+    // cannot be told apart is one session, and the new grant cannot launder it. The platform asks
+    // the review again, so the refusal is the verdict fence's own: the Run it produced reports that
+    // session.
+    let mut second_grant = policy_input(
+        &mission_id,
+        "command_approve_unowned_native_session",
+        INDEPENDENT_REVIEWER_AGENT,
+    );
+    second_grant.expected_revision = 1;
+    control::configure(&mut database, OWNER, second_grant).unwrap();
+    finish_run(&database, &first_observer_run);
+    let shared_observer_run = dispatched_review_run(&mut database, &camp_id, &candidate_id);
+    set_native_session(&database, &shared_observer_run, None, "session-1");
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        INDEPENDENT_REVIEWER_AGENT,
+        &shared_observer_run,
+        "command_stage_unowned_native_session",
+        stage_input(&candidate_id, 2, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_STAGE_REVIEWER_SESSION_SHARED",
+        "assertion an_unowned_equal_native_session_is_treated_as_the_producers"
+    );
+    // The shared session is a refusal, not a deletion: the request that was answered by nobody
+    // stays in the ledger, so the next grant has to ask again rather than reuse it.
+    assert_eq!(
+        count(
+            &database,
+            &format!(
+                "SELECT COUNT(*) FROM loom_stage_review WHERE candidate_id='{candidate_id}'"
+            ),
+        ),
+        1,
+        "assertion the_refused_verdict_leaves_the_one_recorded_verdict_alone"
+    );
+
+    // Same installation, a different session id: independent again. The refused Run's session is
+    // cleared first, so the re-asked review is not judged by that refusal's identity.
+    let mut third_grant = policy_input(
+        &mission_id,
+        "command_approve_other_native_session",
+        INDEPENDENT_REVIEWER_AGENT,
+    );
+    third_grant.expected_revision = 2;
+    control::configure(&mut database, OWNER, third_grant).unwrap();
+    finish_run(&database, &shared_observer_run);
+    database
+        .connection()
+        .execute(
+            "UPDATE conversation SET native_adapter_installation_id=NULL, native_session_id=NULL
+             WHERE id = (SELECT conversation_id FROM agent_run WHERE id=?1)",
+            [&shared_observer_run],
+        )
+        .unwrap();
+    let own_session_run = dispatched_review_run(&mut database, &camp_id, &candidate_id);
+    set_native_session(
+        &database,
+        &own_session_run,
+        Some("installation_producer"),
+        "session-2",
+    );
+    let recorded = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        INDEPENDENT_REVIEWER_AGENT,
+        &own_session_run,
+        "command_stage_other_native_session",
+        stage_input(&candidate_id, 3, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap();
+    assert_eq!(
+        recorded.review.policy_revision, 3,
+        "assertion the_same_installation_in_another_session_is_independent"
+    );
+
+    // Same conversation is the strongest shared identity of all, and it is refused even when the
+    // Native Session pair differs.
+    let mut fourth_grant = policy_input(
+        &mission_id,
+        "command_approve_same_conversation",
+        PRODUCER_AGENT,
+    );
+    fourth_grant.expected_revision = 3;
+    control::configure(&mut database, OWNER, fourth_grant).unwrap();
+    finish_run(&database, &own_session_run);
+    finish_run(&database, PRODUCER_RUN);
+    seed_run(
+        &database,
+        &camp_id,
+        PRODUCER_AGENT,
+        "run_producer_reviewing",
+    );
+    set_native_session(
+        &database,
+        "run_producer_reviewing",
+        Some("installation_producer"),
+        "session-3",
+    );
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        PRODUCER_AGENT,
+        "run_producer_reviewing",
+        "command_stage_same_conversation",
+        stage_input(&candidate_id, 4, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_CONTROL_REVIEWER_SELF",
+        "assertion one_conversation_cannot_judge_its_own_delivery"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_stage_review"),
+            acceptance_status(&database, &candidate_id),
+            count(&database, "SELECT COUNT(*) FROM loom_review"),
+        ),
+        (2, "PENDING".to_string(), 0),
+        "assertion only_the_two_independent_verdicts_land_and_the_owner_still_decides"
+    );
+}
+
+/// Source boundary, the other direction: a Run the platform asked to review one delivery cannot
+/// re-aim itself at the rework of the same Task. After its `request_changes` a new Candidate exists
+/// that nobody has dispatched yet, so a source check that only reads the *payload's* Candidate would
+/// find "no dispatch" and wave the old reviewer through. The rejection has to come from the Run's
+/// own binding, under the standing grant and under a later one, and neither refusal may write a
+/// verdict; an observer the control plane never asked is still a real human/Lead source.
+#[test]
+fn stage_review_cannot_reaim_a_run_bound_to_another_candidate() {
+    let mut database = fixture();
+    configure_observer_runtime(&database);
+    let (mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "control review re-aim",
+        "command_approve_review_reaim",
+        &[PRODUCER_AGENT, REVIEWER_AGENT, INDEPENDENT_REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+
+    // The producer's Run takes the reserved Delivery and records the first delivery.
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_approved_execution_is_reserved"
+    );
+    let producer_run = claim_mission_lane(&mut database, &camp_id, 1)
+        .pop()
+        .expect("the reserved delivery must materialise one run");
+    claim_the_run(&mut database, &camp_id, &producer_run);
+    let (claim_id, fence_generation) = open_claim_of(&database, &plan_id, "task_a", &producer_run);
+    let first = candidate_record(
+        &mut database,
+        LoomCandidateRecordInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: producer_run.clone(),
+            claim_id,
+            fence_generation,
+            command_id: "command_candidate_reaim_first".into(),
+            content_hash: "sha256:reaim-first".into(),
+            evidence_ids: vec![],
+            acceptance_criteria_version: "ac-v1".into(),
+            previous_candidate_id: None,
+        },
+    )
+    .unwrap();
+    let first_candidate_id = first.candidate_id;
+    let first_manifest =
+        control::candidate_manifest_hash(database.connection(), &first_candidate_id).unwrap();
+
+    // The platform dispatches the review of that Candidate, its Run claims the Delivery and asks
+    // for a rewrite — the one verdict this Task is allowed to carry so far.
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_first_delivery_is_handed_to_its_reviewer"
+    );
+    let reviewer_run = claim_mission_lane(&mut database, &camp_id, 1)
+        .pop()
+        .expect("the review delivery must materialise one run");
+    claim_the_run(&mut database, &camp_id, &reviewer_run);
+    let mut changes = stage_input(
+        &first_candidate_id,
+        1,
+        &first_manifest,
+        LoomStageVerdict::RequestChanges,
+    );
+    changes.reason = "the first delivery needs a rewrite".into();
+    changes.criteria_results[1].satisfied = false;
+    control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        &reviewer_run,
+        "command_stage_reaim_first",
+        changes,
+    )
+    .unwrap();
+
+    // The producer delivers the rework under the same grant: a second Candidate, chained on the
+    // first, that no REVIEW dispatch names yet.
+    let rework_claim = claim_acquire(
+        &mut database,
+        LoomClaimAcquireInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: producer_run.clone(),
+            claimant_agent_id: Some(PRODUCER_AGENT.into()),
+            command_id: "command_claim_reaim_rework".into(),
+            lease_seconds: None,
+        },
+    )
+    .unwrap();
+    let second = candidate_record(
+        &mut database,
+        LoomCandidateRecordInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: producer_run.clone(),
+            claim_id: rework_claim.claim_id,
+            fence_generation: rework_claim.fence_generation,
+            command_id: "command_candidate_reaim_second".into(),
+            content_hash: "sha256:reaim-second".into(),
+            evidence_ids: vec![],
+            acceptance_criteria_version: "ac-v1".into(),
+            previous_candidate_id: Some(first_candidate_id.clone()),
+        },
+    )
+    .unwrap();
+    let second_candidate_id = second.candidate_id;
+    let second_manifest =
+        control::candidate_manifest_hash(database.connection(), &second_candidate_id).unwrap();
+    let dispatched_for_rework: i64 = database
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM loom_control_dispatch
+             WHERE plan_id=?1 AND task_id='task_a' AND kind='REVIEW' AND candidate_id=?2",
+            params![&plan_id, &second_candidate_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        dispatched_for_rework, 0,
+        "assertion the_rework_has_no_review_dispatch_yet"
+    );
+
+    // The Run that reviewed the first delivery re-aims itself at the rework: the payload names a
+    // Candidate the ledger never dispatched, so only its own binding can refuse it.
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        &reviewer_run,
+        "command_stage_reaim_standing_grant",
+        stage_input(
+            &second_candidate_id,
+            1,
+            &second_manifest,
+            LoomStageVerdict::Pass,
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_STAGE_REVIEW_SOURCE_UNBOUND",
+        "assertion a_run_asked_to_review_the_old_delivery_cannot_judge_the_rework"
+    );
+
+    // A later approval asks nobody either: re-labelling the old Run with the new revision does not
+    // make the standing grant ask it.
+    let mut reapproved = policy_input(
+        &mission_id,
+        "command_approve_review_reaim_again",
+        REVIEWER_AGENT,
+    );
+    reapproved.expected_revision = 1;
+    control::configure(&mut database, OWNER, reapproved).unwrap();
+    let error = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        &reviewer_run,
+        "command_stage_reaim_new_grant",
+        stage_input(
+            &second_candidate_id,
+            2,
+            &second_manifest,
+            LoomStageVerdict::Pass,
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_STAGE_REVIEW_SOURCE_UNBOUND",
+        "assertion the_reapproved_grant_still_has_not_asked_that_run"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_stage_review"),
+            acceptance_status(&database, &second_candidate_id),
+            task_state(&database, &mission_id, "task_a"),
+            count(&database, "SELECT COUNT(*) FROM loom_review"),
+        ),
+        (1, "PENDING".to_string(), "IN_REVIEW".to_string(), 0),
+        "assertion neither_re-aimed_refusal_writes_a_verdict_or_the_owners_review"
+    );
+
+    // A final approval asks a different Agent, and the platform hands that Agent the review of the
+    // rework: the fence is not a blanket refusal of every Candidate, only of a verdict nobody asked
+    // for. The Run that claimed the new grant's Delivery is the observer.
+    let mut observer = policy_input(
+        &mission_id,
+        "command_approve_review_reaim_observer",
+        INDEPENDENT_REVIEWER_AGENT,
+    );
+    observer.expected_revision = 2;
+    control::configure(&mut database, OWNER, observer).unwrap();
+    finish_run(&database, &reviewer_run);
+    let observer_run = dispatched_review_run(&mut database, &camp_id, &second_candidate_id);
+    assert_eq!(
+        run_agent(&database, &observer_run),
+        INDEPENDENT_REVIEWER_AGENT,
+        "assertion the_final_grant_asked_the_named_observer"
+    );
+    let recorded = control::stage_review_record(
+        &mut database,
+        &mission_id,
+        INDEPENDENT_REVIEWER_AGENT,
+        &observer_run,
+        "command_stage_reaim_observer",
+        stage_input(
+            &second_candidate_id,
+            3,
+            &second_manifest,
+            LoomStageVerdict::Pass,
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            recorded.review.reviewer_agent_run_id.as_str(),
+            recorded.review.policy_revision,
+            recorded.task_status,
+            acceptance_status(&database, &second_candidate_id),
+            count(&database, "SELECT COUNT(*) FROM loom_review"),
+        ),
+        (
+            observer_run.as_str(),
+            3,
+            super::LoomTaskStatus::InReview,
+            "PENDING".to_string(),
+            0,
+        ),
+        "assertion a_dispatched_observer_still_leaves_the_owner_the_decision"
+    );
+}
+
 /// Dispatch boundary: the budget is spent against the whole ledger (cancelled rows included), an
 /// exhausted budget stops the event without inventing a dispatch, and the pre-execution recheck
 /// fails closed on every fact that moved.
@@ -1128,9 +3258,11 @@ fn dispatch_admission_spends_the_ledger_and_rechecks_before_running() {
     plan_import(&mut database, plan_input(&mission_id)).unwrap();
     let plan_id: String = database
         .connection()
-        .query_row("SELECT plan_id FROM loom_plan WHERE mission_id=?1", [&mission_id], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+            [&mission_id],
+            |row| row.get(0),
+        )
         .unwrap();
 
     // A Task that is ready and explicitly assigned: this is the only shape EXECUTE may take.
@@ -1206,8 +3338,12 @@ fn dispatch_admission_spends_the_ledger_and_rechecks_before_running() {
         "assertion an_unreleased_dependency_writes_no_ledger_row"
     );
     assert_eq!(
-        control::dispatch_block_reason(database.connection(), &dispatch_id, &chrono::Utc::now().to_rfc3339())
-            .unwrap(),
+        control::dispatch_block_reason(
+            database.connection(),
+            &dispatch_id,
+            &chrono::Utc::now().to_rfc3339()
+        )
+        .unwrap(),
         None,
         "assertion an_admitted_execution_passes_its_pre_run_recheck"
     );
@@ -1268,7 +3404,12 @@ fn dispatch_admission_spends_the_ledger_and_rechecks_before_running() {
                 REVIEWER_AGENT,
                 REVIEWER_RUN,
                 "command_stage_after_budget",
-                stage_input("candidate_missing", 2, &"0".repeat(64), LoomStageVerdict::Pass),
+                stage_input(
+                    "candidate_missing",
+                    2,
+                    &"0".repeat(64),
+                    LoomStageVerdict::Pass
+                ),
             )
             .unwrap_err()
         ),
@@ -1296,12 +3437,8 @@ fn dispatch_admission_spends_the_ledger_and_rechecks_before_running() {
         )
         .unwrap();
     let now = chrono::Utc::now().to_rfc3339();
-    let reserved_reason = control::dispatch_block_reason(
-        database.connection(),
-        "dispatch_reserved",
-        &now,
-    )
-    .unwrap();
+    let reserved_reason =
+        control::dispatch_block_reason(database.connection(), "dispatch_reserved", &now).unwrap();
     assert_eq!(
         reserved_reason, None,
         "assertion an_unclaimed_earlier_delivery_is_not_an_unknown_outcome"
@@ -1381,11 +3518,13 @@ fn control_facts_survive_a_database_reopen() {
     )
     .unwrap();
     let (candidate_id, manifest) = submitted_candidate(&mut database, &mission_id, PRODUCER_RUN);
+    finish_run(&database, REVIEWER_RUN);
+    let reviewer_run = dispatched_review_run(&mut database, &camp_id, &candidate_id);
     control::stage_review_record(
         &mut database,
         &mission_id,
         REVIEWER_AGENT,
-        REVIEWER_RUN,
+        &reviewer_run,
         "command_stage_persist",
         stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Pass),
     )
@@ -1395,9 +3534,15 @@ fn control_facts_survive_a_database_reopen() {
     database.close();
     let reopened = Database::open(&directory).expect("the reopened database must be admitted");
     let snapshot = control::get(&reopened, &mission_id).unwrap();
-    let policy = snapshot.policy.expect("the approval must survive the reopen");
+    let policy = snapshot
+        .policy
+        .expect("the approval must survive the reopen");
     assert_eq!(
-        (policy.revision, policy.authorization_revision, policy.approved_by.as_str()),
+        (
+            policy.revision,
+            policy.authorization_revision,
+            policy.approved_by.as_str()
+        ),
         (1, 1, OWNER),
         "assertion the_approved_policy_is_storage_not_process_state"
     );
@@ -1474,9 +3619,11 @@ fn dispatchable_plan(
     plan_import(database, plan_input(&mission_id)).unwrap();
     let plan_id: String = database
         .connection()
-        .query_row("SELECT plan_id FROM loom_plan WHERE mission_id=?1", [&mission_id], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+            [&mission_id],
+            |row| row.get(0),
+        )
         .unwrap();
     database
         .connection()

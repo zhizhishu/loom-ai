@@ -60,6 +60,11 @@ const LOOM_STAGE_REVIEW_REPLAY_CONFLICT: &str = "LOOM_STAGE_REVIEW_REPLAY_CONFLI
 const LOOM_STAGE_MANIFEST_MISMATCH: &str = "LOOM_STAGE_MANIFEST_MISMATCH";
 const LOOM_STAGE_CANDIDATE_STALE: &str = "LOOM_STAGE_CANDIDATE_STALE";
 const LOOM_STAGE_REVIEWER_RUN_INVALID: &str = "LOOM_STAGE_REVIEWER_RUN_INVALID";
+/// The reviewing Run is not an independent observer: it shares the Agent session that produced a
+/// delivery of this Task, or it continues (or is continued by) a Run that delivered one.
+const LOOM_STAGE_REVIEWER_SESSION_SHARED: &str = "LOOM_STAGE_REVIEWER_SESSION_SHARED";
+/// The verdict does not come from the Run this Candidate's review was dispatched to.
+const LOOM_STAGE_REVIEW_SOURCE_UNBOUND: &str = "LOOM_STAGE_REVIEW_SOURCE_UNBOUND";
 const LOOM_STAGE_CRITERIA_INCOMPLETE: &str = "LOOM_STAGE_CRITERIA_INCOMPLETE";
 
 const MAX_DISPATCH_BUDGET: i64 = 1000;
@@ -692,9 +697,7 @@ pub fn stage_review_record(
     if assigned.as_deref() != Some(trusted_agent_id.as_str()) {
         return Err(LoomCommandError::rejection(
             LOOM_CONTROL_REVIEWER_INVALID,
-            format!(
-                "agent {trusted_agent_id} is not the approved reviewer of task {task_id}"
-            ),
+            format!("agent {trusted_agent_id} is not the approved reviewer of task {task_id}"),
         ));
     }
 
@@ -715,7 +718,9 @@ pub fn stage_review_record(
     if assignee_agent_id == trusted_agent_id {
         return Err(LoomCommandError::rejection(
             LOOM_CONTROL_REVIEWER_SELF,
-            format!("agent {trusted_agent_id} is the assignee of task {task_id} and cannot review it"),
+            format!(
+                "agent {trusted_agent_id} is the assignee of task {task_id} and cannot review it"
+            ),
         ));
     }
 
@@ -782,7 +787,10 @@ pub fn stage_review_record(
         .with_context(|| format!("candidate {candidate_id} evidenceIds are not a list"))?;
     for result in &criteria_results {
         for evidence_id in &result.evidence_ids {
-            if !candidate_evidence_ids.iter().any(|held| held == evidence_id) {
+            if !candidate_evidence_ids
+                .iter()
+                .any(|held| held == evidence_id)
+            {
                 return Err(LoomCommandError::rejection(
                     LOOM_EVIDENCE_NOT_FOUND,
                     format!(
@@ -795,9 +803,11 @@ pub fn stage_review_record(
     }
 
     // Identity and membership of the reviewing Run, resolved from the trusted Run the Host named.
-    let run: Option<(String, String)> = transaction
+    let run: Option<ReviewingRun> = transaction
         .query_row(
-            "SELECT COALESCE(run.camp_id, turn.camp_id), conversation.agent_id
+            "SELECT COALESCE(run.camp_id, turn.camp_id), conversation.agent_id,
+                    run.conversation_id, conversation.native_adapter_installation_id,
+                    conversation.native_session_id, run.predecessor_agent_run_id
              FROM agent_run run
              JOIN conversation ON conversation.id = run.conversation_id
              LEFT JOIN camp_turn turn ON turn.id = run.camp_turn_id
@@ -805,10 +815,19 @@ pub fn stage_review_record(
                AND run.status='running'
                AND run.cancel_requested_at IS NULL",
             [&trusted_run_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok(ReviewingRun {
+                    camp_id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    conversation_id: row.get(2)?,
+                    native_installation_id: row.get(3)?,
+                    native_session_id: row.get(4)?,
+                    predecessor_run_id: row.get(5)?,
+                })
+            },
         )
         .optional()?;
-    let Some((run_camp_id, run_agent_id)) = run else {
+    let Some(run) = run else {
         return Err(LoomCommandError::rejection(
             LOOM_STAGE_REVIEWER_RUN_INVALID,
             format!(
@@ -821,10 +840,13 @@ pub fn stage_review_record(
         [&mission_id],
         |row| row.get(0),
     )?;
-    if run_agent_id != trusted_agent_id || run_camp_id != mission_camp_id {
+    let run_agent_id = run.agent_id;
+    if run_agent_id != trusted_agent_id || run.camp_id != mission_camp_id {
         return Err(LoomCommandError::rejection(
             LOOM_STAGE_REVIEWER_RUN_INVALID,
-            format!("agent run {trusted_run_id} does not belong to agent {trusted_agent_id} of this Camp"),
+            format!(
+                "agent run {trusted_run_id} does not belong to agent {trusted_agent_id} of this Camp"
+            ),
         ));
     }
     if !active_member(&transaction, &mission_camp_id, &trusted_agent_id)? {
@@ -834,23 +856,18 @@ pub fn stage_review_record(
         ));
     }
 
-    // Nobody reviews their own delivery: neither the producing Run nor the producing agent.
+    // Nobody reviews their own delivery: neither the producing Run nor the producing agent. This is
+    // decided before the session fence so the refusal names the actual violation instead of
+    // reporting a shared session between a Run and itself.
     if producer_run_id == trusted_run_id {
         return Err(LoomCommandError::rejection(
             LOOM_CONTROL_REVIEWER_SELF,
-            format!("agent run {trusted_run_id} produced candidate {candidate_id} and cannot review it"),
+            format!(
+                "agent run {trusted_run_id} produced candidate {candidate_id} and cannot review it"
+            ),
         ));
     }
-    if let Some(producer_agent_id) = agent_of_run(&transaction, &producer_run_id)? {
-        if producer_agent_id == trusted_agent_id {
-            return Err(LoomCommandError::rejection(
-                LOOM_CONTROL_REVIEWER_SELF,
-                format!(
-                    "agent {trusted_agent_id} produced candidate {candidate_id} and cannot review it"
-                ),
-            ));
-        }
-    } else {
+    let Some(producer_agent_id) = agent_of_run(&transaction, &producer_run_id)? else {
         // Fail closed: a Candidate whose producing Run can no longer be resolved cannot prove the
         // reviewer is somebody else, so the verdict is refused instead of waved through.
         return Err(LoomCommandError::rejection(
@@ -859,6 +876,85 @@ pub fn stage_review_record(
                 "candidate {candidate_id} names producer run {producer_run_id}, which cannot be resolved to an agent"
             ),
         ));
+    };
+    if producer_agent_id == trusted_agent_id {
+        return Err(LoomCommandError::rejection(
+            LOOM_CONTROL_REVIEWER_SELF,
+            format!(
+                "agent {trusted_agent_id} produced candidate {candidate_id} and cannot review it"
+            ),
+        ));
+    }
+
+    // Independent observer first: the reviewing Run has to stand outside the Agent session that
+    // produced this Task's deliveries. A verdict written from the producing session, or from a Run
+    // that continues (or is continued by) a producing Run, is the producer judging itself through a
+    // second agent identity — the upstream `factoryCheckIndependent` session/ancestry fence, with no
+    // question exemptions here because LOOM has no accepted-answer continuation. This is decided
+    // before the request: a shared session is disqualifying on its own, and the refusal names the
+    // identity violation instead of what the ledger happens to hold.
+    ensure_reviewer_session_is_independent(
+        &transaction,
+        &plan_id,
+        &task_id,
+        &producer_run_id,
+        &RunSession {
+            run_id: trusted_run_id.clone(),
+            conversation_id: run.conversation_id,
+            native_installation_id: run.native_installation_id,
+            native_session_id: run.native_session_id,
+            predecessor_run_id: run.predecessor_run_id,
+        },
+    )?;
+
+    // A verdict answers one persisted review request, and nothing else: the REVIEW dispatch of *this*
+    // Candidate, of *this* stage and of *this* standing authorization, whose Delivery this very Run
+    // claimed. The reviewer assignment is not a request — an assigned reviewer that is busy with
+    // another Task was asked nothing. A missing ledger row is not a human/Lead request either: the
+    // Host queues every independent stage, so when no dispatch exists nobody was asked, and the Run
+    // that would like to judge is not an observer the Owner's grant appointed. A dispatch written
+    // under an authorization the Owner has since replaced named a Run for a grant that no longer
+    // stands: re-labeling it with the new revision does not make the standing grant ask it.
+    match review_source(
+        &transaction,
+        &plan_id,
+        &task_id,
+        &candidate_id,
+        policy_revision,
+    )? {
+        ReviewSource::DispatchedTo(dispatched_run_id) if dispatched_run_id == trusted_run_id => {}
+        ReviewSource::DispatchedTo(dispatched_run_id) => {
+            return Err(LoomCommandError::rejection(
+                LOOM_STAGE_REVIEW_SOURCE_UNBOUND,
+                format!(
+                    "the review of candidate {candidate_id} was dispatched to agent run {dispatched_run_id}, not to {trusted_run_id}"
+                ),
+            ));
+        }
+        ReviewSource::Unclaimed => {
+            return Err(LoomCommandError::rejection(
+                LOOM_STAGE_REVIEW_SOURCE_UNBOUND,
+                format!(
+                    "the review of candidate {candidate_id} was dispatched but no agent run has claimed its delivery"
+                ),
+            ));
+        }
+        ReviewSource::SupersededAuthorization(dispatched_revision) => {
+            return Err(LoomCommandError::rejection(
+                LOOM_STAGE_REVIEW_SOURCE_UNBOUND,
+                format!(
+                    "the review of candidate {candidate_id} was dispatched under authorization revision {dispatched_revision}; the standing grant {policy_revision} has dispatched no review to agent run {trusted_run_id}"
+                ),
+            ));
+        }
+        ReviewSource::NeverRequested => {
+            return Err(LoomCommandError::rejection(
+                LOOM_STAGE_REVIEW_SOURCE_UNBOUND,
+                format!(
+                    "no review of candidate {candidate_id} was ever dispatched, so nothing asked agent run {trusted_run_id} to judge it; a verdict answers the request the control plane made, not an assignment"
+                ),
+            ));
+        }
     }
 
     // The manifest is whatever the Core can prove about the stored Candidate right now.
@@ -900,7 +996,8 @@ pub fn stage_review_record(
             ),
         ));
     }
-    if verdict == LoomStageVerdict::Pass && criteria_results.iter().any(|result| !result.satisfied) {
+    if verdict == LoomStageVerdict::Pass && criteria_results.iter().any(|result| !result.satisfied)
+    {
         return Err(LoomCommandError::rejection(
             LOOM_STAGE_CRITERIA_INCOMPLETE,
             format!("a pass of candidate {candidate_id} must satisfy every criterion"),
@@ -1078,7 +1175,9 @@ pub fn candidate_manifest_hash(connection: &Connection, candidate_id: &str) -> R
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .with_context(|| {
-                format!("candidate {candidate_id} cites artifact {artifact_id} that is not in its plan")
+                format!(
+                    "candidate {candidate_id} cites artifact {artifact_id} that is not in its plan"
+                )
             })?;
         artifacts.push((artifact_id.clone(), relative_path, sha256, size_bytes));
     }
@@ -1086,12 +1185,14 @@ pub fn candidate_manifest_hash(connection: &Connection, candidate_id: &str) -> R
     artifacts.dedup_by(|left, right| left.0 == right.0);
     let artifacts: Vec<ManifestArtifact<'_>> = artifacts
         .iter()
-        .map(|(artifact_id, relative_path, sha256, size_bytes)| ManifestArtifact {
-            artifact_id,
-            relative_path,
-            sha256,
-            size_bytes: *size_bytes,
-        })
+        .map(
+            |(artifact_id, relative_path, sha256, size_bytes)| ManifestArtifact {
+                artifact_id,
+                relative_path,
+                sha256,
+                size_bytes: *size_bytes,
+            },
+        )
         .collect();
 
     let document = CandidateManifest {
@@ -1268,7 +1369,10 @@ pub(crate) fn validate_stage_review_shape(
             if note.chars().count() > 4000 {
                 return Err(LoomCommandError::rejection(
                     LOOM_INVALID_INPUT,
-                    format!("criterion {} note is longer than 4000 characters", result.criterion_id),
+                    format!(
+                        "criterion {} note is longer than 4000 characters",
+                        result.criterion_id
+                    ),
                 ));
             }
         }
@@ -1322,7 +1426,9 @@ fn validated_reviewers(
         if !task_ids.contains(&task_id) {
             return Err(LoomCommandError::rejection(
                 LOOM_CONTROL_REVIEWER_INVALID,
-                format!("reviewer assignment names task {task_id}, which is not in the approved scope"),
+                format!(
+                    "reviewer assignment names task {task_id}, which is not in the approved scope"
+                ),
             ));
         }
         if reviewers.iter().any(|held| held.task_id == task_id) {
@@ -1344,7 +1450,10 @@ fn validated_reviewers(
             .collect();
         return Err(LoomCommandError::rejection(
             LOOM_CONTROL_REVIEWER_INVALID,
-            format!("every Task needs exactly one reviewer; missing {}", missing.join(", ")),
+            format!(
+                "every Task needs exactly one reviewer; missing {}",
+                missing.join(", ")
+            ),
         ));
     }
 
@@ -1359,7 +1468,10 @@ fn validated_reviewers(
         let Some(assignee) = assignee else {
             return Err(LoomCommandError::rejection(
                 LOOM_CONTROL_TASK_INVALID,
-                format!("task {} is not in the plan of this mission", assignment.task_id),
+                format!(
+                    "task {} is not in the plan of this mission",
+                    assignment.task_id
+                ),
             ));
         };
         if assignee.as_deref() == Some(assignment.reviewer_agent_id.as_str()) {
@@ -1388,11 +1500,7 @@ fn validated_reviewers(
 
 /// `enabled` needs a future expiry; a disabled policy may carry none. An unreadable instant is
 /// always refused, because it cannot be judged.
-fn validated_expiry(
-    expires_at: Option<&str>,
-    enabled: bool,
-    now: &str,
-) -> Result<Option<String>> {
+fn validated_expiry(expires_at: Option<&str>, enabled: bool, now: &str) -> Result<Option<String>> {
     let Some(expires_at) = expires_at.map(str::trim).filter(|value| !value.is_empty()) else {
         if enabled {
             return Err(LoomCommandError::rejection(
@@ -1452,35 +1560,277 @@ fn agent_of_run(connection: &Connection, agent_run_id: &str) -> Result<Option<St
         .optional()?)
 }
 
-fn read_policy(connection: &Connection, plan_id: &str) -> Result<Option<LoomControlPolicy>> {
-    let row: Option<(String, String, i64, i64, i64, i64, String, String, i64, i64, Option<String>, String, String, String)> =
-        connection
+/// The review request a Candidate's verdict is allowed to answer, derived only from the persisted
+/// dispatch ledger.
+#[derive(Debug, PartialEq, Eq)]
+enum ReviewSource {
+    /// The standing authorization dispatched the review of this Candidate and this Run claimed its
+    /// Delivery: the only Run that may answer.
+    DispatchedTo(String),
+    /// The standing authorization dispatched the review but no Run claimed the Delivery yet:
+    /// nobody was asked.
+    Unclaimed,
+    /// The newest review dispatch of this Candidate belongs to an authorization the Owner has since
+    /// replaced, so the standing grant has not asked any Run.
+    SupersededAuthorization(i64),
+    /// No review of this Candidate was dispatched under any authorization, so no Run was asked to
+    /// judge it. The reviewer assignment alone is a role, not a request.
+    NeverRequested,
+}
+
+/// Which Run, under which authorization, the platform bound this Candidate's review to.
+///
+/// The ledger is keyed by `(REVIEW, plan, task, candidate, authorization revision)`, so a Candidate
+/// carries at most one such dispatch per grant. Reading the newest dispatch of the Candidate is what
+/// makes a re-approved grant observable: a Run named by an older grant stays bound to that grant.
+///
+/// The request is read from the Candidate the verdict names, never from the asking Run's own wishes:
+/// a dispatch of some *other* Candidate (a previous delivery, or another Task) is not this request,
+/// and an absent row is not a request either.
+fn review_source(
+    connection: &Connection,
+    plan_id: &str,
+    task_id: &str,
+    candidate_id: &str,
+    policy_revision: i64,
+) -> Result<ReviewSource> {
+    let newest: Option<(i64, Option<String>)> = connection
+        .query_row(
+            "SELECT dispatch.policy_revision, delivery.claimed_agent_run_id
+             FROM loom_control_dispatch dispatch
+             LEFT JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+             WHERE dispatch.plan_id=?1 AND dispatch.task_id=?2 AND dispatch.kind='REVIEW'
+               AND dispatch.candidate_id=?3
+             ORDER BY dispatch.policy_revision DESC, dispatch.created_at DESC,
+                      dispatch.dispatch_id DESC
+             LIMIT 1",
+            params![plan_id, task_id, candidate_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((dispatched_revision, claimed_run_id)) = newest else {
+        return Ok(ReviewSource::NeverRequested);
+    };
+    if dispatched_revision != policy_revision {
+        return Ok(ReviewSource::SupersededAuthorization(dispatched_revision));
+    }
+    Ok(match claimed_run_id {
+        Some(run_id) => ReviewSource::DispatchedTo(run_id),
+        None => ReviewSource::Unclaimed,
+    })
+}
+
+/// The trusted Run asking to review, resolved from the Host's identity in this Camp.
+struct ReviewingRun {
+    camp_id: String,
+    agent_id: String,
+    conversation_id: String,
+    /// The installation that owns the Native Session, part of its identity.
+    native_installation_id: Option<String>,
+    native_session_id: Option<String>,
+    predecessor_run_id: Option<String>,
+}
+
+/// The Agent session one Run executes in, plus the Run it continues.
+struct RunSession {
+    run_id: String,
+    conversation_id: String,
+    native_installation_id: Option<String>,
+    native_session_id: Option<String>,
+    predecessor_run_id: Option<String>,
+}
+
+impl RunSession {
+    fn read(connection: &Connection, run_id: &str) -> Result<Option<Self>> {
+        Ok(connection
             .query_row(
-                "SELECT mission_id, plan_id, revision, authorization_revision, enabled, paused,
+                "SELECT run.id, run.conversation_id,
+                        conversation.native_adapter_installation_id,
+                        conversation.native_session_id, run.predecessor_agent_run_id
+                 FROM agent_run run
+                 JOIN conversation ON conversation.id = run.conversation_id
+                 WHERE run.id=?1",
+                [run_id],
+                |row| {
+                    Ok(Self {
+                        run_id: row.get(0)?,
+                        conversation_id: row.get(1)?,
+                        native_installation_id: row.get(2)?,
+                        native_session_id: row.get(3)?,
+                        predecessor_run_id: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+}
+
+/// Whether two `(installation, id)` pairs name the same Native Session.
+///
+/// A Native Session is identified by the installation that owns it *and* its own id — the same
+/// pair the schema keeps unique. Two installations that each report `session-1` own two sessions; a
+/// matching pair is one. When either side carries no installation identity the owner cannot be
+/// told apart, so an equal id is treated as shared rather than assumed independent.
+fn native_sessions_match(
+    left_installation: Option<&str>,
+    left_session: Option<&str>,
+    right_installation: Option<&str>,
+    right_session: Option<&str>,
+) -> bool {
+    let (Some(left_id), Some(right_id)) = (left_session, right_session) else {
+        return false;
+    };
+    if left_id != right_id {
+        return false;
+    }
+    match (left_installation, right_installation) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
+}
+
+/// True when two Runs observe the world through one Agent session: the same conversation, the same
+/// Native Session, or a continuation edge in either direction.
+fn shares_agent_session(left: &RunSession, right: &RunSession) -> bool {
+    left.conversation_id == right.conversation_id
+        || native_sessions_match(
+            left.native_installation_id.as_deref(),
+            left.native_session_id.as_deref(),
+            right.native_installation_id.as_deref(),
+            right.native_session_id.as_deref(),
+        )
+        || left.predecessor_run_id.as_deref() == Some(right.run_id.as_str())
+        || right.predecessor_run_id.as_deref() == Some(left.run_id.as_str())
+}
+
+/// Every production Run of one Task: the Runs that claimed it, or that produced one of its
+/// Candidates. These are the sessions a review of this Task must stand outside of.
+fn production_run_sessions(
+    connection: &Connection,
+    plan_id: &str,
+    task_id: &str,
+) -> Result<Vec<RunSession>> {
+    let mut sessions: Vec<RunSession> = Vec::new();
+    let mut statement = connection.prepare(
+        "SELECT run.id, run.conversation_id,
+                    conversation.native_adapter_installation_id,
+                    conversation.native_session_id, run.predecessor_agent_run_id
+         FROM agent_run run
+         JOIN conversation ON conversation.id = run.conversation_id
+         WHERE run.id IN (
+             SELECT claim.agent_run_id FROM loom_claim claim
+              WHERE claim.plan_id=?1 AND claim.task_id=?2
+             UNION
+             SELECT candidate.agent_run_id FROM loom_candidate candidate
+              WHERE candidate.plan_id=?1 AND candidate.task_id=?2
+         )",
+    )?;
+    let rows = statement.query_map(params![plan_id, task_id], |row| {
+        Ok(RunSession {
+            run_id: row.get(0)?,
+            conversation_id: row.get(1)?,
+            native_installation_id: row.get(2)?,
+            native_session_id: row.get(3)?,
+            predecessor_run_id: row.get(4)?,
+        })
+    })?;
+    for row in rows {
+        sessions.push(row?);
+    }
+    Ok(sessions)
+}
+
+/// Refuse a reviewing Run that is not an independent observer of this Task's deliveries.
+///
+/// Every Run that claimed this Task or produced one of its Candidates is a production Run. The
+/// reviewer may share a session with none of them: not with the Run that produced the Candidate
+/// under review, and not with a Run that delivered an earlier version of the same Task. The
+/// reviewer may not itself be one of those Runs either — that is the same thread judging its own
+/// work through another identity. A producing Run that can no longer be resolved is judged by the
+/// caller before this fence, which fails closed on it.
+fn ensure_reviewer_session_is_independent(
+    connection: &Connection,
+    plan_id: &str,
+    task_id: &str,
+    producer_run_id: &str,
+    reviewer: &RunSession,
+) -> Result<()> {
+    let producer = RunSession::read(connection, producer_run_id)?;
+    if let Some(producer) = producer.as_ref()
+        && shares_agent_session(reviewer, producer)
+    {
+        return Err(shared_session_error(
+            "the Run that produced the Candidate under review",
+            &producer.run_id,
+        ));
+    }
+
+    for production in production_run_sessions(connection, plan_id, task_id)? {
+        if production.run_id == reviewer.run_id {
+            return Err(shared_session_error("this Task", &production.run_id));
+        }
+        if shares_agent_session(reviewer, &production) {
+            return Err(shared_session_error(
+                "an earlier delivery of this Task",
+                &production.run_id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn shared_session_error(role: &str, run_id: &str) -> anyhow::Error {
+    LoomCommandError::rejection(
+        LOOM_STAGE_REVIEWER_SESSION_SHARED,
+        format!(
+            "agent run {run_id} is not an independent observer: the reviewing Run shares its Agent session, which {role} also used"
+        ),
+    )
+}
+
+fn read_policy(connection: &Connection, plan_id: &str) -> Result<Option<LoomControlPolicy>> {
+    let row: Option<(
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+        i64,
+        i64,
+        Option<String>,
+        String,
+        String,
+        String,
+    )> = connection
+        .query_row(
+            "SELECT mission_id, plan_id, revision, authorization_revision, enabled, paused,
                         task_ids_json, reviewers_json, max_dispatches, max_reworks_per_task,
                         expires_at, approved_by, approved_at, updated_at
                  FROM loom_control_policy WHERE plan_id=?1",
-                [plan_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                        row.get(10)?,
-                        row.get(11)?,
-                        row.get(12)?,
-                        row.get(13)?,
-                    ))
-                },
-            )
-            .optional()?;
+            [plan_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                ))
+            },
+        )
+        .optional()?;
     let Some((
         mission_id,
         plan_id,
@@ -1615,21 +1965,20 @@ fn read_stage_review_by_command(
                         reviewer_agent_run_id: row.get(5)?,
                         policy_revision: row.get(6)?,
                         manifest_hash: row.get(7)?,
-                        verdict: LoomStageVerdict::parse(&verdict)
-                            .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?,
+                        verdict: LoomStageVerdict::parse(&verdict).map_err(|error| {
+                            rusqlite::Error::InvalidParameterName(error.to_string())
+                        })?,
                         reason: row.get(9)?,
-                        criteria_results: serde_json::from_str(&criteria_results_json)
-                            .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?,
+                        criteria_results: serde_json::from_str(&criteria_results_json).map_err(
+                            |error| rusqlite::Error::InvalidParameterName(error.to_string()),
+                        )?,
                         reviewed_at: row.get(11)?,
                     },
                 ))
             },
         )
         .optional()?;
-    Ok(stored.map(|(mission_id, review)| StoredStageReview {
-        review,
-        mission_id,
-    }))
+    Ok(stored.map(|(mission_id, review)| StoredStageReview { review, mission_id }))
 }
 
 fn read_dispatches(connection: &Connection, plan_id: &str) -> Result<Vec<LoomDispatch>> {

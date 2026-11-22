@@ -696,7 +696,14 @@ fn due_events(
         // An earlier attempt of this same event class that produced no matching successor fact
         // keeps the class closed. A plain wait (nothing handed to a Run yet) is not an unknown
         // outcome and writes no reason: only a started-but-unproved or failed attempt does.
-        match prior_outcome_of_class(transaction, plan_id, &event.task_id, event.kind, None)? {
+        match prior_outcome_of_class(
+            transaction,
+            plan_id,
+            &event.task_id,
+            event.kind,
+            None,
+            Some(policy.authorization_revision),
+        )? {
             PriorOutcome::Pending => {
                 // A Run that is still going proves nothing, so this class must not be handed out
                 // again. But the work that Run queued can itself become unreachable: the reservation
@@ -866,18 +873,35 @@ fn event_problem(
             if producer_agent_id == recipient {
                 return Ok(Some("loom.dispatch_recipient_is_producer"));
             }
+            // Who judges is the Owner's assignment, never a choice this scheduler makes: upstream
+            // `automatic-dispatch.ts` queues every stage for its assigned recipient and asks no
+            // session-independence question of its own. Whether the reviewer's session is an
+            // independent observer is `lib/factory/check-independence.ts`'s rule, applied where a
+            // reviewing Run actually exists (`control::stage_review_record`). Judging it here would
+            // refuse a legitimate assignment while still being unable to see a continuation edge
+            // that no Run has recorded yet.
             // An earlier review of this Candidate must have ended with a verdict before a new
             // authorization may ask for another one: a Candidate that nobody judged is not re-asked
-            // under a fresh approval.
+            // under a fresh approval. Only the *standing* authorization counts: a request written
+            // under a grant the Owner has since replaced can never be answered — a verdict must be
+            // written under the standing revision, and the request's own binding names the old one —
+            // so counting it would park the Candidate on a request nobody can satisfy.
             let unjudged_reviews: i64 = transaction.query_row(
                 "SELECT COUNT(*) FROM loom_control_dispatch dispatch
                  WHERE dispatch.plan_id=?1 AND dispatch.task_id=?2 AND dispatch.kind='REVIEW'
                    AND dispatch.candidate_id=?3
+                   AND dispatch.policy_revision=?5
                    AND dispatch.dispatch_id <> COALESCE(?4,'')
                    AND NOT EXISTS(SELECT 1 FROM loom_stage_review review
                                   WHERE review.candidate_id=dispatch.candidate_id
                                     AND review.policy_revision=dispatch.policy_revision)",
-                params![plan_id, task_id, latest_id, excluding_dispatch_id],
+                params![
+                    plan_id,
+                    task_id,
+                    latest_id,
+                    excluding_dispatch_id,
+                    authorization_revision
+                ],
                 |row| row.get(0),
             )?;
             if unjudged_reviews > 0 {
@@ -940,6 +964,7 @@ fn event_problem(
         task_id,
         kind,
         excluding_dispatch_id,
+        Some(authorization_revision),
     )? {
         PriorOutcome::Completed | PriorOutcome::NotExecuted => Ok(recipient_problem),
         PriorOutcome::Pending | PriorOutcome::Failed => Ok(Some(PREVIOUS_OUTCOME_REASON)),
@@ -948,28 +973,41 @@ fn event_problem(
 
 /// The worst outcome among the earlier dispatches of this Task/kind, or `Completed` when every one
 /// of them is either proven finished or never started.
+///
+/// `standing_authorization` only matters for `REVIEW`: a review request written under an
+/// authorization the Owner has since replaced can never be answered, because a verdict has to be
+/// written under the standing revision while the request's own binding names the old one. Treating
+/// such a request as a pending unknown outcome would keep the Candidate from ever being reviewed
+/// again, so it is not counted against the standing grant.
 fn prior_outcome_of_class(
     connection: &Connection,
     plan_id: &str,
     task_id: &str,
     kind: &str,
     excluding_dispatch_id: Option<&str>,
+    standing_authorization: Option<i64>,
 ) -> Result<PriorOutcome> {
-    let mut dispatches: Vec<String> = Vec::new();
+    let mut dispatches: Vec<(String, i64)> = Vec::new();
     {
         let mut statement = connection.prepare(
-            "SELECT dispatch_id FROM loom_control_dispatch
+            "SELECT dispatch_id, policy_revision FROM loom_control_dispatch
              WHERE plan_id=?1 AND task_id=?2 AND kind=?3
              ORDER BY created_at, dispatch_id",
         )?;
-        let rows = statement.query_map(params![plan_id, task_id, kind], |row| row.get(0))?;
+        let rows =
+            statement.query_map(params![plan_id, task_id, kind], |row| Ok((row.get(0)?, row.get(1)?)))?;
         for row in rows {
             dispatches.push(row?);
         }
     }
     let mut worst = PriorOutcome::Completed;
-    for dispatch_id in dispatches {
+    for (dispatch_id, policy_revision) in dispatches {
         if excluding_dispatch_id == Some(dispatch_id.as_str()) {
+            continue;
+        }
+        if kind == REVIEW
+            && standing_authorization.is_some_and(|standing| policy_revision != standing)
+        {
             continue;
         }
         match prior_dispatch_outcome(connection, &dispatch_id)? {
