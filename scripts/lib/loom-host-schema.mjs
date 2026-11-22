@@ -6,10 +6,11 @@ import { isAbsolute } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
 export const CURRENT_HOST_SCHEMA = 187
-export const CURRENT_HOST_MIGRATION = 237
+export const CURRENT_HOST_MIGRATION = 239
 const ARTIFACT_VERSION_MIGRATION = 235
 const LOCAL_HOOK_MIGRATION = 236
 const RECOVERY_LEDGER_MIGRATION = 237
+const DEVICE_SESSION_MIGRATION = 239
 
 export async function verifyRunningHostSchema ({ request, databasePath,
   expectedProjectionSchema = CURRENT_HOST_SCHEMA, expectedMigrationVersion = CURRENT_HOST_MIGRATION }) {
@@ -17,8 +18,9 @@ export async function verifyRunningHostSchema ({ request, databasePath,
     expectedProjectionSchema, expectedMigrationVersion, verified: false }
   try {
     assert.ok((expectedProjectionSchema === 186 && expectedMigrationVersion === 236)
-      || (expectedProjectionSchema === 187 && expectedMigrationVersion === 237),
-      'this acceptance requires a supported projection/migration pair (186/236 or 187/237)')
+      || (expectedProjectionSchema === 187 && expectedMigrationVersion === 237)
+      || (expectedProjectionSchema === 187 && expectedMigrationVersion === DEVICE_SESSION_MIGRATION),
+      'this acceptance requires a supported projection/migration pair (186/236, 187/237 or 187/239)')
     assert.ok(typeof databasePath === 'string' && isAbsolute(databasePath),
       'the isolated Host database path must be explicitly selected')
     const health = await request('health.check', {})
@@ -41,6 +43,8 @@ export async function verifyRunningHostSchema ({ request, databasePath,
       const migration = database.prepare('SELECT version FROM schema_migration WHERE version = ?').get(ARTIFACT_VERSION_MIGRATION)
       const localHook = database.prepare('SELECT version FROM schema_migration WHERE version = ?').get(LOCAL_HOOK_MIGRATION)
       const recoveryLedger = database.prepare('SELECT version FROM schema_migration WHERE version = ?').get(RECOVERY_LEDGER_MIGRATION)
+      const deviceSession = database.prepare('SELECT version FROM schema_migration WHERE version = ?').get(DEVICE_SESSION_MIGRATION)
+      evidence.deviceSessionMigrationPresent = deviceSession?.version === DEVICE_SESSION_MIGRATION
       evidence.localHookMigrationPresent = localHook?.version === LOCAL_HOOK_MIGRATION
       evidence.recoveryLedgerMigrationPresent = recoveryLedger?.version === RECOVERY_LEDGER_MIGRATION
       evidence.contractVersion = marker?.contract_version ?? null
@@ -58,6 +62,10 @@ export async function verifyRunningHostSchema ({ request, databasePath,
       if (expectedProjectionSchema === CURRENT_HOST_SCHEMA) {
         assert.equal(evidence.recoveryLedgerMigrationPresent, true,
           'the LOOM recovery ledger migration is absent')
+      }
+      if (expectedMigrationVersion >= DEVICE_SESSION_MIGRATION) {
+        assert.equal(evidence.deviceSessionMigrationPresent, true,
+          'the device session migration is absent')
       }
       evidence.verified = true
       database.exec('COMMIT')

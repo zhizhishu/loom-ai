@@ -9866,6 +9866,12 @@ impl Database {
             if !self.schema_migration_applied(237)? {
                 migration_step!("migration_237", loom::migrate_recovery_ledger(self));
             }
+            if !self.schema_migration_applied(239)? {
+                migration_step!(
+                    "migration_239",
+                    execution_nodes::migrate_device_session(self)
+                );
+            }
             if let Err(error) =
                 crate::notification::maintain_notification_episode_retention(self.connection())
             {
@@ -10810,6 +10816,12 @@ impl Database {
         }
         if !self.schema_migration_applied(237)? {
             migration_step!("migration_237", loom::migrate_recovery_ledger(self));
+        }
+        if !self.schema_migration_applied(239)? {
+            migration_step!(
+                "migration_239",
+                execution_nodes::migrate_device_session(self)
+            );
         }
         if let Err(error) =
             crate::notification::maintain_notification_episode_retention(self.connection())
@@ -42924,7 +42936,7 @@ mod tests {
                 "current",
                 CURRENT_DATA_CONTRACT_VERSION,
                 CURRENT_PROJECTION_SCHEMA_VERSION,
-                237,
+                239,
             ),
             (
                 "v1.72/schema 152 before compact operations",

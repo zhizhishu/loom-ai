@@ -4524,13 +4524,14 @@ fn a_remote_recipient_is_judged_by_its_node_and_recovers_when_the_node_heartbeat
         "assertion the_stale_node_writes_one_presence_fact"
     );
 
-    // A fresh heartbeat is presence; the Node reporting no usable installation of the selected
-    // harness is the harness step.
+    // An open session is presence, whatever time has passed; the Node reporting no usable
+    // installation of the selected harness is the harness step.
     let fresh = chrono::Utc::now().to_rfc3339();
     database
         .connection()
         .execute(
-            "UPDATE execution_node SET last_heartbeat=?1 WHERE node_id='node_remote'",
+            "UPDATE execution_node SET session_opened_at=?1, session_closed_at=NULL,
+                session_socket_id='fixture-socket' WHERE node_id='node_remote'",
             [&fresh],
         )
         .unwrap();
@@ -5128,13 +5129,14 @@ fn an_unreachable_remote_node_outranks_its_missing_harness() {
         "assertion only_the_presence_fact_is_recorded"
     );
 
-    // A fresh heartbeat with the same missing CLI is a harness problem, because the device is now
+    // An open session with the same missing CLI is a harness problem, because the device is now
     // reachable and only its harness is missing.
     let fresh = chrono::Utc::now().to_rfc3339();
     database
         .connection()
         .execute(
-            "UPDATE execution_node SET last_heartbeat=?1 WHERE node_id='node_remote'",
+            "UPDATE execution_node SET session_opened_at=?1, session_closed_at=NULL,
+                session_socket_id='fixture-socket' WHERE node_id='node_remote'",
             [&fresh],
         )
         .unwrap();

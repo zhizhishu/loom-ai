@@ -1292,23 +1292,26 @@ fn device_failure_reason(connection: &Connection, device: &Device) -> Result<Opt
             node_id,
             adapter_kind,
         } => {
-            // Presence: the Node is paired, still trusted, and heartbeating inside the window Core
-            // uses for every other remote decision.
-            let node: Option<(String, Option<String>, Option<String>)> = connection
+            // Presence: the Node is paired, still trusted, and its own socket opened a session
+            // it has not closed. A column read, never a heartbeat window (decision
+            // 2026-11-17-2215). `last_heartbeat` is display-only and decides nothing here.
+            let node: Option<(String, Option<String>, Option<String>, Option<String>)> = connection
                 .query_row(
-                    "SELECT role,last_heartbeat,revoked_at FROM execution_node WHERE node_id=?1",
+                    "SELECT role,session_opened_at,session_closed_at,revoked_at FROM execution_node WHERE node_id=?1",
                     [node_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()?;
-            let Some((role, last_heartbeat, revoked_at)) = node else {
+            let Some((role, session_opened_at, session_closed_at, revoked_at)) = node else {
                 return Ok(Some(RECIPIENT_OFFLINE_REASON));
             };
             if role != "remote"
                 || revoked_at.is_some()
-                || !crate::execution_node::fresh_heartbeat(
-                    last_heartbeat.as_deref(),
-                    chrono::Utc::now(),
+                || !crate::device_presence::is_device_online(
+                    &crate::device_presence::device_session_state(
+                        session_opened_at.as_deref(),
+                        session_closed_at.as_deref(),
+                    ),
                 )
             {
                 return Ok(Some(RECIPIENT_OFFLINE_REASON));
