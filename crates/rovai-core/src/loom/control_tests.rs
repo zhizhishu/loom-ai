@@ -7116,8 +7116,16 @@ fn watchdog_records_a_long_review_epoch_inside_the_ledger_bound() {
         Some("wait".into()),
         "assertion the_long_epoch_receipt_is_actually_stored"
     );
+    let hold: Option<String> = database
+        .connection()
+        .query_row(
+            "SELECT blocked_reason FROM loom_task WHERE plan_id=?1 AND task_id=?2",
+            params![&plan_id, &long_task],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(
-        watchdog_hold(&database, &long_task).is_none(),
+        hold.is_none(),
         "assertion a_legal_long_identifier_never_holds_a_healthy_review"
     );
 }
