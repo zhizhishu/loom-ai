@@ -3,13 +3,16 @@ import type { LoomDependency } from '@contracts'
 import type { ThreadClient } from '../camp-client'
 import type { AgentProfile, ArtifactSelection, WorkBundle } from './types'
 import { FormMessage } from './Controls'
+import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from './EmptyState'
+import { Icon } from './icons'
 import { FactGraph } from './FactGraph'
 
 /** Read-only fact projection. Edges come from dependency/lineage IDs, never time. */
-export function WorkMap({ bundles, agents, client, onArtifact, onConversation, initialView = 'flow', hideViewTabs = false, focusedTaskId, onTaskSelect }: {
+export function WorkMap({ bundles, agents, client, onArtifact, onConversation, initialView = 'flow', hideViewTabs = false, focusedTaskId, onTaskSelect, onCreateWork }: {
   bundles: WorkBundle[]; agents: AgentProfile[]; client: ThreadClient
   onArtifact(value: ArtifactSelection): void; onConversation(threadId: string): void
   initialView?: 'flow' | 'assets'; hideViewTabs?: boolean; focusedTaskId?: string | null; onTaskSelect?(taskId: string | null): void
+  onCreateWork?(): void
 }) {
   const [view, setView] = useState<'flow' | 'assets'>(initialView)
   useEffect(() => setView(initialView), [initialView])
@@ -36,7 +39,7 @@ export function WorkMap({ bundles, agents, client, onArtifact, onConversation, i
     {!hideViewTabs && <nav className="ln-segment-tabs ln-map-tabs" aria-label="关系图类型"><button type="button" className={view === 'flow' ? 'is-selected' : ''} onClick={() => setView('flow')}>工作流程</button><button type="button" className={view === 'assets' ? 'is-selected' : ''} onClick={() => setView('assets')}>资产关系</button></nav>}
     <div className="ln-map-legend"><span>{taskCount} 项工作</span><span>{assetCount} 份文件</span><span>来自真实记录 · 只读</span></div>
     {error && <><FormMessage error>{error}</FormMessage><button type="button" className="ln-action" onClick={() => setReload(value => value + 1)}>重新读取依赖</button></>}
-    {!bundles.length && <p className="ln-inspector-empty">建立第一项工作后，流程和成果关系会出现在这里。</p>}
+    {!bundles.length && <Empty className="ln-empty--dock"><EmptyHeader><EmptyMedia variant="icon"><Icon name="branch" size={18}/></EmptyMedia><EmptyTitle>建立第一项工作后，流程和成果关系会出现在这里</EmptyTitle><EmptyDescription>任务、依赖和成果全部来自真实记录，这里不推测关系，也不按时间连线。</EmptyDescription></EmptyHeader>{onCreateWork && <EmptyContent><button type="button" className="ln-action" onClick={onCreateWork}>创建一项工作</button></EmptyContent>}</Empty>}
     {bundles.map(bundle => <section key={bundle.mission.missionId} className="ln-map-lane"><h3>{bundle.mission.title}</h3>
       <FactGraph key={`${bundle.mission.missionId}:${view}`} bundle={bundle} agents={agents} dependencies={dependencies[bundle.mission.missionId] ?? []} view={view} focusedTaskId={focusedTaskId} onTaskSelect={onTaskSelect} onArtifact={onArtifact} onConversation={onConversation}/>
     </section>)}

@@ -5,6 +5,7 @@ import type { HostWorkbench } from './host-services'
 import type { AgentProfile, ArtifactSelection, InspectorTab, InspectorMode, LoomReview, WorkBundle, WorkControlFacts, WorkItem } from './types'
 import { Avatar } from './Avatar'
 import { Icon, IconButton, type IconName } from './icons'
+import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from './EmptyState'
 import { Markdown } from './ConversationView'
 import { ChoiceMenu } from './Controls'
 import { WorkMap } from './WorkMap'
@@ -116,14 +117,14 @@ type Props = {
   onArtifact(selection: ArtifactSelection): void; onOpenConversation(threadId: string): void; loading: boolean
   workbench?: HostWorkbench; client?: ThreadClient; theme?: 'day' | 'night'
   onManageAssistant?(agentId?: string): void; onCapabilityDirty?(dirty: boolean): void; onLibrary?(): void
-  threadId?: string | null; conversationTitle?: string; onCreateWork?(): void
+  threadId?: string | null; conversationTitle?: string; onCreateWork?(): void; onConnectDevice?(): void
   selectedTaskId?: string | null; onTaskSelect?(taskId: string | null): void
 }
 
 /** One contextual workspace: tabs change the view, never the selected conversation. */
 export function Inspector({ agents, bundles, agent, mode, tab, onMode, onClose, onExpand, expanded,
   onArtifact, onOpenConversation, loading, client, theme = 'day', onManageAssistant, workbench,
-  threadId = null, conversationTitle, onCreateWork, selectedTaskId: controlledTaskId, onTaskSelect }: Props) {
+  threadId = null, conversationTitle, onCreateWork, onConnectDevice, selectedTaskId: controlledTaskId, onTaskSelect }: Props) {
   const panel = panelFor(mode, tab)
   const [scope, setScope] = useState<WorkspaceScope>('conversation')
   const [query, setQuery] = useState('')
@@ -154,7 +155,7 @@ export function Inspector({ agents, bundles, agent, mode, tab, onMode, onClose, 
       return <button key={selection.artifact.artifactId} type="button" className="ln-asset-row" onClick={() => onArtifact(selection)}>
       <span className="ln-document-icon"><Icon name="file" size={23}/></span><span><strong>{selection.artifact.relativePath.split(/[\\/]/).pop()}</strong><small>{selection.bundle.mission.title} · {relativeDate(selection.artifact.createdAt)}{status !== '' && <> · <span data-state={selection.reviewKind}>{status}</span></>}</small></span><Icon name="right" size={14}/>
     </button>
-    })}{!rows.length && <div className="ln-dock-empty"><Icon name="files" size={30}/><strong>{query ? '没有匹配的成果' : '成果会留在这里'}</strong><p>文档、代码和版本记录会随工作自动归档。打开文件不会自动接受成果。</p>{scope === 'conversation' && threadId && <button type="button" className="ln-text-action" onClick={() => setScope('all')}>查看所有工作中的资产</button>}</div>}</div>
+    })}{!rows.length && <Empty className="ln-empty--dock"><EmptyHeader><EmptyMedia variant="icon"><Icon name="files" size={18}/></EmptyMedia><EmptyTitle>{query ? '没有匹配的成果' : '成果会留在这里'}</EmptyTitle><EmptyDescription>文档、代码和版本记录会随工作自动归档。打开文件不会自动接受成果。</EmptyDescription></EmptyHeader>{scope === 'conversation' && threadId && <EmptyContent><button type="button" className="ln-text-action" onClick={() => setScope('all')}>查看所有工作中的资产</button></EmptyContent>}</Empty>}</div>
   }
   const renderWork = () => <div className="ln-work-groups">{['等待你', '进行中', '受阻', '待开始', '已完成'].map(group => {
     const rows = shown.filter(item => workStatus(item).group === group)
@@ -167,7 +168,7 @@ export function Inspector({ agents, bundles, agent, mode, tab, onMode, onClose, 
     })}</div>
     return group === '已完成' ? <details key={group} className="ln-completed-group"><summary><span>{group}（{rows.length}）</span><i/><Icon name="right" size={13}/></summary>{list}</details>
       : <section key={group} className="ln-work-group"><h3>{group}（{rows.length}）<i/></h3>{list}</section>
-  })}{!shown.length && <div className="ln-dock-empty"><Icon name="board" size={30}/><strong>{loading ? '正在读取工作' : query || owner ? '没有匹配的工作' : '从一个目标开始'}</strong><p>{scope === 'conversation' && threadId ? '这段对话还没有关联的任务。创建工作后，就能在这里跟进分工和成果。' : '把目标交给主助手，分工、待你处理的决定和成果都会出现在这里。'}</p>{onCreateWork && !loading && <button type="button" className="ln-action" onClick={onCreateWork}>创建一项工作</button>}{scope === 'conversation' && threadId && <button type="button" className="ln-text-action" onClick={() => setScope('all')}>查看所有工作</button>}</div>}</div>
+  })}{!shown.length && <Empty className="ln-empty--dock"><EmptyHeader><EmptyMedia variant="icon"><Icon name="board" size={18}/></EmptyMedia><EmptyTitle>{loading ? '正在读取工作' : query || owner ? '没有匹配的工作' : '从一个目标开始'}</EmptyTitle><EmptyDescription>{scope === 'conversation' && threadId ? '这段对话还没有关联的任务。创建工作后，就能在这里跟进分工和成果。' : '把目标交给主助手，分工、待你处理的决定和成果都会出现在这里。'}</EmptyDescription></EmptyHeader>{((!loading && onCreateWork) || (scope === 'conversation' && !!threadId)) && <EmptyContent>{onCreateWork && !loading && <button type="button" className="ln-action" onClick={onCreateWork}>创建一项工作</button>}{scope === 'conversation' && threadId && <button type="button" className="ln-text-action" onClick={() => setScope('all')}>查看所有工作</button>}</EmptyContent>}</Empty>}</div>
   return <aside className={`ln-inspector ln-workspace-dock${expanded ? ' is-expanded' : ''}`} aria-label="工作空间面板">
     {/* Current-conversation identity: the real member avatar, never a stand-in
         illustration. Header and tabs keep their own fixed rows below it. */}
@@ -188,8 +189,10 @@ export function Inspector({ agents, bundles, agent, mode, tab, onMode, onClose, 
     {selectedTask && panel !== 'computer' && <div className="ln-dock-task-context"><Icon name="board" size={13}/><span title={selectedTask.task.title}>{selectedTask.task.title}</span><IconButton icon="close" label="清除关联任务" onClick={() => setSelectedTaskId(null)}/></div>}
     {searchOpen && <div className="ln-inspector-search"><Icon name="search" size={15}/><input aria-label="搜索当前工作空间" placeholder={panel === 'assets' ? '查找文件…' : '查找工作…'} value={query} onChange={event => setQuery(event.target.value)} autoFocus/><IconButton icon="close" label="关闭搜索" onClick={() => { setSearchOpen(false); setQuery('') }}/></div>}
     <div className="ln-inspector-scroll" role="tabpanel" id={`workspace-panel-${panel}`} aria-labelledby={`workspace-tab-${panel}`}>
-      {panel === 'computer' ? <><div className="ln-dock-agent">{agent ? <><Avatar agent={agent} size={30}/><span><strong>{agent.displayName}</strong><small>查看、手动控制和助手控制分别授权</small></span><button type="button" className="ln-text-action" onClick={() => onManageAssistant?.(agent.agentId)}>配置</button></> : <p>选择助手后可查看对应的执行位置和授权。</p>}</div><ComputerWorkspace workbench={workbench} client={client} agent={agent} theme={theme}/></>
-        : panel === 'flow' || panel === 'assets' && assetView === 'lineage' ? client ? <WorkMap bundles={currentBundles} agents={agents} client={client} onArtifact={onArtifact} onConversation={onOpenConversation} focusedTaskId={selectedTaskId} onTaskSelect={setSelectedTaskId} initialView={panel === 'assets' ? 'assets' : 'flow'} hideViewTabs/> : <p className="ln-inspector-empty">当前连接未提供工作关系。</p>
+      {panel === 'computer' ? (agent
+        ? <><div className="ln-dock-agent"><Avatar agent={agent} size={30}/><span><strong>{agent.displayName}</strong><small>查看、手动控制和助手控制分别授权</small></span><button type="button" className="ln-text-action" onClick={() => onManageAssistant?.(agent.agentId)}>配置</button></div><ComputerWorkspace workbench={workbench} client={client} agent={agent} theme={theme} onConnectDevice={onConnectDevice}/></>
+        : <Empty className="ln-empty--dock"><EmptyHeader><EmptyMedia variant="icon"><Icon name="computer" size={18}/></EmptyMedia><EmptyTitle>还没有可以查看的电脑</EmptyTitle><EmptyDescription>选择助手后可查看对应的执行位置和授权；这台电脑要先在「连接与设备」里连接并单独授权，配对不会自动开放屏控。</EmptyDescription></EmptyHeader>{onConnectDevice && <EmptyContent><button type="button" className="ln-action" onClick={onConnectDevice}>去连接设备</button></EmptyContent>}</Empty>)
+        : panel === 'flow' || panel === 'assets' && assetView === 'lineage' ? client ? <WorkMap bundles={currentBundles} agents={agents} client={client} onArtifact={onArtifact} onConversation={onOpenConversation} focusedTaskId={selectedTaskId} onTaskSelect={setSelectedTaskId} initialView={panel === 'assets' ? 'assets' : 'flow'} hideViewTabs onCreateWork={onCreateWork}/> : <Empty className="ln-empty--dock"><EmptyHeader><EmptyMedia variant="icon"><Icon name="branch" size={18}/></EmptyMedia><EmptyTitle>流程和成果关系会连在这里</EmptyTitle><EmptyDescription>当前连接未提供工作关系。建立第一项工作后，任务、依赖和成果会按真实记录连起来。</EmptyDescription></EmptyHeader>{onCreateWork && <EmptyContent><button type="button" className="ln-action" onClick={onCreateWork}>创建一项工作</button></EmptyContent>}</Empty>
         : panel === 'assets' ? renderAssets(selectedTaskId ?? undefined)
         : selectedTask ? <section className="ln-task-detail"><button type="button" className="ln-text-action ln-dock-back" onClick={() => setSelectedTaskId(null)}><Icon name="left" size={14}/>所有工作</button><h1>{selectedTask.task.title}</h1><span className="ln-detail-status"><Icon name={workStatus(selectedTask).icon} size={16}/>{workStatus(selectedTask).label}</span><Markdown text={selectedTask.task.description || '此任务没有补充说明。'}/>{selectedTask.task.blockedReason && <p className="ln-inline-error">{selectedTask.task.blockedReason}</p>}<h3>交付成果</h3>{renderAssets(selectedTask.task.taskId)}<button type="button" className="ln-text-action" onClick={() => onOpenConversation(selectedTask.mission.threadId)}><Icon name="chat" size={15}/>打开相关对话</button></section> : renderWork()}
     </div>
