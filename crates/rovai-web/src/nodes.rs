@@ -3683,6 +3683,107 @@ mod tests {
         assert!(hub.inner.lock().await.computer_waits.is_empty());
     }
 
+    /// A completed remote capture reports the same device the node captured.
+    ///
+    /// The node sends the device with the reply header and the pixels afterwards, in
+    /// separate frames. The completion used to rebuild the reply without that device, so
+    /// every real remote capture was refused by the provider's shape check while the node
+    /// had answered correctly. This pins the device (and the decoded pixels) end to end.
+    #[tokio::test]
+    async fn a_completed_remote_capture_keeps_the_device_and_the_pixels() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD as B64;
+        use loom_protocol::computer::{
+            ComputerBoundsV1, ComputerCodeV1, ComputerDeviceV1, ComputerFrameChunkV1,
+            ComputerFrameHeaderV1, ComputerOpV1, ComputerReplyV1, ComputerRequestV1,
+            chunk_count,
+        };
+        let hub = Arc::new(test_hub());
+        let (node_id, mut frames) = attach_reports(&hub, Vec::new()).await;
+        let generation = hub.inner.lock().await.nodes[&node_id].generation;
+        hub.set_computer_versions(&node_id, generation, vec![COMPUTER_VERSION])
+            .await;
+        let png = {
+            let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+            bytes.extend(std::iter::repeat_n(0x5a, 40));
+            bytes
+        };
+        let device = ComputerDeviceV1 {
+            device_id: "sha256:remote-screen".to_owned(),
+            platform: "linux-x11".to_owned(),
+            bounds: ComputerBoundsV1 {
+                x: 0,
+                y: 0,
+                width: 1280,
+                height: 900,
+            },
+        };
+        let chunk_bytes = loom_protocol::computer::MAX_CHUNK_BYTES;
+        let header = ComputerFrameHeaderV1 {
+            width: 1280,
+            height: 900,
+            scale_millis: 1000,
+            captured_at: 1_700_000_000_000,
+            chunk_bytes,
+            chunk_count: chunk_count(png.len() as u32, chunk_bytes).unwrap() as u32,
+            total_bytes: png.len() as u32,
+        };
+        let call = tokio::spawn({
+            let hub = Arc::clone(&hub);
+            let node_id = node_id.clone();
+            async move {
+                hub.computer_request(
+                    &node_id,
+                    generation,
+                    ComputerRequestV1 {
+                        version: COMPUTER_VERSION,
+                        request_id: "capture_1".to_owned(),
+                        op: ComputerOpV1::Frame {
+                            max_width: 4096,
+                            max_height: 4096,
+                        },
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+            }
+        });
+        let Some(Outbound::Text(text)) = frames.recv().await else {
+            panic!("no computer frame was sent")
+        };
+        let Ok(ServerMessage::Computer { request }) =
+            serde_json::from_str::<ServerMessage>(&text)
+        else {
+            panic!("the frame was not a computer request")
+        };
+        assert_eq!(request.request_id, "capture_1");
+        let mut reply = ComputerReplyV1::refusal("capture_1", ComputerCodeV1::Ok);
+        reply.device = Some(device.clone());
+        reply.frame = Some(header.clone());
+        hub.handle_computer_reply(&node_id, generation, reply).await;
+        for (index, slice) in png.chunks(chunk_bytes as usize).enumerate() {
+            hub.handle_computer_chunk(
+                &node_id,
+                generation,
+                ComputerFrameChunkV1 {
+                    version: COMPUTER_VERSION,
+                    request_id: "capture_1".to_owned(),
+                    seq: (index as u32) + 1,
+                    data: B64.encode(slice),
+                },
+            )
+            .await;
+        }
+        let outcome = call
+            .await
+            .expect("join")
+            .expect("the completed capture must be delivered");
+        assert_eq!(outcome.reply.device.as_ref(), Some(&device));
+        assert_eq!(outcome.reply.frame.as_ref(), Some(&header));
+        assert_eq!(outcome.png.as_deref(), Some(png.as_slice()));
+        assert!(hub.inner.lock().await.computer_waits.is_empty());
+    }
+
     /// The rework's exact interleaving: a caller's connection pre-check passes on
     /// generation `g`, the node then reconnects (and re-advertises computer on the
     /// replacement socket) *before* the request is registered, and the request

@@ -37,7 +37,11 @@ export function ComputerAgentAccess({ port, client, agent, device, theme }: {
     const clock = setInterval(() => setNow(Date.now()), 1000)
     return () => clearInterval(clock)
   }, [])
-  const owned = catalog?.grants.filter(grant => grant.assistantId === agent?.agentId) ?? []
+  // A standing grant covers exactly one device: one for this computer must not block (or be
+  // shown as) authority over another. The device id is the one the panel is currently
+  // reviewing, so a remote node's consent never inherits a local screen's grant.
+  const owned = catalog?.grants.filter(grant => grant.assistantId === agent?.agentId
+    && (device === null || grant.deviceId === device.deviceId)) ?? []
   const active = owned.some(grant => grant.state === 'active' && grant.expiresAt > now)
   const needsCleanup = owned.some(grant => grant.state !== 'revoked' && grant.expiresAt <= now)
   const runtime = agent?.runtimeConfiguration?.adapterKind

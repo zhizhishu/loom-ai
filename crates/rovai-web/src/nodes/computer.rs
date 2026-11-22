@@ -12,8 +12,8 @@
 use super::{Hub, Inner};
 use loom_protocol::ServerMessage;
 use loom_protocol::computer::{
-    COMPUTER_VERSION, ComputerCodeV1, ComputerFrameChunkV1, ComputerFrameHeaderV1, ComputerReplyV1,
-    ComputerRequestV1, MAX_FRAME_BYTES,
+    COMPUTER_VERSION, ComputerCodeV1, ComputerDeviceV1, ComputerFrameChunkV1,
+    ComputerFrameHeaderV1, ComputerReplyV1, ComputerRequestV1, MAX_FRAME_BYTES,
 };
 use std::{
     sync::Arc,
@@ -39,6 +39,11 @@ pub(super) struct ComputerWait {
     pub(super) deadline: Instant,
     pub(super) request: ComputerRequestV1,
     pub(super) header: Option<ComputerFrameHeaderV1>,
+    /// The device the node answered with, kept with the header so the completed
+    /// frame reports the same screen it was captured from. Dropping it here made
+    /// every remote capture fail the provider's shape check even though the node
+    /// had named a real device.
+    pub(super) device: Option<ComputerDeviceV1>,
     pub(super) next_seq: u32,
     pub(super) png: Vec<u8>,
     pub(super) done: Option<oneshot::Sender<ComputerOutcome>>,
@@ -131,6 +136,7 @@ impl Hub {
                     deadline: now + budget,
                     request: request.clone(),
                     header: None,
+                    device: None,
                     next_seq: 1,
                     png: Vec::new(),
                     done: Some(tx),
@@ -220,8 +226,10 @@ impl Hub {
                     inner.computer_waits.remove(&request_id);
                     return;
                 }
+                let device = reply.device.clone();
                 if let Some(wait) = inner.computer_waits.get_mut(&request_id) {
                     wait.header = Some(header);
+                    wait.device = device;
                     wait.next_seq = 1;
                     wait.png.clear();
                 }
@@ -293,7 +301,9 @@ impl Hub {
                 version: COMPUTER_VERSION,
                 request_id: wait.request.request_id.clone(),
                 code: ComputerCodeV1::Ok,
-                device: None,
+                // The device travels with the completed frame: the provider needs the
+                // same screen identity the node captured, not a blank one.
+                device: wait.device,
                 frame: Some(header),
             };
             let _ = done.send(ComputerOutcome {
