@@ -8,6 +8,7 @@ import { ChoiceMenu, FormMessage, SurfaceDialog } from './Controls'
 import { McpConnections } from './McpConnections'
 import { sourceStateLabel, sourceExplanation, sourceTotals, discoveryExplanation } from './native-source-presentation'
 import { Icon, type IconName } from './icons'
+import { matchesVisibility, visibilityChoices } from './capability-scope'
 
 const KINDS: { id: CapabilityKind; label: string; icon: IconName; hint: string }[] = [
   { id:'skill', label:'Skills', icon:'bulb', hint:'可复用的方法与专业技能' },
@@ -29,6 +30,7 @@ export function AssistantCapabilityPicker({ environment, catalogAgentId, runtime
   const [native,setNative] = useState<NativeCatalog | null>(null)
   const [kind,setKind] = useState<CapabilityKind>('skill')
   const [source,setSource] = useState('all')
+  const [visibility,setVisibility] = useState('all')
   const [query,setQuery] = useState('')
   const [loading,setLoading] = useState(true)
   const [busy,setBusy] = useState(false)
@@ -59,7 +61,7 @@ export function AssistantCapabilityPicker({ environment, catalogAgentId, runtime
   const selected = new Set(selectedKeys)
   const needle=query.trim().toLocaleLowerCase()
   const matches=(name:string,note:string)=>!needle||`${name} ${note}`.toLocaleLowerCase().includes(needle)
-  const library=(catalog?.items??[]).filter(item=>!(item.kind==='skill'&&item.source==='工具箱')&&item.kind===kind&&matches(item.name,item.note))
+  const library=(catalog?.items??[]).filter(item=>!(item.kind==='skill'&&item.source==='工具箱')&&item.kind===kind&&(item.kind!=='skill'||matchesVisibility(item.visibilityScope,visibility))&&matches(item.name,item.note))
   const found=(native?.items??[]).filter(item=>item.kind===kind&&(source!=='runtime'||!runtime||item.runtime===runtime)&&(source!=='claude'||item.runtime==='claude-code-cli')&&matches(item.name,item.sourcePath))
   const toggle=(key:string)=>onSelection(selected.has(key)?selectedKeys.filter(value=>value!==key):[...selectedKeys,key])
   const inspect=async(item:NativeCapability)=>{
@@ -94,6 +96,7 @@ export function AssistantCapabilityPicker({ environment, catalogAgentId, runtime
     <div className="ln-onboarding-section-head"><div><h3>把合适的能力交给它</h3><p>从这台主机发现，也可以直接导入。先选择，最后一起保存。</p></div><button type="button" className="ln-action" disabled={busy||loading||disabled} onClick={()=>{void load()}}><Icon name="refresh" size={14}/>刷新</button></div>
     <nav className="ln-cap-kind-tabs" aria-label="四类助手能力">{KINDS.map(entry=><button type="button" key={entry.id} className={kind===entry.id?'is-selected':''} aria-pressed={kind===entry.id} onClick={()=>{setKind(entry.id);setConnections(false)}}><Icon name={entry.icon} size={17}/><span>{entry.label}</span><small>{selectedKeys.filter(key=>key.startsWith(entry.id+':')).length}</small></button>)}</nav>
     <div className="ln-picker-filter"><label className="ln-cap-search"><Icon name="search" size={14}/><input value={query} onChange={event=>setQuery(event.target.value)} placeholder="搜索能力名称或来源…" aria-label="搜索可选能力"/></label><ChoiceMenu label="能力来源" value={source} onChange={setSource} theme={theme} choices={[...(runtime?[{value:'runtime',label:`${RUNTIME_NAMES[runtime]||runtime} 的来源`}]:[]),{value:'all',label:'全部来源（推荐）'},{value:'claude',label:'Claude 原生主来源'},{value:'library',label:'LOOM 能力库'},{value:'native',label:'全部本机客户端'}]}/></div>
+    {kind==='skill'&&<ChoiceMenu label="技能可见范围" value={visibility} onChange={setVisibility} theme={theme} choices={visibilityChoices}/>}
     <p className="ln-native-help">Claude 作为原生配置主来源；Codex / DSH / Pi 的兼容来源会分别标注。发现不等于已导入、已保存或在本次运行生效。</p>
     <div className="ln-picker-source-line"><Icon name="computer" size={14}/><span>{native?.home?.root?'本机来源已确认':'当前连接主机'}{native?` · 发现 ${native.items.length} 项`:''}</span><details><summary>扫描范围</summary><p>{native?.home?.root||'读取主机允许的原生客户端配置；不扫描浏览器设备。'}</p><p>显示真实来源与兼容限制。勾选不复制账号、不执行自动动作。</p>{native?.sources?.filter(item=>item.kind===kind||item.kind==='config').map((item,index)=><p key={index}><strong>{RUNTIME_NAMES[item.runtime]||item.runtime} · {sourceStateLabel(item)}</strong><br/>{sourceExplanation(item)}{item.path!=='<declared>'&&<><br/><span>{item.path}</span></>}</p>)}{native?.errors.map((item,index)=><p key={'error-'+index}>{item.runtime?RUNTIME_NAMES[item.runtime]||item.runtime:'主机'} · {discoveryExplanation(item.code)}</p>)}</details></div>
     {error&&<FormMessage error>{error}</FormMessage>}{scanError&&<FormMessage error>{scanError}</FormMessage>}{notice&&<FormMessage>{notice}</FormMessage>}

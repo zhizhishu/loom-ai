@@ -3832,7 +3832,10 @@ export interface SkillDeliveryGroupView {
   members: SkillDeliveryGroupMemberView[]
 }
 
+export type SkillVisibilityScope = 'private' | 'assigned' | 'global'
 export interface SkillView {
+  visibilityScope?: SkillVisibilityScope
+  learned?: { agentId: string; state: 'active' | 'stale' | 'archived'; pinned: boolean; locked: boolean } | null
   id: string
   name: string
   origin: SkillOrigin
@@ -4411,6 +4414,8 @@ export type CoreMethod =
   | 'skills.import.inspect'
   | 'skills.import.github.inspect'
   | 'skills.import.commit'
+  | 'skills.metadata.set'
+  | 'commands.reconcile'
   | 'skills.setEnabled'
   | 'skills.setGroupAssignments'
   | 'skills.delete'

@@ -385,3 +385,10 @@ export function createCapabilityPort(rpc: CapabilityRpc, localCampId?: string): 
     putHook: (draft) => putHook(rpc, draft)
   }
 }
+
+
+export async function setSkillMetadata(rpc: CapabilityRpc, skillId: string, expectedVersion: number,
+  patch: {visibilityScope?: import('@contracts').SkillVisibilityScope; learnedState?: 'active'|'stale'|'archived'; pinned?:boolean;locked?:boolean}): Promise<void> {
+  const result = await rpc.request<StoredCommandResult>('skills.metadata.set',{commandId:crypto.randomUUID(),command:{skillId,expectedVersion,patch}})
+  if (result.status !== 'applied' && result.status !== 'accepted') throw new CapabilityRequestError(result.code,'技能未保存，请刷新后重试。')
+}

@@ -6,6 +6,8 @@ last_updated: 2026-11-05
 
 # 当前规范与决定理由导航
 
+助手看板、技能三档与离线待发送的边界见 [V1.72-D69](../versions/v1.72/decisions.md#v1-72-d69)；现行 LOOM 范围由 [LOOM 架构](../loom/LOOM-ARCHITECTURE.md)拥有。
+
 跨主机执行与独立能力选择：[跨主机架构](../architecture/cross-host-execution.md)、[Workspace RPC v1](../contracts/workspace-rpc-v1.md)、[Built-in Tool Transport v45](../contracts/builtin-tool-transport-v45.md)；Core 单一权威、原生 driver 与逐工具调用的取舍见 [V1.72-D68](../versions/v1.72/decisions.md#v1-72-d68)。B7 模型上下文及技术/人工确认事实由[原变更记录](../versions/v1.72/model-context-change-loom-run-bundle.md)拥有；导航不推断实施或验收已完成。
 
 Team 创建模板与启动指引：[Team Templates v1](../contracts/team-templates-v1.md)、[Bootstrap v6](../contracts/native-session-bootstrap-v6.md)、[架构](../architecture/team-management.md)；理由见 [V1.72-D57](../versions/v1.72/decisions.md#v1-72-d57)。

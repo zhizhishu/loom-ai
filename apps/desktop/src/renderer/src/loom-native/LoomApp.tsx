@@ -1,3 +1,6 @@
+import { readOutbox } from './pending-outbox-store'
+import { BotBoard } from './BotBoard'
+import { PendingInbox } from './PendingInbox'
 import type { LocalAttachmentOwnerLocator, StoredCommandResult,WorkspaceSelection } from '@contracts'
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
@@ -39,6 +42,18 @@ type Draft = { text: string; files: File[] }
  * tree. Only the authenticated adapter, domain types and animated avatar are shared. */
 export function LoomApp({ environment, onLogout }: Props) {
   const data = useLoomData(environment)
+  const [boardOpen,setBoardOpen] = useState(false)
+  const [pendingOpen,setPendingOpen] = useState(false)
+  const [pendingCount,setPendingCount] = useState(0)
+  useEffect(()=>{
+    const count=()=>{
+      try{setPendingCount(Array.from(new Set(data.conversations.flatMap(c=>c.threadId?[c.threadId]:[]))).reduce((n,id)=>n+readOutbox(id).filter(r=>r.state!=='accepted').length,0))}
+      catch{setPendingCount(0)}
+    }
+    count();window.addEventListener('loom-outbox-changed',count)
+    return()=>window.removeEventListener('loom-outbox-changed',count)
+  },[data.conversations])
+
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 800)
   const [inspectorOpen, setInspectorOpen] = useState(() => window.innerWidth > 800)
   const frameRef = useRef<HTMLElement>(null)
@@ -273,6 +288,11 @@ export function LoomApp({ environment, onLogout }: Props) {
   })
   const shortcutKey = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl'
   return <div className={`ln-app ${expanded && inspectorOpen ? 'ln-inspector-expanded' : ''}`} data-theme={theme} data-loom-frontend="native-v2">
+    <BotBoard open={boardOpen} agents={data.agents} conversations={data.conversations} missions={data.missions} bundles={data.bundles} error={data.error} refresh={data.refresh} theme={theme} onClose={()=>setBoardOpen(false)} onOpen={row=>{
+      setBoardOpen(false)
+      if(row.threadId){setDockSelection({threadId:row.threadId,taskId:row.taskId});void data.openConversation(row.threadId).catch(report)}
+    }}/>
+    <PendingInbox open={pendingOpen} client={environment.client} threadIds={Array.from(new Set(data.conversations.flatMap(c=>c.threadId?[c.threadId]:[])))} theme={theme} onClose={()=>setPendingOpen(false)}/>
     <header className="ln-topbar" aria-label="LOOM 窗口栏">
       <div className="ln-window-left"><div className="ln-traffic-lights" aria-hidden="true"><i/><i/><i/></div><IconButton icon="left" label="后退" disabled={historyIndex.current <= 0} onClick={() => navigate(-1)}/><IconButton icon="right" label="前进" disabled={historyIndex.current >= selectionHistory.current.length - 1} onClick={() => navigate(1)}/></div>
       <button type="button" className="ln-search-trigger" onClick={() => { setQuery(''); setModal('search') }}><Icon name="search" size={14}/><span>搜索对话、助手、工作和成果</span><kbd>{shortcutKey} K</kbd></button>
@@ -283,6 +303,7 @@ export function LoomApp({ environment, onLogout }: Props) {
       {/* rail 的 ＋ 只开新单聊；label 保持「开始新对话」（scripts/lib/loom-browser-live-mode.mjs 的 newConversation 选择器）。 */}
       <IconButton icon="plus" label="开始新对话" onClick={beginDirectConversation}/>
       <IconButton icon="board" label="工作空间" onClick={() => openWork()}/>
+      <IconButton icon="dashboard" label="助手看板" active={boardOpen} onClick={() => setBoardOpen(true)}/>
       <IconButton icon="branch" label="运行与成果" active={runSurfaceOpen} onClick={() => {
         runSurfaceOpener.current=document.activeElement instanceof HTMLElement?document.activeElement:null
         setRunSurfaceOpen(true)
@@ -293,6 +314,7 @@ export function LoomApp({ environment, onLogout }: Props) {
       }}/>
       <IconButton icon="files" label="工作目录" active={settingsSection === 'workspace'} onClick={() => openSettings('workspace')}/>
       <IconButton icon="people" label="管理助手" active={studioOpen} onClick={() => manageAssistant(activeAgent?.agentId)}/>
+      <div className="ln-rail-bottom"><IconButton icon="inbox" label="待发送" active={pendingOpen} onClick={() => setPendingOpen(true)}/>{pendingCount>0&&<small aria-label={`待发送 ${pendingCount} 条`}>{pendingCount}</small>}</div>
       <div className="ln-rail-bottom"><IconButton icon="clock" label="会话活动" onClick={() => setModal('history')}/><ProfileMenu theme={theme} shortcutKey={shortcutKey} onSettings={() => openSettings()} onHistory={() => setModal('history')} onLogout={onLogout}/></div>
     </nav>
       <section ref={frameRef} className="ln-frame" aria-label="LOOM 工作空间" style={{ '--ln-sidebar-width': `${panelWidths.sidebar}px`, '--ln-inspector-width': `${panelWidths.inspector}px` } as React.CSSProperties}>

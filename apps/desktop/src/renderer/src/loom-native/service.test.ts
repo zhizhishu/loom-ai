@@ -4,7 +4,101 @@ import type { ThreadClient } from '../camp-client'
 import { emptyLocalThreadComposerDraft, loadLocalThreadComposerDraft, saveLocalThreadComposerDraft } from '../camp-composer-local-store'
 import { bootstrapSelection, conversationItems, createThreadForAgent, latestStageReview, LOOM_BUNDLE_CONCURRENCY, prepareSendDraft, readThreadSnapshot, readWorkBundle, readWorkBundles, readWorkBundlesFast, sendThreadMessage, stageDraftAttachments, stageReviewFacts, threadMessageSendParams, workControl } from './service'
 import type { WorkBundle } from './types'
+import { ConsoleClient, type WebOperation } from '../../../../../web/src/client'
+import { notifyUnconfirmedThreadSend } from '../camp-client'
+import { readOutbox } from './pending-outbox-store'
 
+it.each(['text', 'attachment', 'storage failure'])('observes an in-flight Web %s send without taking over pending-command recovery', async mode => {
+  const threadId = 'web-in-flight'
+  if (mode === 'attachment') saveLocalThreadComposerDraft({
+    ...emptyLocalThreadComposerDraft(threadId), body: 'later', attachments: [{
+      id: '11111111-1111-4111-8111-111111111111', sourcePath: '/controlled/file', displayName: 'file.txt',
+      kind: 'file', fileCount: null, mediaType: 'text/plain', byteSize: 4, previewKind: 'none', availability: 'available'
+    }]
+  })
+  let rejectSend: ((error: Error) => void) | undefined
+  let recorded = false
+  let reconciles = 0
+  const dispatches: Array<Record<string, unknown>> = []
+  const fetcher = vi.fn<typeof fetch>().mockImplementation(async (url, options) => {
+    if (String(url).endsWith('/login')) return Response.json({ protocolVersion: 5, token: 'a'.repeat(64), clientId: 'd'.repeat(64), editorProof: 'e'.repeat(64), ownerId: 'local_user' })
+    const request = JSON.parse(String(options?.body))
+    if (request.operation === 'commands.reconcile') {
+      reconciles++
+      return Response.json({ result: recorded ? { state: 'recorded', result: { commandResult: applied } } : { state: 'unknown' } })
+    }
+    expect(request.operation).toBe('thread.messages.send')
+    dispatches.push(request.params)
+    return new Promise<Response>((_, reject) => { rejectSend = reject })
+  })
+  const transport = new ConsoleClient('http://localhost:4317', fetcher)
+  await transport.login('b'.repeat(64))
+  const client = mockClient(vi.fn((method, params) => transport.request(method as WebOperation, params)))
+  const enqueue = mode === 'storage failure' ? vi.fn(() => { throw new Error('quota') }) : undefined
+  let settled = false
+  const sending = sendThreadMessage(client, { threadId, text: 'later', files: [] }, enqueue).then(result => { settled = true; return result })
+  await vi.waitFor(() => expect(rejectSend).toBeTypeOf('function'))
+  expect(readOutbox(threadId)).toEqual([])
+  rejectSend!(new TypeError('response lost'))
+  await vi.waitFor(() => expect(reconciles).toBeGreaterThan(0))
+  expect(transport.pendingCommandCount).toBe(1)
+  expect(settled).toBe(false)
+  if (mode === 'text') {
+    expect(readOutbox(threadId)).toMatchObject([{ commandId: dispatches[0]!.commandId, params: dispatches[0], state: 'unconfirmed', text: 'later' }])
+    notifyUnconfirmedThreadSend(dispatches[0])
+    expect(readOutbox(threadId)).toHaveLength(1)
+  } else expect(readOutbox(threadId)).toEqual([])
+  if (enqueue) expect(enqueue).toHaveBeenCalledOnce()
+  recorded = true
+  await vi.waitFor(async () => { await transport.reconcilePending(); expect(transport.pendingCommandCount).toBe(0) })
+  await expect(sending).resolves.toEqual({ threadMessageId: 'msg1' })
+  expect(dispatches).toHaveLength(1)
+  transport.clear()
+})
+
+it.each(['accepted', 'rejected'])('does not enqueue a Web send with an explicit %s result or retain its observer', async outcome => {
+  const threadId = 'web-explicit'
+  let params: Record<string, unknown> | undefined
+  const fetcher = vi.fn<typeof fetch>().mockImplementation(async (url, options) => {
+    if (String(url).endsWith('/login')) return Response.json({ protocolVersion: 5, token: 'a'.repeat(64), clientId: 'd'.repeat(64), editorProof: 'e'.repeat(64), ownerId: 'local_user' })
+    const request = JSON.parse(String(options?.body))
+    if (request.operation === 'commands.reconcile') return Response.json({ result: { state: 'unknown' } })
+    params = request.params
+    return Response.json(outcome === 'accepted' ? { result: { commandResult: applied } } : { error: { code: 'INVALID_ARGUMENT', message: 'invalid' } })
+  })
+  const transport = new ConsoleClient('http://localhost:4317', fetcher)
+  await transport.login('b'.repeat(64))
+  const client = mockClient(vi.fn((method, input) => transport.request(method as WebOperation, input)))
+  const sending = sendThreadMessage(client, { threadId, text: 'later', files: [] })
+  if (outcome === 'accepted') await expect(sending).resolves.toEqual({ threadMessageId: 'msg1' })
+  else await expect(sending).rejects.toThrow('invalid')
+  notifyUnconfirmedThreadSend(params)
+  expect(readOutbox(threadId)).toEqual([])
+  expect(transport.pendingCommandCount).toBe(0)
+  transport.clear()
+})
+
+it('queues a known offline failure as unsent and freezes its command identity',async()=>{
+  const offline=Object.assign(new Error('offline'),{code:'transport.unavailable'})
+  const request=vi.fn().mockRejectedValue(offline);const enqueue=vi.fn()
+  await expect(sendThreadMessage(mockClient(request),{threadId:'offline-known',text:'later',files:[]},enqueue)).rejects.toBe(offline)
+  expect(enqueue).toHaveBeenCalledTimes(1)
+  expect(enqueue.mock.calls[0]?.[0]).toMatchObject({state:'pending',commandId:request.mock.calls[0]?.[1].commandId,params:request.mock.calls[0]?.[1]})
+})
+it('never persists existing draft attachments even when the current File list is empty',async()=>{
+  const threadId='outbox-saved-attachment'
+  const draft={...emptyLocalThreadComposerDraft(threadId),body:'file',attachments:[{id:'11111111-1111-4111-8111-111111111111',sourcePath:'/controlled/file',displayName:'file.txt',kind:'file',fileCount:null,mediaType:'text/plain',byteSize:4,previewKind:'none',availability:'available'}]}
+  saveLocalThreadComposerDraft(draft as ReturnType<typeof emptyLocalThreadComposerDraft>)
+  const enqueue=vi.fn();const request=vi.fn().mockRejectedValue(new TypeError('Failed to fetch'))
+  await expect(sendThreadMessage(mockClient(request),{threadId,text:'file',files:[]},enqueue)).rejects.toThrow('附件不能')
+  expect(enqueue).not.toHaveBeenCalled()
+})
+it('does not confuse an explicit request error with transport uncertainty',async()=>{
+  const error=Object.assign(new Error('invalid'),{code:'INVALID_ARGUMENT'})
+  const enqueue=vi.fn();const request=vi.fn().mockRejectedValue(error)
+  await expect(sendThreadMessage(mockClient(request),{threadId:'outbox-invalid',text:'invalid',files:[]},enqueue)).rejects.toBe(error)
+  expect(enqueue).not.toHaveBeenCalled()
+})
 let store: Map<string,string>
 beforeEach(() => {
   store=new Map()
@@ -259,5 +353,22 @@ describe('native sender preservation and replay',()=>{
     const draft=await stageDraftAttachments(client,emptyLocalThreadComposerDraft('t'),[first,second])
     expect(prepare).toHaveBeenCalledTimes(2);expect(draft.attachments).toHaveLength(2)
     await stageDraftAttachments(client,draft,[first,second]);expect(prepare).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('pending outbox transport boundary',()=>{
+  it('enqueues transport uncertainty once with the frozen command and retains the draft',async()=>{
+    const request=vi.fn().mockRejectedValue(new TypeError('Failed to fetch'))
+    const client=mockClient(request);const enqueue=vi.fn()
+    await expect(sendThreadMessage(client,{threadId:'outbox-transport',text:'keep me',files:[]},enqueue)).rejects.toThrow('Failed to fetch')
+    expect(enqueue).toHaveBeenCalledTimes(1)
+    expect(enqueue.mock.calls[0]?.[0]).toMatchObject({threadId:'outbox-transport',text:'keep me',state:'unconfirmed'})
+  })
+  it('never queues explicit Core rejection or local empty input',async()=>{
+    const request=vi.fn().mockResolvedValue({commandResult:{...applied,status:'rejected'}})
+    const client=mockClient(request);const enqueue=vi.fn()
+    await expect(sendThreadMessage(client,{threadId:'outbox-reject',text:'rejected',files:[]},enqueue)).rejects.toThrow()
+    await expect(sendThreadMessage(client,{threadId:'outbox-empty',text:'',files:[]},enqueue)).rejects.toThrow()
+    expect(enqueue).not.toHaveBeenCalled()
   })
 })

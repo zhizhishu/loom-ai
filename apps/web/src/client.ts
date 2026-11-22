@@ -6,6 +6,7 @@ import { fileDigest } from './file-digest'
 import { uploadRequest } from './upload-request'
 import { newCommandId } from '../../desktop/src/shared/command-id'
 import { recoverLocalThreadSend } from '../../desktop/src/renderer/src/camp-composer-send-recovery'
+import { notifyUnconfirmedThreadSend } from '../../desktop/src/renderer/src/camp-client'
 import type { ThreadReadInvalidation, ChannelKind, ChannelSettingsSnapshot, ExecutionNodeList, ExecutionNodePairing, ExecutionNodeRevocation, FilePreviewBinaryContent, FilePreviewOperationResult, LocalAttachmentSourceView, NodeOutputPage } from '@contracts'
 
 const HOST_WEB_PROTOCOL_VERSION = 5
@@ -48,6 +49,7 @@ export class SessionRequired extends Error {
 }
 
 class ConnectionUnavailable extends Error {
+  readonly code = 'transport.unavailable'
   constructor() { super('服务连接已中断，请恢复连接后重试。') }
 }
 
@@ -90,6 +92,7 @@ export const WEB_OPERATIONS = [
   'skills.import.inspect',
   'skills.import.github.inspect',
   'skills.import.commit',
+  'skills.metadata.set',
   'skills.setEnabled',
   'skills.setGroupAssignments',
   'skills.delete',
@@ -272,6 +275,7 @@ const RECONCILABLE_COMMANDS = new Set<WebOperation>([
 
   'singleChat.open', 'singleChat.send', 'singleChat.end', 'singleChat.pendingInputs.edit',
   'skills.import.commit',
+  'skills.metadata.set',
   'skills.setEnabled',
   'skills.setGroupAssignments',
   'skills.delete',
@@ -752,6 +756,7 @@ export class ConsoleClient {
           await this.#settleKnownFailure(commandId, entry, error)
         } else {
           this.#requireRecovery()
+          if (entry.operation === 'thread.messages.send') notifyUnconfirmedThreadSend(entry.params)
           await this.reconcilePending()
         }
       })

@@ -1,0 +1,54 @@
+.ln-bot-board { box-sizing: border-box; width: 100%; height: 100%; min-height: 0; overflow: auto; padding: calc(24px + var(--top, 0px)) 24px calc(24px + var(--bottom, 0px)); color: var(--ln-text); background: var(--ln-bg); }
+.ln-bot-board-header, .ln-bot-board-toolbar, .ln-board-card-head, .ln-bot-board-search { display: flex; align-items: center; gap: 12px; }
+.ln-bot-board-header { flex-wrap: wrap; margin-bottom: 20px; }
+.ln-bot-board-header h1 { font-size: 22px; margin: 0; }
+.ln-bot-board-header > span, .ln-bot-board small, .ln-bot-board-empty { color: var(--ln-muted); font-size: 12px; }
+.ln-bot-board button, .ln-bot-board input { font: inherit; }
+.ln-bot-board button { cursor: pointer; color: inherit; }
+.ln-bot-board button:focus-visible, .ln-bot-board input:focus-visible { outline: 2px solid var(--ln-blue); outline-offset: 3px; }
+.ln-bot-board-header button { border: 0; background: transparent; padding: 8px; }
+.ln-bot-board-toolbar { flex-wrap: wrap; margin-bottom: 16px; font-size: 13px; }
+.ln-bot-board-search { flex: 1; min-width: 200px; padding: 9px 12px; border: 1px solid var(--ln-line); border-radius: 12px; }
+.ln-bot-board-search input { min-width: 0; width: 100%; border: 0; background: transparent; color: inherit; }
+.ln-bot-board-filters { display: flex; gap: 6px; overflow-x: auto; margin-bottom: 16px; }
+.ln-bot-board-filters button { white-space: nowrap; border: 1px solid var(--ln-line); border-radius: 20px; background: transparent; padding: 6px 12px; font-size: 13px; }
+.ln-bot-board-filters button[aria-pressed=true] { background: var(--ln-selected); border-color: var(--ln-blue); }
+.ln-board-columns { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; align-items: start; }
+.ln-bot-board-column { min-width: 0; background: var(--ln-card); padding: 12px; border-radius: 16px; }
+.ln-bot-board h2 { font-size: 14px; margin: 0 0 12px; display: flex; gap: 8px; align-items: center; }
+.ln-board-card { width: 100%; display: flex; flex-direction: column; gap: 8px; text-align: left; padding: 14px; border: 1px solid var(--ln-line); border-radius: 12px; background: var(--ln-bg); margin-bottom: 10px; overflow-wrap: anywhere; }
+.ln-board-card:hover { border-color: var(--ln-blue); }
+.ln-board-card-head { width: 100%; }
+.ln-board-card-head > span { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.ln-board-card strong { font-size: 14px; }
+.ln-board-card p { margin: 0; font-size: 13px; white-space: pre-wrap; line-height: 1.6; }
+.ln-bot-board-offline-label, .ln-bot-board-snapshot-note, .ln-board-card.is-offline .ln-bot-board-status { color: var(--ln-muted); font-size: 12px; line-height: 1.5; }
+.ln-bot-board-column.is-offline { background: color-mix(in srgb, var(--ln-muted) 10%, var(--ln-bg)); }
+.ln-bot-board-status, .ln-bot-board-open { font-size: 12px; color: var(--ln-blue); }
+.ln-bot-board-warning { color: var(--danger); font-size: 12px; line-height: 1.5; }
+.ln-bot-board-unknown { margin-bottom: 16px; }
+.ln-bot-board-unknown > div { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+.ln-bot-board-desktop .ln-bot-board-progress {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+.ln-bot-board-desktop .ln-bot-board-unknown { margin-top: 16px; }
+.ln-bot-board-other { margin-top: 16px; }
+.ln-bot-board-other > summary {
+  width: fit-content;
+  padding: 6px 0;
+  color: var(--ln-muted);
+  cursor: pointer;
+  font-size: 13px;
+}
+.ln-bot-board-other[open] > summary { margin-bottom: 8px; }
+@media (max-width: 700px) {
+  .ln-bot-board { padding: calc(16px + var(--top, 0px)) 16px calc(16px + var(--bottom, 0px)); }
+  .ln-bot-board-header > span { width: 100%; }
+  .ln-board-columns, .ln-bot-board-unknown > div { grid-template-columns: 1fr; }
+  .ln-bot-board-column { padding: 10px; }
+}
+
+.ln-board-columns{grid-template-columns:repeat(3,minmax(0,1fr))}.ln-bot-board{min-width:min(780px,80vw)}@media(max-width:700px){.ln-board-columns{grid-template-columns:1fr}.ln-bot-board{min-width:0}}

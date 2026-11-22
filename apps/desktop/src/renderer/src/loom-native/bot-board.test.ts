@@ -1,0 +1,47 @@
+import { expect,it,vi } from 'vitest'
+import { createElement, type ReactNode } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import type { AgentProfile, MissionRecord } from './types'
+import { BotBoard } from './BotBoard'
+import { botBoardBucket,botBoardTargets,deriveTaskStatusLine,type BoardTarget } from './bot-board'
+import { markViewed,readSeen } from './bot-board-seen'
+vi.mock('./Controls',async original=>({...await original<typeof import('./Controls')>(),SurfaceDialog:({children}:{children:ReactNode})=>children}))
+it('renders exactly three main columns, collapsed idle rows, and an honest read failure',()=>{
+ const html=renderToStaticMarkup(createElement(BotBoard,{open:true,agents:[],conversations:[],missions:[],bundles:[],error:'offline',refresh:async()=>{},onOpen:()=>{},onClose:()=>{}}))
+ expect(html.match(/<h3>/g)).toHaveLength(3)
+ for(const label of ['需要你','进行中','待查看','空闲 0 · 离线 0','没有符合条件的助手','上次更新'])expect(html).toContain(label)
+ expect(html).toContain('<details>');expect(html).not.toContain('<details open')
+})
+it('derives running agents from mission facts instead of inventing per-bot runtime activity',()=>{
+ const agent={agentId:'a',displayName:'A'} as AgentProfile
+ const mission={missionId:'m',threadId:'t',memberAgentIds:['a'],runningAgentIds:['a'],title:'Real work'} as MissionRecord
+ const [target]=botBoardTargets([agent],[],[mission],[])
+ expect(target?.working).toBe(true);expect(botBoardBucket(target!)).toBe('working')
+})
+const base:BoardTarget={key:'bot',name:'Helper',threadId:'t',taskId:null,attention:false,working:false,title:'',status:'',online:true}
+it('keeps the upstream attention, busy, unseen, idle and offline precedence',()=>{
+ expect(botBoardBucket({...base,attention:true,working:true})).toBe('attention')
+ expect(botBoardBucket({...base,working:true,resultId:'r'})).toBe('working')
+ expect(botBoardBucket({...base,resultId:'r'})).toBe('review')
+ expect(botBoardBucket({...base,resultId:'r'},'r')).toBe('idle')
+ expect(botBoardBucket({...base,online:false})).toBe('offline')
+ expect(botBoardTargets([],[],[],[])).toEqual([])
+})
+it('persists only viewed IDs and surfaces storage failures',()=>{
+ const values=new Map<string,string>();const storage={getItem:(k:string)=>values.get(k)??null,setItem:(k:string,v:string)=>{values.set(k,v)}}
+ expect(readSeen('bot',storage)).toBeUndefined()
+ markViewed('bot','result-id',storage);expect(readSeen('bot',storage)).toBe('result-id')
+ expect([...values.values()]).toEqual(['result-id'])
+ expect(()=>markViewed('bot','next',{...storage,setItem:()=>{throw new Error('blocked')}})).toThrow('blocked')
+})
+
+it('keeps control transitions ahead of attention and maps upstream task lines',()=>{
+ for(const phase of ['stopping','interrupting'])expect(botBoardBucket({...base,phase,attention:true})).toBe('working')
+ expect(botBoardBucket({...base,phase:'failed'})).toBe('attention')
+ expect(deriveTaskStatusLine({status:'working',pendingPrompt:{kind:'plan'}})).toBe('待确认')
+ expect(deriveTaskStatusLine({status:'working',pendingPrompt:{kind:'question'}})).toBe('待你回应')
+ for(const [status,label] of [['working','进行中'],['todo','等待开始'],['blocked','受阻 · 等待前置结果'],['waiting','等待确认']])
+   expect(deriveTaskStatusLine({status:'working'},{status:status!})).toBe(label)
+ expect(deriveTaskStatusLine({status:'triaging'})).toBe('拆解中')
+ expect(deriveTaskStatusLine({status:'waiting'})).toBe('等待前置结果')
+})

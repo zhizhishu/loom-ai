@@ -127,6 +127,7 @@ pub(super) fn reconcile(
         }
         "singleChat.end" => camp!(EndSingleChatCommand),
         "skills.import.commit" => user!(CommitSkillImportCommand),
+        "skills.metadata.set" => user!(SetSkillMetadataCommand),
         "skills.setEnabled" => user!(SetSkillEnabledCommand),
         "skills.setGroupAssignments" => user!(SetSkillGroupAssignmentsCommand),
         "skills.delete" => user!(DeleteSkillCommand),

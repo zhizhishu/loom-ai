@@ -49,6 +49,7 @@ export type CapabilityItem = {
   note: string
   source: string
   scope: 'project' | 'cloud'
+  visibilityScope?: import('@contracts').SkillVisibilityScope
   selected: boolean
   origin: CapabilityOrigin
   toolNames: readonly string[]
@@ -380,3 +381,5 @@ export function presentProjectionMcp(document: unknown): unknown {
   }
   return copy
 }
+
+export { matchesVisibility } from './loom-native/capability-scope'

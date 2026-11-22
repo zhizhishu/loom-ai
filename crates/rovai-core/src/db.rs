@@ -6,6 +6,10 @@ mod automation_naming;
 mod claim_context;
 #[path = "db_compact_execution.rs"]
 mod compact_execution;
+#[path = "db_member_skill_scope.rs"]
+mod member_skill_scope_migration;
+#[path = "db_skill_learning.rs"]
+mod skill_learning_migration;
 #[path = "db_delivery_wake.rs"]
 mod delivery_wake_migration;
 #[path = "db_execution_node.rs"]
@@ -9905,6 +9909,12 @@ impl Database {
             if !self.schema_migration_applied(241)? {
                 migration_step!("migration_241", loom::migrate_camp_hidden(self));
             }
+            if !self.schema_migration_applied(242)? {
+                migration_step!("migration_242", member_skill_scope_migration::migrate(self));
+            }
+            if !self.schema_migration_applied(243)? {
+                migration_step!("migration_243", skill_learning_migration::migrate(self));
+            }
             if let Err(error) =
                 crate::notification::maintain_notification_episode_retention(self.connection())
             {
@@ -10864,6 +10874,12 @@ impl Database {
         }
         if !self.schema_migration_applied(241)? {
             migration_step!("migration_241", loom::migrate_camp_hidden(self));
+        }
+        if !self.schema_migration_applied(242)? {
+            migration_step!("migration_242", member_skill_scope_migration::migrate(self));
+        }
+        if !self.schema_migration_applied(243)? {
+            migration_step!("migration_243", skill_learning_migration::migrate(self));
         }
         if let Err(error) =
             crate::notification::maintain_notification_episode_retention(self.connection())

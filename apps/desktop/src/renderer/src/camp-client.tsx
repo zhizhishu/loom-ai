@@ -71,3 +71,26 @@ export function useThreadClient(): ThreadClient {
 }
 
 export function useEditingRecovery(): EditingRecovery | undefined { return useContext(ThreadClientContext)?.editingRecovery }
+
+type ThreadSendIdentity = { commandId: string; threadId: string }
+const unconfirmedThreadSends = new Map<string, Set<() => void>>()
+
+export function observeUnconfirmedThreadSend(identity: ThreadSendIdentity, listener: () => void): () => void {
+  const key = JSON.stringify([identity.commandId, identity.threadId])
+  const listeners = unconfirmedThreadSends.get(key) ?? new Set<() => void>()
+  listeners.add(listener)
+  unconfirmedThreadSends.set(key, listeners)
+  return () => {
+    listeners.delete(listener)
+    if (!listeners.size) unconfirmedThreadSends.delete(key)
+  }
+}
+
+export function notifyUnconfirmedThreadSend(params: unknown): void {
+  if (!params || typeof params !== 'object') return
+  const { commandId, threadId } = params as Partial<ThreadSendIdentity>
+  if (typeof commandId !== 'string' || typeof threadId !== 'string') return
+  for (const listener of [...unconfirmedThreadSends.get(JSON.stringify([commandId, threadId])) ?? []]) {
+    try { listener() } catch { /* An observer must not interrupt transport recovery. */ }
+  }
+}

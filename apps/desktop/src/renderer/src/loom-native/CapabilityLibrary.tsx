@@ -4,6 +4,8 @@ import type { BusinessEnvironment } from '../business-environment'
 import { createCapabilityPort } from './capability-service'
 import { ChoiceMenu, FormMessage, SurfaceDialog, UnsavedNotice } from './Controls'
 import { Icon } from './icons'
+import { matchesVisibility, scopeLabel, visibilityChoices } from './capability-scope'
+import { setSkillMetadata } from './capability-service'
 
 export function CapabilityLibrary({ open, environment, theme = 'day', onClose, onChanged }: {
   open: boolean; environment: BusinessEnvironment; theme?: 'day' | 'night'; onClose(): void; onChanged(): void
@@ -11,6 +13,7 @@ export function CapabilityLibrary({ open, environment, theme = 'day', onClose, o
   const port = useMemo(() => createCapabilityPort(environment.client), [environment.client])
   const [tab, setTab] = useState<'skills' | 'rule' | 'hook'>('skills')
   const [path, setPath] = useState('')
+  const [visibility,setVisibility] = useState('all')
   const [inspection, setInspection] = useState<SkillImportInspection | null>(null)
   const [library, setLibrary] = useState<readonly SkillView[]>([])
   const [name, setName] = useState('')
@@ -80,7 +83,9 @@ export function CapabilityLibrary({ open, environment, theme = 'day', onClose, o
       {inspection && <div style={{marginTop:16}}>{inspection.candidates.map(candidate => <article className="ln-cap-item" key={candidate.name}><div className="ln-cap-main"><Icon name="bulb" size={20}/><div className="ln-cap-copy"><strong>{candidate.name}</strong><p>{candidate.description}</p><p>{candidate.fileCount} 个文件 · {candidate.totalBytes} 字节</p></div><button type="button" className="ln-action" disabled={busy || !!pendingRegistration || candidate.importAction === 'official_conflict'} onClick={() => { void commit(candidate.name) }}>{candidate.importAction === 'update' ? '确认更新' : candidate.importAction === 'official_conflict' ? '内置名称冲突' : '导入'}</button></div><details className="ln-cap-detail"><summary>来源与检查结果</summary><p>{candidate.sourcePath}</p><pre>{JSON.stringify(candidate.riskSummary,null,2)}</pre></details></article>)}{inspection.rejectedCandidates.map((candidate,index) => <FormMessage error key={index}>{candidate.message}</FormMessage>)}</div>}
       {pendingRegistration && <div className="ln-review-card"><p>导入已成功，但加入能力目录尚未完成。只重试登记，不重新导入。</p><button type="button" className="ln-action" disabled={busy} onClick={() => { void register(pendingRegistration) }}>重试加入目录</button></div>}
       <div className="ln-panel-title" style={{marginTop:24}}><h3>已有技能</h3><small>{library.length} 项</small></div>
-      {library.filter(skill => skill.lifecycleStatus === 'active' && skill.managementPolicy !== 'system_required').map(skill => <article className="ln-cap-item" key={skill.id}><div className="ln-cap-main"><Icon name="bulb" size={18}/><div className="ln-cap-copy"><strong>{skill.name}</strong><p>库内版本 {skill.version}</p></div><button type="button" className="ln-action" disabled={busy} onClick={() => { void register(skill.id) }}>加入可选目录</button></div></article>)}
+      <ChoiceMenu label="技能可见范围" value={visibility} onChange={setVisibility} theme={theme} choices={visibilityChoices}/>
+      {library.filter(skill => matchesVisibility(skill.visibilityScope,visibility) && skill.lifecycleStatus === 'active' && skill.managementPolicy !== 'system_required').map(skill => <article className="ln-cap-item" key={skill.id}><div className="ln-cap-main"><Icon name="bulb" size={18}/><div className="ln-cap-copy"><strong>{skill.name}</strong><p>库内版本 {skill.version} · {scopeLabel(skill.visibilityScope,!!skill.learned)}</p>
+      {skill.learned && <ChoiceMenu label={skill.name+'的可见范围'} value={skill.visibilityScope??'private'} theme={theme} choices={visibilityChoices.filter(c=>c.value!=='all')} onChange={value=>{void execute(async()=>{await setSkillMetadata(environment.client,skill.id,skill.version,{visibilityScope:value as import('@contracts').SkillVisibilityScope});setLibrary(await port.listLibrary());onChanged()})}}/>}</div><button type="button" className="ln-action" disabled={busy} onClick={() => { void register(skill.id) }}>加入可选目录</button></div></article>)}
     </> : <>
       <label className="ln-field"><span>名称</span><input value={name} maxLength={120} aria-label="能力名称" placeholder={tab === 'rule' ? '例如：前端代码约定' : '例如：任务结束后检查'} onChange={event => setName(event.target.value)}/></label>
       {tab === 'rule' ? <label className="ln-field"><span>规则正文</span><textarea value={body} rows={6} maxLength={8000} aria-label="规则正文" placeholder="描述可执行的工作约定，例如使用 pnpm、修改后运行类型检查。" onChange={event => setBody(event.target.value)}/><small>规则是给助手的指引，不会获得额外文件或账号权限。</small></label>

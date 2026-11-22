@@ -1,7 +1,14 @@
 import type { CSSProperties, ReactNode } from 'react'
 
 export type IconName = 'home' | 'bulb' | 'board' | 'clock' | 'files' | 'settings' | 'search' | 'plus' | 'close' | 'left' | 'right' | 'down' | 'up' | 'panel' | 'expand' | 'chat' | 'globe' | 'download' | 'check' | 'hand' | 'progress' | 'blocked' | 'file' | 'image' | 'audio' | 'computer' | 'refresh' | 'attach' | 'copy' | 'stop' | 'more' | 'branch' | 'sun' | 'moon' | 'people' | 'minus' | 'user' | 'bell' | 'command' | 'info'
+  | 'dashboard' | 'inbox' | 'sparkle' | 'pin' | 'lock' | 'archive'
 const paths: Record<IconName, ReactNode> = {
+  dashboard: <><rect x="3" y="3" width="7" height="18" rx="1"/><rect x="14" y="3" width="7" height="8" rx="1"/><rect x="14" y="15" width="7" height="6" rx="1"/></>,
+  inbox: <><path d="M3 4h18v16H3zM3 13h5l2 3h4l2-3h5"/></>,
+  sparkle: <path d="m12 2 3 7 7 3-7 3-3 7-3-7-7-3 7-3z"/>,
+  pin: <path d="m8 3 8 0-1 8 3 4H6l3-4zM12 15v7"/>,
+  lock: <><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V6a4 4 0 0 1 8 0v4"/></>,
+  archive: <><path d="M3 3h18v5H3zM5 8v13h14V8M9 12h6"/></>,
   minus: <path d="M5 12h14"/>,
   user: <><circle cx="12" cy="8" r="4"/><path d="M4.5 20.5a7.5 7.5 0 0 1 15 0"/></>,
   bell: <><path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15Z"/><path d="M10 20.5a2 2 0 0 0 4 0"/></>,

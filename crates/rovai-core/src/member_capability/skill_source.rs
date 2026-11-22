@@ -48,6 +48,8 @@ pub(crate) struct Stamp {
     pub lifecycle_status: String,
     /// Binds the catalog revision to the admitted Library root without exposing Skill text.
     pub root_digest: String,
+    pub owner_agent_id: Option<String>,
+    pub visibility_scope: String,
 }
 
 impl Stamp {
@@ -81,7 +83,7 @@ pub(crate) fn stamp_source_error(stamp: &Stamp) -> Option<String> {
 pub(crate) fn list(database: &Database) -> Result<Vec<Registered>> {
     let mut statement = database.connection().prepare(
         "SELECT s.id, s.name, COALESCE(r.description,''), s.current_revision_id,
-                r.content_digest, s.enabled, s.lifecycle_status, m.library_root
+                r.content_digest, s.enabled, s.lifecycle_status, m.library_root, m.owner_agent_id, m.visibility_scope
          FROM member_skill_source AS m JOIN skill AS s ON s.id = m.skill_id
          LEFT JOIN skill_revision AS r ON r.id = s.current_revision_id
          ORDER BY s.name, s.id",
@@ -97,6 +99,8 @@ pub(crate) fn list(database: &Database) -> Result<Vec<Registered>> {
                 enabled: row.get::<_, i64>(5)? == 1,
                 lifecycle_status: row.get(6)?,
                 root_digest: String::new(),
+                owner_agent_id: row.get(8)?,
+                visibility_scope: row.get(9)?,
             },
             library_root: row.get(7)?,
         })

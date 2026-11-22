@@ -1,3 +1,5 @@
+import { enqueueOutbox, type PendingRecord } from './pending-outbox-store'
+import { observeUnconfirmedThreadSend } from '../camp-client'
 import type {
   AgentProfile,
   ComposerDocument,
@@ -532,7 +534,8 @@ export type SendOutcome = { threadMessageId: string | null }
  */
 export async function sendThreadMessage(
   client: ThreadClient,
-  input: { threadId: string; text: string; files: readonly File[]; recipientAgentId?: string }
+  input: { threadId: string; text: string; files: readonly File[]; recipientAgentId?: string },
+  enqueue: (record: PendingRecord) => void = enqueueOutbox
 ): Promise<SendOutcome> {
   const prepared = prepareSendDraft(input.threadId, input.text, input.recipientAgentId)
   if (!Number.isInteger(prepared.revision) || prepared.revision < 1) {
@@ -547,11 +550,28 @@ export async function sendThreadMessage(
   // Persist first: if the command is rejected or the transport drops, the same
   // draft revision and attachment refs are reused by the retry.
   saveLocalThreadComposerDraft(staged)
-  const result = await client.request<SendThreadMessageResult | null>('thread.messages.send', {
-    ...params,
-    deliveryMode: 'start',
-    steerTargets: []
+  const request = { ...params, deliveryMode: 'start', steerTargets: [] }
+  let queued = false
+  const stopObserving = observeUnconfirmedThreadSend(params, () => {
+    if (queued || staged.attachments.length) return
+    enqueue({ id:params.commandId,threadId:input.threadId,text:input.text,fingerprint:JSON.stringify(unsigned),
+      commandId:params.commandId,params:request,state:'unconfirmed',createdAt:new Date().toISOString() })
+    queued = true
   })
+  let result: SendThreadMessageResult | null
+  try { result = await client.request<SendThreadMessageResult | null>('thread.messages.send', request) }
+  catch (cause) {
+    // Only transport failures are eligible; Core and validation failures never become queued work.
+    const code = cause instanceof Error ? String((cause as Error & {code?:string}).code) : ''
+    if (!(cause instanceof LoomCommandRejected) && (cause instanceof TypeError || /^(transport\.unavailable|ECONNREFUSED|ECONNRESET|ENETUNREACH|ETIMEDOUT)$/.test(code))) {
+      if (staged.attachments.length) throw new Error('附件不能稍后自动重发，请重新选择文件。')
+      if (!queued) enqueue({ id:params.commandId,threadId:input.threadId,text:input.text,fingerprint:JSON.stringify(unsigned),
+        commandId:params.commandId,params:request,state:code==='transport.unavailable'?'pending':'unconfirmed',createdAt:new Date().toISOString() })
+    }
+    throw cause
+  } finally {
+    stopObserving()
+  }
   const command = result?.commandResult ?? null
   if (!command) throw new Error(uiAttribute('消息提交结果暂时不可用，消息与附件已保留。'))
   if (command.status === 'rejected') { settleSendAttempt(client, input.threadId); throw new LoomCommandRejected(command) }
@@ -580,4 +600,10 @@ export async function createThreadForAgent(client: Reader, agentId: string): Pro
   const threadId = stringField(result.payload, 'threadId')
   if (!threadId) throw new Error(uiAttribute('会话已创建，但暂时无法打开。请刷新会话列表后重试。'))
   return threadId
+}
+
+export function settleOutboxAttempt(client: ThreadClient, threadId: string, commandId: string): void {
+  const saved = client.editingRecovery?.get(`loom-native-send:${threadId}`) as {commandId?:string}|null
+  if (sendAttempts.get(client)?.get(threadId)?.commandId === commandId || saved?.commandId === commandId)
+    settleSendAttempt(client,threadId)
 }

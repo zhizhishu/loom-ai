@@ -9,6 +9,7 @@
 
 mod hook_review;
 mod skill_source;
+mod skill_visibility;
 #[cfg(test)]
 pub(crate) use hook_review::test_remote_scope;
 pub(crate) use hook_review::{
@@ -170,6 +171,7 @@ pub(crate) struct MemberCapabilityItem {
     pub note: String,
     pub source: String,
     pub scope: String,
+    pub visibility_scope: Option<String>,
     pub selected: bool,
     pub origin: Option<String>,
     pub tool_names: Vec<String>,
@@ -764,6 +766,9 @@ fn catalog_pieces_scoped(
     }
     // Registered imported Skills are extra catalog rows; the toolbox list above is unchanged.
     for registered in skill_source::list(database)? {
+        if !skill_visibility::is_visible_to_agent(
+            registered.stamp.owner_agent_id.as_deref(), &registered.stamp.visibility_scope, &profile.agent_id
+        ) { continue; }
         let id = skill_source::item_id(&registered.skill_id);
         let stored = choices.get(&("skill".to_string(), id.clone())).cloned();
         pieces.push(CatalogPiece {
@@ -958,6 +963,7 @@ fn catalog_from_pieces(
                 note: piece.note.clone(),
                 source: piece.source.clone(),
                 scope: piece.scope.clone(),
+                visibility_scope: stamps.get(&piece.id).map(|s| s.visibility_scope.clone()),
                 selected: piece.selected,
                 origin: display_origin(piece),
                 tool_names: piece.tool_names.clone(),
@@ -983,6 +989,8 @@ fn catalog_from_pieces(
                     state["libraryEnabled"] = json!(stamp.enabled);
                     state["libraryLifecycle"] = json!(stamp.lifecycle_status);
                     state["libraryRootDigest"] = json!(stamp.root_digest);
+                    state["skillVisibility"] = json!(stamp.visibility_scope);
+                    state["skillOwner"] = json!(stamp.owner_agent_id);
                 }
                 if let Some(definition) = &item.hook_definition {
                     state["hookDefinitionDigest"] = json!(definition.definition_digest);

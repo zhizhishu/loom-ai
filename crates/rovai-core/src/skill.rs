@@ -335,6 +335,8 @@ pub struct SkillView {
     pub management_policy: SkillManagementPolicy,
     pub enabled: bool,
     pub lifecycle_status: String,
+    pub visibility_scope: String,
+    pub learned: Option<LearnedSkillView>,
     pub current_revision: SkillRevisionView,
     pub group_assignments: Vec<SkillGroupAssignmentView>,
     pub version: i64,
@@ -391,6 +393,34 @@ pub struct CommitSkillImportCommand {
 impl sealed::Sealed for CommitSkillImportCommand {}
 impl DomainCommand for CommitSkillImportCommand {
     const TYPE: &'static str = "skill.import.commit";
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LearnedSkillView {
+    pub agent_id: String,
+    pub state: String,
+    pub pinned: bool,
+    pub locked: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillMetadataPatch {
+    pub visibility_scope: Option<String>,
+    pub learned_state: Option<String>,
+    pub pinned: Option<bool>,
+    pub locked: Option<bool>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetSkillMetadataCommand {
+    pub skill_id: String,
+    pub expected_version: i64,
+    pub patch: SkillMetadataPatch,
+}
+impl sealed::Sealed for SetSkillMetadataCommand {}
+impl DomainCommand for SetSkillMetadataCommand {
+    const TYPE: &'static str = "skills.metadata.set";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -921,7 +951,9 @@ impl SkillLibraryService {
                    revision.description, revision.source_type,
                    revision.content_digest, revision.source_metadata_json,
                    revision.risk_summary_json, revision.file_count,
-                   revision.total_bytes, revision.installed_at
+                   revision.total_bytes, revision.installed_at,
+                   COALESCE((SELECT visibility_scope FROM member_skill_source WHERE skill_id=skill.id),'private'),
+                   skill.learned_by_agent_id, skill.learned_state, skill.learned_pinned, skill.learned_locked
             FROM skill
             JOIN skill_revision AS revision
               ON revision.id = skill.current_revision_id
@@ -960,7 +992,9 @@ impl SkillLibraryService {
                        revision.description, revision.source_type,
                        revision.content_digest, revision.source_metadata_json,
                        revision.risk_summary_json, revision.file_count,
-                       revision.total_bytes, revision.installed_at
+                       revision.total_bytes, revision.installed_at,
+                   COALESCE((SELECT visibility_scope FROM member_skill_source WHERE skill_id=skill.id),'private'),
+                   skill.learned_by_agent_id, skill.learned_state, skill.learned_pinned, skill.learned_locked
                 FROM skill
                 JOIN skill_revision AS revision
                   ON revision.id = skill.current_revision_id
@@ -1478,6 +1512,51 @@ impl SkillLibraryService {
             let _ = remove_directory_if_present(final_content.parent().unwrap_or(&final_content));
         }
         execution
+    }
+
+    pub fn set_metadata(
+        &self, database: &mut Database, envelope: &CommandEnvelope<SetSkillMetadataCommand>,
+    ) -> Result<CommandExecution> {
+        self.gateway.execute(database, envelope, |tx| {
+            let Some(current) = self.get_with_connection(tx, &envelope.payload.skill_id)? else {
+                return Ok(CommandHandlerResult::rejected("skill_missing", json!({"message":"技能不存在。"})));
+            };
+            let reject = |code, message| Ok(CommandHandlerResult::rejected(code, json!({"message":message})));
+            if current.version != envelope.payload.expected_version {
+                return reject("version_conflict", "技能已变化，请刷新。");
+            }
+            if current.lifecycle_status != "active" { return reject("skill_deleting", "技能正在删除。"); }
+            let patch = &envelope.payload.patch;
+            if patch.visibility_scope.as_deref().is_some_and(|s| !matches!(s,"private"|"assigned"|"global")) ||
+                patch.learned_state.as_deref().is_some_and(|s| !matches!(s,"active"|"stale"|"archived")) {
+                return reject("INVALID_ARGUMENT", "技能元数据无效。");
+            }
+            if current.learned.is_none() && (patch.learned_state.is_some() || patch.pinned.is_some() || patch.locked.is_some()) {
+                return reject("INVALID_ARGUMENT", "只有习得技能支持这些操作。");
+            }
+            if let Some(scope) = &patch.visibility_scope {
+                let owner: Option<Option<String>> = tx.query_row(
+                    "SELECT owner_agent_id FROM member_skill_source WHERE skill_id=?1",
+                    [&current.id], |r| r.get(0)).optional()?;
+                if owner.is_none() || (owner.as_ref().is_some_and(Option::is_none) && scope != "private") {
+                    return reject("INVALID_ARGUMENT", "未归属的技能不能更改共享范围。");
+                }
+                tx.execute("UPDATE member_skill_source SET visibility_scope=?1 WHERE skill_id=?2", params![scope,current.id])?;
+                if scope == "private" {
+                    if let Some(Some(owner)) = owner {
+                        tx.execute("UPDATE member_capability_choice SET selected=0 WHERE kind='skill' AND item_key=?1 AND agent_id<>?2",
+                            params![format!("library:{}",current.id),owner])?;
+                    }
+                }
+            }
+            tx.execute("UPDATE skill SET learned_state=COALESCE(?1,learned_state),
+                learned_pinned=COALESCE(?2,learned_pinned), learned_locked=COALESCE(?3,learned_locked),
+                version=version+1, updated_at=?4 WHERE id=?5",
+                params![patch.learned_state,patch.pinned,patch.locked,Utc::now().to_rfc3339(),current.id])?;
+            append_skill_event(tx,"skill.metadata.set",&current.id,&envelope.actor,json!({"skillId":current.id}))?;
+            Ok(CommandHandlerResult::applied("skill_metadata_set",json!({"skillId":current.id,"version":current.version+1}),
+                Some(EntityReference { entity_type:"skill".to_string(),entity_id:current.id })))
+        })
     }
 
     pub fn set_enabled(
@@ -2441,6 +2520,10 @@ fn skill_view_from_row(row: &Row<'_>) -> rusqlite::Result<SkillView> {
         origin,
         enabled: row.get(3)?,
         lifecycle_status: row.get(4)?,
+        visibility_scope: row.get(20)?,
+        learned: row.get::<_, Option<String>>(21)?.map(|agent_id| -> rusqlite::Result<LearnedSkillView> {
+            Ok(LearnedSkillView { agent_id, state: row.get(22)?, pinned: row.get(23)?, locked: row.get(24)? })
+        }).transpose()?,
         version: row.get(5)?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
@@ -4230,12 +4313,38 @@ mod windows_skill_library_tests {
 #[cfg(all(test, feature = "slow-tests", unix))]
 mod slow_tests {
     use super::*;
-    use crate::command::ActorRef;
+    use crate::command::{ActorRef, CommandResultStatus};
 
     fn temporary_directory(prefix: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn skill_metadata_scopes_cas_and_replay_are_atomic() {
+        let root = temporary_directory("loom-metadata");
+        let mut db = Database::open(&root.join("db")).unwrap();
+        let library = SkillLibraryService::new(root.join("skills")).unwrap();
+        library.install_bundled_skills(&mut db).unwrap();
+        let skill = library.list(&db).unwrap().remove(0);
+        db.connection().execute("INSERT INTO member_skill_source(skill_id,library_root,registered_at,owner_agent_id) VALUES(?1,'root','now','owner')", [&skill.id]).unwrap();
+        let command = |id: &str, version, scope: &str| user_envelope(id, SetSkillMetadataCommand {
+            skill_id: skill.id.clone(), expected_version:version,
+            patch: SkillMetadataPatch { visibility_scope:Some(scope.to_string()),learned_state:None,pinned:None,locked:None }
+        });
+        let first=command("meta-global",skill.version,"global");
+        assert_eq!(library.set_metadata(&mut db,&first).unwrap().result.status,CommandResultStatus::Applied);
+        assert!(library.set_metadata(&mut db,&first).unwrap().replayed);
+        assert_eq!(library.set_metadata(&mut db,&command("meta-conflict",skill.version,"private")).unwrap().result.status,CommandResultStatus::Rejected);
+        assert_eq!(library.set_metadata(&mut db,&command("meta-invalid",skill.version+1,"invalid")).unwrap().result.status,CommandResultStatus::Rejected);
+        db.connection().execute("INSERT INTO member_capability_choice VALUES('other','skill',?1,1,'explicit','now')",[format!("library:{}",skill.id)]).unwrap();
+        assert_eq!(library.set_metadata(&mut db,&command("meta-private",skill.version+1,"private")).unwrap().result.status,CommandResultStatus::Applied);
+        let selected:bool=db.connection().query_row("SELECT selected FROM member_capability_choice WHERE agent_id='other'",[],|r|r.get(0)).unwrap();
+        assert!(!selected);
+        db.connection().execute("UPDATE member_skill_source SET owner_agent_id=NULL WHERE skill_id=?1",[&skill.id]).unwrap();
+        assert_eq!(library.set_metadata(&mut db,&command("meta-unowned",skill.version+2,"global")).unwrap().result.status,CommandResultStatus::Rejected);
+        drop(db);remove_directory_if_present(&root).unwrap();
     }
 
     fn user_envelope<P>(command_id: &str, payload: P) -> CommandEnvelope<P> {

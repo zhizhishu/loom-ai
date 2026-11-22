@@ -174,6 +174,8 @@ pub enum Operation {
     SkillImportCommit,
     #[serde(rename = "skills.setEnabled")]
     SkillEnable,
+    #[serde(rename = "skills.metadata.set")]
+    SkillMetadataSet,
     #[serde(rename = "skills.setGroupAssignments")]
     SkillGroupsSet,
     #[serde(rename = "skills.delete")]
@@ -635,6 +637,7 @@ impl Operation {
             Self::SkillImportInspect => "skills.import.inspect",
             Self::SkillGithubInspect => "skills.import.github.inspect",
             Self::SkillImportCommit => "skills.import.commit",
+            Self::SkillMetadataSet => "skills.metadata.set",
             Self::SkillEnable => "skills.setEnabled",
             Self::SkillGroupsSet => "skills.setGroupAssignments",
             Self::SkillDelete => "skills.delete",

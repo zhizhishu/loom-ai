@@ -290,7 +290,7 @@ use rovai_core::{
         SingleChatService,
     },
     skill::{
-        CommitSkillImportCommand, DeleteSkillCommand, SetSkillEnabledCommand,
+        CommitSkillImportCommand, DeleteSkillCommand, SetSkillEnabledCommand, SetSkillMetadataCommand,
         SetSkillGroupAssignmentsCommand, SkillContentRequest, SkillLibraryService,
     },
     skill_projection::{
@@ -11182,6 +11182,16 @@ impl Core {
                 )?;
                 if execution.result.status == CommandResultStatus::Applied {
                     self.mark_skill_projections_dirty_best_effort(&mut database, false);
+                }
+                Ok(serde_json::to_value(execution.result)?)
+            }
+            "skills.metadata.set" => {
+                let params: UserCommandParams<SetSkillMetadataCommand> = serde_json::from_value(request.params.clone())?;
+                let mut database = self.database.lock().await;
+                let execution = self.skill_library.set_metadata(&mut database,
+                    &user_command_envelope(params.command_id, params.command))?;
+                if execution.result.status == CommandResultStatus::Applied {
+                    self.mark_skill_projections_dirty_best_effort(&mut database, true);
                 }
                 Ok(serde_json::to_value(execution.result)?)
             }
