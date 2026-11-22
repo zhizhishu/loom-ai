@@ -681,12 +681,13 @@ pub(crate) fn wake_delivery_scheduler_after_commit(
 
 /// The same wake for a write that has already committed and no longer holds its rows.
 /// upstream: Mikka d59c85cb lib/coordinator/wake-after-commit.ts:wakeCoordinatorSoon
-pub(crate) fn wake_delivery_scheduler_now(database: &Database) -> bool {
-    if !has_waiting_delivery_batch_work(database).unwrap_or(false) {
-        return false;
-    }
+///
+/// Upstream wakes unconditionally here: the committed write is the whole reason, and the consumer
+/// re-reads committed state instead of trusting the caller. Gating this on `waiting` rows alone
+/// would swallow the wake for a queued batch Run, a steer input or a control dispatch that only
+/// just became startable; a wake with nothing to do costs the consumer one empty pass.
+pub(crate) fn wake_delivery_scheduler_now(database: &Database) {
     database.execution_wake.delivery.notify_one();
-    true
 }
 
 /// Converts waiting Delivery lanes into immutable, ordered multi-input AgentRuns.
@@ -9445,6 +9446,66 @@ mod tests {
             &fixture.database,
             &[committed]
         ));
+    }
+
+    async fn drain_delivery_wakes(wake: &tokio::sync::Notify) {
+        while tokio::time::timeout(std::time::Duration::from_millis(1), wake.notified())
+            .await
+            .is_ok()
+        {}
+    }
+
+    /// upstream: Mikka d59c85cb lib/coordinator/wake-after-commit.test.ts
+    /// ("already-committed writes notify; delivered or background events do not queue a wake").
+    #[tokio::test]
+    async fn an_already_committed_write_wakes_at_once_and_a_delivered_row_queues_no_wake() {
+        let mut fixture = Fixture::new();
+        let wake = fixture.database.execution_wake.delivery.clone();
+        drain_delivery_wakes(&wake).await;
+
+        // `wakeCoordinatorSoon`: the write already committed and no longer holds its rows, yet it
+        // still notifies — the consumer, not this gate, reads what the commit left behind.
+        let soon = fixture.enqueue("soon-message", "已经提交");
+        wake_delivery_scheduler_now(&fixture.database);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), wake.notified())
+                .await
+                .is_ok(),
+            "an already-committed write notifies the scheduler"
+        );
+
+        // `deliveredAt` set: the claim took the row, so replaying that commit queues nothing.
+        let runs = claim_waiting_delivery_batches(&mut fixture.database, 1).unwrap();
+        assert_eq!(runs.len(), 1);
+        drain_delivery_wakes(&wake).await;
+        assert!(!wake_delivery_scheduler_after_commit(
+            &fixture.database,
+            std::slice::from_ref(&soon)
+        ));
+        // `tier: 'background'` upstream. No LOOM lane is ever admitted as background — a row that
+        // must not start a turn never becomes a Delivery — so an id no Delivery row carries is that
+        // same case: the wake is dropped at the gate, before anything could be queued.
+        assert!(!wake_delivery_scheduler_after_commit(
+            &fixture.database,
+            &["never-a-delivery".to_string()]
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), wake.notified())
+                .await
+                .is_err(),
+            "a delivered or never-a-lane write queues no wake"
+        );
+
+        // And the soon-wake owes the row state nothing at all: with no `waiting` row left it still
+        // notifies, exactly like the unconditional upstream `wakeCoordinatorSoon`.
+        assert!(!has_waiting_delivery_batch_work(&fixture.database).unwrap());
+        wake_delivery_scheduler_now(&fixture.database);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), wake.notified())
+                .await
+                .is_ok(),
+            "the soon-wake does not wait for a `waiting` row to exist"
+        );
     }
 
     /// upstream: Mikka d59c85cb lib/run-recovery-due.ts:nextRunRecoveryDue

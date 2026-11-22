@@ -9875,6 +9875,9 @@ impl Database {
             if !self.schema_migration_applied(237)? {
                 migration_step!("migration_237", loom::migrate_recovery_ledger(self));
             }
+            if !self.schema_migration_applied(240)? {
+                migration_step!("migration_240", loom::migrate_recovery_watchdog_state(self));
+            }
             if let Err(error) =
                 crate::notification::maintain_notification_episode_retention(self.connection())
             {
@@ -10819,6 +10822,9 @@ impl Database {
         }
         if !self.schema_migration_applied(237)? {
             migration_step!("migration_237", loom::migrate_recovery_ledger(self));
+        }
+        if !self.schema_migration_applied(240)? {
+            migration_step!("migration_240", loom::migrate_recovery_watchdog_state(self));
         }
         if let Err(error) =
             crate::notification::maintain_notification_episode_retention(self.connection())
