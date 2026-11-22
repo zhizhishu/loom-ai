@@ -1,4 +1,4 @@
-// upstream: Mikka d59c85cb lib/factory/automatic-dispatch.ts:automaticFactoryDispatch, lib/factory/dispatch.ts:createFactoryDispatch
+// upstream: Mikka d59c85cb lib/factory/automatic-dispatch.ts:automaticFactoryDispatch, lib/factory/dispatch.ts:createFactoryDispatch, lib/factory/watchdog.ts:sweepFactoryWatchdog
 //! LOOM dispatch scheduling: the Core decides, per Plan, which Task event may carry a Delivery
 //! right now, and records that decision in the permanent dispatch ledger.
 //!
@@ -61,18 +61,42 @@
 //!   start, and never mints a second one. `loom_task.blocked_reason` is only the current-state
 //!   mirror of those facts.
 //!
-//! The cloud half of the upstream module (`FACTORY_CLOUD_DISPATCH_AVAILABLE`, `switchToCloud`) has
-//! no counterpart here: cloud (E2B) dispatch stays unavailable, so no pass of this module can start
-//! one and no code in it can be turned on to try.
+//! Three halves of the upstream module have no counterpart here, and deliberately none of them is a
+//! gap a later pass has to fill:
+//!
+//! * **Cloud dispatch** (`FACTORY_CLOUD_DISPATCH_AVAILABLE`, `switchToCloud`, `CloudKeyConfigured`)
+//!   stays unavailable: no pass of this module can start one and no code in it can be turned on to
+//!   try, so the upstream `409 cloudDispatchUnavailable` — including the `e2bKeyNotConfigured`
+//!   branch behind it — has no path to reach.
+//! * **The read-only status half** (`createFactoryDispatchRecovery.status`, BE-16: the reason code is
+//!   computed from the device state right now and *nothing* is written) is `dispatch_block_reason`,
+//!   which is a pure read of the same facts: no pass, no repair and no mirror write is reachable
+//!   from it, so asking it cannot change the answer it is about to give.
+//! * **The `#453` clarification payload** (`factoryDispatchClarification`) is a question the upstream
+//!   frontend renders with a "wait / switch to cloud" choice, and its two options are exactly the two
+//!   facts this module already owns: the wait is the reserved Delivery that resumes by itself, and
+//!   the cloud switch is the branch above that does not exist. The Core-facing surface of the same
+//!   judgement is `loom_task.blocked_reason`, written only by the durable-fact path and never by a
+//!   reader.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 
 use super::super::blocking_dependencies;
+use super::super::watchdog::{
+    WatchdogDecision, WatchdogProgress, WatchdogState, factory_watchdog_decision,
+};
 use super::{LoomControlPolicy, active_member, read_policy};
 use crate::agent_profile::{AdapterKind, RuntimeReadiness, RuntimeReadinessStatus};
-use crate::collaboration::{LoomDispatchAdmission, LoomDispatchAdmissionOutcome};
-use crate::db::Database;
+use crate::collaboration::{
+    LoomDispatchAdmission, LoomDispatchAdmissionOutcome, admit_loom_dispatch_message,
+};
+use crate::db::{
+    Database, LoomRecoveryReceipt, WatchdogObservation, next_watchdog_tries,
+    record_watchdog_observation, recovery_budget, recovery_exhausted, recovery_receipt,
+};
 
 /// One scheduler pass never starts more than this many dispatches, so an approval of a thousand
 /// Tasks cannot turn into a thousand Runs in one tick.
@@ -109,6 +133,54 @@ const REVIEW: &str = "REVIEW";
 const REWORK: &str = "REWORK";
 const HANDOFF: &str = "HANDOFF";
 
+/// The four `blocked_reason` values the watchdog owns. They are the LOOM spelling of the
+/// upstream `attempt.output.watchdog.reasonCode` (`task_stalled`, `external_effect_uncertain`,
+/// `stop_unacknowledged`, `recovery_exhausted`): the receipt keeps the upstream literal, this
+/// field — the Task's current-state mirror — carries the product-facing code. Nothing else may
+/// write these, and the watchdog only ever clears its own.
+const WATCHDOG_STALLED_REASON: &str = "loom.watchdog.task_stalled";
+const WATCHDOG_EXTERNAL_EFFECT_REASON: &str = "loom.watchdog.external_effect_uncertain";
+const WATCHDOG_STOP_TIMEOUT_REASON: &str = "loom.watchdog.stop_unacknowledged";
+const WATCHDOG_EXHAUSTED_REASON: &str = "loom.watchdog.recovery_exhausted";
+const WATCHDOG_REASONS: [&str; 4] = [
+    WATCHDOG_STALLED_REASON,
+    WATCHDOG_EXTERNAL_EFFECT_REASON,
+    WATCHDOG_STOP_TIMEOUT_REASON,
+    WATCHDOG_EXHAUSTED_REASON,
+];
+
+/// Upstream `reasonCode` of each hold, as the receipt records it. The decision table compares
+/// against the `task_stalled` literal, so the mapping is part of the contract, not a label.
+const WATCHDOG_REASON_STALLED: &str = "task_stalled";
+const WATCHDOG_REASON_EXTERNAL_EFFECT: &str = "external_effect_uncertain";
+const WATCHDOG_REASON_STOP_TIMEOUT: &str = "stop_unacknowledged";
+const WATCHDOG_REASON_EXHAUSTED: &str = "recovery_exhausted";
+
+/// Upstream `kind: 'task_watchdog'`: the durable "one actionable blocker" the sweep queues for the
+/// Coordinator, and its counterpart once the Task may run again. `event_log.event_id` is unique, so
+/// the same hold of the same epoch is stored once whatever happens in between.
+///
+/// The two identities are per *different* facts, as upstream keys them: a hold is one fact per epoch
+/// (`task-watchdog:${task.id}:${task.sourceEventId}`, `watchdog.ts:214`), while a hand-back is one
+/// fact per Attempt it minted (`run_redispatched:${runId}`, `dispatch-recovery.ts:150`).
+const WATCHDOG_BLOCKED_EVENT: &str = "loom.watchdog_blocked";
+const WATCHDOG_RECOVERED_EVENT: &str = "loom.watchdog_recovered";
+
+/// Upstream `LIMIT 40`: one bounded pass never scans an unbounded Task set, so the tick's cost is
+/// bounded by the page and the deadline it works against.
+const WATCHDOG_SCAN_LIMIT: usize = 40;
+
+/// The marker a retried Attempt's event identity carries. The base event identity is the epoch a
+/// watchdog receipt, its budget and its backoff are bound to; a retry is another Attempt of that
+/// same epoch, exactly like upstream's `watchdog-retry` event, so the identity is
+/// `[<base parts>, "watchdog_retry", <ordinal>]`.
+const WATCHDOG_RETRY_MARKER: &str = "watchdog_retry";
+
+/// The reason a superseded Attempt is closed with. A `CANCELLED` dispatch never executed, so the
+/// class-level "previous outcome unknown" rule stops treating its failed Run as an unknown result
+/// once the watchdog has resolved it by handing the Task back.
+const WATCHDOG_SUPERSEDED_REASON: &str = "loom.watchdog.superseded";
+
 /// One event the standing policy authorizes right now.
 struct DispatchEvent {
     task_id: String,
@@ -134,16 +206,68 @@ enum PriorOutcome {
     Failed,
 }
 
+/// What one LOOM tick did, so the caller can wake exactly the lanes an accepted write created.
+///
+/// The counters are the upstream sweep's own vocabulary (`scanned`/`recovered`/`blocked`/
+/// `deferred`/`failed`), plus the admitted dispatch count the scheduler already reported.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoomTickOutcome {
+    /// Deliveries the admission half of this tick created.
+    pub admitted: usize,
+    /// Tasks the watchdog observed.
+    pub scanned: usize,
+    /// Tasks the watchdog handed back to the scheduler after a confirmed stop.
+    pub recovered: usize,
+    /// Tasks the watchdog held with a durable reason.
+    pub blocked: usize,
+    /// Tasks whose recorded backoff has not elapsed yet, or whose work was left to another owner.
+    pub deferred: usize,
+}
+
+impl LoomTickOutcome {
+    /// True when a committed hold or recovery has to reach somebody after the write: the blocked
+    /// Task needs its Lead, and the resumed Task needs its dispatch lane woken.
+    pub(crate) fn watchdog_changed(self) -> bool {
+        self.recovered > 0 || self.blocked > 0
+    }
+}
+
 /// Admit every dispatch the standing policies authorize right now, and report how many Deliveries
 /// were created. Reconciliation runs first, so a pass always reacts to what the previous Deliveries
 /// actually did instead of re-dispatching on top of an unknown outcome.
 pub fn admit_due_dispatches(database: &mut Database) -> Result<usize> {
+    Ok(admit_due_dispatches_at(database, chrono::Utc::now())?.admitted)
+}
+
+/// The same tick against an explicit clock.
+///
+/// One tick, in this order and in one `IMMEDIATE` transaction:
+///
+/// 1. **Reconcile.** Every pending dispatch is folded from the outcome of the Delivery/Run behind it,
+///    so nothing below judges a Task against a Run outcome the ledger has not seen yet.
+/// 2. **Watchdog.** Each approved Task is observed once (`sweep_watchdog`): the decision table from
+///    `loom::watchdog` judges the persisted facts, a hold is written durably, an old executor is
+///    asked to stop, and only a Task whose executor demonstrably ended is handed back.
+/// 3. **Dispatch.** Due events are admitted, so a Task the watchdog just released is picked up in
+///    the very same transaction — and a Task it just held is not, because the hold is part of the
+///    event's own admission rules (`event_problem`).
+///
+/// The clock is an argument rather than a hidden `now()` so a caller — a test, or a future deadline
+/// budget — decides which instant the pass judges, exactly as the pure decision table does.
+pub(crate) fn admit_due_dispatches_at(
+    database: &mut Database,
+    now: DateTime<Utc>,
+) -> Result<LoomTickOutcome> {
     let transaction = database
         .connection_mut()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let now = chrono::Utc::now().to_rfc3339();
+    let now_text = now.to_rfc3339();
 
-    reconcile_dispatches(&transaction, &now)?;
+    reconcile_dispatches(&transaction, &now_text)?;
+
+    // The sweep judges every Task against the instant this pass was opened, never against a second
+    // reading of the wall clock halfway through the transaction.
+    let watchdog = sweep_watchdog(&transaction, now)?;
 
     let mut plans: Vec<(String, String)> = Vec::new();
     {
@@ -166,12 +290,15 @@ pub fn admit_due_dispatches(database: &mut Database) -> Result<usize> {
             &transaction,
             &plan_id,
             &mission_id,
-            &now,
+            &now_text,
             MAX_DISPATCHES_PER_TICK - admitted,
         )?;
     }
     transaction.commit()?;
-    Ok(admitted)
+    Ok(LoomTickOutcome {
+        admitted,
+        ..watchdog
+    })
 }
 
 /// Why this recorded dispatch may not proceed, or `None` when it may.
@@ -796,6 +923,16 @@ fn event_problem(
         None
     };
 
+    // A Task the watchdog holds — a stalled executor, an external effect with an uncertain receipt,
+    // a stop the old executor never acknowledged, or an exhausted recovery budget — is not handed
+    // out again. The hold is what makes a replay impossible until the watchdog releases it: the
+    // scheduler asks this before it mints an event, and the pre-execution recheck asks it again
+    // immediately before a reserved Delivery starts. Releasing the hold is the watchdog's own write,
+    // so a Task it just resumed is admitted by the very same tick.
+    if let Some(reason) = watchdog_hold_reason(transaction, plan_id, task_id)? {
+        return Ok(Some(reason));
+    }
+
     let task_state: Option<(String, Option<String>)> = transaction
         .query_row(
             "SELECT status, assignee_agent_id FROM loom_task WHERE plan_id=?1 AND task_id=?2",
@@ -892,6 +1029,7 @@ fn event_problem(
                    AND dispatch.candidate_id=?3
                    AND dispatch.policy_revision=?5
                    AND dispatch.dispatch_id <> COALESCE(?4,'')
+                   AND dispatch.status <> 'CANCELLED'
                    AND NOT EXISTS(SELECT 1 FROM loom_stage_review review
                                   WHERE review.candidate_id=dispatch.candidate_id
                                     AND review.policy_revision=dispatch.policy_revision)",
@@ -987,22 +1125,29 @@ fn prior_outcome_of_class(
     excluding_dispatch_id: Option<&str>,
     standing_authorization: Option<i64>,
 ) -> Result<PriorOutcome> {
-    let mut dispatches: Vec<(String, i64)> = Vec::new();
+    let mut dispatches: Vec<(String, i64, String)> = Vec::new();
     {
         let mut statement = connection.prepare(
-            "SELECT dispatch_id, policy_revision FROM loom_control_dispatch
+            "SELECT dispatch_id, policy_revision, status FROM loom_control_dispatch
              WHERE plan_id=?1 AND task_id=?2 AND kind=?3
              ORDER BY created_at, dispatch_id",
         )?;
-        let rows =
-            statement.query_map(params![plan_id, task_id, kind], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let rows = statement.query_map(params![plan_id, task_id, kind], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
         for row in rows {
             dispatches.push(row?);
         }
     }
     let mut worst = PriorOutcome::Completed;
-    for (dispatch_id, policy_revision) in dispatches {
+    for (dispatch_id, policy_revision, status) in dispatches {
         if excluding_dispatch_id == Some(dispatch_id.as_str()) {
+            continue;
+        }
+        // A `CANCELLED` dispatch never executed: its Delivery was cancelled before the work started,
+        // or the watchdog closed the Attempt it resolved by handing the Task back. It is not an
+        // unknown outcome of this class and must not keep the successor closed.
+        if status == "CANCELLED" {
             continue;
         }
         if kind == REVIEW
@@ -1171,6 +1316,1120 @@ fn reconcile_dispatches(transaction: &Transaction<'_>, now: &str) -> Result<()> 
             params![status, reason, now, &dispatch_id],
         )?;
     }
+    Ok(())
+}
+
+/// The stable epoch identity of one recorded dispatch (upstream `sourceEventId`).
+///
+/// A LOOM event identity is the dedupe key: a JSON array of the facts that make one dispatch the
+/// dispatch it is. Two things follow. A retried Attempt must stay in the *same* epoch, so the retry
+/// suffix is stripped here; and the ledger column is bounded at 120 characters while a legal Task
+/// id is up to 200, which makes a REVIEW identity longer than any receipt column may hold. The
+/// epoch is therefore a digest of that identity: stable, bounded, and never a value that can abort
+/// the whole tick because one identifier happens to be long.
+pub(crate) fn request_epoch(dedupe_key: &str) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(base_event_identity(dedupe_key).as_bytes());
+    let mut hex = String::with_capacity(70);
+    hex.push_str("epoch:");
+    for byte in digest.iter() {
+        hex.push(DIGITS[usize::from(byte >> 4)] as char);
+        hex.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    hex
+}
+
+/// The event identity a retried Attempt belongs to: the recorded dedupe key without the
+/// `watchdog_retry` suffix. A key that is not that shape is its own base.
+fn base_event_identity(dedupe_key: &str) -> String {
+    let Ok(parts) = serde_json::from_str::<Vec<String>>(dedupe_key) else {
+        return dedupe_key.to_string();
+    };
+    if parts.len() >= 2 && parts[parts.len() - 2] == WATCHDOG_RETRY_MARKER {
+        if let Ok(base) = serde_json::to_string(&parts[..parts.len() - 2]) {
+            return base;
+        }
+    }
+    dedupe_key.to_string()
+}
+
+/// The event identity of one retried Attempt of `base` (upstream's `watchdog-retry` event).
+fn retry_dedupe_key(base: &str, ordinal: i64) -> Result<String> {
+    let mut parts: Vec<String> = serde_json::from_str(base)
+        .context("a recorded LOOM dispatch identity must be a JSON array of strings")?;
+    parts.push(WATCHDOG_RETRY_MARKER.to_string());
+    parts.push(ordinal.to_string());
+    let parts = parts.iter().map(String::as_str).collect::<Vec<_>>();
+    dedupe_key(&parts)
+}
+
+/// One Task the sweep observes, with every fact the decision table reads already resolved.
+///
+/// The facts are the persisted ones and nothing else: the Task row, the current Attempt (its
+/// dispatch, its Delivery, its claim) and the Run behind it. Lease and heartbeat timestamps are
+/// deliberately absent — `agent_run.execution_lease_expires_at`, `loom_claim.lease_expires_at` and
+/// `execution_node.last_heartbeat` say that a process is *alive*, never that it made progress, so a
+/// hung executor that keeps renewing its lease must still be stopped.
+struct WatchdogSubject {
+    plan_id: String,
+    mission_id: String,
+    camp_id: Option<String>,
+    task_id: String,
+    /// The current Attempt's identity. The ledger treats it like upstream's `attemptId`: a new
+    /// Attempt restarts `tries`, while the epoch budget it inherits stays spent.
+    attempt_id: String,
+    /// The epoch: the event identity of the current Attempt (upstream `sourceEventId`). A different
+    /// event is a different epoch with its own budget; a retry of the same event is not.
+    request_epoch: String,
+    /// Mikka Task status (`pending` / `running` / `blocked`), mapped from LOOM's own row.
+    task_status: &'static str,
+    /// Mikka stage (`execute` / `review` / `verify`), derived from the current event kind.
+    stage: &'static str,
+    run_status: Option<String>,
+    active_run: bool,
+    uncertain_effect: bool,
+    progress_at: DateTime<Utc>,
+}
+
+/// What one observation did, so the pass can be counted the way upstream counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Observation {
+    /// A healthy, human-owned or already-held Task: the receipt is refreshed and nothing is spent.
+    Wait,
+    /// The recorded backoff has not elapsed, so this pass did not judge the Task again.
+    Deferred,
+    /// The Task was held with a durable reason and its executor was asked to stop.
+    Blocked,
+    /// The old executor demonstrably ended, so the Task was handed back to the scheduler.
+    Recovered,
+    /// Reconciliation or dispatch: another half of this tick acts, the watchdog only observes.
+    HandedOff,
+}
+
+/// Observe every Task of an approved Plan once (upstream `sweepFactoryWatchdog`).
+///
+/// The sweep is the watchdog's *whole* write path: it decides, records the durable receipt, holds
+/// the Task, asks a stale executor to stop, and hands a Task back only once that executor is gone.
+/// It reuses the tick's own reconciliation and dispatch instead of opening a second execution path,
+/// exactly as upstream reuses host reconciliation/dispatch and leaves semantic replanning to the
+/// Coordinator's own Decisions API.
+fn sweep_watchdog(transaction: &Transaction<'_>, now: DateTime<Utc>) -> Result<LoomTickOutcome> {
+    let mut outcome = LoomTickOutcome::default();
+    for subject in watchdog_subjects(transaction, now)? {
+        outcome.scanned += 1;
+        match observe_watchdog(transaction, &subject, now)? {
+            Observation::Wait | Observation::HandedOff => {}
+            Observation::Deferred => outcome.deferred += 1,
+            Observation::Blocked => outcome.blocked += 1,
+            Observation::Recovered => outcome.recovered += 1,
+        }
+    }
+    Ok(outcome)
+}
+
+/// The Tasks one bounded pass observes: those an approved, unexpired and unpaused policy scopes, in
+/// the order upstream scans them (`updatedAt`, then identity) and never more than one page of them.
+fn watchdog_subjects(
+    transaction: &Transaction<'_>,
+    now: DateTime<Utc>,
+) -> Result<Vec<WatchdogSubject>> {
+    let mut rows: Vec<(String, String, String, String, Option<String>, String)> = Vec::new();
+    {
+        // The approval is part of the *selection*, not a filter after it: a page filled with Tasks
+        // no approved policy scopes would otherwise use up the whole bound and the Tasks the sweep
+        // may actually repair would never be observed. A Task whose recorded backoff has not
+        // elapsed sorts last for the same reason: it is counted as deferred when the page has room,
+        // but it can never occupy the head of the page forever.
+        let mut statement = transaction.prepare(
+            "SELECT task.plan_id, plan.mission_id, task.task_id, task.status, task.blocked_reason,
+                    task.updated_at
+             FROM loom_task task
+             JOIN loom_plan plan ON plan.plan_id = task.plan_id
+             JOIN loom_control_policy policy
+                  ON policy.plan_id = task.plan_id AND policy.mission_id = plan.mission_id
+             WHERE task.status IN ('DRAFT','READY','IN_REVIEW','BLOCKED')
+               AND policy.enabled = 1 AND policy.paused = 0
+               AND policy.expires_at IS NOT NULL
+               AND julianday(policy.expires_at) > julianday(?2)
+               AND EXISTS(SELECT 1 FROM json_each(policy.task_ids_json)
+                           WHERE value = task.task_id)
+             ORDER BY EXISTS(
+                          SELECT 1 FROM loom_task_recovery receipt
+                           WHERE receipt.task_id = task.task_id
+                             AND julianday(receipt.next_at) > julianday(?2)
+                             AND receipt.rowid = (SELECT newest.rowid FROM loom_task_recovery newest
+                                                   WHERE newest.task_id = task.task_id
+                                                   ORDER BY newest.observed_at DESC, newest.rowid DESC
+                                                   LIMIT 1)),
+                      task.updated_at, task.task_id
+             LIMIT ?1",
+        )?;
+        let mapped = statement.query_map(params![WATCHDOG_SCAN_LIMIT as i64, now.to_rfc3339()], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?;
+        for row in mapped {
+            rows.push(row?);
+        }
+    }
+
+    // One policy row per Plan, read once per pass: an absent row is remembered as such so a Plan
+    // without an approval costs one lookup instead of one per Task.
+    let mut policies: std::collections::HashMap<String, Option<LoomControlPolicy>> =
+        std::collections::HashMap::new();
+    let now_text = now.to_rfc3339();
+    let mut subjects = Vec::new();
+    for (plan_id, mission_id, task_id, status, blocked_reason, updated_at) in rows {
+        if !policies.contains_key(&plan_id) {
+            let loaded = read_policy(transaction, &plan_id)?;
+            policies.insert(plan_id.clone(), loaded);
+        }
+        let Some(Some(policy)) = policies.get(&plan_id) else {
+            continue;
+        };
+        // A disabled, paused, expired or foreign policy is not an authority to repair anything:
+        // pausing an approval is an explicit human act, and then the human's own path owns the Task.
+        if !policy.enabled || policy.paused || policy.mission_id != mission_id {
+            continue;
+        }
+        let Some(expires_at) = policy.expires_at.as_deref() else {
+            continue;
+        };
+        if !expiry_is_future(expires_at, &now_text) {
+            continue;
+        }
+        if !policy.task_ids.iter().any(|scoped| scoped == &task_id) {
+            continue;
+        }
+        let Some(facts) = watchdog_task_facts(
+            transaction,
+            &plan_id,
+            &task_id,
+            &status,
+            blocked_reason.as_deref(),
+            &updated_at,
+            now,
+        )?
+        else {
+            continue;
+        };
+        let camp_id: Option<String> = transaction
+            .query_row(
+                "SELECT camp_id FROM mission WHERE id=?1",
+                [&mission_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        subjects.push(WatchdogSubject {
+            plan_id,
+            mission_id,
+            camp_id,
+            task_id,
+            attempt_id: facts.attempt_id,
+            request_epoch: facts.request_epoch,
+            task_status: facts.task_status,
+            stage: facts.stage,
+            run_status: facts.run_status,
+            active_run: facts.active_run,
+            uncertain_effect: facts.uncertain_effect,
+            progress_at: facts.progress_at,
+        });
+    }
+    Ok(subjects)
+}
+
+/// Every Run that holds one Task right now, as `(id, status, startedAt, endedAt)`.
+///
+/// Two persisted facts say a Run holds a Task: the Delivery of its current Dispatch names it once the
+/// claim materialised it, and an unreleased `loom.claim` names the Run that took the Task's write
+/// lease. Both are read, because a Task whose Delivery the scheduler has not re-associated yet is
+/// still held by the Run the claim names — and a Task that *looks* idle would otherwise be handed out
+/// underneath a live executor.
+fn task_runs_sql(plan_index: u8, task_index: u8) -> String {
+    format!(
+        "SELECT run.id, run.status, run.started_at, run.ended_at
+           FROM loom_control_dispatch dispatch
+           JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+           JOIN agent_run run ON run.id = delivery.claimed_agent_run_id
+          WHERE dispatch.plan_id=?{plan_index} AND dispatch.task_id=?{task_index}
+         UNION
+         SELECT run.id, run.status, run.started_at, run.ended_at
+           FROM loom_claim claim
+           JOIN agent_run run ON run.id = claim.agent_run_id
+          WHERE claim.plan_id=?{plan_index} AND claim.task_id=?{task_index}
+            AND claim.released_at IS NULL"
+    )
+}
+
+/// The facts of one Task's current Attempt, or `None` when the Task is already settled.
+struct WatchdogTaskFacts {
+    attempt_id: String,
+    request_epoch: String,
+    task_status: &'static str,
+    stage: &'static str,
+    run_status: Option<String>,
+    active_run: bool,
+    uncertain_effect: bool,
+    progress_at: DateTime<Utc>,
+}
+
+/// Resolve one Task's persisted facts, exactly as upstream's per-candidate state query does, but
+/// without reading a heartbeat, a lease or the wall clock behind the caller's back.
+fn watchdog_task_facts(
+    transaction: &Transaction<'_>,
+    plan_id: &str,
+    task_id: &str,
+    status: &str,
+    blocked_reason: Option<&str>,
+    updated_at: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<WatchdogTaskFacts>> {
+    // The current Attempt: the latest dispatch this Task ever recorded. A Task no dispatch reached
+    // yet has no Attempt, and the epoch it will be handed out under is the execution event the
+    // scheduler is about to mint — the ledger records that identity, so the budget of the first
+    // Attempt is already bound to the event that will carry it.
+    let attempt: Option<(String, String, String, Option<String>)> = transaction
+        .query_row(
+            "SELECT dispatch.dispatch_id, dispatch.kind, dispatch.dedupe_key,
+                    delivery.claimed_agent_run_id
+             FROM loom_control_dispatch dispatch
+             LEFT JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+             WHERE dispatch.plan_id=?1 AND dispatch.task_id=?2
+             ORDER BY dispatch.created_at DESC, dispatch.dispatch_id DESC LIMIT 1",
+            params![plan_id, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let (attempt_id, event_kind, request_epoch, current_run_id) = match attempt {
+        Some((dispatch_id, kind, dedupe_key, run_id)) => {
+            (dispatch_id, Some(kind), request_epoch(&dedupe_key), run_id)
+        }
+        None => {
+            // No Attempt has been recorded yet, so the first one will be the EXECUTE event the
+            // scheduler is about to mint. Its identity is the epoch the receipt is bound to, and
+            // the Attempt id is bounded the same way: `task:{task_id}` would exceed the ledger's
+            // 120-character column for a legal long Task id.
+            let event = dedupe_key(&[EXECUTE, plan_id, task_id])?;
+            (
+                format!("task:{}", &request_epoch(&event)["epoch:".len()..]),
+                None,
+                request_epoch(&event),
+                None,
+            )
+        }
+    };
+
+    let mut runs: Vec<(String, String)> = Vec::new();
+    {
+        let mut statement = transaction.prepare(&task_runs_sql(1, 2))?;
+        let mapped = statement.query_map(params![plan_id, task_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        for row in mapped {
+            runs.push(row?);
+        }
+    }
+    // Upstream `activeRun`: a Run that still holds the Task. `waiting` is a live Run here, not a
+    // finished one, so it keeps the Task from being dispatched a second time.
+    let active_run = runs
+        .iter()
+        .any(|(_, status)| matches!(status.as_str(), "queued" | "running" | "waiting"));
+    let run_status = current_run_id
+        .as_deref()
+        .and_then(|current| runs.iter().find(|(run_id, _)| run_id == current))
+        .map(|(_, status)| watchdog_run_status(status).to_string());
+
+    let progress_at = watchdog_progress_at(transaction, plan_id, task_id, updated_at, now)?;
+    Ok(Some(WatchdogTaskFacts {
+        attempt_id,
+        request_epoch,
+        task_status: watchdog_task_status(status, blocked_reason),
+        stage: watchdog_stage(event_kind.as_deref()),
+        run_status,
+        active_run,
+        uncertain_effect: watchdog_uncertain_effect(transaction, &runs, now)?,
+        progress_at,
+    }))
+}
+
+/// The LOOM Run status in the decision table's vocabulary.
+///
+/// Mikka's `waiting_input` and LOOM's `waiting` are the same fact — a live Run whose next move needs
+/// something a human or another lane owns — so the table's own first branch (which must never stop
+/// such a Run) is what protects it here. Every other literal is spelled the same on both sides.
+fn watchdog_run_status(status: &str) -> &'static str {
+    match status {
+        "queued" => "queued",
+        "running" => "running",
+        "waiting" => "waiting_input",
+        "succeeded" => "succeeded",
+        "failed" => "failed",
+        "cancelled" => "cancelled",
+        // An unrecognised literal is a Run that is not provably live: the table's terminal set
+        // contains none of this spelling, so it reads as "not terminal" and only ever waits.
+        _ => "unknown",
+    }
+}
+
+/// The LOOM Task row in the decision table's vocabulary.
+///
+/// LOOM keeps two facts apart that Mikka folds into one status column: the state machine in
+/// `loom_task.status` (which a hold never rewrites) and the current hold in `blocked_reason`
+/// (which the owner that applied it writes). A Task carrying a reason is therefore *held*, and a
+/// held Task whose receipt names a reason this watchdog did not record falls through to `wait` —
+/// exactly like upstream's blocked Task whose `watchdog.reasonCode` is not `task_stalled`.
+fn watchdog_task_status(status: &str, blocked_reason: Option<&str>) -> &'static str {
+    if blocked_reason.is_some() || status == "BLOCKED" {
+        return "blocked";
+    }
+    match status {
+        "IN_REVIEW" => "running",
+        // `DRAFT` and `READY` are both "nothing is running yet" — the scan never yields anything
+        // else, because a finished Task is not observed at all.
+        _ => "pending",
+    }
+}
+
+/// The stage window a Task is measured against. LOOM has no stage column: the current event kind is
+/// the stage. `REWORK` is another execution of the same Task, and `HANDOFF` is the Lead's own final
+/// verification, so only the review window is short enough to be a separate case.
+fn watchdog_stage(event_kind: Option<&str>) -> &'static str {
+    match event_kind {
+        Some(REVIEW) => "review",
+        Some(HANDOFF) => "verify",
+        // `EXECUTE`, `REWORK` and a Task no dispatch reached yet: the next event the scheduler mints
+        // is an execution, so the long execute window is the honest one.
+        _ => "execute",
+    }
+}
+
+/// Upstream `GREATEST(t.updatedAt, a.createdAt, a.finishedAt, c.createdAt, cp.updatedAt, max tool
+/// output)`: the newest *persisted* progress instant.
+///
+/// Only facts that record work appear here. Lease renewals, execution heartbeats and an
+/// `agent_run.updated_at` that a renewal bumps are deliberately left out: they prove a process is
+/// alive, never that it advanced, and reading them would let a hung executor hold its Task open
+/// forever.
+fn watchdog_progress_at(
+    transaction: &Transaction<'_>,
+    plan_id: &str,
+    task_id: &str,
+    task_updated_at: &str,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
+    let mut candidates: Vec<Option<String>> = vec![Some(task_updated_at.to_string())];
+    let scalar = |sql: &str| -> Result<Option<String>> {
+        Ok(transaction
+            .query_row(sql, params![plan_id, task_id], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten())
+    };
+    // The Attempt's own start and end, from the facts that record them: the claim the Run took and
+    // the Run's own boundaries. The ledger row's `created_at` is the admission instant of the event,
+    // which the claim of that very event records again — and its `updated_at` moves when a later
+    // pass folds an outcome, which is a judgement about the attempt, not progress it made.
+    candidates.push(scalar(
+        "SELECT MAX(claimed_at) FROM loom_claim WHERE plan_id=?1 AND task_id=?2",
+    )?);
+    candidates.push(scalar(
+        "SELECT MAX(created_at) FROM loom_candidate WHERE plan_id=?1 AND task_id=?2",
+    )?);
+    candidates.push(scalar(
+        "SELECT MAX(reviewed_at) FROM loom_stage_review WHERE plan_id=?1 AND task_id=?2",
+    )?);
+    // The Run's own boundaries: when it started and when it ended. Not its `updated_at`, which a
+    // lease renewal bumps.
+    candidates.push(scalar(&format!(
+        "SELECT MAX(started_at) FROM ({})",
+        task_runs_sql(1, 2)
+    ))?);
+    candidates.push(scalar(&format!(
+        "SELECT MAX(ended_at) FROM ({})",
+        task_runs_sql(1, 2)
+    ))?);
+    candidates.push(scalar(
+        "SELECT MAX(created_at) FROM loom_artifact WHERE plan_id=?1 AND task_id=?2",
+    )?);
+    // Upstream `max(run_chunks.createdAt) WHERE chunk->>'type'='tool_output'`: the tool result a
+    // Run actually persisted is progress, even when no Candidate or artifact exists yet. Without
+    // it a long task that keeps completing tool calls — the normal shape of real work — would be
+    // judged stalled at the window and its executor stopped for no reason.
+    candidates.push(scalar(&format!(
+        "SELECT MAX(evidence.occurred_at)
+           FROM agent_run_execution_evidence evidence
+          WHERE evidence.kind IN ('tool_result','command','file_change')
+            AND evidence.agent_run_id IN (SELECT id FROM ({}))",
+        task_runs_sql(1, 2)
+    ))?);
+    Ok(latest_instant(candidates).unwrap_or(now))
+}
+
+/// The newest instant of a set of RFC 3339 readings. An unreadable instant is not "long ago" and not
+/// "just now": it simply does not extend progress.
+fn latest_instant(candidates: impl IntoIterator<Item = Option<String>>) -> Option<DateTime<Utc>> {
+    candidates
+        .into_iter()
+        .flatten()
+        .filter_map(|reading| {
+            DateTime::parse_from_rfc3339(&reading)
+                .ok()
+                .map(|at| at.with_timezone(&Utc))
+        })
+        .max()
+}
+
+/// Upstream `uncertainEffect`: an external action of this Task may already have committed, so it
+/// must be reconciled before anything is replayed.
+///
+/// LOOM's external effects are the Remote Workspace operations one Run dispatched to a Node, and
+/// only a `Run` operation can change the workspace at all: `List` and `Read` carry no effect, so an
+/// in-flight one is ordinary work and never a reason to stop the executor. A `Run` whose receipt
+/// is genuinely unsettled is one that is explicitly `unknown`, one that is already cancelling (the
+/// cancel race means its process may still be running), or one that is still in flight past its own
+/// deadline. A `Run` inside its deadline is running normally, not uncertain.
+fn watchdog_uncertain_effect(
+    transaction: &Transaction<'_>,
+    runs: &[(String, String)],
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    if runs.is_empty()
+        || !crate::remote_execution::authority_table_available(
+            transaction,
+            "workspace_rpc_requests",
+        )?
+    {
+        return Ok(false);
+    }
+    let run_ids = serde_json::to_string(
+        &runs
+            .iter()
+            .map(|(run_id, _)| run_id.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .context("a LOOM watchdog run identity list must serialise")?;
+    let mut statement = transaction.prepare(
+        "SELECT state, dispatch_json FROM workspace_rpc_requests
+          WHERE run_id IN (SELECT value FROM json_each(?1))",
+    )?;
+    let mut rows = statement.query(params![&run_ids])?;
+    let now_ms = now.timestamp_millis();
+    while let Some(row) = rows.next()? {
+        // `RequestState`: queued 0, dispatched 1, running 2, cancel requested 3, completed 4,
+        // failed 5, cancelled 6, unknown 7. A terminal request has a settled receipt.
+        let state: i64 = row.get(0)?;
+        let dispatch: String = row.get(1)?;
+        let Ok(dispatch) = serde_json::from_str::<loom_protocol::workspace_rpc::WorkspaceDispatch>(
+            &dispatch,
+        ) else {
+            // A row this Core cannot read is not proof that nothing committed: fail closed.
+            return Ok(true);
+        };
+        let changes_workspace = matches!(
+            dispatch.request.operation,
+            loom_protocol::workspace_rpc::WorkspaceOperation::Run { .. }
+        );
+        let settled = matches!(state, 4 | 5 | 6);
+        if settled || !changes_workspace {
+            continue;
+        }
+        let deadline_passed = i64::try_from(dispatch.deadline_unix_ms)
+            .map(|deadline| deadline <= now_ms)
+            .unwrap_or(true);
+        if matches!(state, 7 | 3) || deadline_passed {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Observe one Task once and apply what the decision table answered.
+fn observe_watchdog(
+    transaction: &Transaction<'_>,
+    subject: &WatchdogSubject,
+    now: DateTime<Utc>,
+) -> Result<Observation> {
+    let previous: Option<LoomRecoveryReceipt> = recovery_receipt(
+        transaction,
+        &subject.task_id,
+        &subject.attempt_id,
+        &subject.request_epoch,
+    )?;
+    let progress_at = subject.progress_at.to_rfc3339();
+    let decision = {
+        let progress = WatchdogProgress {
+            task_status: subject.task_status,
+            task_stage: subject.stage,
+            source_event_id: &subject.request_epoch,
+            run_status: subject.run_status.as_deref(),
+            active_run: subject.active_run,
+            uncertain_effect: subject.uncertain_effect,
+            // LOOM has no provider-fallback lane yet, so no durable provider intent exists that a
+            // dedicated recovery pass would own. The decision's provider branch therefore stays the
+            // table's own owner test rather than being fed a fabricated fact here.
+            provider_pending: false,
+            progress_at: subject.progress_at,
+            watchdog: previous.as_ref().map(|receipt| WatchdogState {
+                reason_code: receipt.reason_code.as_deref(),
+                request_epoch: Some(receipt.request_epoch.as_str()),
+                stopped_at: receipt.stopped_at.as_deref(),
+            }),
+        };
+        factory_watchdog_decision(&progress, now)
+    };
+
+    // Upstream `if (action === 'wait')`: the branch that spends nothing. It is written even while an
+    // earlier backoff is still running, because "this Task is still healthy" is exactly the fact
+    // that keeps a progressing Task from permanently occupying the head of a bounded scan.
+    if decision == WatchdogDecision::Wait {
+        record_watchdog_observation(
+            transaction,
+            WatchdogObservation {
+                task_id: &subject.task_id,
+                attempt_id: &subject.attempt_id,
+                request_epoch: &subject.request_epoch,
+                action: "wait",
+                blocked: subject.task_status == "blocked",
+                progress_at: Some(&progress_at),
+                reason_code: None,
+                stopped_at: None,
+                now,
+            },
+        )?;
+        return Ok(Observation::Wait);
+    }
+
+    // Reconciliation and dispatch stay with the owners this tick already runs: `reconcile_dispatches`
+    // folded every Delivery/Run outcome before this sweep started, and `admit_plan` hands out the due
+    // events after it. Repeating either here would open a second write path for the same decision.
+    if matches!(
+        decision,
+        WatchdogDecision::Reconcile | WatchdogDecision::Dispatch
+    ) {
+        return Ok(Observation::HandedOff);
+    }
+
+    // Upstream `if (previous?.result?.nextAt > now) { deferred++; return }`: a repair action is not
+    // re-judged before the backoff it recorded has elapsed.
+    if previous.as_ref().is_some_and(|receipt| receipt.defers(now)) {
+        return Ok(Observation::Deferred);
+    }
+
+    let action = match decision {
+        WatchdogDecision::ExternalEffect => "external_effect",
+        WatchdogDecision::Stalled => "stalled",
+        WatchdogDecision::StopTimeout => "stop_timeout",
+        WatchdogDecision::RecoverStall => "recover_stall",
+        WatchdogDecision::Wait | WatchdogDecision::Reconcile | WatchdogDecision::Dispatch => {
+            unreachable!("the branches above own these decisions")
+        }
+    };
+    let tries = next_watchdog_tries(previous.as_ref().map(|receipt| receipt.tries), action);
+    let budget = recovery_budget(transaction, &subject.task_id, &subject.request_epoch)?;
+    let exhausted = recovery_exhausted(tries, action, budget);
+    // Upstream `recoverable`: only a stalled Task in an execution stage can be replayed. LOOM has no
+    // question-continuation attempt (`originalSessionOnly`), so the stage is the whole condition.
+    let recoverable =
+        action == "stalled" && matches!(subject.stage, "execute" | "review" | "verify");
+    let blocked = matches!(
+        decision,
+        WatchdogDecision::Stalled
+            | WatchdogDecision::ExternalEffect
+            | WatchdogDecision::StopTimeout
+    ) || exhausted;
+
+    if !blocked {
+        // `recover_stall` and nothing else reaches here: the old executor is demonstrably gone, so
+        // the Task may be handed back. Reconcile already ran at the top of this tick; what remains
+        // is upstream's `store.apply(retry)` followed by `host.dispatch`: close the Attempt this
+        // epoch spent, release the fence the dead Run still holds, clear this module's own hold, and
+        // mint the next Attempt of the *same* epoch — the retried delivery then starts through the
+        // ordinary Delivery/Run path, exactly like the first one did.
+        let Some((retry_dispatch_id, _)) = retry_watchdog_attempt(transaction, subject, now)?
+        else {
+            // No room for another Attempt — the plan's dispatch budget or the Task's rework budget
+            // is spent, or the recipient can no longer be addressed. That is upstream's deferred
+            // savepoint path: the hold is left as it was, so the Task waits for a human instead of
+            // being reported as recovered when nothing was handed back.
+            return Ok(Observation::Deferred);
+        };
+        record_watchdog_fact(
+            transaction,
+            // Upstream `run_redispatched:${runId}` (`lib/factory/dispatch-recovery.ts:150`, held to
+            // "exactly one run_redispatched per run" by `dispatch-recovery.db.test.ts:84,97`): the
+            // durable identity of a hand-back is the Attempt it minted, and a dispatch id plays the
+            // part of the Run id here. `tries` cannot: it restarts at this Attempt's own first value
+            // (`watchdog.ts:183`), so keying the fact on it would fold every recovery of one epoch
+            // into the very first row and lose the rest.
+            format!(
+                "{WATCHDOG_RECOVERED_EVENT}:{}:{}:{}:{retry_dispatch_id}",
+                subject.plan_id, subject.task_id, subject.request_epoch
+            ),
+            WATCHDOG_RECOVERED_EVENT,
+            subject,
+            serde_json::json!({
+                "missionId": subject.mission_id,
+                "planId": subject.plan_id,
+                "taskId": subject.task_id,
+                "requestEpoch": subject.request_epoch,
+                "attemptId": retry_dispatch_id,
+                "action": action,
+                "tries": tries,
+                "recoveryTries": previous
+                    .as_ref()
+                    .map_or(1, |receipt| receipt.recovery_tries + 1),
+                "previousRunStatus": subject.run_status,
+            }),
+            &now.to_rfc3339(),
+        )?;
+        // Upstream keys the receipt by the Attempt it *observed* and that Attempt's source Event
+        // (`factoryEventId('task-watchdog', `${task.attemptId}:${task.sourceEventId}`)`), so the row
+        // this pass writes is the one a later observation of that Attempt reads. The hand-back minted
+        // a successor Attempt, but the observation — and the `recoveryTries` it spent — belongs to
+        // the Attempt whose executor had to stop. The retry keeps the epoch, so the budget summed
+        // over every Attempt of the epoch keeps what the earlier hand-backs already spent.
+        record_watchdog_observation(
+            transaction,
+            WatchdogObservation {
+                task_id: &subject.task_id,
+                attempt_id: &subject.attempt_id,
+                request_epoch: &subject.request_epoch,
+                action,
+                blocked: false,
+                progress_at: Some(&progress_at),
+                reason_code: None,
+                // Upstream rewrites the Attempt's watchdog state only when it applies a hold, so a
+                // hand-back keeps the pair it recorded. It is inert: the Task is no longer held, so
+                // the decision's held-Task branch cannot be reached by it.
+                stopped_at: None,
+                now,
+            },
+        )?;
+        return Ok(Observation::Recovered);
+    }
+
+    // Upstream chooses the reasonCode before it acts, and `stoppedAt` is the instant this hold
+    // requested the stop. Only `stop_timeout` keeps the earlier one: its whole point is that the stop
+    // was requested and never acknowledged.
+    let (reason_code, reason, stopped_at) = if action == "external_effect" {
+        (
+            WATCHDOG_REASON_EXTERNAL_EFFECT,
+            "An external action has an uncertain receipt. Reconcile it before any replay.",
+            Some(now.to_rfc3339()),
+        )
+    } else if recoverable {
+        (
+            WATCHDOG_REASON_STALLED,
+            "No persisted task progress within the stage window. Check the executor and workspace before resuming.",
+            Some(now.to_rfc3339()),
+        )
+    } else if action == "stop_timeout" {
+        (
+            WATCHDOG_REASON_STOP_TIMEOUT,
+            "The old executor has not acknowledged its stop. Restore or disconnect it before another worker can safely resume.",
+            None,
+        )
+    } else {
+        (
+            WATCHDOG_REASON_EXHAUSTED,
+            "Automatic recovery attempts are exhausted. Restore the executor or credential and explicitly resume this task.",
+            Some(now.to_rfc3339()),
+        )
+    };
+    let hold = watchdog_hold_code(reason_code);
+    set_watchdog_hold(
+        transaction,
+        &subject.plan_id,
+        &subject.task_id,
+        hold,
+        &now.to_rfc3339(),
+    )?;
+    // The old execution is asked to stop whatever the reason is: an uncertain effect must not keep
+    // running, and a stalled executor must not be resumed underneath itself. The request is a fence,
+    // not a kill: the Executor's own acknowledgement is what makes the Run terminal, and only that
+    // acknowledgement lets a later observation replay the Task.
+    stop_watchdog_runs(
+        transaction,
+        &subject.plan_id,
+        &subject.task_id,
+        hold,
+        &now.to_rfc3339(),
+    )?;
+    record_watchdog_fact(
+        transaction,
+        format!(
+            "{WATCHDOG_BLOCKED_EVENT}:{}:{}:{}:{reason_code}",
+            subject.plan_id, subject.task_id, subject.request_epoch
+        ),
+        WATCHDOG_BLOCKED_EVENT,
+        subject,
+        serde_json::json!({
+            "missionId": subject.mission_id,
+            "planId": subject.plan_id,
+            "taskId": subject.task_id,
+            "requestEpoch": subject.request_epoch,
+            "attemptId": subject.attempt_id,
+            "action": action,
+            "reasonCode": reason_code,
+            "reason": reason,
+            "stage": subject.stage,
+            "stoppedAt": stopped_at,
+            "tries": tries,
+            "recoveryTries": previous
+                .as_ref()
+                .map_or(0, |receipt| receipt.recovery_tries),
+        }),
+        &now.to_rfc3339(),
+    )?;
+    record_watchdog_observation(
+        transaction,
+        WatchdogObservation {
+            task_id: &subject.task_id,
+            attempt_id: &subject.attempt_id,
+            request_epoch: &subject.request_epoch,
+            action,
+            blocked: true,
+            progress_at: Some(&progress_at),
+            reason_code: Some(reason_code),
+            stopped_at: stopped_at.as_deref(),
+            now,
+        },
+    )?;
+    Ok(Observation::Blocked)
+}
+
+/// The product-facing `blocked_reason` of one upstream `reasonCode`.
+fn watchdog_hold_code(reason_code: &str) -> &'static str {
+    match reason_code {
+        WATCHDOG_REASON_EXTERNAL_EFFECT => WATCHDOG_EXTERNAL_EFFECT_REASON,
+        WATCHDOG_REASON_STOP_TIMEOUT => WATCHDOG_STOP_TIMEOUT_REASON,
+        WATCHDOG_REASON_EXHAUSTED => WATCHDOG_EXHAUSTED_REASON,
+        _ => WATCHDOG_STALLED_REASON,
+    }
+}
+
+/// The watchdog hold this Task currently carries, when it carries one.
+///
+/// This is the rule that makes a replay impossible while the watchdog holds the Task: the scheduler
+/// asks it before it hands anything out, and so does the pre-execution recheck.
+fn watchdog_hold_reason(
+    connection: &Connection,
+    plan_id: &str,
+    task_id: &str,
+) -> Result<Option<&'static str>> {
+    let reason: Option<String> = connection
+        .query_row(
+            "SELECT blocked_reason FROM loom_task WHERE plan_id=?1 AND task_id=?2",
+            params![plan_id, task_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(reason.as_deref().and_then(|reason| {
+        WATCHDOG_REASONS
+            .into_iter()
+            .find(|candidate| *candidate == reason)
+    }))
+}
+
+/// Apply the watchdog's hold. A reason another owner wrote is never overwritten, and an unchanged
+/// value writes nothing at all: this field is the current-state mirror, while the durable facts live
+/// in the domain event log and the recovery ledger.
+fn set_watchdog_hold(
+    transaction: &Transaction<'_>,
+    plan_id: &str,
+    task_id: &str,
+    reason: &str,
+    now: &str,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE loom_task SET blocked_reason=?1, updated_at=?2, revision=revision+1
+         WHERE plan_id=?3 AND task_id=?4
+           AND (blocked_reason IS NULL OR blocked_reason IN (?5,?6,?7,?8))
+           AND (blocked_reason IS NULL OR blocked_reason <> ?1)",
+        params![
+            reason,
+            now,
+            plan_id,
+            task_id,
+            WATCHDOG_STALLED_REASON,
+            WATCHDOG_EXTERNAL_EFFECT_REASON,
+            WATCHDOG_STOP_TIMEOUT_REASON,
+            WATCHDOG_EXHAUSTED_REASON
+        ],
+    )?;
+    Ok(())
+}
+
+/// Clear this module's own holds — all four — and nothing else.
+fn clear_watchdog_hold(
+    transaction: &Transaction<'_>,
+    plan_id: &str,
+    task_id: &str,
+    now: &str,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE loom_task SET blocked_reason=NULL, updated_at=?1, revision=revision+1
+         WHERE plan_id=?2 AND task_id=?3 AND blocked_reason IN (?4,?5,?6,?7)",
+        params![
+            now,
+            plan_id,
+            task_id,
+            WATCHDOG_STALLED_REASON,
+            WATCHDOG_EXTERNAL_EFFECT_REASON,
+            WATCHDOG_STOP_TIMEOUT_REASON,
+            WATCHDOG_EXHAUSTED_REASON
+        ],
+    )?;
+    Ok(())
+}
+
+/// The claim fence a dead Run still holds. Releasing it is part of handing the Task back: until it is
+/// released no other Run can claim the Task, and after it is released the ordinary `loom.claim` path
+/// is the only way to take it.
+fn release_watchdog_claim(
+    transaction: &Transaction<'_>,
+    plan_id: &str,
+    task_id: &str,
+    now: &str,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE loom_claim SET released_at=?1
+         WHERE plan_id=?2 AND task_id=?3 AND released_at IS NULL",
+        params![now, plan_id, task_id],
+    )?;
+    Ok(())
+}
+
+/// Hand one held Task back as a new Attempt of the same epoch (upstream `retry` + `dispatch`).
+///
+/// The whole retry is one savepoint: a retry that cannot be admitted — the plan's dispatch budget
+/// is spent, the Task's rework budget is spent, the approval was superseded, or the recipient can
+/// no longer be addressed — must leave the hold, the claim and the ledger exactly as they were
+/// instead of aborting the tick. The caller counts that as `deferred`, which is upstream's own
+/// savepoint rollback path.
+fn retry_watchdog_attempt(
+    transaction: &Transaction<'_>,
+    subject: &WatchdogSubject,
+    now: DateTime<Utc>,
+) -> Result<Option<(String, String)>> {
+    transaction.execute_batch("SAVEPOINT watchdog_retry")?;
+    match write_watchdog_retry(transaction, subject, now) {
+        Ok(Some(retry)) => {
+            transaction.execute_batch("RELEASE SAVEPOINT watchdog_retry")?;
+            Ok(Some(retry))
+        }
+        Ok(None) => {
+            transaction.execute_batch(
+                "ROLLBACK TO SAVEPOINT watchdog_retry;
+                 RELEASE SAVEPOINT watchdog_retry;",
+            )?;
+            Ok(None)
+        }
+        Err(error) => {
+            transaction.execute_batch(
+                "ROLLBACK TO SAVEPOINT watchdog_retry;
+                 RELEASE SAVEPOINT watchdog_retry;",
+            )?;
+            eprintln!(
+                "loom watchdog retry for task {} was not admitted: {error:#}",
+                subject.task_id
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// The writes one retry consists of, all inside the caller's savepoint.
+fn write_watchdog_retry(
+    transaction: &Transaction<'_>,
+    subject: &WatchdogSubject,
+    now: DateTime<Utc>,
+) -> Result<Option<(String, String)>> {
+    let Some(policy) = read_policy(transaction, &subject.plan_id)? else {
+        return Ok(None);
+    };
+    // A paused, disabled or superseded approval owns the Task again; the watchdog must not spend it.
+    if !policy.enabled
+        || policy.paused
+        || policy.mission_id != subject.mission_id
+        || !policy.task_ids.iter().any(|scoped| scoped == &subject.task_id)
+    {
+        return Ok(None);
+    }
+    let Some(camp_id) = subject.camp_id.as_deref() else {
+        return Ok(None);
+    };
+    // The Attempt this epoch spent: its kind, Candidate and recipient are what its successor repeats.
+    let attempt: Option<(String, String, Option<String>, i64, String, String)> = transaction
+        .query_row(
+            "SELECT dispatch_id, kind, candidate_id, policy_revision, recipient_agent_id, dedupe_key
+             FROM loom_control_dispatch
+             WHERE plan_id=?1 AND task_id=?2
+             ORDER BY created_at DESC, dispatch_id DESC LIMIT 1",
+            params![&subject.plan_id, &subject.task_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((old_dispatch_id, kind, candidate_id, policy_revision, recipient, old_key)) = attempt
+    else {
+        return Ok(None);
+    };
+    if policy_revision != policy.authorization_revision {
+        return Ok(None);
+    }
+    // Upstream `checkFactoryRepairBudget`: the dispatch budget and the per-Task rework budget bound
+    // automatic repair exactly like they bound the first attempt.
+    let spent: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM loom_control_dispatch WHERE plan_id=?1",
+        [&subject.plan_id],
+        |row| row.get(0),
+    )?;
+    if spent >= policy.max_dispatches {
+        return Ok(None);
+    }
+    if kind == REWORK {
+        let reworks: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM loom_control_dispatch
+             WHERE plan_id=?1 AND task_id=?2 AND kind='REWORK'",
+            params![&subject.plan_id, &subject.task_id],
+            |row| row.get(0),
+        )?;
+        if reworks >= policy.max_reworks_per_task {
+            return Ok(None);
+        }
+    }
+    if !recipient_is_addressable(transaction, camp_id, &recipient)? {
+        return Ok(None);
+    }
+
+    // The epoch this Attempt belongs to, and the ordinal of the Attempt being minted — counted from
+    // the recorded identities, so a replay of this pass derives the same key instead of stacking a
+    // second copy of the same retry.
+    let base = base_event_identity(&old_key);
+    let epoch = request_epoch(&base);
+    let mut attempts = 0_i64;
+    {
+        let mut statement = transaction.prepare(
+            "SELECT dedupe_key FROM loom_control_dispatch
+             WHERE plan_id=?1 AND task_id=?2 AND kind=?3",
+        )?;
+        let keys = statement.query_map(
+            params![&subject.plan_id, &subject.task_id, &kind],
+            |row| row.get::<_, String>(0),
+        )?;
+        for key in keys {
+            if base_event_identity(&key?) == base {
+                attempts += 1;
+            }
+        }
+    }
+    let retry_key = retry_dedupe_key(&base, attempts + 1)?;
+    let now_text = now.to_rfc3339();
+
+    // The Attempt that ended is closed as superseded: a `CANCELLED` dispatch never executed, so the
+    // class-level "previous outcome unknown" rule no longer reads its failed Run as an unresolved
+    // result. Its history — dispatch row, Delivery and Run — is kept as the record it is.
+    let superseded = transaction.execute(
+        "UPDATE loom_control_dispatch SET status='CANCELLED', reason=?1, updated_at=?2
+         WHERE dispatch_id=?3 AND status IN ('WAITING','DISPATCHED','BLOCKED')",
+        params![WATCHDOG_SUPERSEDED_REASON, &now_text, &old_dispatch_id],
+    )?;
+    if superseded != 1 {
+        return Ok(None);
+    }
+    // Release the fence the dead Run still holds, and this module's own hold, before the successor
+    // is admitted: the very same tick must be able to start it.
+    release_watchdog_claim(transaction, &subject.plan_id, &subject.task_id, &now_text)?;
+    clear_watchdog_hold(transaction, &subject.plan_id, &subject.task_id, &now_text)?;
+
+    let dispatch_id = format!("dispatch_{}", uuid::Uuid::new_v4().simple());
+    let admission = LoomDispatchAdmission {
+        mission_id: &subject.mission_id,
+        dispatch_id: dispatch_id.as_str(),
+        plan_id: &subject.plan_id,
+        task_id: &subject.task_id,
+        kind: &kind,
+        candidate_id: candidate_id.as_deref(),
+        policy_revision,
+        recipient_agent_id: &recipient,
+        dedupe_key: retry_key.as_str(),
+        now: &now_text,
+    };
+    match admit_loom_dispatch_message(transaction, &admission)? {
+        LoomDispatchAdmissionOutcome::Admitted { .. } => Ok(Some((dispatch_id, epoch))),
+        LoomDispatchAdmissionOutcome::Skipped => Ok(None),
+    }
+}
+
+/// Ask every live Run of this Task to stop, exactly as upstream's blocked branch does: the first
+/// request keeps its instant and its reason, so a repeated observation cannot extend the window in
+/// which the old executor is expected to acknowledge.
+fn stop_watchdog_runs(
+    transaction: &Transaction<'_>,
+    plan_id: &str,
+    task_id: &str,
+    reason_code: &str,
+    now: &str,
+) -> Result<()> {
+    transaction.execute(
+        &format!(
+            "UPDATE agent_run
+                SET cancel_requested_at=COALESCE(cancel_requested_at, ?1),
+                    cancel_reason_code=COALESCE(cancel_reason_code, ?2),
+                    updated_at=?1,
+                    version=version+1
+              WHERE status IN ('queued','running','waiting')
+                AND id IN (SELECT id FROM ({}))",
+            task_runs_sql(3, 4)
+        ),
+        params![now, reason_code, plan_id, task_id],
+    )?;
+    Ok(())
+}
+
+/// One durable watchdog fact in the domain event log: the blocker a Lead has to see, and the record
+/// that the Task may run again. The identity is the upstream dedupe key, so a repeated observation of
+/// the same hold of the same epoch stores one row and the history is never rewritten.
+fn record_watchdog_fact(
+    transaction: &Transaction<'_>,
+    event_id: String,
+    event_type: &str,
+    subject: &WatchdogSubject,
+    payload: serde_json::Value,
+    now: &str,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO event_log(event_id, event_type, payload_json, camp_id, entity_type, entity_id,
+                               actor_type, actor_id, created_at)
+         VALUES(?1, ?2, ?3, ?4, 'loom_task', ?5, 'system', 'loom.watchdog', ?6)
+         ON CONFLICT(event_id) DO NOTHING",
+        params![
+            event_id,
+            event_type,
+            serde_json::to_string(&payload)
+                .context("a LOOM watchdog fact must serialise as JSON")?,
+            subject.camp_id,
+            subject.task_id,
+            now
+        ],
+    )?;
     Ok(())
 }
 
