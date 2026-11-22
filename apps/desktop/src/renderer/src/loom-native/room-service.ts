@@ -1,6 +1,7 @@
 import type {
   ActionApprovalView,
   AgentProfile,
+  HiddenThreadItem,
   CoreMethod,
   CreateThreadRequest,
   MemberPresence,
@@ -494,7 +495,8 @@ export const ROOM_LEAD_REMOVAL_BLOCKED = uiAttribute('当前主助手不能直�
 export interface RoomMemberRemoveInput {
   threadId: string
   agentIds: readonly string[]
-  /** 退出群聊 empties the group on purpose, so the Lead may go last with nobody to inherit. */
+  /** 批内允许主助手在没有继任者时也移出。M9-1c 后「退出群聊」不再走这里：它只隐藏，
+   * 移出助手始终是逐个人的显式动作，所以这条路径默认关闭，也只有显式调用者才打开。 */
   allowLeadWithoutSuccessor?: boolean
 }
 
@@ -605,30 +607,53 @@ export async function removeRoomMembers(
   return outcome
 }
 
-/** Participants leave first; the Lead goes last so the group keeps answering until the end. */
-export function roomLeaveOrder(agentIds: readonly string[], defaultLeadAgentId: string | null): string[] {
-  const ids = [...new Set(agentIds.filter(agentId => typeof agentId === 'string' && agentId !== ''))]
-  if (defaultLeadAgentId === null) return ids
-  return [
-    ...ids.filter(agentId => agentId !== defaultLeadAgentId),
-    ...ids.filter(agentId => agentId === defaultLeadAgentId)
-  ]
+// ----------------------------------------------------------------- hidden
+
+/**
+ * 退出群聊 = 把这个群从**我的列表**隐藏（M9-1c，Hark 拍板；即 Mikka 群行的 `hidden`）。
+ *
+ * 群、成员、消息、附件与历史全部保留；助手不会因此离队 —— 把一个助手移出群聊仍然走
+ * `threads.members.remove`（`camp_member.status = 'left'`），不经过这里。
+ * 恢复就是同一个开关的 `hidden:false`，`已隐藏`列表由 `threads.hiddenList` 只读给出。
+ */
+export interface RoomHideInput {
+  threadId: string
+  hidden: boolean
 }
 
-export interface RoomLeaveInput {
-  threadId: string
-  activeAgentIds: readonly string[]
-  defaultLeadAgentId: string | null
+export function roomHideParams(commandId: string, input: RoomHideInput): unknown {
+  return { commandId, command: { threadId: input.threadId, hidden: input.hidden } }
 }
 
 /**
- * 退出群聊 in LOOM: the person leaves, so the assistants end their membership. History stays and
- * the same group is re-invitable — nothing is deleted and no assistant is silently kept.
+ * Core's answer is the only proof the list changed: a receipt that does not carry back the exact
+ * flag that was asked for is unknown, never success.
  */
-export async function leaveRoom(port: RoomPort, input: RoomLeaveInput): Promise<RoomMemberRemoveOutcome> {
-  const order = roomLeaveOrder(input.activeAgentIds, input.defaultLeadAgentId)
-  if (order.length === 0) throw new Error(uiAttribute('群里还没有助手。'))
-  return removeRoomMembers(port, { threadId: input.threadId, agentIds: order, allowLeadWithoutSuccessor: true })
+export async function setRoomHidden(port: RoomPort, input: RoomHideInput): Promise<void> {
+  const threadId = input.threadId.trim()
+  if (threadId === '') throw new Error(uiAttribute('当前会话尚未准备好。'))
+  const outcome = classifyRoomCommand(await port.request<StoredCommandResult | null>(
+    'threads.setHidden',
+    roomHideParams(newCommandId(), { ...input, threadId })
+  ))
+  if (outcome.kind === 'unknown') throw new Error(outcome.message)
+  if (outcome.kind === 'rejected') throw new LoomCommandRejected(outcome.result)
+  const hidden = outcome.result.payload.hidden
+  if (typeof hidden !== 'boolean' || hidden !== input.hidden) {
+    throw new Error(uiAttribute('隐藏结果未确认，请刷新会话列表后重试。'))
+  }
+}
+
+const HIDDEN_LIST_UNREADABLE = uiAttribute('已隐藏列表读取结果不可用，请重试。')
+
+/** `已隐藏` 列表：只读。回执不是数组时是读取失败，不是一个空列表。 */
+export async function readHiddenRooms(port: RoomPort): Promise<HiddenThreadItem[]> {
+  const rows = await port.request<HiddenThreadItem[] | null>('threads.hiddenList')
+  if (!Array.isArray(rows)) throw new Error(HIDDEN_LIST_UNREADABLE)
+  return rows.filter(row => Boolean(row)
+    && typeof row.id === 'string' && row.id !== ''
+    && typeof row.title === 'string'
+    && typeof row.hiddenAt === 'string')
 }
 
 // ----------------------------------------------------------------- roster

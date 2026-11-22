@@ -69,6 +69,7 @@ pub(super) fn reconcile(
         "missions.start" => user!(crate::mission::StartMissionCommand),
         "missions.linkPr" => user!(crate::mission::LinkMissionPrCommand),
         "camps.rename" => camp!(RenameThreadCommand),
+        "camps.setHidden" => camp!(SetThreadHiddenCommand),
         "camps.delete" => camp!(DeleteThreadCommand),
         "camps.retryDeletion" => user!(RetryThreadDeletionCommand),
         "camps.discardPending" => camp!(DiscardPendingThreadCommand),

@@ -19,17 +19,17 @@ import {
   createRoom,
   emptyRoomDraft,
   initialRoomDraft,
-  leaveRoom,
   QUICK_CHAT_CHOICE,
+  readHiddenRooms,
   readRoomMemberRemovalPreview,
   removeRoomMembers,
   resolveRoomPermission,
   ROOM_LEAD_REMOVAL_BLOCKED,
   roomDraftProblems,
-  roomLeaveOrder,
   roomPort,
   roomPermissionChoices,
   roomRoster,
+  setRoomHidden,
   roomSubmitProblem,
   roomWorkspaceChoices,
   type RoomDraft,
@@ -406,42 +406,58 @@ describe('removeRoomMembers', () => {
   })
 })
 
-describe('roomLeaveOrder', () => {
-  it('keeps participants first and the primary Lead last', () => {
-    expect(roomLeaveOrder(['a', 'b', 'c'], 'a')).toEqual(['b', 'c', 'a'])
-    expect(roomLeaveOrder(['b', 'a'], 'b')).toEqual(['a', 'b'])
-    expect(roomLeaveOrder(['a', 'b'], null)).toEqual(['a', 'b'])
-    expect(roomLeaveOrder(['a', 'a', ''], 'a')).toEqual(['a'])
-  })
-})
-
-describe('leaveRoom', () => {
-  it('empties the group with one fresh preview per member and the Lead last', async () => {
-    let generation = 3
+describe('setRoomHidden', () => {
+  it('hides by one Core command and never removes a single assistant', async () => {
     const { port, calls } = fakePort({
-      'threads.members.removalPreview': params => previewOf(String(params?.agentId), {
-        membershipGeneration: generation,
-        isDefaultLead: params?.agentId === 'a'
-      }),
-      'threads.members.remove': () => {
-        generation += 1
-        return applied({ membershipGeneration: generation, membershipStatus: 'left', changed: true })
-      }
+      'threads.setHidden': () => applied({ threadId: 't', hidden: true, hiddenAt: '2026-01-01T00:00:00Z' })
     })
-    const outcome = await leaveRoom(port, { threadId: 't', activeAgentIds: ['a', 'b'], defaultLeadAgentId: 'a' })
-    expect(outcome).toEqual({ removedAgentIds: ['b', 'a'], failures: [], nextDefaultLeadAgentId: null })
-    const removals = calls.filter(call => call.method === 'threads.members.remove')
-    expect(removals.map(call => (call.params?.command as { agentId: string }).agentId)).toEqual(['b', 'a'])
-    expect(removals.map(call => (call.params?.command as { expectedMembershipGeneration: number }).expectedMembershipGeneration))
-      .toEqual([3, 4])
-    expect(removals.every(call => !('replacementDefaultLeadAgentId' in (call.params?.command as Record<string, unknown>)))).toBe(true)
+    await setRoomHidden(port, { threadId: 't', hidden: true })
+    expect(calls.map(call => call.method)).toEqual(['threads.setHidden'])
+    expect(calls[0].params).toEqual({ commandId: expect.any(String), command: { threadId: 't', hidden: true } })
+    // 退出群聊不再是「把助手全部移出」：一个人都不动。
+    expect(calls.some(call => call.method === 'threads.members.remove')).toBe(false)
+    expect(calls.some(call => call.method === 'threads.members.removalPreview')).toBe(false)
     expect(calls.some(call => call.method === 'thread.messages.send')).toBe(false)
   })
 
-  it('refuses an empty group without touching Core', async () => {
+  it('restores with the same switch', async () => {
+    const { port, calls } = fakePort({
+      'threads.setHidden': () => applied({ threadId: 't', hidden: false, hiddenAt: null })
+    })
+    await setRoomHidden(port, { threadId: 't', hidden: false })
+    expect((calls[0].params?.command as { hidden: boolean }).hidden).toBe(false)
+  })
+
+  it('treats a receipt that does not carry back the flag as unconfirmed', async () => {
+    const { port } = fakePort({ 'threads.setHidden': () => applied({ threadId: 't' }) })
+    await expect(setRoomHidden(port, { threadId: 't', hidden: true })).rejects.toThrow('隐藏结果未确认')
+  })
+
+  it('surfaces a rejected receipt and never reports success', async () => {
+    const { port } = fakePort({
+      'threads.setHidden': () => rejected('camp.not_found')
+    })
+    await expect(setRoomHidden(port, { threadId: 't', hidden: true })).rejects.toThrow()
+  })
+
+  it('refuses a blank Thread id without touching Core', async () => {
     const { port, calls } = fakePort({})
-    await expect(leaveRoom(port, { threadId: 't', activeAgentIds: [], defaultLeadAgentId: null })).rejects.toThrow()
+    await expect(setRoomHidden(port, { threadId: ' ', hidden: true })).rejects.toThrow()
     expect(calls).toEqual([])
+  })
+})
+
+describe('readHiddenRooms', () => {
+  it('reads the hidden list verbatim', async () => {
+    const rows = [{ id: 't', title: '旧群', projectPath: '/local', hiddenAt: '2026-01-01T00:00:00Z' }]
+    const { port, calls } = fakePort({ 'threads.hiddenList': () => rows })
+    await expect(readHiddenRooms(port)).resolves.toEqual(rows)
+    expect(calls.map(call => call.method)).toEqual(['threads.hiddenList'])
+  })
+
+  it('never turns an unreadable receipt into an empty list', async () => {
+    const { port } = fakePort({ 'threads.hiddenList': () => ({ rows: [] }) })
+    await expect(readHiddenRooms(port)).rejects.toThrow('已隐藏列表读取结果不可用')
   })
 })
 

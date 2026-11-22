@@ -55,6 +55,8 @@ export type WorkspaceListing = { name: string; projectPath: string; parentPath: 
 
 export const WEB_OPERATIONS = [
   'threads.rename',
+  'threads.setHidden',
+  'threads.hiddenList',
   'threads.delete',
   'threads.deletionIssues',
   'threads.retryDeletion',

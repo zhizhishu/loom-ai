@@ -1748,6 +1748,65 @@ pub(super) fn migrate_recovery_watchdog_state(database: &mut Database) -> Result
     Ok(())
 }
 
+fn camp_hidden_column_present(connection: &Connection) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('camp') WHERE name = 'list_hidden_at')",
+        [],
+        |row| row.get(0),
+    )
+}
+
+/// Migration 241 (M9-1c): 「退出群聊」= 把这个群从我的列表**隐藏**。
+///
+/// Hark's decision, and Mikka's own wording: a hidden group is not an archived group. Upstream puts
+/// the person's own 隐藏 on the group row itself (`hidden?: boolean`, `lib/group-messages.ts:130`) and
+/// keeps the hidden rows out of the main list, listed apart (`components/nav/bot-list.tsx:54-55`;
+/// `153-155` is the 隐藏 / 取消隐藏 menu). The group, its roster, its history and its attachments stay
+/// exactly as they were — the person only stops seeing it in the conversation list, and 恢复 brings it
+/// back. So this is one nullable timestamp column and nothing else: no column is dropped, no existing
+/// row is rewritten, and a row that is hidden twice keeps the first timestamp.
+///
+/// The column is deliberately *not* named `archived_at`: `camp` retired exactly that pair in v57
+/// (`migrate_member_task_camp_contract_v57`) and the current-shape test pins its absence
+/// (`db.rs` `assert_table_columns(connection, "camp", &["activation_state"], &["status","archived_at"])`).
+/// Naming it `list_hidden_at` keeps that contract intact while still recording one reversible fact.
+///
+/// A column that is already there is skipped, so a re-opened or rolled-back database can run the
+/// step again; the presence gate below is what decides whether the result is admissible.
+pub(super) fn migrate_camp_hidden(database: &mut Database) -> Result<()> {
+    let tx = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let present: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='camp')",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        present,
+        "the camp table must exist before its hidden state is added"
+    );
+    if !camp_hidden_column_present(&tx)? {
+        tx.execute_batch("ALTER TABLE camp ADD COLUMN list_hidden_at TEXT;")?;
+    }
+    let applied: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migration WHERE version=241)",
+        [],
+        |row| row.get(0),
+    )?;
+    if applied {
+        tx.commit()?;
+        return Ok(());
+    }
+    tx.execute_batch("INSERT INTO schema_migration VALUES(241,datetime('now'));")?;
+    anyhow::ensure!(
+        camp_hidden_column_present(&tx)?,
+        "LOOM camp hidden schema invalid"
+    );
+    tx.commit()?;
+    Ok(())
+}
+
 /// Only synthetic migration fixtures reverse the Attempt watchdog state: it rebuilds the exact
 /// M5-B ledger migration 237 creates with the rows already recorded, so the upgrade path is tested
 /// against real data rather than against an empty table.
@@ -3348,6 +3407,59 @@ mod tests {
             Some(recorded),
             "assertion the_rerun_keeps_the_recorded_receipt"
         );
+    }
+
+    /// M9-1c: 241 only adds a visibility column. Every existing Thread keeps its row, keeps
+    /// showing in the list (NULL = not hidden), and hiding/restoring is one reversible flag.
+    #[test]
+    fn camp_hidden_migration_is_additive_and_reversible() {
+        let directory = std::env::temp_dir().join(format!(
+            "rovai-camp-hidden-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut database = crate::test_support::fresh_schema_database_fast_at(&directory);
+        database
+            .connection()
+            .execute_batch(
+                "INSERT INTO camp(id,title,project_binding_kind,project_path,created_at,updated_at)
+                 VALUES('camp-hidden','keep me','directory','/local','2026-01-01','2026-01-01');
+                 DELETE FROM schema_migration WHERE version=241;
+                 ALTER TABLE camp DROP COLUMN list_hidden_at;",
+            )
+            .unwrap();
+        assert_eq!(migration_receipts(&database, 241), 0);
+
+        migrate_camp_hidden(&mut database).unwrap();
+
+        assert_eq!(migration_receipts(&database, 241), 1);
+        // No projection bump: a hidden column does not change the data contract.
+        assert_eq!(projection_version(&database), 187);
+        assert!(camp_hidden_column_present(database.connection()).unwrap());
+        let title: String = database
+            .connection()
+            .query_row(
+                "SELECT title FROM camp WHERE id='camp-hidden'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "keep me", "assertion hiding_keeps_every_thread_row");
+        let visible: Option<String> = database
+            .connection()
+            .query_row(
+                "SELECT list_hidden_at FROM camp WHERE id='camp-hidden'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(visible, None, "assertion a_new_thread_is_in_my_list");
+
+        // The same step answers twice: a repeated run keeps the receipt at exactly one.
+        migrate_camp_hidden(&mut database).unwrap();
+        assert_eq!(migration_receipts(&database, 241), 1);
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// A refused receipt rolls the whole migration back: no ledger, no half-applied source.

@@ -313,6 +313,9 @@ const allowedMethods = new Set<CoreMethod>([
   'threads.discardPending',
   'threads.pendingDraft.setPresence',
   'threads.rename',
+  // M9-1c: 退出群聊 = 从我的列表隐藏；「已隐藏」列表只读，恢复走同一个开关。
+  'threads.setHidden',
+  'threads.hiddenList',
   'threads.members.fast.check',
   'threads.members.fast.set',
   'threads.members.add',

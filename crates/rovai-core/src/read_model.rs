@@ -41,6 +41,17 @@ pub use message_model::ThreadMessageRuntimeModelView;
 pub const READ_MODEL_SCHEMA_VERSION: i64 = 36;
 pub const EVENT_BATCH_SCHEMA_VERSION: i64 = 9;
 pub const NAVIGATION_SCHEMA_VERSION: i64 = 3;
+
+/// M9-1c 已隐藏列表的一行：只写「这个群被我隐藏了」这一个事实。
+/// 它不携带成员、消息或执行，也不声称群还在主列表里——隐藏的意思正好相反；恢复就是把它清空。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HiddenThreadItem {
+    pub id: String,
+    pub title: String,
+    pub project_path: String,
+    pub hidden_at: String,
+}
 pub const EXECUTION_EVIDENCE_PAGE_SCHEMA_VERSION: i64 = 1;
 pub const CAMP_MESSAGE_AROUND_SCHEMA_VERSION: i64 = 1;
 pub const CAMP_MESSAGE_FIND_SCHEMA_VERSION: i64 = 1;
@@ -1135,6 +1146,36 @@ impl ReadModelService {
         };
         tx.commit()?;
         Ok(result)
+    }
+
+    /// M9-1c：「已隐藏」里列的就是这些群——`camp.list_hidden_at IS NOT NULL`，最新隐藏的在最前。
+    ///
+    /// 这是只读投影：它不套会话列表的 `VISIBLE` 条件（那个条件是「被删/待激活」的可见性，
+    /// 不是隐藏），也不看 mission 与草稿——隐藏的群照样可能带使命。
+    pub fn hidden_camps(&self, database: &mut Database) -> Result<Vec<HiddenThreadItem>> {
+        let tx = database.connection_mut().transaction()?;
+        let mut statement = tx.prepare(
+            r#"
+            SELECT camp.id, camp.title, camp.project_path, camp.list_hidden_at
+            FROM camp
+            WHERE camp.list_hidden_at IS NOT NULL
+              AND camp.deletion_operation_id IS NULL
+            ORDER BY camp.list_hidden_at DESC, camp.id
+            "#,
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(HiddenThreadItem {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    project_path: row.get(2)?,
+                    hidden_at: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        tx.commit()?;
+        Ok(rows)
     }
 
     pub fn find_navigation_camp(

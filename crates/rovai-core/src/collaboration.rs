@@ -177,6 +177,26 @@ impl DomainCommand for RenameThreadCommand {
     const TYPE: &'static str = "camp.rename";
 }
 
+/// M9-1c：「退出群聊」= 把这个群从**我的列表**里隐藏（Mikka 的群行 `hidden`，不叫归档）。
+///
+/// 隐藏只写 `camp.list_hidden_at`（迁移 241），群本身、成员、消息与历史全部保留；
+/// 恢复就是把它清空。它不改变任何助手的在群状态 —— 移出助手仍走既有的
+/// `camp_member.status = 'left'` 接口（`remove_camp_member`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetThreadHiddenCommand {
+    #[serde(deserialize_with = "crate::camp_id::deserialize_camp_id_string")]
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    /// 一个开关，不是一个动作：`true` 隐藏，`false` 恢复。
+    pub hidden: bool,
+}
+
+impl sealed::Sealed for SetThreadHiddenCommand {}
+impl DomainCommand for SetThreadHiddenCommand {
+    const TYPE: &'static str = "camp.setHidden";
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WithdrawThreadMessageCommand {
@@ -1160,6 +1180,80 @@ impl CollaborationService {
                     "threadId": envelope.payload.camp_id,
                     "title": title,
                     "version": version + 1,
+                }),
+                Some(EntityReference {
+                    entity_type: "camp".to_string(),
+                    entity_id: envelope.payload.camp_id.clone(),
+                }),
+            ))
+        })
+    }
+
+    /// M9-1c：把群从「我的列表」隐藏或恢复。
+    ///
+    /// 隐藏不是删除、不是退群、更不是把助手的在群状态改成 `left`：它只在 `camp` 上记一个
+    /// `list_hidden_at` 时间戳，群、成员、消息、附件与执行历史都原样保留，恢复后重新出现在
+    /// 会话列表里。命令幂等——重复隐藏只保留第一次的时间戳，重复恢复不报错。
+    pub fn set_camp_hidden(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<SetThreadHiddenCommand>,
+    ) -> Result<CommandExecution> {
+        self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(envelope.actor, ActorRef::User { .. }) {
+                return Ok(rejected(
+                    "camp.hide_user_required",
+                    "Only a User can hide a Thread from their list",
+                ));
+            }
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM camp WHERE id = ?1 AND deletion_operation_id IS NULL)",
+                [&envelope.payload.camp_id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(rejected("camp.not_found", "Thread does not exist"));
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            // First hide keeps its timestamp; a repeat is a no-op for the time and only bumps
+            // the Thread's own version, which readers use to notice the list row changed.
+            transaction.execute(
+                r#"
+                UPDATE camp
+                SET list_hidden_at = CASE WHEN ?2 THEN COALESCE(list_hidden_at, ?3) ELSE NULL END,
+                    version = version + 1,
+                    updated_at = ?3
+                WHERE id = ?1
+                "#,
+                params![
+                    envelope.payload.camp_id,
+                    envelope.payload.hidden,
+                    now
+                ],
+            )?;
+            let hidden_at: Option<String> = transaction.query_row(
+                "SELECT list_hidden_at FROM camp WHERE id = ?1",
+                [&envelope.payload.camp_id],
+                |row| row.get::<_, Option<String>>(0),
+            )?;
+            append_domain_event(
+                transaction,
+                "camp.hidden_changed",
+                Some(&envelope.payload.camp_id),
+                Some(("camp", &envelope.payload.camp_id)),
+                &envelope.actor,
+                envelope.execution_epoch,
+                &serde_json::json!({
+                    "hidden": envelope.payload.hidden,
+                    "hiddenAt": hidden_at,
+                }),
+            )?;
+            Ok(CommandHandlerResult::applied(
+                "camp.hidden_changed",
+                serde_json::json!({
+                    "threadId": envelope.payload.camp_id,
+                    "hidden": envelope.payload.hidden,
+                    "hiddenAt": hidden_at,
                 }),
                 Some(EntityReference {
                     entity_type: "camp".to_string(),
@@ -9991,6 +10085,106 @@ mod slow_tests {
             json!(["agent_2", "agent_1"])
         );
 
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+    /// M9-1c：「退出群聊」= 把这个群从我的列表**隐藏**（Mikka 的群行 `hidden`）。
+    /// 它不会把任何一个助手移出群聊，群与成员原样保留；恢复只是把同一个开关关掉。
+    #[test]
+    fn camp_hidden_hides_the_thread_without_removing_any_member() {
+        let (mut database, directory) = test_database();
+        let service = CollaborationService::default();
+        let camp_id =
+            create_camp_with_members(&service, &mut database, &directory, &["agent_1", "agent_2"]);
+        let hidden = service
+            .set_camp_hidden(
+                &mut database,
+                &user_envelope(
+                    "hide-camp",
+                    Some(&camp_id),
+                    SetThreadHiddenCommand {
+                        camp_id: camp_id.clone(),
+                        hidden: true,
+                    },
+                ),
+            )
+            .expect("Camp should be hidden");
+        assert_eq!(hidden.result.code, "camp.hidden_changed");
+        assert_eq!(hidden.result.payload["hidden"], json!(true));
+        assert!(
+            hidden.result.payload["hiddenAt"].is_string(),
+            "assertion hiding_records_when_it_happened"
+        );
+        // 一个助手都没走：在群成员仍然是 active，移出仍走 camp_member.status='left' 的旧接口。
+        let active_members: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM camp_member WHERE camp_id = ?1 AND status = 'active'",
+                [&camp_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            active_members, 2,
+            "assertion leaving_a_group_never_empties_it"
+        );
+        let hidden_rows = ReadModelService.hidden_camps(&mut database).unwrap();
+        assert_eq!(
+            hidden_rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![camp_id.as_str()],
+            "assertion the_hidden_list_is_where_it_goes"
+        );
+        // 重复隐藏是幂等的：时间戳保留第一次那个。
+        let hidden_at = hidden_rows[0].hidden_at.clone();
+        service
+            .set_camp_hidden(
+                &mut database,
+                &user_envelope(
+                    "hide-camp-again",
+                    Some(&camp_id),
+                    SetThreadHiddenCommand {
+                        camp_id: camp_id.clone(),
+                        hidden: true,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            ReadModelService.hidden_camps(&mut database).unwrap()[0]
+                .hidden_at
+                .as_str(),
+            hidden_at.as_str()
+        );
+        let restored = service
+            .set_camp_hidden(
+                &mut database,
+                &user_envelope(
+                    "restore-camp",
+                    Some(&camp_id),
+                    SetThreadHiddenCommand {
+                        camp_id: camp_id.clone(),
+                        hidden: false,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(restored.result.payload["hidden"], json!(false));
+        assert!(
+            ReadModelService.hidden_camps(&mut database)
+                .unwrap()
+                .is_empty(),
+            "assertion restoring_puts_it_back_in_the_list"
+        );
+        let title: String = database
+            .connection()
+            .query_row("SELECT title FROM camp WHERE id = ?1", [&camp_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!title.is_empty(), "assertion the_group_and_its_history_stay");
         drop(database);
         std::fs::remove_dir_all(directory).expect("temporary database should be removable");
     }

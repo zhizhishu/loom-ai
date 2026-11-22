@@ -6,13 +6,14 @@ import { isAbsolute } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
 export const CURRENT_HOST_SCHEMA = 187
-export const CURRENT_HOST_MIGRATION = 240
+export const CURRENT_HOST_MIGRATION = 241
 const ARTIFACT_VERSION_MIGRATION = 235
 const LOCAL_HOOK_MIGRATION = 236
 const RECOVERY_LEDGER_MIGRATION = 237
 const DELIVERY_WAKE_MIGRATION = 238
 const DEVICE_SESSION_MIGRATION = 239
 const WATCHDOG_STATE_MIGRATION = 240
+const CAMP_HIDDEN_MIGRATION = 241
 
 export async function verifyRunningHostSchema ({ request, databasePath,
   expectedProjectionSchema = CURRENT_HOST_SCHEMA, expectedMigrationVersion = CURRENT_HOST_MIGRATION }) {
@@ -23,8 +24,9 @@ export async function verifyRunningHostSchema ({ request, databasePath,
       || (expectedProjectionSchema === 187 && expectedMigrationVersion === 237)
       || (expectedProjectionSchema === 187 && expectedMigrationVersion === 238)
       || (expectedProjectionSchema === 187 && expectedMigrationVersion === DEVICE_SESSION_MIGRATION)
-      || (expectedProjectionSchema === 187 && expectedMigrationVersion === 240),
-      'this acceptance requires a supported projection/migration pair (186/236, 187/237, 187/238, 187/239 or 187/240)')
+      || (expectedProjectionSchema === 187 && expectedMigrationVersion === 240)
+      || (expectedProjectionSchema === 187 && expectedMigrationVersion === CAMP_HIDDEN_MIGRATION),
+      'this acceptance requires a supported projection/migration pair (186/236, 187/237, 187/238, 187/239, 187/240 or 187/241)')
     assert.ok(typeof databasePath === 'string' && isAbsolute(databasePath),
       'the isolated Host database path must be explicitly selected')
     const health = await request('health.check', {})
@@ -49,6 +51,8 @@ export async function verifyRunningHostSchema ({ request, databasePath,
       const recoveryLedger = database.prepare('SELECT version FROM schema_migration WHERE version = ?').get(RECOVERY_LEDGER_MIGRATION)
       const deliveryWake = database.prepare('SELECT version FROM schema_migration WHERE version = ?').get(DELIVERY_WAKE_MIGRATION)
       const watchdogState = database.prepare('SELECT version FROM schema_migration WHERE version = ?').get(WATCHDOG_STATE_MIGRATION)
+      const campHidden = database.prepare('SELECT version FROM schema_migration WHERE version = ?').get(CAMP_HIDDEN_MIGRATION)
+      evidence.campHiddenMigrationPresent = campHidden?.version === CAMP_HIDDEN_MIGRATION
       evidence.localHookMigrationPresent = localHook?.version === LOCAL_HOOK_MIGRATION
       evidence.recoveryLedgerMigrationPresent = recoveryLedger?.version === RECOVERY_LEDGER_MIGRATION
       evidence.watchdogStateMigrationPresent = watchdogState?.version === WATCHDOG_STATE_MIGRATION
@@ -77,6 +81,10 @@ export async function verifyRunningHostSchema ({ request, databasePath,
         if (expectedMigrationVersion === WATCHDOG_STATE_MIGRATION) {
           assert.equal(evidence.watchdogStateMigrationPresent, true,
             'the LOOM watchdog state migration is absent')
+        }
+        if (expectedMigrationVersion >= CAMP_HIDDEN_MIGRATION) {
+          assert.equal(evidence.campHiddenMigrationPresent, true,
+            'the LOOM camp hidden migration is absent')
         }
       }
       if (expectedMigrationVersion >= DEVICE_SESSION_MIGRATION) {

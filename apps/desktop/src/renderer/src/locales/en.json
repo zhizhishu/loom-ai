@@ -4720,5 +4720,17 @@
   "返回输入框": "Back to fields",
   "高级编辑（显示原文）": "Advanced editing (show raw values)",
   "连接信息": "Connection settings",
-  "使用这个运行端的助手会共用这些连接设置。": "Assistants using this runtime share these connection settings."
+  "使用这个运行端的助手会共用这些连接设置。": "Assistants using this runtime share these connection settings.",
+  "已隐藏": "Hidden",
+  "已隐藏的群": "Hidden groups",
+  "恢复": "Restore",
+  "隐藏群聊": "Hide group",
+  "确认隐藏": "Confirm hide",
+  "退出群聊": "Leave group",
+  "这个群会从会话列表隐藏；群里的助手、消息和历史全部保留，可以在「已隐藏」里恢复。": "This group is hidden from your conversation list. Its assistants, messages and history are all kept, and Hidden can bring it back.",
+  "隐藏结果未确认，请刷新会话列表后重试。": "The hide result is unconfirmed. Refresh the conversation list and try again.",
+  "已隐藏列表读取结果不可用，请重试。": "The hidden list could not be read. Please try again.",
+  "隐藏未完成，会话列表尚未更新。": "Hiding did not complete. Your conversation list is unchanged.",
+  "恢复结果未确认，请刷新会话列表后重试。": "The restore result is unconfirmed. Refresh the conversation list and try again.",
+  "没有已隐藏的群": "No hidden groups"
 }

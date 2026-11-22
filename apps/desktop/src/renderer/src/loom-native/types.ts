@@ -1,5 +1,6 @@
 import type {
   AgentProfile,
+  HiddenThreadItem,
   LoomArtifact,
   LoomCandidate,
   LoomControlSnapshot,
@@ -13,6 +14,7 @@ import type {
 } from '@contracts'
 export type {
   AgentProfile,
+  HiddenThreadItem,
   LoomArtifact,
   LoomCandidate,
   LoomControlSnapshot,
