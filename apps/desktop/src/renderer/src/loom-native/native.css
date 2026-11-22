@@ -185,3 +185,24 @@
 /* 群里的说话对象是 @ 出来的，不需要收件人下拉；只留一行说明。 */
 .ln-composer-hint{margin:0 0 5px;padding:0 2px;font-size:11px;color:var(--ln-muted)}
 .ln-composer-hint strong{font-weight:600}
+
+/* AgentOpenUi / AgentOpenUiButton (Mikka apps/mobile/components/OpenUI.tsx, components/workspace/agent-openui-button.tsx):
+   a reply that parses as OpenUI draws its cards with the shell's own elements; one that does not keeps the source
+   block. Upstream's grid turns to three columns from 26rem, wider than the reply column, so this one stops at two. */
+.ln-openui{display:flex;min-width:0;flex-direction:column;gap:10px}
+.ln-openui-prose,.ln-openui-text{min-width:0}
+.ln-openui-stack{display:flex;min-width:0;flex-direction:column;gap:10px}
+.ln-openui-inline{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px;margin:0;font-size:14px;line-height:1.55}
+.ln-openui-chip{font-size:12px;padding:1px 6px;border-radius:6px;background:var(--ln-bubble);color:var(--ln-muted);overflow-wrap:anywhere}
+a.ln-openui-chip{color:var(--ln-blue);text-decoration:underline;text-underline-offset:2px}
+.ln-openui-card{display:flex;min-width:0;flex-direction:column;gap:8px;padding:12px;border-radius:16px;background:var(--ln-card)}
+.ln-openui-card>h3{font-size:14px;font-weight:600;margin:0}
+.ln-openui-card-description{font-size:13px;line-height:1.55;margin:0;color:var(--ln-muted)}
+.ln-openui-grid{display:grid;min-width:0;gap:12px;grid-template-columns:minmax(0,1fr)}
+@media (min-width:26rem){.ln-openui-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.ln-openui-button{display:flex;flex-direction:column;align-items:flex-start;gap:6px}
+.ln-openui-button-face{border:1px solid var(--ln-line);border-radius:9px;padding:5px 11px;font-size:12px;background:transparent;color:var(--ln-text);cursor:pointer}
+.ln-openui-button-face.is-primary{background:var(--ln-bubble)}
+.ln-openui-button-face.is-destructive{border-color:var(--ln-danger);color:var(--ln-danger)}
+.ln-openui-button-face:disabled{color:var(--ln-muted);border-color:var(--ln-line);background:transparent;cursor:default}
+.ln-openui-button-reason{font-size:12px;line-height:1.5;color:var(--ln-muted)}
