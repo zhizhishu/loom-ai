@@ -6,6 +6,8 @@ mod automation_naming;
 mod claim_context;
 #[path = "db_compact_execution.rs"]
 mod compact_execution;
+#[path = "db_delivery_wake.rs"]
+mod delivery_wake_migration;
 #[path = "db_execution_node.rs"]
 mod execution_nodes;
 #[path = "db_execution_storage.rs"]
@@ -1029,6 +1031,7 @@ struct CurrentMigrationState {
     v235: bool,
     v236: bool,
     v237: bool,
+    v238: bool,
 }
 
 impl CurrentMigrationState {
@@ -1050,6 +1053,16 @@ impl CurrentMigrationState {
     }
 
     fn admits(&self, contract: &str, schema: i64, classifier: &str) -> bool {
+        if self.v238 {
+            // 238 persists Delivery wake facts without moving the projection schema, exactly
+            // like 236 and 237: 187 is the marker both before and after its receipt exists.
+            let mut previous = *self;
+            previous.v238 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 187
+                && self.v237
+                && previous.admits(CURRENT_DATA_CONTRACT_VERSION, 187, classifier);
+        }
         if self.v237 {
             let mut previous = *self;
             previous.v237 = false;
@@ -6314,7 +6327,8 @@ fn load_current_migration_state(
             EXISTS(SELECT 1 FROM schema_migration WHERE version=234),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=235),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=236),
-            EXISTS(SELECT 1 FROM schema_migration WHERE version=237)
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=237),
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=238)
         "#,
         [],
         |row| {
@@ -6487,6 +6501,7 @@ fn load_current_migration_state(
                 v235: row.get(165)?,
                 v236: row.get(166)?,
                 v237: row.get(167)?,
+                v238: row.get(168)?,
             })
         },
     )
@@ -9866,6 +9881,9 @@ impl Database {
             if !self.schema_migration_applied(237)? {
                 migration_step!("migration_237", loom::migrate_recovery_ledger(self));
             }
+            if !self.schema_migration_applied(238)? {
+                migration_step!("migration_238", delivery_wake_migration::migrate(self));
+            }
             if let Err(error) =
                 crate::notification::maintain_notification_episode_retention(self.connection())
             {
@@ -10810,6 +10828,9 @@ impl Database {
         }
         if !self.schema_migration_applied(237)? {
             migration_step!("migration_237", loom::migrate_recovery_ledger(self));
+        }
+        if !self.schema_migration_applied(238)? {
+            migration_step!("migration_238", delivery_wake_migration::migrate(self));
         }
         if let Err(error) =
             crate::notification::maintain_notification_episode_retention(self.connection())
@@ -42643,6 +42664,7 @@ mod tests {
             v235: version >= 235,
             v236: version >= 236,
             v237: version >= 237,
+            v238: version >= 238,
         }
     }
 
@@ -42924,6 +42946,12 @@ mod tests {
                 "current",
                 CURRENT_DATA_CONTRACT_VERSION,
                 CURRENT_PROJECTION_SCHEMA_VERSION,
+                238,
+            ),
+            (
+                "v1.72/schema 187 before the Delivery wake persistence",
+                "v1.72",
+                187,
                 237,
             ),
             (
@@ -43500,7 +43528,7 @@ mod tests {
         }
 
         assert!(migration_state_through(141).admits("v1.52", 92, V142_CLASSIFIER_VERSION));
-        let current = migration_state_through(237);
+        let current = migration_state_through(238);
         assert!(current.admits(
             CURRENT_DATA_CONTRACT_VERSION,
             CURRENT_PROJECTION_SCHEMA_VERSION,
@@ -44276,7 +44304,7 @@ mod tests {
             )
             .expect("current contract marker should load");
 
-        assert_eq!(state, migration_state_through(237));
+        assert_eq!(state, migration_state_through(238));
         assert!(state.admits(&contract, schema, &classifier));
         assert!(has_admissible_data_contract(
             &directory.join("rovai.sqlite")
