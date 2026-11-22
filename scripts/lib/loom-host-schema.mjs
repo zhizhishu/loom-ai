@@ -11,6 +11,7 @@ const ARTIFACT_VERSION_MIGRATION = 235
 const LOCAL_HOOK_MIGRATION = 236
 const RECOVERY_LEDGER_MIGRATION = 237
 const DELIVERY_WAKE_MIGRATION = 238
+const DEVICE_SESSION_MIGRATION = 239
 const WATCHDOG_STATE_MIGRATION = 240
 
 export async function verifyRunningHostSchema ({ request, databasePath,
@@ -21,8 +22,9 @@ export async function verifyRunningHostSchema ({ request, databasePath,
     assert.ok((expectedProjectionSchema === 186 && expectedMigrationVersion === 236)
       || (expectedProjectionSchema === 187 && expectedMigrationVersion === 237)
       || (expectedProjectionSchema === 187 && expectedMigrationVersion === 238)
+      || (expectedProjectionSchema === 187 && expectedMigrationVersion === DEVICE_SESSION_MIGRATION)
       || (expectedProjectionSchema === 187 && expectedMigrationVersion === 240),
-      'this acceptance requires a supported projection/migration pair (186/236, 187/237, 187/238 or 187/240)')
+      'this acceptance requires a supported projection/migration pair (186/236, 187/237, 187/238, 187/239 or 187/240)')
     assert.ok(typeof databasePath === 'string' && isAbsolute(databasePath),
       'the isolated Host database path must be explicitly selected')
     const health = await request('health.check', {})
@@ -50,6 +52,8 @@ export async function verifyRunningHostSchema ({ request, databasePath,
       evidence.localHookMigrationPresent = localHook?.version === LOCAL_HOOK_MIGRATION
       evidence.recoveryLedgerMigrationPresent = recoveryLedger?.version === RECOVERY_LEDGER_MIGRATION
       evidence.watchdogStateMigrationPresent = watchdogState?.version === WATCHDOG_STATE_MIGRATION
+      const deviceSession = database.prepare('SELECT version FROM schema_migration WHERE version = ?').get(DEVICE_SESSION_MIGRATION)
+      evidence.deviceSessionMigrationPresent = deviceSession?.version === DEVICE_SESSION_MIGRATION
       evidence.deliveryWakeMigrationPresent = deliveryWake?.version === DELIVERY_WAKE_MIGRATION
       evidence.contractVersion = marker?.contract_version ?? null
       evidence.projectionSchema = marker?.projection_schema_version ?? null
@@ -74,6 +78,10 @@ export async function verifyRunningHostSchema ({ request, databasePath,
           assert.equal(evidence.watchdogStateMigrationPresent, true,
             'the LOOM watchdog state migration is absent')
         }
+      }
+      if (expectedMigrationVersion >= DEVICE_SESSION_MIGRATION) {
+        assert.equal(evidence.deviceSessionMigrationPresent, true,
+          'the device session migration is absent')
       }
       evidence.verified = true
       database.exec('COMMIT')

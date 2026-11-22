@@ -518,7 +518,22 @@ impl Hub {
             self.detach(node_id, generation).await;
             return Err("token_revoked");
         }
+        // The socket that opened last owns the session, and presence is that column pair, never a
+        // heartbeat window (decision 2026-11-17-2215). A report that cannot be written does not
+        // decide whether this socket is accepted; the next report repairs it.
+        self.report_session(node_id, generation, true);
         Ok(generation)
+    }
+
+    /// Open or close this exact socket's session. A failure is not surfaced: presence is read
+    /// from the columns, and a later report rewrites them.
+    fn report_session(&self, node_id: &str, generation: u64, connected: bool) {
+        let socket_id = generation.to_string();
+        let _ = if connected {
+            self.store.open_device_session(node_id, &socket_id)
+        } else {
+            self.store.close_device_session(node_id, &socket_id)
+        };
     }
 
     async fn set_run_bundle_versions(&self, node_id: &str, generation: u64, versions: Vec<u32>) {
@@ -622,6 +637,9 @@ impl Hub {
         // deadline, and no stale frame can be delivered to its replacement.
         computer::fail_computer_waiters(&mut inner, node_id);
         drop(inner);
+        // Only the socket that owns the session closes it; a late close of a replaced socket is
+        // ignored above, exactly as the upstream session decision requires.
+        self.report_session(node_id, generation, false);
         if let Some(pipes) = self.pipes.get() {
             pipes.node_disconnected(node_id, generation).await;
         }

@@ -3706,6 +3706,9 @@ fn recovered_fact() -> (String, Option<String>) {
 
 /// Point one member at a remote Node and give that Node the selected harness: a real
 /// `member_execution_target` row, a ready `mission_workspace` on that Node and a reported CLI.
+/// Presence is the device session the Node's own socket opened, never the `last_heartbeat` stamp
+/// (decision 2026-11-17-2215), so `session_open` alone decides whether the fixture Node is online;
+/// `last_seen` is only the display stamp and cannot stand in for a session however fresh it is.
 /// Returns the workspace id.
 fn select_remote_node(
     database: &OwnedTestDatabase,
@@ -3713,7 +3716,8 @@ fn select_remote_node(
     member_id: &str,
     node_id: &str,
     adapter_kind: AdapterKind,
-    heartbeat: &str,
+    last_seen: &str,
+    session_open: bool,
 ) -> String {
     let connection = database.connection();
     let mission_id: String = connection
@@ -3728,9 +3732,16 @@ fn select_remote_node(
     connection
         .execute(
             "INSERT INTO execution_node(node_id,display_name,role,os,arch,token_digest,paired_at,
-                                        revoked_at,last_heartbeat)
-             VALUES(?1,'Remote Node','remote',NULL,NULL,?2,?3,NULL,?3)",
-            params![node_id, "a".repeat(64), heartbeat],
+                                        revoked_at,last_heartbeat,session_opened_at,
+                                        session_socket_id)
+             VALUES(?1,'Remote Node','remote',NULL,NULL,?2,?3,NULL,?3,?4,?5)",
+            params![
+                node_id,
+                "a".repeat(64),
+                last_seen,
+                session_open.then_some(last_seen),
+                session_open.then_some("fixture-socket")
+            ],
         )
         .unwrap();
     connection
@@ -3743,7 +3754,7 @@ fn select_remote_node(
                 node_id,
                 adapter_kind.as_str(),
                 format!("{root}/{}", adapter_kind.as_str()),
-                heartbeat,
+                last_seen,
                 format!("sha256:{}", "b".repeat(64))
             ],
         )
@@ -3764,7 +3775,7 @@ fn select_remote_node(
                 node_id,
                 root,
                 format!("{root}/.git"),
-                heartbeat
+                last_seen
             ],
         )
         .unwrap();
@@ -3782,7 +3793,7 @@ fn select_remote_node(
             "INSERT INTO member_execution_target(member_id,revision,node_id,selection_json,
                                                  updated_at)
              VALUES(?1,1,?2,?3,?4)",
-            params![member_id, node_id, selection.to_string(), heartbeat],
+            params![member_id, node_id, selection.to_string(), last_seen],
         )
         .unwrap();
     workspace_id
@@ -4577,10 +4588,11 @@ fn an_unreachable_recipient_holds_the_reserved_delivery_and_the_same_queued_run_
 }
 
 /// Presence boundary, ported from the upstream device vocabulary: when a member explicitly selected
-/// a remote Node, that Node is the device — its heartbeat is presence and its catalog is the
-/// harness. The local installation of that Agent is not the device and must not be consulted.
+/// a remote Node, that Node is the device — the session its own socket opened is presence and its
+/// catalog is the harness. The local installation of that Agent is not the device and must not be
+/// consulted.
 #[test]
-fn a_remote_recipient_is_judged_by_its_node_and_recovers_when_the_node_heartbeats() {
+fn a_remote_recipient_is_judged_by_its_node_and_recovers_when_the_node_opens_a_session() {
     let mut database = fixture();
     let (mission_id, plan_id) = dispatchable_plan(
         &mut database,
@@ -4590,6 +4602,8 @@ fn a_remote_recipient_is_judged_by_its_node_and_recovers_when_the_node_heartbeat
         &[],
     );
     let camp_id = camp_of(&database, &mission_id);
+    // The Node last reported an hour ago and has no session open. Presence is the session, so the
+    // stamp below decides nothing: a Node without an open session is offline.
     let stale = (chrono::Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339();
     select_remote_node(
         &database,
@@ -4598,32 +4612,34 @@ fn a_remote_recipient_is_judged_by_its_node_and_recovers_when_the_node_heartbeat
         "node_remote",
         AdapterKind::CodexCli,
         &stale,
+        false,
     );
-    // The Agent's local installation is still present, enabled and launchable. A stale Node must
-    // still decide, because the Node is where the work would run.
+    // The Agent's local installation is still present, enabled and launchable. A Node with no open
+    // session must still decide, because the Node is where the work would run.
     assert_eq!(
         control::admit_due_dispatches(&mut database).unwrap(),
         1,
-        "assertion a_stale_node_reserves_the_work_without_starting_it"
+        "assertion a_node_without_an_open_session_reserves_the_work_without_starting_it"
     );
     assert_eq!(
         task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
         Some("loom.dispatch_recipient_offline"),
-        "assertion a_stale_node_heartbeat_is_reported_as_presence"
+        "assertion a_closed_device_session_is_reported_as_presence"
     );
     assert_eq!(
         dispatch_events(&database, "task_a"),
         vec![failure_fact("loom.dispatch_recipient_offline")],
-        "assertion the_stale_node_writes_one_presence_fact"
+        "assertion the_node_without_an_open_session_writes_one_presence_fact"
     );
 
-    // A fresh heartbeat is presence; the Node reporting no usable installation of the selected
-    // harness is the harness step.
+    // An open session is presence, whatever time has passed; the Node reporting no usable
+    // installation of the selected harness is the harness step.
     let fresh = chrono::Utc::now().to_rfc3339();
     database
         .connection()
         .execute(
-            "UPDATE execution_node SET last_heartbeat=?1 WHERE node_id='node_remote'",
+            "UPDATE execution_node SET session_opened_at=?1, session_closed_at=NULL,
+                session_socket_id='fixture-socket' WHERE node_id='node_remote'",
             [&fresh],
         )
         .unwrap();
@@ -5187,6 +5203,7 @@ fn an_unreachable_remote_node_outranks_its_missing_harness() {
         &[],
     );
     let camp_id = camp_of(&database, &mission_id);
+    // No session is open, so the Node is offline however recently it reported.
     let stale = (chrono::Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339();
     select_remote_node(
         &database,
@@ -5195,8 +5212,9 @@ fn an_unreachable_remote_node_outranks_its_missing_harness() {
         "node_remote",
         AdapterKind::CodexCli,
         &stale,
+        false,
     );
-    // Every fact is broken at once: the heartbeat is stale *and* the Node reports no usable CLI.
+    // Every fact is broken at once: no session is open *and* the Node reports no usable CLI.
     database
         .connection()
         .execute(
@@ -5213,7 +5231,7 @@ fn an_unreachable_remote_node_outranks_its_missing_harness() {
     assert_eq!(
         task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
         Some("loom.dispatch_recipient_offline"),
-        "assertion presence_outranks_the_harness_a_stale_node_cannot_be_trusted_to_report"
+        "assertion presence_outranks_the_harness_a_node_without_an_open_session_cannot_be_trusted_to_report"
     );
     assert_eq!(
         dispatch_events(&database, "task_a"),
@@ -5221,13 +5239,14 @@ fn an_unreachable_remote_node_outranks_its_missing_harness() {
         "assertion only_the_presence_fact_is_recorded"
     );
 
-    // A fresh heartbeat with the same missing CLI is a harness problem, because the device is now
+    // An open session with the same missing CLI is a harness problem, because the device is now
     // reachable and only its harness is missing.
     let fresh = chrono::Utc::now().to_rfc3339();
     database
         .connection()
         .execute(
-            "UPDATE execution_node SET last_heartbeat=?1 WHERE node_id='node_remote'",
+            "UPDATE execution_node SET session_opened_at=?1, session_closed_at=NULL,
+                session_socket_id='fixture-socket' WHERE node_id='node_remote'",
             [&fresh],
         )
         .unwrap();
@@ -5754,6 +5773,7 @@ async fn a_remote_queued_run_waits_for_its_harness_instead_of_being_rejected() {
         "node_remote",
         AdapterKind::CodexCli,
         &fresh,
+        true,
     );
     assert_eq!(
         control::admit_due_dispatches(&mut database).unwrap(),

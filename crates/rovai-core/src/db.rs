@@ -9893,6 +9893,12 @@ impl Database {
             if !self.schema_migration_applied(238)? {
                 migration_step!("migration_238", delivery_wake_migration::migrate(self));
             }
+            if !self.schema_migration_applied(239)? {
+                migration_step!(
+                    "migration_239",
+                    execution_nodes::migrate_device_session(self)
+                );
+            }
             if !self.schema_migration_applied(240)? {
                 migration_step!("migration_240", loom::migrate_recovery_watchdog_state(self));
             }
@@ -10843,6 +10849,12 @@ impl Database {
         }
         if !self.schema_migration_applied(238)? {
             migration_step!("migration_238", delivery_wake_migration::migrate(self));
+        }
+        if !self.schema_migration_applied(239)? {
+            migration_step!(
+                "migration_239",
+                execution_nodes::migrate_device_session(self)
+            );
         }
         if !self.schema_migration_applied(240)? {
             migration_step!("migration_240", loom::migrate_recovery_watchdog_state(self));

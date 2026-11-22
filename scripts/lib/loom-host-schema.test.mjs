@@ -7,9 +7,11 @@ import test from 'node:test'
 import { verifyRunningHostSchema } from './loom-host-schema.mjs'
 
 // Migration 240 (the LOOM watchdog state on the durable recovery ledger) is the current receipt,
-// so a current database also carries 235, 236, 237 and 238 (the Delivery wake persistence).
-// 238 and 240 add columns only, so the projection schema stays 187.
-const priorReceipts = migration => migration >= 240 ? [235, 236, 237, 238]
+// so a current database also carries 235, 236, 237, 238 (the Delivery wake persistence) and 239
+// (the device session columns).
+// 238, 239 and 240 add columns only, so the projection schema stays 187.
+const priorReceipts = migration => migration >= 240 ? [235, 236, 237, 238, 239]
+  : migration >= 239 ? [235, 236, 237, 238]
   : migration >= 238 ? [235, 236, 237]
   : migration >= 237 ? [235, 236] : migration >= 236 ? [235] : []
 
@@ -40,6 +42,7 @@ test('the running Host actual schema is verified read-only, with no runtime or s
   assert.equal(evidence.localHookMigrationPresent, true)
   assert.equal(evidence.recoveryLedgerMigrationPresent, true)
   assert.equal(evidence.watchdogStateMigrationPresent, true)
+  assert.equal(evidence.deviceSessionMigrationPresent, true)
   assert.equal(evidence.deliveryWakeMigrationPresent, true)
   assert.equal(evidence.source, 'running-host-health-and-read-only-database')
   assert.deepEqual(f.methods, ['health.check'])
@@ -54,6 +57,7 @@ test('the running Host actual schema is verified read-only, with no runtime or s
   assert.equal(hookEvidence.latestMigrationVersion, 236)
   assert.equal(hookEvidence.localHookMigrationPresent, true)
   assert.equal(hookEvidence.recoveryLedgerMigrationPresent, false)
+  assert.equal(hookEvidence.deviceSessionMigrationPresent, false)
   assert.equal(hookEvidence.watchdogStateMigrationPresent, false)
   assert.equal(hookEvidence.artifactVersionMigrationPresent, true)
   assert.deepEqual(await readFile(hook.path), hookBefore)
