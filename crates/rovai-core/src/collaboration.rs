@@ -9507,6 +9507,177 @@ mod slow_tests {
     }
 
     #[test]
+    fn removal_requires_the_previewed_generation_and_the_member_version() {
+        let (mut database, directory) = test_database();
+        let service = CollaborationService::default();
+        let camp_id = create_camp_with_members(
+            &service,
+            &mut database,
+            &directory,
+            &["agent_1", "agent_2"],
+        );
+        let preview = service
+            .camp_member_removal_preview(&database, &camp_id, "agent_2")
+            .unwrap()
+            .unwrap();
+        assert!(preview.removable);
+        assert!(!preview.is_default_lead);
+        assert_eq!(preview.remaining_member_count, 1);
+
+        // A generation the renderer added up itself is refused, not applied.
+        let stale_generation = service
+            .remove_camp_member(
+                &mut database,
+                &user_envelope(
+                    "remove-member-stale-generation",
+                    Some(&camp_id),
+                    RemoveThreadMemberCommand {
+                        camp_id: camp_id.clone(),
+                        agent_id: "agent_2".to_string(),
+                        expected_membership_generation: preview.membership_generation + 1,
+                        expected_membership_version: preview.membership_version,
+                        replacement_default_lead_agent_id: None,
+                        reason: None,
+                        source: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            stale_generation.result.status,
+            CommandResultStatus::Rejected
+        );
+        assert_eq!(
+            stale_generation.result.code,
+            "camp.membership_generation_conflict"
+        );
+        assert_eq!(
+            stale_generation.result.payload["currentMembershipGeneration"],
+            preview.membership_generation
+        );
+
+        // The member's own lifetime is fenced independently of the Camp generation.
+        let stale_version = service
+            .remove_camp_member(
+                &mut database,
+                &user_envelope(
+                    "remove-member-stale-version",
+                    Some(&camp_id),
+                    RemoveThreadMemberCommand {
+                        camp_id: camp_id.clone(),
+                        agent_id: "agent_2".to_string(),
+                        expected_membership_generation: preview.membership_generation,
+                        expected_membership_version: preview.membership_version + 1,
+                        replacement_default_lead_agent_id: None,
+                        reason: None,
+                        source: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(stale_version.result.status, CommandResultStatus::Rejected);
+        assert_eq!(
+            stale_version.result.code,
+            "camp.membership_version_conflict"
+        );
+        assert_eq!(
+            stale_version.result.payload["currentMembershipVersion"],
+            preview.membership_version
+        );
+        assert_eq!(
+            database
+                .connection()
+                .query_row(
+                    "SELECT status FROM camp_member WHERE camp_id = ?1 AND agent_id = 'agent_2'",
+                    [&camp_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "active"
+        );
+
+        // The exact preview values are accepted and advance both revisions by one.
+        let removed = service
+            .remove_camp_member(
+                &mut database,
+                &user_envelope(
+                    "remove-member-from-fresh-preview",
+                    Some(&camp_id),
+                    RemoveThreadMemberCommand {
+                        camp_id: camp_id.clone(),
+                        agent_id: "agent_2".to_string(),
+                        expected_membership_generation: preview.membership_generation,
+                        expected_membership_version: preview.membership_version,
+                        replacement_default_lead_agent_id: None,
+                        reason: None,
+                        source: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(removed.result.status, CommandResultStatus::Accepted);
+        assert_eq!(removed.result.payload["membershipStatus"], "left");
+        assert_eq!(
+            removed.result.payload["membershipGeneration"],
+            preview.membership_generation + 1
+        );
+        assert_eq!(
+            database
+                .connection()
+                .query_row(
+                    "SELECT membership_generation FROM camp WHERE id = ?1",
+                    [&camp_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            preview.membership_generation + 1
+        );
+        // Removing a participant never moves the group off its Lead.
+        assert_eq!(
+            database
+                .connection()
+                .query_row(
+                    "SELECT default_lead_agent_id FROM camp WHERE id = ?1",
+                    [&camp_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap(),
+            Some("agent_1".to_string())
+        );
+
+        // 移出 twice is refused instead of silently succeeding on a ended lifetime.
+        let ended = service
+            .camp_member_removal_preview(&database, &camp_id, "agent_2")
+            .unwrap()
+            .unwrap();
+        assert!(!ended.removable);
+        assert_eq!(ended.blocker_code.as_deref(), Some("camp.member_not_active"));
+        let removed_again = service
+            .remove_camp_member(
+                &mut database,
+                &user_envelope(
+                    "remove-member-already-ended",
+                    Some(&camp_id),
+                    RemoveThreadMemberCommand {
+                        camp_id: camp_id.clone(),
+                        agent_id: "agent_2".to_string(),
+                        expected_membership_generation: ended.membership_generation,
+                        expected_membership_version: ended.membership_version,
+                        replacement_default_lead_agent_id: None,
+                        reason: None,
+                        source: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(removed_again.result.status, CommandResultStatus::Rejected);
+        assert_eq!(removed_again.result.code, "camp.member_not_active");
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn external_membership_hints_require_an_allowlisted_bound_source_and_next_generation() {
         let (mut database, directory) = test_database();
         let service = CollaborationService::default();

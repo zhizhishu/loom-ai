@@ -8,6 +8,7 @@ import type {
   NewConversationDefaults,
   StoredCommandResult,
   ThreadCreationPreflight,
+  ThreadMemberRemovalPreview,
   ThreadSnapshot,
   WorkspaceInspection,
   WorkspaceSelection
@@ -452,6 +453,182 @@ export async function changeRoomLead(port: RoomPort, input: RoomLeadChangeInput)
   ))
   if (outcome.kind === 'unknown') throw new Error(outcome.message)
   if (outcome.kind === 'rejected') throw new LoomCommandRejected(outcome.result)
+}
+
+// --------------------------------------------------------------- removal
+
+/**
+ * Core's read-only impact statement (`camp-membership-v1` §2). It is not an authorization:
+ * the command re-validates inside its transaction, and the CAS values it must carry come from
+ * this exact preview, never from a number the renderer added up itself.
+ */
+export type RoomMemberRemovalPreview = ThreadMemberRemovalPreview
+
+export function roomMemberRemovalPreviewParams(threadId: string, agentId: string): unknown {
+  return { threadId, agentId }
+}
+
+const REMOVAL_PREVIEW_UNREADABLE = uiAttribute('成员影响预览读取结果不可用，请重新读取会话后再试。')
+
+/** A preview that is not provably this member of this Thread is never a usable one. */
+export async function readRoomMemberRemovalPreview(
+  port: RoomPort,
+  threadId: string,
+  agentId: string
+): Promise<RoomMemberRemovalPreview> {
+  const value = await port.request<ThreadMemberRemovalPreview | null>(
+    'threads.members.removalPreview',
+    roomMemberRemovalPreviewParams(threadId, agentId)
+  )
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(REMOVAL_PREVIEW_UNREADABLE)
+  if (value.threadId !== threadId || value.agentId !== agentId) throw new Error(REMOVAL_PREVIEW_UNREADABLE)
+  if (!Number.isInteger(value.membershipGeneration) || value.membershipGeneration < 1) throw new Error(REMOVAL_PREVIEW_UNREADABLE)
+  if (!Number.isInteger(value.membershipVersion) || value.membershipVersion < 1) throw new Error(REMOVAL_PREVIEW_UNREADABLE)
+  if (typeof value.removable !== 'boolean') throw new Error(REMOVAL_PREVIEW_UNREADABLE)
+  return value
+}
+
+/** The primary Lead may not be removed on its own: the group needs another Lead first. */
+export const ROOM_LEAD_REMOVAL_BLOCKED = uiAttribute('当前主助手不能直接移出，请先把另一位助手设为主助手。')
+
+export interface RoomMemberRemoveInput {
+  threadId: string
+  agentIds: readonly string[]
+  /** 退出群聊 empties the group on purpose, so the Lead may go last with nobody to inherit. */
+  allowLeadWithoutSuccessor?: boolean
+}
+
+/** No replacement is ever invented here: `changeRoomLead` hands the group over first. */
+export function roomMemberRemoveParams(commandId: string, preview: RoomMemberRemovalPreview): unknown {
+  return {
+    commandId,
+    command: {
+      threadId: preview.threadId,
+      agentId: preview.agentId,
+      expectedMembershipGeneration: preview.membershipGeneration,
+      expectedMembershipVersion: preview.membershipVersion
+    }
+  }
+}
+
+export interface RoomMemberRemoveFailure {
+  agentId: string
+  message: string
+}
+
+export interface RoomMemberRemoveOutcome {
+  removedAgentIds: string[]
+  failures: RoomMemberRemoveFailure[]
+  /** The assistant Core handed the group to, when the removed member was the Lead. */
+  nextDefaultLeadAgentId: string | null
+}
+
+function roomMemberRemovalConflict(code: string): boolean {
+  return roomMembershipConflict(code)
+    || code === 'camp.default_lead_unavailable'
+    || code === 'camp.default_lead_replacement_not_applicable'
+}
+
+function removalAdvanced(step: StoredCommandResult, preview: RoomMemberRemovalPreview): boolean {
+  const next = step.payload.membershipGeneration
+  return typeof next === 'number' && Number.isInteger(next) && next > preview.membershipGeneration
+}
+
+/**
+ * Removing is not dispatch. Every removal advances the Camp generation, so each step reads a fresh
+ * preview and submits exactly its generation and the member's own version. A conflict or an
+ * unreadable receipt stops the batch instead of guessing what the roster now is.
+ */
+export async function removeRoomMembers(
+  port: RoomPort,
+  input: RoomMemberRemoveInput
+): Promise<RoomMemberRemoveOutcome> {
+  const threadId = input.threadId.trim()
+  if (threadId === '') throw new Error(uiAttribute('当前会话尚未准备好。'))
+  const agentIds = [...new Set(input.agentIds.filter(agentId => typeof agentId === 'string' && agentId !== ''))]
+  const outcome: RoomMemberRemoveOutcome = { removedAgentIds: [], failures: [], nextDefaultLeadAgentId: null }
+  for (let index = 0; index < agentIds.length; index += 1) {
+    const agentId = agentIds[index]
+    const stop = (message: string): void => {
+      outcome.failures.push({ agentId, message })
+      for (const remaining of agentIds.slice(index + 1)) outcome.failures.push({ agentId: remaining, message })
+    }
+    // Every removal advances the Camp generation, so the CAS values come from a fresh preview;
+    // an unreadable preview stops the batch instead of guessing the roster.
+    const read: { preview: RoomMemberRemovalPreview } | { failure: string } =
+      await readRoomMemberRemovalPreview(port, threadId, agentId).then(
+        value => ({ preview: value }),
+        error => ({ failure: readErrorMessage(error) })
+      )
+    if ('failure' in read) {
+      stop(read.failure)
+      break
+    }
+    const preview = read.preview
+    if (!preview.removable) {
+      outcome.failures.push({ agentId, message: uiAttribute('该助手已不在群里，请刷新后重试。') })
+      continue
+    }
+    if (preview.isDefaultLead && input.allowLeadWithoutSuccessor !== true) {
+      stop(ROOM_LEAD_REMOVAL_BLOCKED)
+      break
+    }
+    let step: RoomCommandOutcome
+    try {
+      step = classifyRoomCommand(await port.request<StoredCommandResult | null>(
+        'threads.members.remove',
+        roomMemberRemoveParams(newCommandId(), preview)
+      ))
+    } catch (error) {
+      step = { kind: 'unknown', message: readErrorMessage(error) }
+    }
+    if (step.kind === 'unknown') {
+      stop(step.message)
+      break
+    }
+    if (step.kind === 'rejected') {
+      if (roomMemberRemovalConflict(step.result.code)) {
+        stop(uiAttribute('名册已发生变化，请在刷新后重试。'))
+        break
+      }
+      outcome.failures.push({ agentId, message: loomCommandMessage(step.result) })
+      continue
+    }
+    if (!removalAdvanced(step.result, preview)) {
+      stop(uiAttribute('名册版本未确认，已停止继续移出。请重新读取会话后再试。'))
+      break
+    }
+    outcome.removedAgentIds.push(agentId)
+    const nextLead = step.result.payload.nextDefaultLeadAgentId
+    if (typeof nextLead === 'string' && nextLead !== '') outcome.nextDefaultLeadAgentId = nextLead
+  }
+  return outcome
+}
+
+/** Participants leave first; the Lead goes last so the group keeps answering until the end. */
+export function roomLeaveOrder(agentIds: readonly string[], defaultLeadAgentId: string | null): string[] {
+  const ids = [...new Set(agentIds.filter(agentId => typeof agentId === 'string' && agentId !== ''))]
+  if (defaultLeadAgentId === null) return ids
+  return [
+    ...ids.filter(agentId => agentId !== defaultLeadAgentId),
+    ...ids.filter(agentId => agentId === defaultLeadAgentId)
+  ]
+}
+
+export interface RoomLeaveInput {
+  threadId: string
+  activeAgentIds: readonly string[]
+  defaultLeadAgentId: string | null
+}
+
+/**
+ * 退出群聊 in LOOM: the person leaves, so the assistants end their membership. History stays and
+ * the same group is re-invitable — nothing is deleted and no assistant is silently kept.
+ */
+export async function leaveRoom(port: RoomPort, input: RoomLeaveInput): Promise<RoomMemberRemoveOutcome> {
+  const order = roomLeaveOrder(input.activeAgentIds, input.defaultLeadAgentId)
+  if (order.length === 0) throw new Error(uiAttribute('群里还没有助手。'))
+  return removeRoomMembers(port, { threadId: input.threadId, agentIds: order, allowLeadWithoutSuccessor: true })
 }
 
 // ----------------------------------------------------------------- roster

@@ -6,6 +6,7 @@ import type {
   NavigationSnapshot,
   StoredCommandResult,
   ThreadCreationPreflight,
+  ThreadMemberRemovalPreview,
   ThreadSnapshot
 } from '@contracts'
 import type { BusinessEnvironment } from '../business-environment'
@@ -18,9 +19,14 @@ import {
   createRoom,
   emptyRoomDraft,
   initialRoomDraft,
+  leaveRoom,
   QUICK_CHAT_CHOICE,
+  readRoomMemberRemovalPreview,
+  removeRoomMembers,
   resolveRoomPermission,
+  ROOM_LEAD_REMOVAL_BLOCKED,
   roomDraftProblems,
+  roomLeaveOrder,
   roomPort,
   roomPermissionChoices,
   roomRoster,
@@ -98,6 +104,18 @@ function preflightOf(ids: readonly string[], lead: string | null = null): Thread
     initialLeadAgentId: lead,
     blockers: []
   }
+}
+
+function previewOf(agentId: string, over: Record<string, unknown> = {}): ThreadMemberRemovalPreview {
+  return {
+    threadId: 't', agentId, displayName: agentId.toUpperCase(),
+    membershipGeneration: 3, membershipVersion: 1, isDefaultLead: false,
+    remainingMemberCount: 1, nextDefaultLeadAgentId: null,
+    nonTerminalAgentRunCount: 0, openAssignedTaskCount: 0,
+    pendingDeliveryCount: 0, runningDeliveryCount: 0,
+    removable: true, blockerCode: null,
+    ...over
+  } as unknown as ThreadMemberRemovalPreview
 }
 
 function approvalOf(over: Record<string, unknown> = {}): ActionApprovalView {
@@ -272,6 +290,158 @@ describe('changeRoomLead', () => {
     const denied = fakePort({ 'threads.changeDefaultLead': () => rejected('camp.member_not_active') })
     await expect(changeRoomLead(denied.port, { threadId: 't', successorAgentId: 'b', expectedVersion: 1 }))
       .rejects.toBeInstanceOf(LoomCommandRejected)
+  })
+})
+
+describe('readRoomMemberRemovalPreview', () => {
+  it('reads the exact member of this Thread and returns Core\'s preview verbatim', async () => {
+    const preview = previewOf('b', { membershipGeneration: 5, membershipVersion: 2 })
+    const { port, calls } = fakePort({ 'threads.members.removalPreview': () => preview })
+    await expect(readRoomMemberRemovalPreview(port, 't', 'b')).resolves.toEqual(preview)
+    expect(calls).toEqual([{ method: 'threads.members.removalPreview', params: { threadId: 't', agentId: 'b' } }])
+  })
+
+  it('refuses a preview that is not provably this member with usable revisions', async () => {
+    const otherMember = fakePort({ 'threads.members.removalPreview': () => previewOf('someone-else') })
+    await expect(readRoomMemberRemovalPreview(otherMember.port, 't', 'b')).rejects.toThrow()
+    const otherThread = fakePort({ 'threads.members.removalPreview': () => previewOf('b', { threadId: 'other' }) })
+    await expect(readRoomMemberRemovalPreview(otherThread.port, 't', 'b')).rejects.toThrow()
+    const noVersion = fakePort({ 'threads.members.removalPreview': () => previewOf('b', { membershipVersion: 0 }) })
+    await expect(readRoomMemberRemovalPreview(noVersion.port, 't', 'b')).rejects.toThrow()
+    const noGeneration = fakePort({ 'threads.members.removalPreview': () => previewOf('b', { membershipGeneration: null }) })
+    await expect(readRoomMemberRemovalPreview(noGeneration.port, 't', 'b')).rejects.toThrow()
+    const missing = fakePort({ 'threads.members.removalPreview': () => null })
+    await expect(readRoomMemberRemovalPreview(missing.port, 't', 'b')).rejects.toThrow()
+  })
+})
+
+describe('removeRoomMembers', () => {
+  it('submits the previewed generation and the member version for one member', async () => {
+    const { port, calls } = fakePort({
+      'threads.members.removalPreview': () => previewOf('b', { membershipGeneration: 3, membershipVersion: 2 }),
+      'threads.members.remove': () => applied({ membershipGeneration: 4, membershipStatus: 'left', changed: true })
+    })
+    const outcome = await removeRoomMembers(port, { threadId: 't', agentIds: ['b'] })
+    expect(outcome).toEqual({ removedAgentIds: ['b'], failures: [], nextDefaultLeadAgentId: null })
+    expect(calls[1].params).toMatchObject({
+      command: { threadId: 't', agentId: 'b', expectedMembershipGeneration: 3, expectedMembershipVersion: 2 }
+    })
+    expect((calls[1].params?.command as Record<string, unknown>).replacementDefaultLeadAgentId).toBeUndefined()
+  })
+
+  it('never removes the primary Lead before another assistant takes over', async () => {
+    const { port, calls } = fakePort({
+      'threads.members.removalPreview': () => previewOf('a', { isDefaultLead: true })
+    })
+    const outcome = await removeRoomMembers(port, { threadId: 't', agentIds: ['a', 'b'] })
+    expect(outcome.removedAgentIds).toEqual([])
+    expect(outcome.failures.map(failure => failure.message)).toEqual([ROOM_LEAD_REMOVAL_BLOCKED, ROOM_LEAD_REMOVAL_BLOCKED])
+    expect(calls.some(call => call.method === 'threads.members.remove')).toBe(false)
+  })
+
+  it('stops the batch when Core reports a stale roster', async () => {
+    const { port, calls } = fakePort({
+      'threads.members.removalPreview': params => previewOf(String(params?.agentId)),
+      'threads.members.remove': () => rejected('camp.membership_generation_conflict')
+    })
+    const outcome = await removeRoomMembers(port, { threadId: 't', agentIds: ['b', 'c'] })
+    expect(outcome.removedAgentIds).toEqual([])
+    expect(outcome.failures.map(failure => failure.agentId)).toEqual(['b', 'c'])
+    expect(calls.filter(call => call.method === 'threads.members.remove')).toHaveLength(1)
+  })
+
+  it('refuses to remove a Lead whose successor was refused by Core', async () => {
+    const { port } = fakePort({
+      'threads.members.removalPreview': () => previewOf('b'),
+      'threads.members.remove': () => rejected('camp.default_lead_unavailable')
+    })
+    const outcome = await removeRoomMembers(port, { threadId: 't', agentIds: ['b'] })
+    expect(outcome.removedAgentIds).toEqual([])
+    expect(outcome.failures).toHaveLength(1)
+  })
+
+  it('treats an unreadable preview or receipt as unconfirmed, never as removed', async () => {
+    const unreadable = fakePort({ 'threads.members.removalPreview': () => null })
+    const blocked = await removeRoomMembers(unreadable.port, { threadId: 't', agentIds: ['b', 'c'] })
+    expect(blocked.removedAgentIds).toEqual([])
+    expect(blocked.failures.map(failure => failure.agentId)).toEqual(['b', 'c'])
+
+    const unknown = fakePort({
+      'threads.members.removalPreview': () => previewOf('b'),
+      'threads.members.remove': () => new Error('connection lost')
+    })
+    const lost = await removeRoomMembers(unknown.port, { threadId: 't', agentIds: ['b'] })
+    expect(lost.removedAgentIds).toEqual([])
+    expect(lost.failures).toHaveLength(1)
+  })
+
+  it('stops when the receipt did not advance the generation', async () => {
+    const { port } = fakePort({
+      'threads.members.removalPreview': () => previewOf('b', { membershipGeneration: 3 }),
+      'threads.members.remove': () => applied({ membershipGeneration: 3, changed: true })
+    })
+    const outcome = await removeRoomMembers(port, { threadId: 't', agentIds: ['b'] })
+    expect(outcome.removedAgentIds).toEqual([])
+    expect(outcome.failures).toHaveLength(1)
+  })
+
+  it('reports an ended membership instead of pretending it removed the member', async () => {
+    const { port, calls } = fakePort({
+      'threads.members.removalPreview': params => previewOf(String(params?.agentId), { removable: false, blockerCode: 'camp.member_not_active' }),
+      'threads.members.remove': () => applied({ membershipGeneration: 4 })
+    })
+    const outcome = await removeRoomMembers(port, { threadId: 't', agentIds: ['b'] })
+    expect(outcome.removedAgentIds).toEqual([])
+    expect(outcome.failures).toEqual([{ agentId: 'b', message: '该助手已不在群里，请刷新后重试。' }])
+    expect(calls.some(call => call.method === 'threads.members.remove')).toBe(false)
+  })
+
+  it('refuses an empty target set without sending anything', async () => {
+    const { port, calls } = fakePort({})
+    await expect(removeRoomMembers(port, { threadId: ' ', agentIds: ['b'] })).rejects.toThrow()
+    await expect(removeRoomMembers(port, { threadId: 't', agentIds: ['', ''] })).resolves.toEqual({
+      removedAgentIds: [], failures: [], nextDefaultLeadAgentId: null
+    })
+    expect(calls).toEqual([])
+  })
+})
+
+describe('roomLeaveOrder', () => {
+  it('keeps participants first and the primary Lead last', () => {
+    expect(roomLeaveOrder(['a', 'b', 'c'], 'a')).toEqual(['b', 'c', 'a'])
+    expect(roomLeaveOrder(['b', 'a'], 'b')).toEqual(['a', 'b'])
+    expect(roomLeaveOrder(['a', 'b'], null)).toEqual(['a', 'b'])
+    expect(roomLeaveOrder(['a', 'a', ''], 'a')).toEqual(['a'])
+  })
+})
+
+describe('leaveRoom', () => {
+  it('empties the group with one fresh preview per member and the Lead last', async () => {
+    let generation = 3
+    const { port, calls } = fakePort({
+      'threads.members.removalPreview': params => previewOf(String(params?.agentId), {
+        membershipGeneration: generation,
+        isDefaultLead: params?.agentId === 'a'
+      }),
+      'threads.members.remove': () => {
+        generation += 1
+        return applied({ membershipGeneration: generation, membershipStatus: 'left', changed: true })
+      }
+    })
+    const outcome = await leaveRoom(port, { threadId: 't', activeAgentIds: ['a', 'b'], defaultLeadAgentId: 'a' })
+    expect(outcome).toEqual({ removedAgentIds: ['b', 'a'], failures: [], nextDefaultLeadAgentId: null })
+    const removals = calls.filter(call => call.method === 'threads.members.remove')
+    expect(removals.map(call => (call.params?.command as { agentId: string }).agentId)).toEqual(['b', 'a'])
+    expect(removals.map(call => (call.params?.command as { expectedMembershipGeneration: number }).expectedMembershipGeneration))
+      .toEqual([3, 4])
+    expect(removals.every(call => !('replacementDefaultLeadAgentId' in (call.params?.command as Record<string, unknown>)))).toBe(true)
+    expect(calls.some(call => call.method === 'thread.messages.send')).toBe(false)
+  })
+
+  it('refuses an empty group without touching Core', async () => {
+    const { port, calls } = fakePort({})
+    await expect(leaveRoom(port, { threadId: 't', activeAgentIds: [], defaultLeadAgentId: null })).rejects.toThrow()
+    expect(calls).toEqual([])
   })
 })
 
