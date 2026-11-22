@@ -18,14 +18,15 @@ import { panelFor, modeFor, readPanelPreference } from './workspace-panel'
 import { searchWorkspace } from './workspace-search'
 import { WorkspaceSearch } from './WorkspaceSearch'
 import { PanelResizeHandle } from './PanelResizeHandle'
-import { WorkspaceManager } from './WorkspaceManager'
+import { SettingsPage, type SettingsLeaveGuard } from './SettingsPage'
+import { ProfileMenu } from './ProfileMenu'
+import { readStoredSettingsSection, type SettingsSectionId } from './settings-sections'
 import { RunStatusDialog } from './RunStatusDialog'
 import { RunActivityHistory } from './RunningActivity'
 import { storedPanelWidth, fittedPanelWidths, type PanelSide, type PanelWidths } from './panel-resize'
 
 // Load optional editors only when opened; keep them mounted after first use so
 // transport-unknown drafts cannot be discarded by closing a modal.
-const NativeSetup = lazy(() => import('./NativeSetup').then(v => ({default:v.NativeSetup})))
 const AssistantStudio = lazy(() => import('./AssistantStudio').then(v => ({default:v.AssistantStudio})))
 const CapabilityLibrary = lazy(() => import('./CapabilityLibrary').then(v => ({default:v.CapabilityLibrary})))
 const RoomDialog = lazy(() => import('./RoomDialog').then(v => ({default:v.RoomDialog})))
@@ -70,9 +71,11 @@ export function LoomApp({ environment, onLogout }: Props) {
   const [tab, setTab] = useState<InspectorTab>('details')
   const [expanded, setExpanded] = useState(false)
   const [theme, setTheme] = useState<'day' | 'night'>(() => sessionStorage.getItem('loom.native.theme') === 'night' ? 'night' : 'day')
-  const [modal, setModal] = useState<'search' | 'settings' | 'history' | null>(null)
+  const [modal, setModal] = useState<'search' | 'history' | null>(null)
   const [newRoom, setNewRoom] = useState(false)
-  const [workspaceManagerOpen,setWorkspaceManagerOpen] = useState(false)
+  const [settingsSection, setSettingsSection] = useState<SettingsSectionId | null>(null)
+  // Same guard as the inspector (`safeInspectorAction`): unsaved capability edits ask before the settings page covers them.
+  const openSettings = (id?: SettingsSectionId) => safeInspectorAction(() => { setCapabilityDirty(false); setSettingsSection(id ?? readStoredSettingsSection(typeof localStorage === 'undefined' ? null : localStorage)) })
   const [runSurfaceOpen, setRunSurfaceOpen] = useState(false)
   const runSurfaceOpener = useRef<HTMLElement | null>(null)
   const [roomInitialWorkspace,setRoomInitialWorkspace] = useState<WorkspaceSelection|null>(null)
@@ -87,21 +90,21 @@ export function LoomApp({ environment, onLogout }: Props) {
   const [studioOpen, setStudioOpen] = useState(false)
   const [studioAgent, setStudioAgent] = useState<string | undefined>()
   const [libraryOpen, setLibraryOpen] = useState(false)
-  const [setupOpen, setSetupOpen] = useState(false)
-  const [visitedPanels,setVisitedPanels]=useState({setup:false,studio:false,room:false,members:false,library:false})
+  const [visitedPanels,setVisitedPanels]=useState({studio:false,room:false,members:false,library:false})
   useEffect(()=>{
     setVisitedPanels(value=>{
-      const next={setup:value.setup||setupOpen,studio:value.studio||studioOpen,room:value.room||newRoom,
+      const next={studio:value.studio||studioOpen,room:value.room||newRoom,
         members:value.members||membersOpen,library:value.library||libraryOpen}
       return Object.keys(next).every(key=>next[key as keyof typeof next]===value[key as keyof typeof next]) ? value : next
     })
-  },[setupOpen,studioOpen,newRoom,membersOpen,libraryOpen])
+  },[studioOpen,newRoom,membersOpen,libraryOpen])
 
   const [dockSelection, setDockSelection] = useState<{ threadId: string | null; taskId: string | null } | null>(null)
   const [capabilityEpoch, setCapabilityEpoch] = useState(0)
   const [capabilityDirty, setCapabilityDirty] = useState(false)
   const [pendingInspectorAction, setPendingInspectorAction] = useState<(() => void) | null>(null)
   const safeInspectorAction = (action: () => void) => { if (capabilityDirty) setPendingInspectorAction(() => action); else action() }
+  const openCreatedConversation: typeof data.openConversation = (...args) => { setSettingsSection(null); return data.openConversation(...args) }
   const manageAssistant = (agentId?: string) => { setStudioAgent(agentId); setStudioOpen(true) }
   const [query, setQuery] = useState('')
   const [artifact, setArtifact] = useState<ArtifactSelection | null>(null)
@@ -138,7 +141,13 @@ export function LoomApp({ environment, onLogout }: Props) {
   const work = useMemo(() => flattenWork(data.bundles), [data.bundles])
   const attentionCount = work.filter(item => workStatus(item).group === '等待你').length
   const report = (error: unknown) => setNotice(error instanceof Error ? error.message : String(error))
-  const select = async (item: ConversationItem, remember = true, taskId: string | null = null) => {
+  // Leaving the settings page goes through its unsaved-changes guard (SettingsPage `guardSettingsLeave`).
+  const settingsLeaveGuard = useRef<SettingsLeaveGuard | null>(null)
+  const registerSettingsLeave = useRef((guard: SettingsLeaveGuard | null) => { settingsLeaveGuard.current = guard }).current
+  const leaveSettings = (action: () => void) => { const guard = settingsSection ? settingsLeaveGuard.current : null; if (guard) guard(action); else action() }
+  const select = (item: ConversationItem, remember = true, taskId: string | null = null) => leaveSettings(() => { void selectNow(item, remember, taskId) })
+  const selectNow = async (item: ConversationItem, remember: boolean, taskId: string | null) => {
+    setSettingsSection(null)
     setSendError(null)
     setDockSelection({ threadId: item.threadId, taskId })
     if (remember && selectionHistory.current[historyIndex.current]?.id !== item.id) {
@@ -211,13 +220,14 @@ export function LoomApp({ environment, onLogout }: Props) {
     finally { setSending(false) }
     return sent
   }
-  const openWork = (mode: InspectorMode = 'work') => safeInspectorAction(() => { setCapabilityDirty(false); setInspectorMode(mode); setInspectorOpen(true); setExpanded(false) })
+  const openWork = (mode: InspectorMode = 'work') => leaveSettings(() => safeInspectorAction(() => { setSettingsSection(null); setCapabilityDirty(false); setInspectorMode(mode); setInspectorOpen(true); setExpanded(false) }))
 
   useEffect(() => {
     document.title = 'LOOM'
     const handler = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); setQuery(''); setModal('search') }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'b') { event.preventDefault(); setSidebarOpen(value => !value) }
+      if ((event.metaKey || event.ctrlKey) && event.key === ',') { event.preventDefault(); openSettings() }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
@@ -266,10 +276,10 @@ export function LoomApp({ environment, onLogout }: Props) {
     <header className="ln-topbar" aria-label="LOOM 窗口栏">
       <div className="ln-window-left"><div className="ln-traffic-lights" aria-hidden="true"><i/><i/><i/></div><IconButton icon="left" label="后退" disabled={historyIndex.current <= 0} onClick={() => navigate(-1)}/><IconButton icon="right" label="前进" disabled={historyIndex.current >= selectionHistory.current.length - 1} onClick={() => navigate(1)}/></div>
       <button type="button" className="ln-search-trigger" onClick={() => { setQuery(''); setModal('search') }}><Icon name="search" size={14}/><span>搜索对话、助手、工作和成果</span><kbd>{shortcutKey} K</kbd></button>
-      <div className="ln-window-actions"><button className="ln-top-work" type="button" title="等待你处理的工作" aria-label="等待你处理的工作" onClick={() => openWork()}><Icon name="chat" size={15}/>{attentionCount > 0 && <span>{attentionCount}</span>}</button><IconButton icon="globe" label="连接与设置" onClick={() => setSetupOpen(true)}/></div>
+      <div className="ln-window-actions"><button className="ln-top-work" type="button" title="等待你处理的工作" aria-label="等待你处理的工作" onClick={() => openWork()}><Icon name="chat" size={15}/>{attentionCount > 0 && <span>{attentionCount}</span>}</button></div>
     </header>
     <div className="ln-window-body"><nav className="ln-rail" aria-label="主要页面">
-      <IconButton icon="home" label="对话" active={!studioOpen && !setupOpen} onClick={() => { setExpanded(false); setSidebarOpen(true); if (!active) beginConversation() }}/>
+      <IconButton icon="home" label="对话" active={!studioOpen && !settingsSection} onClick={() => leaveSettings(() => { setSettingsSection(null); setExpanded(false); setSidebarOpen(true); if (!active) beginConversation() })}/>
       {/* rail 的 ＋ 只开新单聊；label 保持「开始新对话」（scripts/lib/loom-browser-live-mode.mjs 的 newConversation 选择器）。 */}
       <IconButton icon="plus" label="开始新对话" onClick={beginDirectConversation}/>
       <IconButton icon="board" label="工作空间" onClick={() => openWork()}/>
@@ -281,23 +291,20 @@ export function LoomApp({ environment, onLogout }: Props) {
         // run-facts projection cached before the plan existed.
         void data.refresh().catch(report)
       }}/>
-      <IconButton icon="files" label="工作目录" onClick={() => setWorkspaceManagerOpen(true)}/>
+      <IconButton icon="files" label="工作目录" active={settingsSection === 'workspace'} onClick={() => openSettings('workspace')}/>
       <IconButton icon="people" label="管理助手" active={studioOpen} onClick={() => manageAssistant(activeAgent?.agentId)}/>
-      <IconButton icon="globe" label="连接与设备" active={setupOpen} onClick={() => setSetupOpen(true)}/>
-      <div className="ln-rail-bottom"><IconButton icon="clock" label="会话活动" onClick={() => setModal('history')}/><IconButton icon="settings" label="设置" onClick={() => setModal('settings')}/><button type="button" className="ln-user-button" aria-label="个人与连接设置" onClick={() => setModal('settings')}>L</button></div>
+      <div className="ln-rail-bottom"><IconButton icon="clock" label="会话活动" onClick={() => setModal('history')}/><ProfileMenu theme={theme} shortcutKey={shortcutKey} onSettings={() => openSettings()} onHistory={() => setModal('history')} onLogout={onLogout}/></div>
     </nav>
       <section ref={frameRef} className="ln-frame" aria-label="LOOM 工作空间" style={{ '--ln-sidebar-width': `${panelWidths.sidebar}px`, '--ln-inspector-width': `${panelWidths.inspector}px` } as React.CSSProperties}>
-        {sidebarOpen && <Sidebar agents={data.agents} items={data.conversations} selectedId={data.selectedId} loading={data.loading} groupRosters={groupRosters} hidden={data.hidden} onRestoreHidden={threadId => { void data.setHidden(threadId, false) }} onSelect={item => safeInspectorAction(() => { setCapabilityDirty(false); void select(item) })} onCreate={beginConversation} onCollapse={() => setSidebarOpen(false)} onEditAssistant={agentId => manageAssistant(agentId)}/>}{sidebarOpen && <PanelResizeHandle side="sidebar" frame={frameRef} widths={panelWidths} sidebarOpen={sidebarOpen} inspectorOpen={inspectorOpen} onResize={resizePanel}/> }
-        <ConversationView item={active} agents={data.agents} snapshot={data.snapshot} bundles={data.bundles} loading={data.loading} sending={sending} draft={draft.text} files={draft.files} error={sendError} onDraft={text => patchDraft({ text })} onFiles={files => patchDraft({ files })} onSend={agentId => { void send(agentId) }} onPrompt={sendPrompt} onRetryRun={retryLastRun} onConfigureRuntime={() => manageAssistant(activeAgent?.agentId)} onOpenRuntimeSetup={() => setSetupOpen(true)} onProfile={() => manageAssistant(activeAgent?.agentId)} onWorkspaceManager={() => setWorkspaceManagerOpen(true)} onMembers={() => setMembersOpen(true)} onArtifact={setArtifact} onShowSidebar={() => setSidebarOpen(true)} sidebarHidden={!sidebarOpen} onShowWork={() => openWork()} inspectorHidden={!inspectorOpen} onAttachment={(messageId,attachmentId) => { void openAttachment(messageId,attachmentId) }} onPreviewAttachment={previewAttachment} approvalBusy={approvalBusy} onResolveApproval={(approvalId,optionId) => { void resolveApproval(approvalId,optionId) }}/>
+        {settingsSection ? <SettingsPage section={settingsSection} onLeaveGuard={registerSettingsLeave} onSection={setSettingsSection} environment={environment} agents={data.agents} theme={theme} onTheme={setTheme} threadId={active?.threadId ?? undefined} onLogout={onLogout} onRefreshWorkspace={() => { void data.refresh().catch(report) }} onManageAssistants={() => manageAssistant(activeAgent?.agentId)} onStartWorkspace={root => { setSettingsSection(null); beginWorkIn(root) }} onChanged={() => { setCapabilityEpoch(value => value + 1); void data.refresh().catch(report) }}/>
+        : <>{sidebarOpen && <Sidebar agents={data.agents} items={data.conversations} selectedId={data.selectedId} loading={data.loading} groupRosters={groupRosters} hidden={data.hidden} onRestoreHidden={threadId => { void data.setHidden(threadId, false) }} onSelect={item => safeInspectorAction(() => { setCapabilityDirty(false); void select(item) })} onCreate={beginConversation} onCollapse={() => setSidebarOpen(false)} onEditAssistant={agentId => manageAssistant(agentId)}/>}{sidebarOpen && <PanelResizeHandle side="sidebar" frame={frameRef} widths={panelWidths} sidebarOpen={sidebarOpen} inspectorOpen={inspectorOpen} onResize={resizePanel}/> }
+        <ConversationView item={active} agents={data.agents} snapshot={data.snapshot} bundles={data.bundles} loading={data.loading} sending={sending} draft={draft.text} files={draft.files} error={sendError} onDraft={text => patchDraft({ text })} onFiles={files => patchDraft({ files })} onSend={agentId => { void send(agentId) }} onPrompt={sendPrompt} onRetryRun={retryLastRun} onConfigureRuntime={() => manageAssistant(activeAgent?.agentId)} onOpenRuntimeSetup={() => openSettings('runtime')} onProfile={() => manageAssistant(activeAgent?.agentId)} onWorkspaceManager={() => openSettings('workspace')} onMembers={() => setMembersOpen(true)} onArtifact={setArtifact} onShowSidebar={() => setSidebarOpen(true)} sidebarHidden={!sidebarOpen} onShowWork={() => openWork()} inspectorHidden={!inspectorOpen} onAttachment={(messageId,attachmentId) => { void openAttachment(messageId,attachmentId) }} onPreviewAttachment={previewAttachment} approvalBusy={approvalBusy} onResolveApproval={(approvalId,optionId) => { void resolveApproval(approvalId,optionId) }}/>
         {inspectorOpen && <PanelResizeHandle side="inspector" frame={frameRef} widths={panelWidths} sidebarOpen={sidebarOpen} inspectorOpen={inspectorOpen} onResize={resizePanel}/>}
-        {inspectorOpen && <Inspector key={capabilityEpoch} selectedTaskId={dockSelection?.threadId === (active?.threadId ?? null) ? dockSelection?.taskId ?? null : null} onTaskSelect={taskId => setDockSelection({ threadId: active?.threadId ?? null, taskId })} threadId={active?.threadId} conversationTitle={active?.title} onCreateWork={beginWork} onConnectDevice={() => setSetupOpen(true)} workbench={environment.workbench} client={environment.client} theme={theme} onManageAssistant={manageAssistant} onCapabilityDirty={setCapabilityDirty} onLibrary={() => safeInspectorAction(() => { setCapabilityDirty(false); setLibraryOpen(true) })} agents={data.agents} bundles={data.bundles} agent={activeAgent} mode={inspectorMode} tab={tab} onTab={value => safeInspectorAction(() => { setTab(value); setCapabilityDirty(false) })} onMode={value => safeInspectorAction(() => { setInspectorMode(value); setCapabilityDirty(false) })} onClose={() => safeInspectorAction(() => { setInspectorOpen(false); setExpanded(false); setCapabilityDirty(false) })} onExpand={() => setExpanded(value => !value)} expanded={expanded} onArtifact={setArtifact} loading={data.loading} onOpenConversation={threadId => { const item = data.conversations.find(item => item.threadId === threadId); if (item) void select(item) }}/>}</section>
+        {inspectorOpen && <Inspector key={capabilityEpoch} selectedTaskId={dockSelection?.threadId === (active?.threadId ?? null) ? dockSelection?.taskId ?? null : null} onTaskSelect={taskId => setDockSelection({ threadId: active?.threadId ?? null, taskId })} threadId={active?.threadId} conversationTitle={active?.title} onCreateWork={beginWork} onConnectDevice={() => openSettings('devices')} workbench={environment.workbench} client={environment.client} theme={theme} onManageAssistant={manageAssistant} onCapabilityDirty={setCapabilityDirty} onLibrary={() => safeInspectorAction(() => { setCapabilityDirty(false); setLibraryOpen(true) })} agents={data.agents} bundles={data.bundles} agent={activeAgent} mode={inspectorMode} tab={tab} onTab={value => safeInspectorAction(() => { setTab(value); setCapabilityDirty(false) })} onMode={value => safeInspectorAction(() => { setInspectorMode(value); setCapabilityDirty(false) })} onClose={() => safeInspectorAction(() => { setInspectorOpen(false); setExpanded(false); setCapabilityDirty(false) })} onExpand={() => setExpanded(value => !value)} expanded={expanded} onArtifact={setArtifact} loading={data.loading} onOpenConversation={threadId => { const item = data.conversations.find(item => item.threadId === threadId); if (item) void select(item) }}/>}</>}</section>
     </div>
     {(notice || data.error) && <div className="ln-notice" role="alert"><span>{notice || data.error}</span><IconButton icon="refresh" label="重试读取" onClick={() => { setNotice(null); void data.refresh().catch(report) }}/><IconButton icon="close" label="关闭提示" onClick={() => setNotice(null)}/></div>}
-    {visitedPanels.setup&&<Suspense fallback={<span role="status" className="ln-loading">正在打开连接与设备…</span>}><NativeSetup open={setupOpen} environment={environment} theme={theme} threadId={active?.threadId ?? undefined} onClose={() => setSetupOpen(false)} onChanged={() => { setCapabilityEpoch(value => value + 1); void data.refresh().catch(report) }} onManageAssistants={() => manageAssistant(activeAgent?.agentId)}/></Suspense>}
-    {visitedPanels.studio&&<Suspense fallback={<span role="status" className="ln-loading">正在打开助手编辑…</span>}><AssistantStudio threadId={active?.threadId ?? undefined} onCreatedConversation={data.openConversation} onOpenConnections={() => setSetupOpen(true)} catalogEpoch={capabilityEpoch} open={studioOpen} environment={environment} agents={data.agents} initialAgentId={studioAgent} theme={theme} onClose={() => setStudioOpen(false)} onRefresh={data.refresh} onLibrary={() => setLibraryOpen(true)}/></Suspense>}
-    <WorkspaceManager open={workspaceManagerOpen} environment={environment} theme={theme}
-      onClose={()=>setWorkspaceManagerOpen(false)} onStart={beginWorkIn}/>
-    {visitedPanels.room&&<Suspense fallback={<span role="status" className="ln-loading">正在打开新工作…</span>}><RoomDialog open={newRoom} initialMode={roomMode} initialWorkspace={roomInitialWorkspace} environment={environment} agents={data.agents} initialAgentId={activeAgent?.agentId} theme={theme} onClose={() => setNewRoom(false)} onCreated={data.openConversation} onNewAssistant={() => manageAssistant()}/></Suspense>}
+    {visitedPanels.studio&&<Suspense fallback={<span role="status" className="ln-loading">正在打开助手编辑…</span>}><AssistantStudio threadId={active?.threadId ?? undefined} onCreatedConversation={openCreatedConversation} onOpenConnections={() => openSettings('runtime')} catalogEpoch={capabilityEpoch} open={studioOpen} environment={environment} agents={data.agents} initialAgentId={studioAgent} theme={theme} onClose={() => setStudioOpen(false)} onRefresh={data.refresh} onLibrary={() => setLibraryOpen(true)}/></Suspense>}
+    {visitedPanels.room&&<Suspense fallback={<span role="status" className="ln-loading">正在打开新工作…</span>}><RoomDialog open={newRoom} initialMode={roomMode} initialWorkspace={roomInitialWorkspace} environment={environment} agents={data.agents} initialAgentId={activeAgent?.agentId} theme={theme} onClose={() => setNewRoom(false)} onCreated={openCreatedConversation} onNewAssistant={() => manageAssistant()}/></Suspense>}
     {visitedPanels.members&&<Suspense fallback={null}><RoomMembersDialog open={membersOpen} environment={environment} agents={data.agents} snapshot={data.snapshot} theme={theme} onClose={() => setMembersOpen(false)} onRefresh={data.refresh}/></Suspense>}
     {visitedPanels.library&&<Suspense fallback={<span role="status" className="ln-loading">正在打开能力库…</span>}><CapabilityLibrary open={libraryOpen} environment={environment} theme={theme} onClose={() => setLibraryOpen(false)} onChanged={() => { setCapabilityEpoch(value => value + 1); void data.refresh() }}/></Suspense>}
     <SurfaceDialog open={pendingInspectorAction !== null} title="保留能力修改？" theme={theme} onClose={() => setPendingInspectorAction(null)} className="ln-room-dialog"><UnsavedNotice onKeep={() => setPendingInspectorAction(null)} onDiscard={() => { const action = pendingInspectorAction; setPendingInspectorAction(null); setCapabilityDirty(false); action?.() }}/></SurfaceDialog>
@@ -306,10 +313,9 @@ export function LoomApp({ environment, onLogout }: Props) {
       onClose={() => setRunSurfaceOpen(false)} onCreateWork={() => { setRunSurfaceOpen(false); beginWork() }}
       onArtifact={selection => { setRunSurfaceOpen(false); setArtifact(selection) }}/>
     {artifact && <ArtifactView key={`${artifact.bundle.mission.missionId}:${artifact.artifact.artifactId}:${artifact.candidate?.candidateId ?? "none"}`} theme={theme} fallbackFocus={runSurfaceOpener.current} selection={currentArtifact?.selection ?? artifact} contextAvailable={currentArtifact?.contextAvailable ?? false} onClose={() => setArtifact(null)} onRefresh={data.refresh}/>}
-    <Dialog.Root open={modal !== null} onOpenChange={open => { if (!open) setModal(null) }}><Dialog.Portal><div className="ln-portal" data-theme={theme}><Dialog.Overlay className="ln-modal-backdrop"/><Dialog.Content className={`ln-dialog${modal === 'search' ? ' ln-search-dialog' : ''}`} aria-describedby={undefined}><header><Dialog.Title>{modal === 'search' ? '搜索' : modal === 'history' ? '会话活动' : '设置'}</Dialog.Title><Dialog.Close asChild><button type="button" className="ln-icon-button" aria-label="关闭"><Icon name="close"/></button></Dialog.Close></header>
+    <Dialog.Root open={modal !== null} onOpenChange={open => { if (!open) setModal(null) }}><Dialog.Portal><div className="ln-portal" data-theme={theme}><Dialog.Overlay className="ln-modal-backdrop"/><Dialog.Content className={`ln-dialog${modal === 'search' ? ' ln-search-dialog' : ''}`} aria-describedby={undefined}><header><Dialog.Title>{modal === 'search' ? '搜索' : '会话活动'}</Dialog.Title><Dialog.Close asChild><button type="button" className="ln-icon-button" aria-label="关闭"><Icon name="close"/></button></Dialog.Close></header>
       {modal === 'search' && <><div className="ln-search-field"><Icon name="search"/><input placeholder="搜索对话、助手、工作或文件名…" aria-label="全局搜索" value={query} onChange={event => setQuery(event.target.value)} autoFocus/></div><WorkspaceSearch results={searchResults} query={query} onConversation={item => safeInspectorAction(() => { void select(item); setModal(null) })} onAssistant={agentId => { setModal(null); manageAssistant(agentId) }} onWork={searchWork} onArtifact={searchArtifact}/></>}
       {modal === 'history' && <div className="ln-dialog-results"><RunActivityHistory runs={data.snapshot?.agentRuns ?? []} agents={data.agents} sending={sending} onRetry={retryLastRun}/></div>}
-      {modal === 'settings' && <><div className="ln-settings-row"><span>外观</span><select value={theme} aria-label="外观主题" onChange={event => setTheme(event.target.value as 'day' | 'night')}><option value="day">浅色</option><option value="night">深色</option></select></div><div className="ln-settings-row"><span>工作空间</span><button className="ln-action" type="button" onClick={()=>{setModal(null);setWorkspaceManagerOpen(true)}}>管理工作目录</button></div><div className="ln-settings-row"><span>刷新工作空间</span><IconButton icon="refresh" label="刷新工作空间" onClick={() => { void data.refresh().catch(report) }}/></div>{onLogout && <button className="ln-text-action" type="button" onClick={onLogout}>退出当前连接</button>}</>}
     </Dialog.Content></div></Dialog.Portal></Dialog.Root>
   </div>
 }

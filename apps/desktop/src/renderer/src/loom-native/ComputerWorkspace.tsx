@@ -28,6 +28,6 @@ export function ComputerWorkspace({workbench,client,agent,theme,onConnectDevice}
     {error&&<FormMessage error>{error}</FormMessage>}
     {nodeId!=='local'&&<p className="ln-computer-target-hint">所选电脑：{selected?.displayName||'设备不可用'}</p>}
     {nodeId!=='local'&&!allowed?<FormMessage error>设备离线或桌面不可用，控制已停止。连接恢复后请重新授权。</FormMessage>:<ComputerPanel key={nodeId} port={port} client={client} agent={agent} theme={theme}/>}
-    {!nodes.length&&<Empty className="ln-empty--inline"><EmptyHeader><EmptyMedia variant="icon"><Icon name="computer" size={18}/></EmptyMedia><EmptyTitle>还没有可查看的其他电脑</EmptyTitle><EmptyDescription>在「连接与设备」中添加其他电脑后，这里会列出它们的执行位置；屏控必须单独授权。</EmptyDescription></EmptyHeader>{onConnectDevice&&<EmptyContent><button type="button" className="ln-action" onClick={onConnectDevice}>去连接设备</button></EmptyContent>}</Empty>}
+    {!nodes.length&&<Empty className="ln-empty--inline"><EmptyHeader><EmptyMedia variant="icon"><Icon name="computer" size={18}/></EmptyMedia><EmptyTitle>还没有可查看的其他电脑</EmptyTitle><EmptyDescription>在「设置 › 设备」中添加其他电脑后，这里会列出它们的执行位置；屏控必须单独授权。</EmptyDescription></EmptyHeader>{onConnectDevice&&<EmptyContent><button type="button" className="ln-action" onClick={onConnectDevice}>去连接设备</button></EmptyContent>}</Empty>}
   </section>
 }

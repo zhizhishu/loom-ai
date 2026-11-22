@@ -1,0 +1,77 @@
+/* 抄自 mikka-current@250d2451（Win11 loom\_artifacts\reference-repos\mikka-current，或 Bero /bundles/refs/mikka-current）：components/settings/settings-shell.tsx、components/settings/primitives.tsx、components/workspace-menu.tsx（Mikka 用 Tailwind，这里按同样尺寸写成 .ln-* 样式） */
+/* Settings page: the frame's first column is the section list, the second scrolls the
+ * section (Mikka `components/settings/settings-shell.tsx:26-30`,
+ * `components/ui/settings-layout.tsx:5`). Tokens come from `--ln-*` in native.css. */
+.ln-settings{display:flex;flex:1;min-width:0;min-height:0;background:var(--ln-bg)}
+.ln-settings-list{flex:0 0 240px;width:240px;min-width:0;display:flex;flex-direction:column;gap:2px;padding:14px 9px;border-right:1px solid var(--ln-line);overflow:auto}
+.ln-settings-list-title{font-size:14px;font-weight:600;padding:4px 8px 6px}
+.ln-settings-search{display:flex;align-items:center;gap:7px;padding:6px 9px;margin:0 2px 8px;border-radius:9px;background:var(--ln-card);color:var(--ln-muted)}
+.ln-settings-search input{flex:1;min-width:0;font-size:12px;padding:2px 0;color:var(--ln-text)}
+.ln-settings-group{display:flex;flex-direction:column;gap:1px;margin-top:8px}
+.ln-settings-group-title{font-size:11px;font-weight:500;color:var(--ln-muted);padding:5px 8px 3px;letter-spacing:.02em}
+.ln-settings-item{display:flex;align-items:center;gap:9px;width:100%;padding:8px 9px;border-radius:9px;font-size:13px;text-align:left;color:var(--ln-text)}
+.ln-settings-item:hover{background:var(--ln-hover)}
+.ln-settings-item.is-active{background:var(--ln-selected)}
+.ln-settings-item>svg{color:var(--ln-muted)}
+.ln-settings-item.is-active>svg{color:var(--ln-text)}
+.ln-settings-item>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ln-settings-empty{margin:6px 9px;font-size:12px;color:var(--ln-muted)}
+
+.ln-settings-body{flex:1;min-width:0;overflow:auto;padding:30px 40px 56px}
+.ln-settings-content{max-width:760px;margin:0 auto;display:flex;flex-direction:column;gap:28px}
+.ln-settings-title{font-size:20px;font-weight:600;line-height:1.35}
+
+/* 区：无卡片、无描边，只用发丝线分行（Mikka primitives.tsx:36-40）。 */
+.ln-settings-section{display:flex;flex-direction:column;gap:4px}
+.ln-settings-section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;padding:0 2px}
+.ln-settings-section-copy{display:flex;min-width:0;flex-direction:column;gap:2px}
+.ln-settings-section-title{font-size:13px;font-weight:600}
+.ln-settings-section-description{font-size:11.5px;color:var(--ln-muted);line-height:1.6}
+.ln-settings-section-action{display:flex;flex:0 0 auto;align-items:center;gap:8px}
+.ln-settings-rows{display:flex;flex-direction:column}
+.ln-settings-row{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:14px 2px;border-bottom:1px solid var(--ln-line)}
+.ln-settings-rows>.ln-settings-row:last-child{border-bottom:0}
+.ln-settings-row-copy{display:flex;align-items:center;gap:10px;min-width:0}
+.ln-settings-row-copy>svg{color:var(--ln-muted)}
+.ln-settings-row-copy>div{display:flex;min-width:0;flex-direction:column;gap:3px}
+.ln-settings-row-title{font-size:13px;font-weight:500;line-height:1.5}
+.ln-settings-row-description{font-size:12px;color:var(--ln-muted);line-height:1.65;overflow-wrap:anywhere}
+.ln-settings-row-control{flex:0 0 auto;display:flex;align-items:center;gap:8px;font-size:12px}
+.ln-settings-row.is-loading{opacity:.6}
+.ln-settings-skeleton{display:block;width:150px;height:12px;border-radius:6px;background:var(--ln-card)}
+.ln-settings-skeleton.is-short{width:52px}
+.ln-settings-save-error{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border-radius:10px;background:color-mix(in srgb,var(--ln-blue) 8%,transparent);font-size:12px;color:var(--ln-text)}
+.ln-settings-value{font-size:12px;color:var(--ln-muted)}
+.ln-settings-surface{display:flex;flex-direction:column;padding:2px 0 6px}
+.ln-settings-block{display:flex;flex-direction:column;min-width:0}
+.ln-settings-error{display:flex;flex-direction:column;align-items:flex-start;gap:8px;padding:18px;border-radius:12px;background:var(--ln-card);font-size:12.5px;color:var(--ln-muted)}
+.ln-settings-error strong{font-size:13px;color:var(--ln-text)}
+.ln-sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+
+/* 界面语言：旧组件的 radio 组，在设置行里排成三格。 */
+.ln-settings-language{display:inline-flex;gap:4px}
+.ln-settings-language label{display:inline-flex;align-items:center;gap:5px;padding:5px 9px;border-radius:8px;background:var(--ln-card);font-size:12px;cursor:pointer}
+.ln-settings-language label.selected{background:var(--ln-selected)}
+.ln-settings-language input{margin:0;accent-color:var(--ln-blue)}
+
+/* 整段挂的旧整页（通知/快捷键/记忆/诊断/关于）自带页头，这里只把字号对齐设置页。 */
+.ln-settings-body .settings-page-heading{margin:0 0 4px}
+.ln-settings-body .settings-page-heading h1{font-size:20px;line-height:1.35;font-weight:600}
+.ln-settings-body .settings-page-eyebrow{font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--ln-muted)}
+.ln-settings-body .settings-page-heading-copy>p:last-child{font-size:12px;color:var(--ln-muted);line-height:1.7}
+
+/* 头像菜单：向上弹，不遮头像（Mikka components/workspace-menu.tsx:79-80）。 */
+.ln-portal .ln-profile-menu{min-width:196px;max-width:min(280px,calc(100vw - 24px));padding:5px;border-radius:12px;background:var(--ln-bg);box-shadow:0 18px 44px #0000002b,0 0 0 1px var(--ln-line);z-index:120}
+.ln-profile-menu-label{padding:7px 9px 5px;font-size:11px;color:var(--ln-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ln-profile-menu-item{display:flex;align-items:center;gap:9px;padding:8px 9px;border-radius:8px;font-size:13px;color:var(--ln-text);cursor:pointer;outline:none}
+.ln-profile-menu-item[data-highlighted]{background:var(--ln-hover)}
+.ln-profile-menu-item>span{flex:1;min-width:0}
+.ln-profile-menu-item>kbd{font-size:11px;color:var(--ln-muted)}
+.ln-profile-menu-item.is-danger{color:#c23b32}
+.ln-profile-menu-separator{height:1px;margin:5px 4px;background:var(--ln-line)}
+
+@media(max-width:760px){
+  .ln-settings{flex-direction:column}
+  .ln-settings-list{flex:0 0 auto;width:auto;flex-direction:column;border-right:0;border-bottom:1px solid var(--ln-line);max-height:38vh}
+  .ln-settings-body{padding:18px 14px 40px}
+}

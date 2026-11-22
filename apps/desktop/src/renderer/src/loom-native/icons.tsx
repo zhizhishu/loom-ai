@@ -1,8 +1,12 @@
 import type { CSSProperties, ReactNode } from 'react'
 
-export type IconName = 'home' | 'bulb' | 'board' | 'clock' | 'files' | 'settings' | 'search' | 'plus' | 'close' | 'left' | 'right' | 'down' | 'up' | 'panel' | 'expand' | 'chat' | 'globe' | 'download' | 'check' | 'hand' | 'progress' | 'blocked' | 'file' | 'image' | 'audio' | 'computer' | 'refresh' | 'attach' | 'copy' | 'stop' | 'more' | 'branch' | 'sun' | 'moon' | 'people' | 'minus'
+export type IconName = 'home' | 'bulb' | 'board' | 'clock' | 'files' | 'settings' | 'search' | 'plus' | 'close' | 'left' | 'right' | 'down' | 'up' | 'panel' | 'expand' | 'chat' | 'globe' | 'download' | 'check' | 'hand' | 'progress' | 'blocked' | 'file' | 'image' | 'audio' | 'computer' | 'refresh' | 'attach' | 'copy' | 'stop' | 'more' | 'branch' | 'sun' | 'moon' | 'people' | 'minus' | 'user' | 'bell' | 'command' | 'info'
 const paths: Record<IconName, ReactNode> = {
   minus: <path d="M5 12h14"/>,
+  user: <><circle cx="12" cy="8" r="4"/><path d="M4.5 20.5a7.5 7.5 0 0 1 15 0"/></>,
+  bell: <><path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15Z"/><path d="M10 20.5a2 2 0 0 0 4 0"/></>,
+  command: <path d="M9 9V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3Z"/>,
+  info: <><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></>,
   people: <><circle cx="8" cy="7" r="3"/><path d="M2.5 19v-2a5.5 5.5 0 0 1 11 0v2M16 4.5a3 3 0 0 1 0 6M16.5 13a5 5 0 0 1 5 4v2"/></>,
   home: <><path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1Z"/><path d="M9 21v-8h6v8"/></>,
   bulb: <><path d="M9 18h6m-5 3h4M8.2 14.5a6 6 0 1 1 7.6 0c-.8.6-.8 1.5-.8 2.5H9c0-1-.1-1.9-.8-2.5Z"/></>,
@@ -36,6 +40,9 @@ const paths: Record<IconName, ReactNode> = {
   sun: <><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l2 2m10 10 2 2M5 19l2-2M17 7l2-2"/></>,
   moon: <path d="M20 15A8 8 0 0 1 9 4a9 9 0 1 0 11 11Z"/>
 }
+/** Every icon name, for tests that check a name is drawable. */
+export const ICON_NAMES = Object.keys(paths) as IconName[]
+
 export function Icon({ name, size = 18, className = '', style }: { name: IconName; size?: number; className?: string; style?: CSSProperties }) {
   return <svg className={`ln-icon ${className}`} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={style}>{paths[name]}</svg>
 }

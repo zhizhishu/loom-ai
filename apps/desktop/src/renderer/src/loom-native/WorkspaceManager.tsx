@@ -8,8 +8,8 @@ import {readWorkspaceDefault,writeWorkspaceDefault,validateWorkspaceDefault} fro
 type Entry = WorkspaceSelection & { key:string; threads:number }
 /** User-facing saved project manager. It only registers validated locations,
  * never claims registration grants cross-root filesystem access to a Run. */
-export function WorkspaceManager({open,environment,theme,onClose,onStart}:{
-  open:boolean; environment:BusinessEnvironment;theme:'day'|'night';
+export function WorkspaceManager({open=true,embedded=false,environment,theme,onClose,onStart}:{
+  open?:boolean; embedded?:boolean; environment:BusinessEnvironment;theme:'day'|'night';
   onClose():void;onStart(value:WorkspaceSelection):void
 }){
   const [pref,setPref]=useState<NavigationPreferencesSnapshot|null>(null)
@@ -77,7 +77,7 @@ export function WorkspaceManager({open,environment,theme,onClose,onStart}:{
   const start=(entry:Entry)=>void apply(async()=>{
     const checked=await validate(entry)
     onStart(checked)
-    onClose()
+    if(!embedded)onClose()
   })
   const forget=(entry:Entry)=>void apply(async()=>{
     if(entry.threads>0)throw Error('此目录仍有工作对话，请先保留它；这里只移除收藏，不删除源文件。')
@@ -85,8 +85,7 @@ export function WorkspaceManager({open,environment,theme,onClose,onStart}:{
     if(defaultRoot?.projectPath===entry.projectPath){writeWorkspaceDefault(localStorage,null);setDefaultRoot(null)}
     setMessage('已取消收藏（没有删除任何文件，原生运行端的授权也没有因此改变）。')
   })
-  return <SurfaceDialog open={open} title="工作目录" description="管理默认运行根和多个项目；跨目录访问仍需目标运行端单独批准。" theme={theme} onClose={()=>{if(!busy)onClose()}} className="ln-room-dialog ln-workspace-manager">
-    <div className="ln-room-content">
+  const content=<div className="ln-room-content">
       <p className="ln-native-help">采用多根工作区管理：一个项目作为新任务默认根，其他项目可随时独立开始工作。保存目录不授予已有 AgentRun 跨目录读写权限；需要越界操作时，仍由原生 Runtime 的权限请求决定。</p>
       <div className="ln-panel-title"><h3>默认运行目录</h3><button className="ln-action" type="button" disabled={busy} onClick={add}><Icon name="plus" size={14}/>添加目录</button></div>
       <div className="ln-workspace-choice"><Icon name="files" size={23}/><span><strong>{defaultRoot?.name||'主机默认快速对话'}</strong><small>{defaultRoot?.projectPath||'未固定到项目目录'}</small></span>{defaultRoot&&<button className="ln-text-action" type="button" disabled={busy} onClick={clearDefault}>取消默认</button>}</div>
@@ -104,7 +103,10 @@ export function WorkspaceManager({open,environment,theme,onClose,onStart}:{
         {!entries.length&&<p className="ln-inspector-empty">还没有登记项目，可以从主机挑选目录。</p>}
       </div>
       <p className="ln-native-help">这里的「移除」仅管理项目列表，不删除文件，也不撤销已有原生 CLI 运行中的工具权限。真正跨根运行必须明确设定目标根或单独通过 Runtime 权限审批。</p>
-      <footer className="ln-form-actions"><button className="ln-action" type="button" disabled={busy} onClick={onClose}>关闭</button></footer>
+      {!embedded&&<footer className="ln-form-actions"><button className="ln-action" type="button" disabled={busy} onClick={onClose}>关闭</button></footer>}
     </div>
+  if(embedded)return <section className="ln-workspace-manager is-embedded" aria-label="工作目录">{content}</section>
+  return <SurfaceDialog open={open} title="工作目录" description="管理默认运行根和多个项目；跨目录访问仍需目标运行端单独批准。" theme={theme} onClose={()=>{if(!busy)onClose()}} className="ln-room-dialog ln-workspace-manager">
+    {content}
   </SurfaceDialog>
 }

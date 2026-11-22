@@ -47,7 +47,7 @@ export function AssistantCapabilityPicker({ environment, catalogAgentId, runtime
     setLoading(true);setError('');setScanError('')
     const [library, found] = await Promise.allSettled([
       catalogAgentId ? port.read(catalogAgentId) : Promise.resolve(null),
-      environment.workbench ? environment.workbench.catalog(threadId) : Promise.reject(new Error('当前主机没有提供原生发现接口。请在连接与设备中检查所连接的主机。'))
+      environment.workbench ? environment.workbench.catalog(threadId) : Promise.reject(new Error('当前主机没有提供原生发现接口。请在设置 › 运行端中检查所连接的主机。'))
     ])
     if(ticket!==generation.current)return
     if(library.status==='fulfilled'){setCatalog(library.value);if(library.value)catalogueCallback.current?.(library.value)}else setError(hostFeatureError(library.reason))
