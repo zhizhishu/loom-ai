@@ -54,8 +54,24 @@ pub(super) fn migrate(database: &mut Database) -> Result<()> {
         },
         "Delivery wake migration requires schema 187"
     );
-    tx.execute_batch(SCHEMA_SQL)?;
-    tx.execute_batch("INSERT INTO schema_migration VALUES(238,datetime('now'));")?;
+    // A rolled-back receipt can leave the columns behind; add only what is missing.
+    for statement in SCHEMA_SQL.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let column = statement
+            .strip_prefix("ALTER TABLE camp_message_delivery ADD COLUMN ")
+            .and_then(|rest| rest.split_whitespace().next());
+        if let Some(column) = column {
+            let present: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('camp_message_delivery') WHERE name = ?1",
+                [column],
+                |row| row.get(0),
+            )?;
+            if present == 1 {
+                continue;
+            }
+        }
+        tx.execute_batch(statement)?;
+    }
+    tx.execute_batch("INSERT OR REPLACE INTO schema_migration VALUES(238,datetime('now'));")?;
     validate_migration_foreign_keys(&tx, &["camp_message_delivery"])?;
     anyhow::ensure!(
         schema_matches(&tx)?,
