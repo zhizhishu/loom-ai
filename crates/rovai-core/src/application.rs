@@ -14160,16 +14160,35 @@ impl Core {
     /// Admit the LOOM dispatches the standing approval makes due, then wake exactly the lanes an
     /// accepted write created. Selection, scope and budget are the control plane's own transaction,
     /// so a restart resumes from the permanent ledger instead of dispatching the same event twice.
-    async fn admit_due_loom_dispatches(&self) -> Result<usize> {
-        let admitted = {
+    ///
+    /// The same tick also runs the watchdog sweep (reconcile → observe/hold/stop → dispatch), and
+    /// every wake below happens *after* the database lock — and therefore the transaction — has been
+    /// released: a wake is never inside the write it announces.
+    async fn admit_due_loom_dispatches(&self) -> Result<rovai_core::loom::control::LoomTickOutcome> {
+        let outcome = {
             let mut database = self.database.lock().await;
-            rovai_core::loom::control::admit_due_dispatches(&mut database)?
+            rovai_core::loom::control::admit_due_dispatches_at(
+                &mut database,
+                chrono::Utc::now(),
+            )?
         };
-        if admitted > 0 {
+        if outcome.admitted > 0 {
             self.delivery_batch_scheduler_notify.notify_one();
             self.execution_wake.runs.notify_one();
         }
-        Ok(admitted)
+        if outcome.watchdog_changed() {
+            // A hold or a hand-back is a committed Task fact the scheduler and the Lead both have to
+            // see: the dispatch lane looks for the released Task, and the projection has to show the
+            // reason the Task is parked with.
+            self.delivery_batch_scheduler_notify.notify_one();
+            self.execution_wake.runs.notify_one();
+            emit_navigation_invalidated(&self.output, "missions.loomUpdated", None);
+            eprintln!(
+                "loom watchdog pass scanned={} recovered={} blocked={} deferred={}",
+                outcome.scanned, outcome.recovered, outcome.blocked, outcome.deferred,
+            );
+        }
+        Ok(outcome)
     }
 
     /// One due-timer pass of the Message Delivery recovery loop: it runs only the sweeps whose work
@@ -38031,5 +38050,220 @@ for line in sys.stdin:
             ),
             None
         );
+    }
+
+    /// The Core's own LOOM tick — the one `collect_delivery_batch_dispatch_candidates` calls before it
+    /// claims anything — runs the watchdog sweep, and every wake it owes happens after the write
+    /// committed. The fixture is a real Mission, a real imported Plan, a real approval and a real
+    /// claimed Task whose only stale fact is its persisted progress.
+    #[tokio::test]
+    async fn the_loom_tick_holds_a_stalled_task_and_wakes_after_the_commit() {
+        use rovai_core::loom::control::{
+            LoomControlPolicyInput, LoomReviewerAssignment, configure,
+        };
+        use rovai_core::loom::{LoomPlanImportCriterion, LoomPlanImportInput, LoomPlanImportTask};
+        use rovai_core::mission::{CreateMissionCommand, MissionService};
+
+        let (mut database, root) = rovai_core::test_support::seeded_runtime_database();
+        let workspace = root.join("loom-watchdog-tick");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let created = MissionService::default()
+            .create(
+                &mut database,
+                &rovai_core::command::CommandEnvelope {
+                    command_id: uuid::Uuid::new_v4().to_string(),
+                    actor: rovai_core::command::ActorRef::User {
+                        user_id: "local_user".into(),
+                    },
+                    camp_id: None,
+                    expected_versions: vec![],
+                    execution_epoch: None,
+                    payload: CreateMissionCommand {
+                        team: None,
+                        title: "watchdog tick".into(),
+                        description: String::new(),
+                        description_content: None,
+                        project_path: workspace.to_string_lossy().into_owned(),
+                        project_binding_kind:
+                            rovai_core::collaboration::ProjectBindingKind::Directory,
+                        member_agent_ids: vec!["agent_1".into(), "agent_2".into()],
+                        default_lead_agent_id: "agent_1".into(),
+                        tags: vec![],
+                        source_attachments: vec![],
+                    },
+                },
+            )
+            .unwrap();
+        let mission_id = created.result.payload["missionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET profile_status='present' WHERE id IN ('agent_1','agent_2')",
+                [],
+            )
+            .unwrap();
+        rovai_core::loom::plan_import(
+            &mut database,
+            LoomPlanImportInput {
+                mission_id: mission_id.clone(),
+                goal: "Ship the watched plan".into(),
+                acceptance_criteria_version: "ac-v1".into(),
+                criteria: vec![LoomPlanImportCriterion {
+                    criterion_id: "criterion_one".into(),
+                    text: "the delivery is complete".into(),
+                }],
+                tasks: vec![LoomPlanImportTask {
+                    task_id: "task_a".into(),
+                    title: "Task A".into(),
+                    description: String::new(),
+                    assignee_agent_id: Some("agent_1".into()),
+                }],
+                dependencies: vec![],
+            },
+        )
+        .unwrap();
+        let plan_id: String = database
+            .connection()
+            .query_row(
+                "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+                [&mission_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let camp_id: String = database
+            .connection()
+            .query_row(
+                "SELECT camp_id FROM mission WHERE id=?1",
+                [&mission_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        configure(
+            &mut database,
+            "local_user",
+            LoomControlPolicyInput {
+                mission_id: mission_id.clone(),
+                command_id: "command_watchdog_tick".into(),
+                expected_revision: 0,
+                enabled: true,
+                task_ids: vec!["task_a".into()],
+                reviewers: vec![LoomReviewerAssignment {
+                    task_id: "task_a".into(),
+                    reviewer_agent_id: "agent_2".into(),
+                }],
+                max_dispatches: 4,
+                max_reworks_per_task: 1,
+                expires_at: Some("2099-01-01T00:00:00Z".into()),
+            },
+        )
+        .unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_task SET status='READY', assignee_agent_id='agent_1'
+                 WHERE plan_id=?1 AND task_id='task_a'",
+                [&plan_id],
+            )
+            .unwrap();
+
+        let core = Arc::new(test_core_for_database(&root, database).unwrap());
+        let directory = root.clone();
+
+        // The admission half of the tick hands the approved Task out, and wakes the lane.
+        let admitted = core.admit_due_loom_dispatches().await.unwrap();
+        assert_eq!(
+            admitted.admitted, 1,
+            "assertion the_core_tick_admits_the_approved_task"
+        );
+        assert_eq!(
+            (admitted.blocked, admitted.recovered),
+            (0, 0),
+            "assertion nothing is held while the_task_is_still_new"
+        );
+        // Consume the permit that admission stored, so the check below is about the watchdog only.
+        tokio::time::timeout(Duration::from_secs(5), core.execution_wake.runs.notified())
+            .await
+            .expect("the admission wake must have been signalled");
+
+        // The Task is claimed by a live Run whose only activity is a heartbeat: its persisted
+        // progress is an hour old.
+        let claimed_at = (chrono::Utc::now() - chrono::Duration::minutes(50)).to_rfc3339();
+        let run_id = "run_watchdog_tick".to_string();
+        {
+            let database = core.database.lock().await;
+            // The Mission already opened this Camp's conversation with its Lead, so the Run joins it
+            // instead of opening a second one for the same member.
+            let conversation_id: String = database
+                .connection()
+                .query_row(
+                    "SELECT id FROM conversation WHERE camp_id=?1 AND agent_id='agent_1'",
+                    [&camp_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            database
+                .connection()
+                .execute_batch(&format!(
+                    "INSERT INTO camp_turn(id,camp_id,trigger_type,trigger_id,status,created_at,updated_at)
+                     VALUES('turn_{run_id}','{camp_id}','system_event','{run_id}','running','2026-08-31','2026-08-31');
+                     INSERT INTO agent_run(id,camp_turn_id,conversation_id,
+                                           initial_camp_context_through_sequence,
+                                           initial_conversation_context_through_sequence,
+                                           responsibility_key,start_reason,purpose,completion_role,
+                                           effective_config_json,workspace_json,status,idempotency_key,
+                                           runtime_adapter_kind,execution_epoch,created_at,started_at,
+                                           updated_at,execution_lease_owner,execution_lease_expires_at)
+                     VALUES('{run_id}','turn_{run_id}','{conversation_id}',0,0,'{run_id}','initial',
+                            'test','required','{{}}','{{}}','running','{run_id}','qoder-cli',1,
+                            '2026-08-31','{claimed_at}','{claimed_at}','loom-tick','2999-01-01T00:00:00Z');
+                     INSERT INTO loom_claim(claim_id,plan_id,task_id,agent_run_id,claimant_agent_id,
+                                            command_id,lease_expires_at,fence_generation,claimed_at)
+                     VALUES('claim_watchdog_tick','{plan_id}','task_a','{run_id}','agent_1',
+                            'command_claim_watchdog_tick','2999-01-01T00:00:00Z',1,'{claimed_at}');
+                     UPDATE loom_task SET updated_at='{claimed_at}'
+                       WHERE plan_id='{plan_id}' AND task_id='task_a';"
+                ))
+                .unwrap();
+        }
+
+        let held = core.admit_due_loom_dispatches().await.unwrap();
+        assert_eq!(
+            (held.scanned, held.blocked, held.recovered),
+            (1, 1, 0),
+            "assertion the_core_tick_runs_the_watchdog_sweep: {held:?}"
+        );
+        {
+            let database = core.database.lock().await;
+            let reason: Option<String> = database
+                .connection()
+                .query_row(
+                    "SELECT blocked_reason FROM loom_task WHERE plan_id=?1 AND task_id='task_a'",
+                    [&plan_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                reason.as_deref(),
+                Some("loom.watchdog.task_stalled"),
+                "assertion the_core_tick_holds_the_stalled_task"
+            );
+        }
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            core.execution_wake.runs.notified(),
+        )
+        .await
+        .expect("a committed hold must wake the dispatch lane after the transaction");
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            core.delivery_batch_scheduler_notify.notified(),
+        )
+        .await
+        .expect("a committed hold must wake the delivery scheduler after the transaction");
+        drop(core);
+        std::fs::remove_dir_all(directory).ok();
     }
 }

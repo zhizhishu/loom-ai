@@ -11,11 +11,11 @@
 //! persists uppercase control-plane literals (`READY` / `BLOCKED` / `IN_REVIEW` / ...), so
 //! the caller that wires this table to `loom_task` maps its status onto the Mikka
 //! vocabulary at the call site; the table itself stays a literal port.
-
-// The upstream sweep (`sweepFactoryWatchdog`) is the consumer, and its LOOM wiring lands in M5;
-// until then nothing outside the tests constructs these types, so the dead-code lint is expected
-// rather than a sign that the port is unused.
-#![allow(dead_code)]
+//!
+//! The consumer is the LOOM tick's watchdog sweep in [`crate::loom::control`]: it resolves the
+//! persisted facts of one Task and one Attempt, asks this table, and then writes what the answer
+//! implies (a durable receipt, a hold, a stop request, or a hand-back). Nothing here reads or
+//! writes anything, so the same table serves the sweep, a test and a future second caller.
 
 use chrono::{DateTime, Utc};
 

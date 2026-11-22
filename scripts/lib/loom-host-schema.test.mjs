@@ -6,11 +6,12 @@ import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 import { verifyRunningHostSchema } from './loom-host-schema.mjs'
 
-// Migration 237 (the durable LOOM recovery ledger) is the current receipt, so a current
-// database also carries 235 (artifact versions) and 236 (local Hook snapshots).
-const priorReceipts = migration => migration >= 237 ? [235, 236] : migration >= 236 ? [235] : []
+// Migration 240 (the LOOM watchdog state on the durable recovery ledger) is the current receipt,
+// so a current database also carries 235, 236 and 237.
+const priorReceipts = migration => migration >= 240 ? [235, 236, 237]
+  : migration >= 237 ? [235, 236] : migration >= 236 ? [235] : []
 
-async function fixture (t, schema = 187, migration = 237, previousReceipts = priorReceipts(migration)) {
+async function fixture (t, schema = 187, migration = 240, previousReceipts = priorReceipts(migration)) {
   const dir = await mkdtemp(join(tmpdir(), 'loom-host-schema-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const path = join(dir, 'rovai.sqlite')
@@ -33,9 +34,10 @@ test('the running Host actual schema is verified read-only, with no runtime or s
   const evidence = await verifyRunningHostSchema({ request: f.request, databasePath: f.path })
   assert.equal(evidence.verified, true)
   assert.equal(evidence.projectionSchema, 187)
-  assert.equal(evidence.latestMigrationVersion, 237)
+  assert.equal(evidence.latestMigrationVersion, 240)
   assert.equal(evidence.localHookMigrationPresent, true)
   assert.equal(evidence.recoveryLedgerMigrationPresent, true)
+  assert.equal(evidence.watchdogStateMigrationPresent, true)
   assert.equal(evidence.source, 'running-host-health-and-read-only-database')
   assert.deepEqual(f.methods, ['health.check'])
   assert.deepEqual(await readFile(f.path), before)
@@ -49,6 +51,7 @@ test('the running Host actual schema is verified read-only, with no runtime or s
   assert.equal(hookEvidence.latestMigrationVersion, 236)
   assert.equal(hookEvidence.localHookMigrationPresent, true)
   assert.equal(hookEvidence.recoveryLedgerMigrationPresent, false)
+  assert.equal(hookEvidence.watchdogStateMigrationPresent, false)
   assert.equal(hookEvidence.artifactVersionMigrationPresent, true)
   assert.deepEqual(await readFile(hook.path), hookBefore)
 })
@@ -85,7 +88,7 @@ test('health from a different database cannot validate the selected isolated Hos
   const expected = await fixture(t), foreign = await fixture(t)
   await assert.rejects(verifyRunningHostSchema({ request: foreign.request, databasePath: expected.path }),
     /different database/)
-  for (const [expectedProjectionSchema, expectedMigrationVersion] of [[185, 235], [186, 237], [187, 236], [188, 238]]) {
+  for (const [expectedProjectionSchema, expectedMigrationVersion] of [[185, 235], [186, 237], [187, 236], [188, 240]]) {
     await assert.rejects(verifyRunningHostSchema({ request: expected.request, databasePath: expected.path,
       expectedProjectionSchema, expectedMigrationVersion }), /requires a supported projection\/migration pair/)
   }

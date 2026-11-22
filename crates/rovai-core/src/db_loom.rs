@@ -1048,7 +1048,9 @@ pub(super) fn schema_matches(
             && artifact_schema_matches(connection)?);
     let task_host_recorded =
         projection_schema_version < 178 || task_holds_execution_host(connection)?;
-    let recovery_recorded = projection_schema_version < 187 || recovery_schema_matches(connection)?;
+    // A schema-187 database may be the M5-B ledger (ten columns) or the current one; the M5-B
+    // shape is a supported upgrade source and stays admissible until migration 240 ran.
+    let recovery_recorded = projection_schema_version < 187 || recovery_schema_accepts(connection)?;
     Ok(holds(
         PLAN_TABLE,
         &[
@@ -1490,7 +1492,60 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
 const RECOVERY_ACTION: &str = "CHECK(action IN ('wait','external_effect','recover_stall',\
      'stop_timeout','reconcile','dispatch','stalled'))";
 
+fn recovery_table_sql() -> String {
+    format!(
+        r#"
+        CREATE TABLE {RECOVERY_TABLE} (
+            task_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL CHECK(length(attempt_id) BETWEEN 1 AND 120),
+            request_epoch TEXT NOT NULL CHECK(length(request_epoch) BETWEEN 1 AND 120),
+            action TEXT NOT NULL {RECOVERY_ACTION},
+            tries INTEGER NOT NULL CHECK(tries >= 0),
+            recovery_tries INTEGER NOT NULL CHECK(recovery_tries >= 0),
+            blocked INTEGER NOT NULL CHECK(blocked IN (0,1)),
+            progress_at TEXT,
+            observed_at TEXT NOT NULL,
+            next_at TEXT NOT NULL,
+            -- The upstream watchdog state that lives on the Attempt output rather than in the
+            -- `task_watchdog` receipt (`factory_attempts.output->'watchdog'`): the reason the
+            -- Task was held, and the instant its stop was requested. A `wait` receipt refreshes
+            -- `observed_at` but must not move either of them, or the five-minute stop window
+            -- would restart on every observation and never time out.
+            reason_code TEXT CHECK(reason_code IS NULL OR length(reason_code) BETWEEN 1 AND 120),
+            stopped_at TEXT,
+            PRIMARY KEY(task_id, attempt_id, request_epoch),
+            FOREIGN KEY(task_id) REFERENCES {TASK_TABLE}(task_id) ON DELETE CASCADE
+        );
+        "#
+    )
+}
+
+/// The indexes and the budget trigger. They are recreated with the table, because the schema gate
+/// compares SQLite's own SQL text: a rebuilt table keeps the exact strings below, an `ALTER TABLE`
+/// would keep the old column text and silently weaken the comparison.
+fn recovery_index_sql() -> String {
+    format!(
+        r#"
+        CREATE INDEX loom_task_recovery_epoch_idx
+            ON {RECOVERY_TABLE}(task_id, request_epoch);
+        CREATE INDEX loom_task_recovery_next_idx ON {RECOVERY_TABLE}(next_at);
+        CREATE TRIGGER loom_task_recovery_budget_never_shrinks
+            BEFORE UPDATE ON {RECOVERY_TABLE}
+            WHEN NEW.recovery_tries < OLD.recovery_tries
+            BEGIN SELECT RAISE(ABORT,
+                'a recorded LOOM recovery budget is never refunded'); END;
+        "#
+    )
+}
+
 fn recovery_sql() -> String {
+    format!("{}{}", recovery_table_sql(), recovery_index_sql())
+}
+
+/// Migration 237 as M5-B shipped it: ten columns, no Attempt watchdog state. This is a supported
+/// *upgrade source* for [`migrate_recovery_watchdog_state`], never a shape a current Core writes.
+/// It is kept verbatim so the M5-B ledger is recognised exactly, not approximately.
+fn recovery_sql_v187_legacy() -> String {
     format!(
         r#"
         CREATE TABLE {RECOVERY_TABLE} (
@@ -1541,7 +1596,7 @@ fn recovery_schema_objects(
 /// in the same order, the same primary key and cascade, both real indexes over the columns
 /// their names promise, and the real budget trigger body.
 ///
-/// Counting ten columns or looking for object names is not enough. Renaming `next_at` keeps the
+/// Counting the columns or looking for object names is not enough. Renaming `next_at` keeps the
 /// count while `defers` can no longer read the stored backoff, and a trigger called
 /// `loom_task_recovery_budget_never_shrinks` whose body is `SELECT 1` keeps the name while
 /// refunding a spent budget. The comparison therefore runs this module's own SQL in a scratch
@@ -1552,11 +1607,10 @@ fn recovery_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
     expected.execute_batch(&recovery_sql())?;
     if recovery_schema_objects(connection)? != recovery_schema_objects(&expected)? {
         return Ok(false);
-    }
-    let declared: i64 = connection.query_row(
+    }    let declared: i64 = connection.query_row(
         "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name IN
              ('task_id','attempt_id','request_epoch','action','tries','recovery_tries',
-              'blocked','progress_at','observed_at','next_at')",
+              'blocked','progress_at','observed_at','next_at','reason_code','stopped_at')",
         [RECOVERY_TABLE],
         |row| row.get(0),
     )?;
@@ -1567,8 +1621,8 @@ fn recovery_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
     )?;
     let holds =
         |name: &str, expected_sql: &str| trigger_sql_matches(connection, name, expected_sql);
-    Ok(declared == 10
-        && total == 10
+    Ok(declared == 12
+        && total == 12
         && holds(
             "loom_task_recovery_budget_never_shrinks",
             &format!(
@@ -1579,6 +1633,20 @@ fn recovery_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
                      'a recorded LOOM recovery budget is never refunded'); END"
             ),
         )?)
+}
+
+/// Whether the ledger is exactly the M5-B shape (migration 237 as it shipped). It is still a
+/// supported database to open and to upgrade from, but never a shape this Core writes.
+fn recovery_schema_is_legacy(connection: &Connection) -> rusqlite::Result<bool> {
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(&recovery_sql_v187_legacy())?;
+    Ok(recovery_schema_objects(connection)? == recovery_schema_objects(&expected)?)
+}
+
+/// What contract admission accepts at schema 187: the current ledger, or the M5-B ledger that
+/// [`migrate_recovery_watchdog_state`] upgrades in place. An unknown third shape stays refused.
+fn recovery_schema_accepts(connection: &Connection) -> rusqlite::Result<bool> {
+    Ok(recovery_schema_matches(connection)? || recovery_schema_is_legacy(connection)?)
 }
 
 /// Migration 237: the durable watchdog recovery ledger. Upstream keeps `tries`,
@@ -1621,6 +1689,97 @@ pub(super) fn migrate_recovery_ledger(database: &mut Database) -> Result<()> {
     Ok(())
 }
 
+/// Migration 240: the Attempt's watchdog state (`reasonCode` / `stoppedAt`) on the M5-B ledger.
+///
+/// M5-B shipped `loom_task_recovery` at projection schema 187 with ten columns; M5-C adds the
+/// upstream `attempt.output.watchdog` pair. A database created by M5-B is therefore upgraded in
+/// place: its rows — every spent recovery try, recorded backoff and hold — are copied into the
+/// current shape, and the receipt is admitted only once the rebuilt ledger is exactly the current
+/// one. A fresh database already has the shape; the step then only records that it ran.
+///
+/// The table is rebuilt instead of `ALTER TABLE ... ADD COLUMN` because the schema gate compares
+/// SQLite's own SQL text: an `ALTER` would leave the appended columns in a form the exact
+/// comparison refuses, so the gate would silently stop guarding the real shape.
+pub(super) fn migrate_recovery_watchdog_state(database: &mut Database) -> Result<()> {
+    let tx = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        matches!(
+            classify_database_contract(&tx)?,
+            DatabaseContractClassification::Current(ref marker)
+            | DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 187
+        ),
+        "LOOM watchdog state migration requires schema 187"
+    );
+    let present: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [RECOVERY_TABLE],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        present,
+        "the LOOM recovery ledger must exist before its watchdog state is added"
+    );
+    if !recovery_schema_matches(&tx)? {
+        anyhow::ensure!(
+            recovery_schema_is_legacy(&tx)?,
+            "the LOOM recovery ledger is neither the current nor the M5-B shape"
+        );
+        tx.execute_batch("ALTER TABLE loom_task_recovery RENAME TO loom_task_recovery_m5b;")?;
+        tx.execute_batch(&recovery_table_sql())?;
+        tx.execute_batch(
+            "INSERT INTO loom_task_recovery(
+                 task_id,attempt_id,request_epoch,action,tries,recovery_tries,blocked,
+                 progress_at,observed_at,next_at)
+             SELECT task_id,attempt_id,request_epoch,action,tries,recovery_tries,blocked,
+                    progress_at,observed_at,next_at
+             FROM loom_task_recovery_m5b;",
+        )?;
+        tx.execute_batch("DROP TABLE loom_task_recovery_m5b;")?;
+        tx.execute_batch(&recovery_index_sql())?;
+        anyhow::ensure!(
+            recovery_schema_matches(&tx)?,
+            "the rebuilt LOOM recovery ledger is not the current shape"
+        );
+    }
+    tx.execute_batch("INSERT INTO schema_migration VALUES(240,datetime('now'));")?;
+    anyhow::ensure!(
+        recovery_schema_matches(&tx)?,
+        "LOOM recovery ledger schema invalid"
+    );
+    tx.commit()?;
+    Ok(())
+}
+
+/// Only synthetic migration fixtures reverse the Attempt watchdog state: it rebuilds the exact
+/// M5-B ledger with the rows already recorded, so the upgrade path is tested against real data.
+#[cfg(test)]
+pub(super) fn downgrade_recovery_watchdog_state_for_test(connection: &Connection) {
+    connection
+        .execute_batch(
+            "ALTER TABLE loom_task_recovery RENAME TO loom_task_recovery_m5c;
+             CREATE TABLE loom_task_recovery_m5c_rows AS
+                 SELECT task_id,attempt_id,request_epoch,action,tries,recovery_tries,blocked,
+                        progress_at,observed_at,next_at
+                 FROM loom_task_recovery_m5c;
+             DROP TABLE loom_task_recovery_m5c;",
+        )
+        .unwrap();
+    connection
+        .execute_batch(&recovery_sql_v187_legacy())
+        .unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO loom_task_recovery
+             SELECT * FROM loom_task_recovery_m5c_rows;
+             DROP TABLE loom_task_recovery_m5c_rows;
+             DELETE FROM schema_migration WHERE version=240;",
+        )
+        .unwrap();
+}
+
 /// Only synthetic migration fixtures reverse this ledger; product code never drops it.
 #[cfg(test)]
 pub(super) fn downgrade_recovery_ledger_for_test(connection: &Connection) {
@@ -1637,7 +1796,7 @@ pub(super) fn downgrade_recovery_ledger_for_test(connection: &Connection) {
     connection
         .execute_batch(
             "DROP TABLE loom_task_recovery;
-             DELETE FROM schema_migration WHERE version=237;
+             DELETE FROM schema_migration WHERE version IN (237,240);
              UPDATE rovai_data_contract SET projection_schema_version=186
                WHERE singleton=1 AND projection_schema_version=187;",
         )
@@ -1645,15 +1804,14 @@ pub(super) fn downgrade_recovery_ledger_for_test(connection: &Connection) {
 }
 
 /// One persisted watchdog receipt: the upstream `task_watchdog` event's `request` and
-/// `result` in one row. `request_epoch` is the Task's source Event the receipt is bound to,
-/// `attempt_id` is the Attempt that observed it, and `tries`/`recovery_tries`/`next_at` are
-/// the durable budget and backoff that must survive a restart.
-// The M5 watchdog sweep is the consumer, and its LOOM wiring lands next; until then the
-// receipt API is exercised only by the migration tests, so the dead-code lint is expected
-// rather than a sign that the port is unused (same posture as `loom::watchdog`).
-#[allow(dead_code)]
+/// `result` in one row, together with the Attempt's own watchdog state. `request_epoch` is the
+/// Task's source Event the receipt is bound to, `attempt_id` is the Attempt that observed it,
+/// and `tries`/`recovery_tries`/`next_at` are the durable budget and backoff that must survive
+/// a restart. `reason_code`/`stopped_at` are the upstream `attempt.output.watchdog` pair:
+/// which hold this Attempt applied and when it asked its executor to stop.
+// The M5-C watchdog sweep is the consumer; the migration tests also exercise this API.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct LoomRecoveryReceipt {
+pub(crate) struct LoomRecoveryReceipt {
     pub task_id: String,
     pub attempt_id: String,
     pub request_epoch: String,
@@ -1664,13 +1822,14 @@ pub(super) struct LoomRecoveryReceipt {
     pub progress_at: Option<String>,
     pub observed_at: String,
     pub next_at: String,
+    pub reason_code: Option<String>,
+    pub stopped_at: Option<String>,
 }
 
-#[allow(dead_code)]
 impl LoomRecoveryReceipt {
     /// Upstream: a receipt whose `nextAt` is still in the future defers a new observation.
     /// An unreadable instant is not "long past": it simply stops deferring, never aborts.
-    pub(super) fn defers(&self, now: DateTime<Utc>) -> bool {
+    pub(crate) fn defers(&self, now: DateTime<Utc>) -> bool {
         DateTime::parse_from_rfc3339(&self.next_at).is_ok_and(|next| next > now)
     }
 }
@@ -1678,8 +1837,7 @@ impl LoomRecoveryReceipt {
 /// Upstream `tries = action === 'stalled' ? 0 : (previous?.result?.tries ?? 0) + 1`.
 /// A `stalled` receipt resets the Attempt counter because the stop itself is a new
 /// observation, while every other action spends one more try of the same Attempt.
-#[allow(dead_code)]
-pub(super) fn next_watchdog_tries(previous: Option<i64>, action: &str) -> i64 {
+pub(crate) fn next_watchdog_tries(previous: Option<i64>, action: &str) -> i64 {
     if action == "stalled" {
         0
     } else {
@@ -1689,15 +1847,13 @@ pub(super) fn next_watchdog_tries(previous: Option<i64>, action: &str) -> i64 {
 
 /// Upstream `recoveryTries = (previous?.result?.recoveryTries ?? 0) + (action ===
 /// 'recover_stall' ? 1 : 0)`: only an actual replay spends the automatic recovery budget.
-#[allow(dead_code)]
-pub(super) fn next_recovery_tries(previous: Option<i64>, action: &str) -> i64 {
+pub(crate) fn next_recovery_tries(previous: Option<i64>, action: &str) -> i64 {
     previous.unwrap_or(0) + i64::from(action == "recover_stall")
 }
 
 /// Upstream `nextAt = now + Math.min(15, 2 ** tries) * 60_000`: minutes 1, 2, 4, 8, then a
 /// 15-minute ceiling, so a retry storm can never exceed one observation per 15 minutes.
-#[allow(dead_code)]
-pub(super) fn watchdog_next_at(now: DateTime<Utc>, tries: i64) -> DateTime<Utc> {
+pub(crate) fn watchdog_next_at(now: DateTime<Utc>, tries: i64) -> DateTime<Utc> {
     let minutes = (1_i64 << tries.clamp(0, 4)).min(15);
     now + chrono::Duration::minutes(minutes)
 }
@@ -1709,8 +1865,7 @@ pub(super) const WATCHDOG_WAIT_MINUTES: i64 = 5;
 
 /// Upstream `nextAt = now + (task.status === 'blocked' ? 60_000 : 5 * 60_000)` for `wait`:
 /// a progressing or human-owned Task is simply re-observed later.
-#[allow(dead_code)]
-pub(super) fn watchdog_wait_next_at(now: DateTime<Utc>, blocked: bool) -> DateTime<Utc> {
+pub(crate) fn watchdog_wait_next_at(now: DateTime<Utc>, blocked: bool) -> DateTime<Utc> {
     let minutes = if blocked {
         WATCHDOG_WAIT_BLOCKED_MINUTES
     } else {
@@ -1721,14 +1876,12 @@ pub(super) fn watchdog_wait_next_at(now: DateTime<Utc>, blocked: bool) -> DateTi
 
 /// Upstream `exhausted = tries > WATCHDOG_MAX_RECOVERIES || (action === 'recover_stall' &&
 /// budget.count >= WATCHDOG_MAX_RECOVERIES)`, with the budget summed over the epoch.
-#[allow(dead_code)]
-pub(super) fn recovery_exhausted(tries: i64, action: &str, budget: i64) -> bool {
+pub(crate) fn recovery_exhausted(tries: i64, action: &str, budget: i64) -> bool {
     let max = crate::loom::watchdog::WATCHDOG_MAX_RECOVERIES;
     tries > max || (action == "recover_stall" && budget >= max)
 }
 
-#[allow(dead_code)]
-pub(super) fn recovery_receipt(
+pub(crate) fn recovery_receipt(
     connection: &Connection,
     task_id: &str,
     attempt_id: &str,
@@ -1737,7 +1890,8 @@ pub(super) fn recovery_receipt(
     connection
         .query_row(
             "SELECT task_id,attempt_id,request_epoch,action,tries,recovery_tries,blocked,
-                    progress_at,observed_at,next_at FROM loom_task_recovery
+                    progress_at,observed_at,next_at,reason_code,stopped_at
+             FROM loom_task_recovery
              WHERE task_id=?1 AND attempt_id=?2 AND request_epoch=?3",
             params![task_id, attempt_id, request_epoch],
             |row| {
@@ -1752,6 +1906,8 @@ pub(super) fn recovery_receipt(
                     progress_at: row.get(7)?,
                     observed_at: row.get(8)?,
                     next_at: row.get(9)?,
+                    reason_code: row.get(10)?,
+                    stopped_at: row.get(11)?,
                 })
             },
         )
@@ -1760,8 +1916,7 @@ pub(super) fn recovery_receipt(
 
 /// The spent automatic-recovery budget of one Task and source Event, summed across its
 /// Attempts exactly like the upstream budget query.
-#[allow(dead_code)]
-pub(super) fn recovery_budget(
+pub(crate) fn recovery_budget(
     connection: &Connection,
     task_id: &str,
     request_epoch: &str,
@@ -1772,6 +1927,27 @@ pub(super) fn recovery_budget(
         params![task_id, request_epoch],
         |row| row.get(0),
     )
+}
+
+/// One watchdog observation of one Attempt: everything the ledger has to persist about a single
+/// pass. The `wait` branch spends nothing and keeps the previous `action`/`tries`/
+/// `recoveryTries`; a blocked observation also carries the Attempt's watchdog state
+/// (`reasonCode`/`stoppedAt`), while a non-blocked one leaves whatever an earlier hold recorded
+/// alone.
+pub(crate) struct WatchdogObservation<'a> {
+    pub task_id: &'a str,
+    pub attempt_id: &'a str,
+    pub request_epoch: &'a str,
+    pub action: &'a str,
+    pub blocked: bool,
+    pub progress_at: Option<&'a str>,
+    /// The upstream `reasonCode` of the hold this observation applied, when it applied one.
+    pub reason_code: Option<&'a str>,
+    /// The instant the stop was requested. Only the observation that first requests it states it;
+    /// a later escalation (`stop_timeout`) keeps the stored one, so the five-minute window is
+    /// measured from the real request.
+    pub stopped_at: Option<&'a str>,
+    pub now: DateTime<Utc>,
 }
 
 /// Observe one Task once: read the durable previous receipt, derive `tries`,
@@ -1786,7 +1962,7 @@ pub(super) fn recovery_budget(
 /// decision's `blocked` result. A wait therefore never consumes the budget and never rewrites a
 /// recorded `stalled`/`reconcile` action, exactly like the upstream `ON CONFLICT` result merge.
 #[allow(dead_code)]
-pub(super) fn record_watchdog_recovery(
+pub(crate) fn record_watchdog_recovery(
     connection: &Connection,
     task_id: &str,
     attempt_id: &str,
@@ -1796,6 +1972,37 @@ pub(super) fn record_watchdog_recovery(
     progress_at: Option<&str>,
     now: DateTime<Utc>,
 ) -> rusqlite::Result<LoomRecoveryReceipt> {
+    record_watchdog_observation(
+        connection,
+        WatchdogObservation {
+            task_id,
+            attempt_id,
+            request_epoch,
+            action,
+            blocked,
+            progress_at,
+            reason_code: None,
+            stopped_at: None,
+            now,
+        },
+    )
+}
+
+pub(crate) fn record_watchdog_observation(
+    connection: &Connection,
+    observation: WatchdogObservation<'_>,
+) -> rusqlite::Result<LoomRecoveryReceipt> {
+    let WatchdogObservation {
+        task_id,
+        attempt_id,
+        request_epoch,
+        action,
+        blocked,
+        progress_at,
+        reason_code,
+        stopped_at,
+        now,
+    } = observation;
     let previous = recovery_receipt(connection, task_id, attempt_id, request_epoch)?;
     let waiting = action == "wait";
     // Upstream `action: previous?.result?.action ?? 'wait'`.
@@ -1822,6 +2029,12 @@ pub(super) fn record_watchdog_recovery(
     } else {
         watchdog_next_at(now, tries)
     };
+    // Upstream `attempt.output = output || {watchdog: {...}}`: only an observation that applies a
+    // hold rewrites the Attempt's watchdog state, so a plain wait or a reconcile keeps it.
+    let previous_reason = previous
+        .as_ref()
+        .and_then(|prior| prior.reason_code.clone());
+    let previous_stopped_at = previous.as_ref().and_then(|prior| prior.stopped_at.clone());
     let receipt = LoomRecoveryReceipt {
         task_id: task_id.to_string(),
         attempt_id: attempt_id.to_string(),
@@ -1833,16 +2046,19 @@ pub(super) fn record_watchdog_recovery(
         progress_at: progress_at.map(str::to_string),
         observed_at: now.to_rfc3339(),
         next_at: next_at.to_rfc3339(),
+        reason_code: reason_code.map(str::to_string).or(previous_reason),
+        stopped_at: stopped_at.map(str::to_string).or(previous_stopped_at),
     };
     connection.execute(
         "INSERT INTO loom_task_recovery(task_id,attempt_id,request_epoch,action,tries,
-                recovery_tries,blocked,progress_at,observed_at,next_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                recovery_tries,blocked,progress_at,observed_at,next_at,reason_code,stopped_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
          ON CONFLICT(task_id,attempt_id,request_epoch) DO UPDATE SET
              action=excluded.action,tries=excluded.tries,
              recovery_tries=excluded.recovery_tries,blocked=excluded.blocked,
              progress_at=excluded.progress_at,observed_at=excluded.observed_at,
-             next_at=excluded.next_at",
+             next_at=excluded.next_at,reason_code=excluded.reason_code,
+             stopped_at=excluded.stopped_at",
         params![
             receipt.task_id,
             receipt.attempt_id,
@@ -1854,6 +2070,8 @@ pub(super) fn record_watchdog_recovery(
             receipt.progress_at,
             receipt.observed_at,
             receipt.next_at,
+            receipt.reason_code,
+            receipt.stopped_at,
         ],
     )?;
     Ok(receipt)
@@ -2970,6 +3188,130 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    /// The M5-B ledger (migration 237, ten columns) is a supported source for the M5-C Attempt
+    /// watchdog state. A database that already spent recovery tries and recorded a backoff must
+    /// reopen through the product path with every one of those facts intact — the upgrade adds the
+    /// two columns, it never starts the budget over or forgets a recorded hold.
+    #[test]
+    fn recovery_watchdog_state_upgrades_the_m5b_ledger_in_place() {
+        let mut database = crate::test_support::seeded_runtime_database_owned();
+        let directory = database.directory().to_path_buf();
+        let (_, task_id) =
+            imported_plan_task(&mut database, &directory, "LOOM watchdog state upgrade");
+        let recorded = record_watchdog_recovery(
+            database.connection(),
+            &task_id,
+            "dispatch_m5b_attempt",
+            "epoch:m5b",
+            "recover_stall",
+            false,
+            Some("2026-11-01T00:00:00+00:00"),
+            chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(recorded.recovery_tries, 1);
+
+        downgrade_recovery_watchdog_state_for_test(database.connection());
+        {
+            let connection = database.connection();
+            let columns: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info(?1)",
+                    [RECOVERY_TABLE],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                columns, 10,
+                "assertion the_fixture_is_the_m5b_ledger_migration_237_shipped"
+            );
+            assert!(!recovery_schema_matches(connection).unwrap());
+            assert!(recovery_schema_is_legacy(connection).unwrap());
+            assert!(
+                recovery_schema_accepts(connection).unwrap(),
+                "assertion the_m5b_ledger_is_a_supported_upgrade_source"
+            );
+            assert_eq!(migration_receipts(&database, 240), 0);
+            // The M5-B database still opens: its marker and LOOM shape are the ones it shipped with.
+            assert!(matches!(
+                classify_database_contract(connection).unwrap(),
+                DatabaseContractClassification::Current(_)
+            ));
+        }
+
+        database.close();
+        let reopened = Database::open(&directory)
+            .expect("the M5-B recovery ledger must reopen through the product path");
+        assert_eq!(
+            migration_receipts(&reopened, 240),
+            1,
+            "assertion the_watchdog_state_step_records_its_receipt"
+        );
+        assert_eq!(projection_version(&reopened), 187);
+        let columns: i64 = reopened
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info(?1)",
+                [RECOVERY_TABLE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 12, "assertion the_upgrade_added_the_watchdog_state");
+        assert!(recovery_schema_matches(reopened.connection()).unwrap());
+        assert!(matches!(
+            classify_database_contract(reopened.connection()).unwrap(),
+            DatabaseContractClassification::Current(_)
+        ));
+        let receipt = recovery_receipt(
+            reopened.connection(),
+            &task_id,
+            "dispatch_m5b_attempt",
+            "epoch:m5b",
+        )
+        .unwrap()
+        .expect("the recorded M5-B receipt must survive the upgrade");
+        assert_eq!(
+            (
+                receipt.action,
+                receipt.recovery_tries,
+                receipt.progress_at,
+                receipt.observed_at,
+                receipt.next_at,
+                receipt.reason_code,
+                receipt.stopped_at,
+            ),
+            (
+                recorded.action,
+                recorded.recovery_tries,
+                recorded.progress_at,
+                recorded.observed_at,
+                recorded.next_at,
+                None,
+                None,
+            ),
+            "assertion the_upgrade_preserves_budget_backoff_and_receipt"
+        );
+        assert_eq!(
+            recovery_budget(reopened.connection(), &task_id, "epoch:m5b").unwrap(),
+            1,
+            "assertion the_upgraded_epoch_budget_is_still_spent"
+        );
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        // A second open is a no-op: the step already ran and the rebuilt ledger is the current one.
+        drop(reopened);
+        let twice = Database::open(&directory).expect("the upgraded database must reopen");
+        assert_eq!(migration_receipts(&twice, 240), 1);
+        assert!(recovery_schema_matches(twice.connection()).unwrap());
     }
 
     /// A refused receipt rolls the whole migration back: no ledger, no half-applied source.
