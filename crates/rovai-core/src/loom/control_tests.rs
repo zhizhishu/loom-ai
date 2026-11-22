@@ -3718,8 +3718,9 @@ fn select_remote_node(
     connection
         .execute(
             "INSERT INTO execution_node(node_id,display_name,role,os,arch,token_digest,paired_at,
-                                        revoked_at,last_heartbeat)
-             VALUES(?1,'Remote Node','remote',NULL,NULL,?2,?3,NULL,?3)",
+                                        revoked_at,last_heartbeat,session_opened_at,
+                                        session_socket_id)
+             VALUES(?1,'Remote Node','remote',NULL,NULL,?2,?3,NULL,?3,?3,'fixture-socket')",
             params![node_id, "a".repeat(64), heartbeat],
         )
         .unwrap();
