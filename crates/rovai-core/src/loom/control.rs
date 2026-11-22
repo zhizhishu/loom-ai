@@ -1665,33 +1665,79 @@ impl RunSession {
     }
 }
 
-/// True when two Runs observe the world through one Agent session: the same conversation, the same
-/// Native Session, or a continuation edge in either direction.
+/// Whether two `(installation, id)` pairs name the same Native Session.
 ///
 /// A Native Session is identified by the installation that owns it *and* its own id — the same
 /// pair the schema keeps unique. Two installations that each report `session-1` own two sessions; a
 /// matching pair is one. When either side carries no installation identity the owner cannot be
 /// told apart, so an equal id is treated as shared rather than assumed independent.
-fn shares_agent_session(left: &RunSession, right: &RunSession) -> bool {
-    let same_native_session = match (
-        left.native_session_id.as_deref(),
-        right.native_session_id.as_deref(),
-    ) {
-        (Some(left_id), Some(right_id)) if left_id == right_id => match (
-            left.native_installation_id.as_deref(),
-            right.native_installation_id.as_deref(),
-        ) {
-            (Some(left_installation), Some(right_installation)) => {
-                left_installation == right_installation
-            }
-            _ => true,
-        },
-        _ => false,
+fn native_sessions_match(
+    left_installation: Option<&str>,
+    left_session: Option<&str>,
+    right_installation: Option<&str>,
+    right_session: Option<&str>,
+) -> bool {
+    let (Some(left_id), Some(right_id)) = (left_session, right_session) else {
+        return false;
     };
+    if left_id != right_id {
+        return false;
+    }
+    match (left_installation, right_installation) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
+}
+
+/// True when two Runs observe the world through one Agent session: the same conversation, the same
+/// Native Session, or a continuation edge in either direction.
+fn shares_agent_session(left: &RunSession, right: &RunSession) -> bool {
     left.conversation_id == right.conversation_id
-        || same_native_session
+        || native_sessions_match(
+            left.native_installation_id.as_deref(),
+            left.native_session_id.as_deref(),
+            right.native_installation_id.as_deref(),
+            right.native_session_id.as_deref(),
+        )
         || left.predecessor_run_id.as_deref() == Some(right.run_id.as_str())
         || right.predecessor_run_id.as_deref() == Some(left.run_id.as_str())
+}
+
+/// Every production Run of one Task: the Runs that claimed it, or that produced one of its
+/// Candidates. These are the sessions a review of this Task must stand outside of.
+fn production_run_sessions(
+    connection: &Connection,
+    plan_id: &str,
+    task_id: &str,
+) -> Result<Vec<RunSession>> {
+    let mut sessions: Vec<RunSession> = Vec::new();
+    let mut statement = connection.prepare(
+        "SELECT run.id, run.conversation_id,
+                    conversation.native_adapter_installation_id,
+                    conversation.native_session_id, run.predecessor_agent_run_id
+         FROM agent_run run
+         JOIN conversation ON conversation.id = run.conversation_id
+         WHERE run.id IN (
+             SELECT claim.agent_run_id FROM loom_claim claim
+              WHERE claim.plan_id=?1 AND claim.task_id=?2
+             UNION
+             SELECT candidate.agent_run_id FROM loom_candidate candidate
+              WHERE candidate.plan_id=?1 AND candidate.task_id=?2
+         )",
+    )?;
+    let rows = statement.query_map(params![plan_id, task_id], |row| {
+        Ok(RunSession {
+            run_id: row.get(0)?,
+            conversation_id: row.get(1)?,
+            native_installation_id: row.get(2)?,
+            native_session_id: row.get(3)?,
+            predecessor_run_id: row.get(4)?,
+        })
+    })?;
+    for row in rows {
+        sessions.push(row?);
+    }
+    Ok(sessions)
 }
 
 /// Refuse a reviewing Run that is not an independent observer of this Task's deliveries.
@@ -1719,43 +1765,14 @@ fn ensure_reviewer_session_is_independent(
         ));
     }
 
-    let mut earlier: Vec<RunSession> = Vec::new();
-    {
-        let mut statement = connection.prepare(
-            "SELECT run.id, run.conversation_id,
-                        conversation.native_adapter_installation_id,
-                        conversation.native_session_id, run.predecessor_agent_run_id
-             FROM agent_run run
-             JOIN conversation ON conversation.id = run.conversation_id
-             WHERE run.id IN (
-                 SELECT claim.agent_run_id FROM loom_claim claim
-                  WHERE claim.plan_id=?1 AND claim.task_id=?2
-                 UNION
-                 SELECT candidate.agent_run_id FROM loom_candidate candidate
-                  WHERE candidate.plan_id=?1 AND candidate.task_id=?2
-             )",
-        )?;
-        let rows = statement.query_map(params![plan_id, task_id], |row| {
-            Ok(RunSession {
-                run_id: row.get(0)?,
-                conversation_id: row.get(1)?,
-                native_installation_id: row.get(2)?,
-                native_session_id: row.get(3)?,
-                predecessor_run_id: row.get(4)?,
-            })
-        })?;
-        for row in rows {
-            earlier.push(row?);
+    for production in production_run_sessions(connection, plan_id, task_id)? {
+        if production.run_id == reviewer.run_id {
+            return Err(shared_session_error("this Task", &production.run_id));
         }
-    }
-    for delivery in &earlier {
-        if delivery.run_id == reviewer.run_id {
-            return Err(shared_session_error("this Task", &delivery.run_id));
-        }
-        if shares_agent_session(reviewer, delivery) {
+        if shares_agent_session(reviewer, &production) {
             return Err(shared_session_error(
                 "an earlier delivery of this Task",
-                &delivery.run_id,
+                &production.run_id,
             ));
         }
     }
