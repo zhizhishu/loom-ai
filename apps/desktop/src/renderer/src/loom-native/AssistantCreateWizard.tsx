@@ -5,7 +5,7 @@ import type { HookReviewSnapshot } from '../member-catalog-model'
 import { Avatar } from './Avatar'
 import { Icon } from './icons'
 import { ChoiceMenu, FormMessage, SurfaceDialog } from './Controls'
-import { AssistantCreateRejected, readAssistant, readAssistantRuntimeOptions, type AssistantRuntimeOption } from './assistant-service'
+import { AssistantCreateRejected, assistantRuntimeAvailabilityLabel, assistantRuntimeSetupDefaults, piPurgeNeedsFileGrant, readAssistant, readAssistantRuntimeOptions, withPiPurgeFileGrant, type AssistantRuntimeOption } from './assistant-service'
 import { ASSISTANT_PRESETS, availablePresetName, presetIdentity } from './assistant-presets'
 import { AssistantCapabilityPicker } from './AssistantCapabilityPicker'
 import { finishAssistantSetup, newSetupAttempt, setupProblems, setupSignature, type AssistantSetupAttempt, type AssistantSetupDraft } from './assistant-onboarding'
@@ -45,6 +45,9 @@ export function AssistantCreateWizard({ environment, agents, theme, onCreated, o
   const ticket = useRef(0)
   const catalogAgentId = agents.find(agent=>agent.presence==='present'&&!agent.removedAt)?.agentId??null
   const selectedOption=options.find(option=>option.kind===draft.runtime?.adapterKind)
+  // Pi is LOOM's built-in primary assistant. Its absence is a connection problem the
+  // user can act on, not a silently greyed-out row nobody can explain.
+  const piMissing=!loading&&options.some(option=>option.kind==='pi'&&!option.usable)
   const errors=setupProblems(draft,locked?[]:agents.map(agent=>agent.displayName))
   useEffect(() => { if (locked) setStep(STEPS.length - 1) }, [])
   const dangerous=selectedOption?.permissionOptions.filter(item=>item.risk!=='normal')??[]
@@ -58,7 +61,11 @@ export function AssistantCreateWizard({ environment, agents, theme, onCreated, o
   useEffect(()=>{void readOptions();return()=>{ticket.current++}},[readOptions])
   const chooseRuntime=(option:AssistantRuntimeOption)=>{
     if(!option.usable||!option.defaults||locked)return
-    const value=structuredClone(option.defaults)
+    // A new assistant starts from the installation's own defaults. The single Pi
+    // exception is documented in assistantRuntimeSetupDefaults: an absent `native`
+    // file policy would make Pi Purge Append unsavable afterwards.
+    const value=assistantRuntimeSetupDefaults(option)
+    if(!value)return
     if(option.installation?.snapshot?.permissionSchemaVersion!==undefined)value.permissions.schemaVersion=option.installation.snapshot.permissionSchemaVersion
     patch({runtime:value})
   }
@@ -113,10 +120,17 @@ export function AssistantCreateWizard({ environment, agents, theme, onCreated, o
       {step===0&&<><div className="ln-onboarding-section-head"><div><h3>先选一个起点</h3><p>名字和职责都能改；模板不会替你授予权限。</p></div></div><div className="ln-preset-grid">{ASSISTANT_PRESETS.map(item=><button type="button" className={preset===item.id?'is-selected':''} key={item.id} disabled={locked} onClick={()=>{setPreset(item.id);const identity=presetIdentity(item);identity.name=availablePresetName(identity.name,agents.map(agent=>agent.displayName));patch({identity,avatarRef:item.avatarRef})}}><Avatar agent={{agentId:`preset:${item.id}`,displayName:item.name,avatarRef:item.avatarRef} as AgentProfile} name={item.name} size={29}/><span><strong>{item.name}</strong><small>{item.role}</small></span>{preset===item.id&&<Icon name="check" size={14}/>}</button>)}</div>
         <div className="ln-field-grid"><label className="ln-field"><span>名称</span><input aria-label="新助手名称" value={draft.identity.name} maxLength={40} disabled={locked} onChange={event=>patch({identity:{...draft.identity,name:event.target.value}})}/></label><label className="ln-field"><span>职责</span><input aria-label="新助手职责" value={draft.identity.role} disabled={locked} onChange={event=>patch({identity:{...draft.identity,role:event.target.value}})}/></label></div><label className="ln-field"><span>它主要帮你做什么</span><textarea aria-label="新助手用途" rows={3} value={draft.identity.purpose} disabled={locked} onChange={event=>patch({identity:{...draft.identity,purpose:event.target.value}})}/></label><label className="ln-field"><span>沟通方式</span><input aria-label="新助手沟通方式" value={draft.identity.style.join('、')} disabled={locked} onChange={event=>patch({identity:{...draft.identity,style:event.target.value.split(/[、,，]/).map(value=>value.trim()).filter(Boolean)}})}/></label></>}
       {step===1&&<><div className="ln-onboarding-section-head"><div><h3>选择执行引擎</h3><p>助手身份保持不变，运行方式可以以后更换。</p></div><button type="button" className="ln-action" disabled={loading} onClick={()=>{void readOptions()}}><Icon name="refresh" size={14}/>重新读取</button></div>
-        <div className="ln-wizard-runtimes">{options.map(option=><button type="button" className={draft.runtime?.adapterKind===option.kind?'is-selected':''} key={option.kind} disabled={!option.usable||busy||locked} onClick={()=>chooseRuntime(option)}><span className={`ln-runtime-mark is-${option.kind}`}>{RUNTIME_MARKS[option.kind]}</span><span><strong>{option.label}</strong><small>{option.usable?`${option.models.length} 个可选模型${option.models.length===0?' · 默认模型需运行验证':''}`:option.installation?'需要检查配置':'主机尚未发现'}</small></span>{draft.runtime?.adapterKind===option.kind&&<Icon name="check" size={15}/>}</button>)}</div>
+        <div className="ln-wizard-runtimes">{options.map(option=><button type="button" className={draft.runtime?.adapterKind===option.kind?'is-selected':''} key={option.kind} disabled={!option.usable||busy||locked} onClick={()=>chooseRuntime(option)}><span className={`ln-runtime-mark is-${option.kind}`}>{RUNTIME_MARKS[option.kind]}</span><span><strong>{option.label}</strong><small>{assistantRuntimeAvailabilityLabel(option)}</small></span>{draft.runtime?.adapterKind===option.kind&&<Icon name="check" size={15}/>}</button>)}</div>
+        {piMissing&&<p className="ln-native-help" role="status">内置主助手需要连接本机 Pi 运行环境。<button type="button" className="ln-text-action" onClick={onOpenConnections}>到「连接与设备」检查 Pi</button></p>}
         {loading&&<p className="ln-picker-empty">正在读取主机的实际安装信息…</p>}
         {draft.runtime&&<><label className="ln-field"><span>模型</span><ChoiceMenu label="新助手模型" theme={theme} disabled={locked} value={draft.runtime.model.mode==='explicit'?draft.runtime.model.modelId:'__default'} onChange={setModel} choices={[{value:'__default',label:'使用运行端默认模型',description:'保留主机原配置，不自动换模型'},...(selectedOption?.models??[]).filter(model=>!model.hidden&&!model.deprecated).map(model=>({value:model.id,label:model.displayName||model.id}))]}/></label>
-          <details className="ln-wizard-permissions"><summary>权限与高级选项 <small>沿用此运行端的真实设置</small></summary>{selectedOption?.permissionOptions.map(descriptor=><label className="ln-field" key={descriptor.key}><span>{descriptor.label}</span>{descriptor.valueType==='enum'?<ChoiceMenu theme={theme} label={`新助手${descriptor.label}`} disabled={locked||!descriptor.supported} value={JSON.stringify(draft.runtime?.permissions.values[descriptor.key])} onChange={encoded=>patch({runtime:{...draft.runtime!,permissions:{...draft.runtime!.permissions,values:{...draft.runtime!.permissions.values,[descriptor.key]:JSON.parse(encoded)}}}})} choices={descriptor.choices.map(choice=>({value:JSON.stringify(choice.value),label:choice.label}))}/>:<small>{JSON.stringify(draft.runtime?.permissions.values[descriptor.key])}</small>}<small>{descriptor.unsupportedReason||descriptor.description}</small></label>)}<p>“仅一次”与“本会话允许”以运行端实际提供的选项为准，不自动扩大成永久权限。</p></details></>}
+          <details className="ln-wizard-permissions"><summary>权限与高级选项 <small>沿用此运行端的真实设置</small></summary>{selectedOption?.permissionOptions.map(descriptor=><label className="ln-field" key={descriptor.key}><span>{descriptor.label}</span>{descriptor.valueType==='enum'?<ChoiceMenu theme={theme} label={`新助手${descriptor.label}`} disabled={locked||!descriptor.supported} value={JSON.stringify(draft.runtime?.permissions.values[descriptor.key])} onChange={encoded=>patch({runtime:{...draft.runtime!,permissions:{...draft.runtime!.permissions,values:{...draft.runtime!.permissions.values,[descriptor.key]:JSON.parse(encoded)}}}})} choices={descriptor.choices.map(choice=>({value:JSON.stringify(choice.value),label:choice.label}))}/>:<small>{JSON.stringify(draft.runtime?.permissions.values[descriptor.key])}</small>}<small>{descriptor.unsupportedReason||descriptor.description}</small></label>)}<p>“仅一次”与“本会话允许”以运行端实际提供的选项为准，不自动扩大成永久权限。</p></details>
+          {draft.runtime.adapterKind==='pi'&&<details className="ln-wizard-permissions"><summary>助手设定 · Pi Purge <small>默认关闭，只作用于这个助手</small></summary>
+            <label className="ln-field"><span>启用方式</span><ChoiceMenu theme={theme} label="新助手 Pi Purge 模式" disabled={locked} value={draft.runtime!.piPurge?.mode??'off'} onChange={value=>patch({runtime:{...draft.runtime!,piPurge:{mode:value as 'off'|'append',persona:draft.runtime!.piPurge?.persona??''}}})} choices={[{value:'off',label:'关闭',description:'Off'},{value:'append',label:'追加助手设定',description:'Append'}]}/></label>
+            <label className="ln-field"><span>角色与偏好</span><textarea aria-label="新助手 Pi Purge 人格提示词" rows={4} maxLength={16*1024} disabled={locked} value={draft.runtime!.piPurge?.persona??''} placeholder="写清这个助手的角色、表达风格和任务偏好" onChange={event=>patch({runtime:{...draft.runtime!,piPurge:{mode:draft.runtime!.piPurge?.mode??'off',persona:event.target.value}}})}/><small>追加（Append）把设定放在 Pi 原始系统提示词前；{(draft.runtime!.piPurge?.persona??'').length} 字符。人格不扩大工具与文件授权。</small></label>
+            {piPurgeNeedsFileGrant(draft.runtime)&&<div className="ln-review-card"><h3>追加（Append）需要工作目录文件权限</h3><p>当前「文件与任务权限」是原生或未设置，Core 会在保存时拒绝这个组合（pi_purge_requires_file_grant）。</p><button type="button" className="ln-action" disabled={locked} onClick={()=>patch({runtime:withPiPurgeFileGrant(draft.runtime!)})}>设为读写工作目录</button></div>}
+          </details>}
+        </>}
         <button type="button" className="ln-text-action" onClick={onOpenConnections}>找不到客户端？检查连接与安装</button>
         <button type="button" className="ln-text-action" disabled={locked} onClick={()=>{patch({runtime:null});setStep(2)}}>先创建身份，稍后配置运行端</button>
       </>}

@@ -35,12 +35,16 @@ type Reader = Pick<ThreadClient, 'request'>
 
 // ------------------------------------------------------------- runtime registry
 
-/** The four Runtime choices this surface offers. Exact Core AdapterKind ids only. */
+/**
+ * The four Runtime choices this surface offers. Exact Core AdapterKind ids only.
+ * Pi is first because it is LOOM's built-in primary assistant, not because any
+ * installation is certain: being listed first never claims a package is present.
+ */
 export const ASSISTANT_RUNTIME_KINDS = [
+  'pi',
   'claude-code-cli',
   'codex-cli',
-  'deepseek-harness',
-  'pi'
+  'deepseek-harness'
 ] as const
 
 export type AssistantRuntimeKind = (typeof ASSISTANT_RUNTIME_KINDS)[number]
@@ -58,34 +62,44 @@ export type AssistantRuntimePort = {
    * availability is a Host observation, never a constant in the UI registry.
    */
   embedded: { transport: 'embedded-pi'; availability: 'from-host' } | null
+  /**
+   * Pi is the built-in primary assistant's default brain
+   * (`docs/loom/LOOM-ARCHITECTURE.md:143`: 主助手默认大脑). Like `label`, this is
+   * product placement, never a claim that the package or launcher exists.
+   */
+  builtinPrimary: boolean
 }
 
 export const ASSISTANT_RUNTIME_REGISTRY: Readonly<
   Record<AssistantRuntimeKind, AssistantRuntimePort>
 > = {
+  pi: {
+    kind: 'pi',
+    label: 'Pi',
+    transport: 'native-cli',
+    embedded: { transport: 'embedded-pi', availability: 'from-host' },
+    builtinPrimary: true
+  },
   'claude-code-cli': {
     kind: 'claude-code-cli',
     label: 'Claude Code',
     transport: 'native-cli',
-    embedded: null
+    embedded: null,
+    builtinPrimary: false
   },
   'codex-cli': {
     kind: 'codex-cli',
     label: 'Codex CLI',
     transport: 'native-cli',
-    embedded: null
+    embedded: null,
+    builtinPrimary: false
   },
   'deepseek-harness': {
     kind: 'deepseek-harness',
     label: 'DSH',
     transport: 'native-cli',
-    embedded: null
-  },
-  pi: {
-    kind: 'pi',
-    label: 'Pi',
-    transport: 'native-cli',
-    embedded: { transport: 'embedded-pi', availability: 'from-host' }
+    embedded: null,
+    builtinPrimary: false
   }
 }
 
@@ -219,6 +233,110 @@ export function assistantRuntimeChoice(
     },
     ...(kind === 'pi' ? { piPurge: structuredClone(kept?.piPurge ?? { mode: 'off', persona: '' }) } : {})
   }
+}
+
+// ------------------------------------------------- Pi Purge file-policy facts
+
+/**
+ * Permission key Core reads before it will stage a Pi Purge Append Run.
+ * Mirrors `PI_FILE_ACCESS_KEY` (crates/rovai-core/src/pi/file_grant.rs:57).
+ */
+export const PI_FILE_ACCESS_KEY = 'loom_file_access'
+
+/**
+ * The three guarded `loom_file_access` policies Core accepts for Append; `native`,
+ * an absent value and any unreadable value are all refused there
+ * (agent_profile.rs:497-516 `pi_purge_append_without_file_grant`).
+ */
+export const PI_PURGE_FILE_ACCESS = [
+  'workspace_read_only',
+  'workspace_read_write',
+  'workspace_workflow'
+] as const
+
+/** The one guarded policy this surface offers as a one-click repair. */
+export const PI_PURGE_FILE_ACCESS_FIX = 'workspace_read_write'
+
+/**
+ * The mode Core would read out of `permissions.values`, by the same strictness:
+ * absent → `native` (legacy, never migrated); a bare mode string or an object
+ * with exactly one `mode` key → that mode; anything else → unreadable.
+ * See `mode_from_permissions` (pi/file_grant.rs:119-149).
+ */
+function piFileAccessMode(values: Record<string, unknown>): string {
+  const raw = values[PI_FILE_ACCESS_KEY]
+  if (raw === undefined) return 'native'
+  if (typeof raw === 'string') return raw
+  if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
+    // Exactly one `mode` key: an extra key is an error in Core, not a wider policy.
+    const keys = Object.keys(raw)
+    const mode = (raw as Record<string, unknown>).mode
+    return keys.length === 1 && keys[0] === 'mode' && typeof mode === 'string' ? mode : 'unreadable'
+  }
+  return 'unreadable'
+}
+
+function guardsPiPurgeAppend(values: Record<string, unknown>): boolean {
+  const mode = piFileAccessMode(values)
+  return (PI_PURGE_FILE_ACCESS as readonly string[]).includes(mode)
+}
+
+/**
+ * True exactly when Core would answer this draft with
+ * `pi_purge_requires_file_grant`: Append is selected and the file policy is
+ * `native`, absent or unreadable. Configuration-time warning only — Core stays
+ * the authority and never has this draft silently widened for it.
+ */
+export function piPurgeNeedsFileGrant(choice: MemberRuntimeConfiguration | null): boolean {
+  if (!choice || choice.adapterKind !== 'pi' || choice.piPurge?.mode !== 'append') return false
+  return !guardsPiPurgeAppend(choice.permissions.values)
+}
+
+/** The one-click repair the caller offers next to that warning. */
+export function withPiPurgeFileGrant(
+  choice: MemberRuntimeConfiguration
+): MemberRuntimeConfiguration {
+  return {
+    ...choice,
+    permissions: {
+      ...choice.permissions,
+      values: { ...choice.permissions.values, [PI_FILE_ACCESS_KEY]: PI_PURGE_FILE_ACCESS_FIX }
+    }
+  }
+}
+
+/**
+ * The values a *new* assistant starts from: the installation's own defaults.
+ *
+ * One Pi exception: an absent `loom_file_access` is read by Core as `native`
+ * (pi/file_grant.rs:125-127), and `native` makes Pi Purge Append unsavable, so a
+ * fresh Pi assistant starts at `workspace_read_write` instead of inheriting a
+ * policy nobody chose. A default that is already guarded is kept as reported,
+ * and no other Runtime, model or permission value is touched.
+ */
+export function assistantRuntimeSetupDefaults(
+  option: AssistantRuntimeOption
+): MemberRuntimeConfiguration | null {
+  if (!option.defaults) return null
+  const value = structuredClone(option.defaults)
+  if (option.kind !== 'pi' || guardsPiPurgeAppend(value.permissions.values)) return value
+  return withPiPurgeFileGrant(value)
+}
+
+/**
+ * The one-line Runtime fact a Runtime picker shows under each Runtime name.
+ * Pi is the built-in primary assistant, so an unusable Pi says what to connect
+ * instead of the generic 「主机尚未发现」 nobody can act on.
+ */
+export function assistantRuntimeAvailabilityLabel(option: AssistantRuntimeOption): string {
+  const builtinPrimary = ASSISTANT_RUNTIME_REGISTRY[option.kind].builtinPrimary
+  if (!option.usable) {
+    return builtinPrimary
+      ? '内置主助手需要连接本机 Pi 运行环境'
+      : option.installation ? '需要检查配置' : '主机尚未发现'
+  }
+  const models = `${option.models.length} 个可选模型${option.models.length === 0 ? ' · 默认模型需运行验证' : ''}`
+  return builtinPrimary ? `内置 · 主助手默认大脑 · ${models}` : models
 }
 
 /** Save one exact-version Runtime choice; returns the receipt's new profile version. */

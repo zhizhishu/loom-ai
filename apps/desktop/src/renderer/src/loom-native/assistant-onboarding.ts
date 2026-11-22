@@ -19,7 +19,7 @@ export type AssistantSetupAttempt = {
   runtimeCommandId: string
   roomCommandId: string
   agentId?: string
-  runtimeEnvelope?: { agentId: string; expectedVersion: number; adapterKind: MemberRuntimeConfiguration['adapterKind']; model: MemberRuntimeConfiguration['model']; permissions: MemberRuntimeConfiguration['permissions'] }
+  runtimeEnvelope?: { agentId: string; expectedVersion: number; adapterKind: MemberRuntimeConfiguration['adapterKind']; model: MemberRuntimeConfiguration['model']; permissions: MemberRuntimeConfiguration['permissions']; piPurge?: MemberRuntimeConfiguration['piPurge'] }
   runtimeSaved?: boolean
   capabilitiesSaved?: boolean
   threadId?: string
@@ -40,6 +40,10 @@ export function setupProblems(draft: AssistantSetupDraft, existingNames: readonl
   if (draft.identity.name.length > 40) issues.push('助手名称不能超过40个字符。')
   if (existingNames.some(value => value.trim().toLocaleLowerCase() === draft.identity.name.trim().toLocaleLowerCase())) issues.push('这个名字已被使用，请换一个名字。')
   if (draft.runtime && draft.runtime.permissions.adapterKind !== draft.runtime.adapterKind) issues.push('权限配置与所选运行端不一致。')
+  // Core refuses an Append Run without a persona body, and the wizard saves the whole
+  // Runtime document in one command, so the draft stops here instead of failing later.
+  const purge = draft.runtime?.piPurge ?? null
+  if (purge?.mode === 'append' && !purge.persona.trim()) issues.push('追加人格（Append）需要填写助手设定。')
   if (!draft.runtime && draft.capabilityKeys.some(key => key.startsWith('hook:'))) issues.push('选择运行端之后才能确认 Hook 的执行范围。')
   return issues
 }
@@ -58,7 +62,7 @@ export async function finishAssistantSetup(environment: BusinessEnvironment, dra
   attempt.agentId = agent.agentId
   onProgress?.(attempt)
   if (draft.runtime && !attempt.runtimeSaved) {
-    attempt.runtimeEnvelope ??= { agentId:agent.agentId, expectedVersion:agent.version, adapterKind:draft.runtime.adapterKind, model:structuredClone(draft.runtime.model), permissions:structuredClone(draft.runtime.permissions) }
+    attempt.runtimeEnvelope ??= { agentId:agent.agentId, expectedVersion:agent.version, adapterKind:draft.runtime.adapterKind, model:structuredClone(draft.runtime.model), permissions:structuredClone(draft.runtime.permissions), ...(draft.runtime.adapterKind === 'pi' && draft.runtime.piPurge ? { piPurge:structuredClone(draft.runtime.piPurge) } : {}) }
     onProgress?.(attempt)
     const result = await client.request<StoredCommandResult>('members.runtime.set', { commandId:attempt.runtimeCommandId, command:attempt.runtimeEnvelope })
     if (!result || result.status !== 'applied') throw new Error(result?.code ? `运行配置未保存：${result.code}` : '运行配置结果尚未确认，重试将核对同一次请求。')

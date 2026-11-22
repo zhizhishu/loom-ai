@@ -52,6 +52,20 @@ describe('assistant setup is one resumable user operation',()=>{
   expect(vi.mocked(env.client.request).mock.calls[1]).toEqual(first)
   expect(first[0]).toBe('members.runtime.set')
  })
+ it('carries the Pi persona in the one Runtime document and refuses an empty Append',async()=>{
+  const piRuntime={...runtime,piPurge:{mode:'append' as const,persona:'Be concise and cite evidence.'}}
+  const value={...draft(),runtime:piRuntime}
+  expect(setupProblems(value)).toEqual([])
+  const env=environment()
+  await finishAssistantSetup(env,value,newSetupAttempt(value))
+  const call=vi.mocked(env.client.request).mock.calls[0] as unknown as [string,{command:Record<string,unknown>}]
+  expect(call[0]).toBe('members.runtime.set')
+  expect(call[1].command.piPurge).toEqual({mode:'append',persona:'Be concise and cite evidence.'})
+  expect(call[1].command.permissions).toEqual(piRuntime.permissions)
+  const empty={...draft(),runtime:{...runtime,piPurge:{mode:'append' as const,persona:'  '}}}
+  expect(setupProblems(empty)).toContain('追加人格（Append）需要填写助手设定。')
+  await expect(finishAssistantSetup(environment(),empty,newSetupAttempt(empty))).rejects.toThrow('Append')
+ })
  it('does not accept edits to a definition whose command may already be running',async()=>{
   const value=draft(),attempt=newSetupAttempt(value)
   await expect(finishAssistantSetup(environment(),{...value,identity:{...value.identity,name:'Other'}},attempt)).rejects.toThrow('原配置')
