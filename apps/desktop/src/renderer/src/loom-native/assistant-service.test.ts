@@ -12,12 +12,17 @@ import {
   AssistantCreateRejected,
   assistantIdentityDraft,
   assistantIdentityOf,
+  assistantRuntimeAvailabilityLabel,
   assistantRuntimeChoice,
   assistantRuntimePort,
+  assistantRuntimeSetupDefaults,
   createAssistant,
+  piPurgeNeedsFileGrant,
   readAssistantRuntimeOptions,
   saveAssistantIdentity,
-  saveAssistantRuntime
+  saveAssistantRuntime,
+  withPiPurgeFileGrant,
+  type AssistantRuntimeOption
 } from './assistant-service'
 
 const model = {
@@ -138,13 +143,15 @@ function client(request: unknown): ThreadClient {
 }
 
 describe('assistant Runtime registry', () => {
-  it('offers exactly the four approved Core ids and claims nothing about installation', () => {
-    expect([...ASSISTANT_RUNTIME_KINDS]).toEqual(['claude-code-cli', 'codex-cli', 'deepseek-harness', 'pi'])
+  it('lists Pi first as the built-in primary brain and still claims nothing about installation', () => {
+    expect([...ASSISTANT_RUNTIME_KINDS]).toEqual(['pi', 'claude-code-cli', 'codex-cli', 'deepseek-harness'])
     for (const kind of ASSISTANT_RUNTIME_KINDS) {
       const port = ASSISTANT_RUNTIME_REGISTRY[kind]
       expect(port.kind).toBe(kind)
       expect(port.transport).toBe('native-cli')
-      expect(Object.keys(port).sort()).toEqual(['embedded', 'kind', 'label', 'transport'])
+      expect(Object.keys(port).sort()).toEqual(['builtinPrimary', 'embedded', 'kind', 'label', 'transport'])
+      // 主助手默认大脑 is a placement fact for Pi only; it is never an install claim.
+      expect(port.builtinPrimary).toBe(kind === 'pi')
     }
     expect(ASSISTANT_RUNTIME_REGISTRY.pi.embedded).toEqual({ transport: 'embedded-pi', availability: 'from-host' })
     expect(ASSISTANT_RUNTIME_REGISTRY['codex-cli'].embedded).toBeNull()
@@ -162,7 +169,10 @@ describe('assistant Runtime catalogue', () => {
     const options = await readAssistantRuntimeOptions(client(request))
     expect(request).toHaveBeenCalledWith('runtime.installations.list')
     expect(options.map(option => option.kind)).toEqual([...ASSISTANT_RUNTIME_KINDS])
-    const claude = options[0]!
+    // Pi is listed first because it is the built-in primary brain, not because it is installed.
+    expect(options[0]!.kind).toBe('pi')
+    expect(options[0]!.usable).toBe(false)
+    const claude = options.find(option => option.kind === 'claude-code-cli')!
     expect(claude.installation?.id).toBe('installation-claude')
     expect(claude.usable).toBe(true)
     expect(claude.models).toEqual([model])
@@ -184,19 +194,22 @@ describe('assistant Runtime catalogue', () => {
   })
 
   it('does not treat a custom-scope install, a disabled install or foreign defaults as usable', async () => {
-    const custom = await readAssistantRuntimeOptions(client(vi.fn(async () => [
+    // The catalogue lists Pi first (built-in primary assistant), so the Runtime under
+    // test is looked up by kind: an index would silently assert against Pi instead.
+    const claudeOf = (rows: AssistantRuntimeOption[]) => rows.find(row => row.kind === 'claude-code-cli')!
+    const custom = claudeOf(await readAssistantRuntimeOptions(client(vi.fn(async () => [
       installation({ id: 'custom', installationClass: 'custom' })
-    ])))
-    expect(custom[0]!.installation).toBeNull()
-    expect(custom[0]!.usable).toBe(false)
+    ]))))
+    expect(custom.installation).toBeNull()
+    expect(custom.usable).toBe(false)
 
-    const disabled = await readAssistantRuntimeOptions(client(vi.fn(async () => [
+    const disabled = claudeOf(await readAssistantRuntimeOptions(client(vi.fn(async () => [
       installation({ id: 'disabled', enabled: false })
-    ])))
-    expect(disabled[0]!.installation?.id).toBe('disabled')
-    expect(disabled[0]!.usable).toBe(false)
+    ]))))
+    expect(disabled.installation?.id).toBe('disabled')
+    expect(disabled.usable).toBe(false)
 
-    const foreign = await readAssistantRuntimeOptions(client(vi.fn(async () => [
+    const foreign = claudeOf(await readAssistantRuntimeOptions(client(vi.fn(async () => [
       installation({
         id: 'foreign-defaults',
         memberRuntimeDefaults: {
@@ -205,14 +218,54 @@ describe('assistant Runtime catalogue', () => {
           permissions: { ...defaults.permissions, adapterKind: 'codex-cli' }
         }
       })
-    ])))
-    expect(foreign[0]!.installation?.id).toBe('foreign-defaults')
-    expect(foreign[0]!.defaults).toBeNull()
-    expect(foreign[0]!.usable).toBe(false)
+    ]))))
+    expect(foreign.installation?.id).toBe('foreign-defaults')
+    expect(foreign.defaults).toBeNull()
+    expect(foreign.usable).toBe(false)
   })
 
   it('fails instead of inventing a catalogue when the read returns nothing usable', async () => {
     await expect(readAssistantRuntimeOptions(client(vi.fn(async () => null)))).rejects.toThrow('智能体安装列表')
+  })
+
+  it('names Pi as the built-in primary brain in every installation state', async () => {
+    const piDefaults: MemberRuntimeConfiguration = {
+      adapterKind: 'pi', model: { mode: 'runtime_default' },
+      permissions: { adapterKind: 'pi', schemaVersion: 1, values: {} }
+    }
+    const installedPi = await readAssistantRuntimeOptions(client(vi.fn(async () => [
+      installation({ adapterKind: 'pi', memberRuntimeDefaults: piDefaults })
+    ])))
+    const live = installedPi.find(option => option.kind === 'pi')!
+    expect(live.usable).toBe(true)
+    expect(assistantRuntimeAvailabilityLabel(live)).toBe('内置 · 主助手默认大脑 · 1 个可选模型')
+
+    const noModels = await readAssistantRuntimeOptions(client(vi.fn(async () => [
+      installation({
+        adapterKind: 'pi',
+        memberRuntimeDefaults: piDefaults,
+        snapshot: { ...installation().snapshot!, models: [] }
+      })
+    ])))
+    expect(assistantRuntimeAvailabilityLabel(noModels.find(option => option.kind === 'pi')!))
+      .toBe('内置 · 主助手默认大脑 · 0 个可选模型 · 默认模型需运行验证')
+
+    // A machine without Pi gets an instruction, not a grey row that never explains itself.
+    const absent = await readAssistantRuntimeOptions(client(vi.fn(async () => [])))
+    expect(assistantRuntimeAvailabilityLabel(absent.find(option => option.kind === 'pi')!))
+      .toBe('内置主助手需要连接本机 Pi 运行环境')
+    expect(assistantRuntimeAvailabilityLabel(absent.find(option => option.kind === 'claude-code-cli')!))
+      .toBe('主机尚未发现')
+
+    // Every other Runtime keeps its existing wording: found but not ready, then ready.
+    const notReady = await readAssistantRuntimeOptions(client(vi.fn(async () => [
+      installation({ enabled: false })
+    ])))
+    expect(assistantRuntimeAvailabilityLabel(notReady.find(option => option.kind === 'claude-code-cli')!))
+      .toBe('需要检查配置')
+    const ready = await readAssistantRuntimeOptions(client(vi.fn(async () => [installation()])))
+    expect(assistantRuntimeAvailabilityLabel(ready.find(option => option.kind === 'claude-code-cli')!))
+      .toBe('1 个可选模型')
   })
 })
 
@@ -330,6 +383,106 @@ describe('assistant Runtime choice and save', () => {
       client: client(stale), agent: profile,
       choice: assistantRuntimeChoice(profile, 'claude-code-cli', installation())!
     })).rejects.toThrow('无法确认最新版本')
+  })
+})
+
+describe('Pi Purge file policy', () => {
+  const piChoice = (
+    values: Record<string, unknown>,
+    mode: 'off' | 'append' = 'append'
+  ): MemberRuntimeConfiguration => ({
+    adapterKind: 'pi',
+    model: { mode: 'runtime_default' },
+    permissions: { adapterKind: 'pi', schemaVersion: 1, values },
+    piPurge: { mode, persona: 'Be concise and cite evidence.' }
+  })
+
+  const piOption = (values: Record<string, unknown> | null): AssistantRuntimeOption => ({
+    kind: 'pi',
+    label: 'Pi',
+    installation: null,
+    usable: true,
+    models: [],
+    permissionOptions: [],
+    permissionSchemaVersion: 1,
+    defaults: values === null ? null : {
+      adapterKind: 'pi',
+      model: { mode: 'runtime_default' },
+      permissions: { adapterKind: 'pi', schemaVersion: 1, values }
+    }
+  })
+
+  it('warns exactly where Core answers pi_purge_requires_file_grant', () => {
+    // Rows mirror the Core unit test agent_profile.rs:6447-6456.
+    const rows: Array<[string, Record<string, unknown>, boolean]> = [
+      ['read only', { loom_file_access: 'workspace_read_only' }, false],
+      ['read write', { loom_file_access: 'workspace_read_write' }, false],
+      ['read write object', { loom_file_access: { mode: 'workspace_read_write' } }, false],
+      ['workflow', { loom_file_access: 'workspace_workflow' }, false],
+      ['absent means native', {}, true],
+      ['native', { loom_file_access: 'native' }, true],
+      ['native object', { loom_file_access: { mode: 'native' } }, true],
+      ['unknown mode', { loom_file_access: 'workspace' }, true],
+      ['extra key is an error', { loom_file_access: { mode: 'workspace_read_write', tools: ['read'] } }, true]
+    ]
+    for (const [label, values, warns] of rows) {
+      expect(`${label}:${piPurgeNeedsFileGrant(piChoice(values))}`).toBe(`${label}:${warns}`)
+    }
+  })
+
+  it('never warns for Off, a missing Purge preference or another Runtime', () => {
+    expect(piPurgeNeedsFileGrant(piChoice({}, 'off'))).toBe(false)
+    expect(piPurgeNeedsFileGrant({ ...piChoice({}), piPurge: null })).toBe(false)
+    const noPurge = piChoice({})
+    delete noPurge.piPurge
+    expect(piPurgeNeedsFileGrant(noPurge)).toBe(false)
+    expect(piPurgeNeedsFileGrant(null)).toBe(false)
+    expect(piPurgeNeedsFileGrant({
+      ...piChoice({}),
+      adapterKind: 'claude-code-cli',
+      permissions: { adapterKind: 'claude-code-cli', schemaVersion: 1, values: {} }
+    })).toBe(false)
+  })
+
+  it('raises only the file policy in one click and keeps the rest of the draft', () => {
+    const draft = piChoice({ permission_mode: 'plan', loom_file_access: 'native' })
+    const repaired = withPiPurgeFileGrant(draft)
+    expect(repaired.permissions.values).toEqual({
+      permission_mode: 'plan',
+      loom_file_access: 'workspace_read_write'
+    })
+    expect(repaired.piPurge).toEqual(draft.piPurge)
+    expect(repaired.model).toEqual(draft.model)
+    expect(piPurgeNeedsFileGrant(repaired)).toBe(false)
+    // The original draft is not mutated: Core's refusal still sees what the user chose.
+    expect(draft.permissions.values.loom_file_access).toBe('native')
+  })
+
+  it('starts a new Pi assistant at workspace_read_write instead of an unchosen native policy', () => {
+    const empty = assistantRuntimeSetupDefaults(piOption({}))!
+    expect(empty.permissions.values).toEqual({ loom_file_access: 'workspace_read_write' })
+    expect(empty.adapterKind).toBe('pi')
+    expect(empty.model).toEqual({ mode: 'runtime_default' })
+
+    const native = assistantRuntimeSetupDefaults(piOption({ loom_file_access: 'native' }))!
+    expect(native.permissions.values).toEqual({ loom_file_access: 'workspace_read_write' })
+
+    // A default the Host already guards is kept as reported, and other values survive.
+    const readOnly = assistantRuntimeSetupDefaults(piOption({ loom_file_access: 'workspace_read_only', other: 1 }))!
+    expect(readOnly.permissions.values).toEqual({ loom_file_access: 'workspace_read_only', other: 1 })
+
+    // Nothing else is rewritten, and no default is invented.
+    const claude = assistantRuntimeSetupDefaults({
+      ...piOption({}),
+      kind: 'claude-code-cli',
+      defaults: {
+        adapterKind: 'claude-code-cli',
+        model: { mode: 'runtime_default' },
+        permissions: { adapterKind: 'claude-code-cli', schemaVersion: 1, values: {} }
+      }
+    })!
+    expect(claude.permissions.values).toEqual({})
+    expect(assistantRuntimeSetupDefaults(piOption(null))).toBeNull()
   })
 })
 

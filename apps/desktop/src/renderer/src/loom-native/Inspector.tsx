@@ -167,7 +167,7 @@ export function Inspector({ agents, bundles, agent, mode, tab, onMode, onClose, 
     })}</div>
     return group === '已完成' ? <details key={group} className="ln-completed-group"><summary><span>{group}（{rows.length}）</span><i/><Icon name="right" size={13}/></summary>{list}</details>
       : <section key={group} className="ln-work-group"><h3>{group}（{rows.length}）<i/></h3>{list}</section>
-  })}{!shown.length && <div className="ln-dock-empty"><Icon name="board" size={30}/><strong>{loading ? '正在读取工作' : query || owner ? '没有匹配的工作' : '从一个目标开始'}</strong><p>{scope === 'conversation' && threadId ? '这段对话还没有关联的任务。创建工作后，就能在这里跟进分工和成果。' : '把目标交给主助手，分工、待你处理的决定和成果都会出现在这里。'}</p>{onCreateWork && !loading && <button type="button" className="ln-action" onClick={onCreateWork}>创建一项工作</button>}{scope === 'conversation' && threadId && <button type="button" className="ln-text-action" onClick={() => setScope('all')}>查看所有工作</button>}</div>}</div>
+  })}{!shown.length && <div className="ln-dock-empty"><Icon name="board" size={30}/><strong>{loading ? '正在读取工作' : query || owner ? '没有匹配的工作' : '从一个目标开始'}</strong><p>{scope === 'conversation' && threadId ? '这段对话还没有关联的任务。创建工作后，就能在这里跟进分工和成果。' : '把目标交给协调助手，分工、待你处理的决定和成果都会出现在这里。'}</p>{onCreateWork && !loading && <button type="button" className="ln-action" onClick={onCreateWork}>创建一项工作</button>}{scope === 'conversation' && threadId && <button type="button" className="ln-text-action" onClick={() => setScope('all')}>查看所有工作</button>}</div>}</div>
   return <aside className={`ln-inspector ln-workspace-dock${expanded ? ' is-expanded' : ''}`} aria-label="工作空间面板">
     {/* Current-conversation identity: the real member avatar, never a stand-in
         illustration. Header and tabs keep their own fixed rows below it. */}

@@ -151,7 +151,8 @@ describe('readRuntimeSetup', () => {
     if (read.status !== 'ready') throw new Error('expected ready')
     expect(read.cards.map((card) => card.runtimeKind)).toEqual([...PRODUCT_RUNTIME_KINDS])
     expect(read.platform).toBe('windows-x64')
-    expect(read.cards[0].displayName).toBe('Claude Code')
+    // Pi leads the fixed order because it is the built-in primary assistant's brain.
+    expect(read.cards[0].displayName).toBe('Pi')
   })
 
   it('does not go green from a found path, an enabled install and defaults', async () => {

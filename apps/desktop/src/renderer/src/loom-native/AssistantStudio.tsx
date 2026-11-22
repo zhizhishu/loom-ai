@@ -11,7 +11,8 @@ import { AssistantCapabilityEditor } from './AssistantCapabilityEditor'
 import { ExecutionPanel } from './ExecutionPanel'
 import {
   ASSISTANT_RUNTIME_REGISTRY, assistantIdentityOf, assistantRuntimeChoice,
-  createAssistant, readAssistantRuntimeOptions, saveAssistantIdentity, saveAssistantRuntime,
+  createAssistant, piPurgeNeedsFileGrant, readAssistantRuntimeOptions, saveAssistantIdentity,
+  saveAssistantRuntime, withPiPurgeFileGrant,
   type AssistantIdentity, type AssistantRuntimeKind, type AssistantRuntimeOption
 } from './assistant-service'
 
@@ -24,7 +25,10 @@ export function AssistantStudio({ open, environment, agents, initialAgentId, thr
 }) {
   const [selected, setSelected] = useState<string | null>(null)
   const [local, setLocal] = useState<AgentProfile | null>(null)
-  const [tab, setTab] = useState<'identity' | 'capabilities' | 'runtime' | 'location'>('identity')
+  // `persona` is Pi Purge, moved out of 「运行与权限」 so the built-in primary
+  // assistant's character has its own place instead of a third-level fold below
+  // the model selectors.
+  const [tab, setTab] = useState<'identity' | 'capabilities' | 'runtime' | 'persona' | 'location'>('identity')
   const [identity, setIdentity] = useState<AssistantIdentity>(blankIdentity)
   const [baseline, setBaseline] = useState('')
   const [options, setOptions] = useState<AssistantRuntimeOption[]>([])
@@ -113,6 +117,22 @@ export function AssistantStudio({ open, environment, agents, initialAgentId, thr
     } catch (cause) { if (ticket === generation.current) setError(cause instanceof Error ? cause.message : '配置未保存，请核对后重试。') }
     finally { if (ticket === generation.current) setBusy(false) }
   }
+  // A Pi Purge Append draft can only be applied when Core issues a workspace file
+  // grant, and that needs a guarded `loom_file_access` mode. The saved config is
+  // echoed below, never the draft, so “保存了没有生效” and “没保存” stay distinguishable.
+  const savedPurge = local?.runtimeConfiguration?.adapterKind === 'pi'
+    ? local.runtimeConfiguration.piPurge ?? null
+    : null
+  const draftPurge = runtime?.adapterKind === 'pi' ? runtime.piPurge ?? null : null
+  const purgeDirty = JSON.stringify(draftPurge) !== JSON.stringify(savedPurge)
+  // 口径照上游 pi-purge.ts:263（`已开启（${mode}），每轮注入 ${body.length} 字符`）。
+  const purgeStatus = !savedPurge || savedPurge.mode === 'off'
+    ? '已保存：关闭（Off）— 不注入人格，只使用 Pi 原始系统提示词。'
+    : `已保存：追加（Append）— 每轮注入 ${savedPurge.persona.length} 字符，并保留 Pi 原始系统提示词。`
+  // Both 「运行与权限」and 「人格」save through one path, so a permission change
+  // (including the one-click Pi file grant) still gets its own confirmation.
+  const requestSave = () => { if (changedDangerous.length) setDangerConfirm(true); else void saveRuntime() }
+  const saveDisabled = !runtimeDirty || !runtime || busy || !option?.usable
   const permissionField = (descriptor: PermissionOptionDescriptor) => {
     const value = runtime?.permissions.values[descriptor.key]
     const disabled = !descriptor.supported || busy
@@ -125,13 +145,20 @@ export function AssistantStudio({ open, environment, agents, initialAgentId, thr
       <small>{descriptor.unsupportedReason || descriptor.description}{descriptor.risk !== 'normal' ? ' · 变更前将单独确认范围' : ''}</small>
     </label>
   }
+  // The one-click repair sits next to whichever tab the user is editing, because
+  // the append switch (人格) and the file policy (运行与权限) are two tabs apart.
+  const purgeGrantWarning = piPurgeNeedsFileGrant(runtime) ? <section className="ln-review-card" aria-label="Pi Purge 文件权限提示">
+    <h3>追加（Append）需要工作目录文件权限</h3>
+    <p>当前「文件与任务权限」是原生或未设置，Core 会在保存时拒绝这个组合（pi_purge_requires_file_grant）。</p>
+    <button type="button" className="ln-action" disabled={busy} onClick={() => setRuntime(current => current ? withPiPurgeFileGrant(current) : current)}>设为读写工作目录</button>
+  </section> : null
   return <SurfaceDialog open={open} title="你的助手" description="每位助手有自己的职责、能力和运行方式。" theme={theme} onClose={() => guard(onClose)} className="ln-studio">
     <div className="ln-studio-layout"><aside className="ln-studio-roster" aria-label="助手名单">
       {roster.map(agent => <button type="button" className={`ln-studio-person ${selected === agent.agentId ? 'is-selected' : ''}`} key={agent.agentId} onClick={() => guard(() => choose(agent))}><Avatar agent={agent} size={32}/><span><strong>{agent.displayName}</strong><small>{agent.teamRole || '助手'}</small></span></button>)}
       <button type="button" className={`ln-studio-person ${!selected ? 'is-selected' : ''}`} onClick={() => guard(() => choose(null))}><Icon name="plus" size={25}/><span><strong>新建助手</strong></span></button>
     </aside><div className="ln-studio-main">{!local ? <AssistantCreateWizard environment={environment} agents={agents} theme={theme} onDirtyChange={setCapDirty} onBusyChange={setWizardBusy} onOpenConnections={onOpenConnections}
       onCreated={async (created, threadId) => { choose(created); await onRefresh(); if (threadId && onCreatedConversation) { onClose(); await onCreatedConversation(threadId) } }} /> : <><div className="ln-studio-identity"><Avatar agent={local} name={identity.name || '新助手'} size={48}/><div><h3>{local?.displayName || '新助手'}</h3><p>{local ? local.teamRole || '定义职责，配好能力，再开始协作。' : '从用途开始，不需要写很长的提示词。'}</p></div></div>
-      <nav className="ln-segment-tabs ln-studio-tabs" aria-label="助手配置分区">{(['identity','capabilities','runtime','location'] as const).map((value,index) => <button type="button" key={value} className={tab === value ? 'is-selected' : ''} disabled={!local && value !== 'identity'} onClick={() => guard(() => setTab(value))}>{['资料','能力','运行与权限','工作位置'][index]}</button>)}</nav>
+      <nav className="ln-segment-tabs ln-studio-tabs" aria-label="助手配置分区">{(['identity','capabilities','runtime','persona','location'] as const).map((value,index) => <button type="button" key={value} className={tab === value ? 'is-selected' : ''} disabled={!local && value !== 'identity'} onClick={() => guard(() => setTab(value))}>{['资料','能力','运行与权限','人格','工作位置'][index]}</button>)}</nav>
       <div className="ln-studio-content">
         {tab === 'identity' && <>
           <div className="ln-field-grid"><label className="ln-field"><span>名称</span><input aria-label="助手名称" value={identity.name} maxLength={40} onChange={event => patch({ name: event.target.value })} placeholder="给它一个名字"/></label><label className="ln-field"><span>职责</span><input aria-label="助手职责" value={identity.role} maxLength={120} onChange={event => patch({ role: event.target.value })} placeholder="例如：前端工程师"/></label></div>
@@ -156,18 +183,25 @@ export function AssistantStudio({ open, environment, agents, initialAgentId, thr
               ...option.models.filter(model => !model.hidden && !model.deprecated).map(model => ({ value:model.id,label:model.displayName || model.id }))
             ]}/>{runtime.model.mode === 'explicit' && !option.models.some(model => runtime.model.mode === 'explicit' && model.id === runtime.model.modelId) && <small>当前已保存的模型不在最新目录中：{runtime.model.modelId}。不会自动换成其他模型。</small>}</label>
             {explicitModel && selectedModel?.options.map(modelOption => <label className="ln-field" key={modelOption.key}><span>{modelOption.label}</span><ChoiceMenu theme={theme} label={modelOption.label} value={String(explicitModel.options[modelOption.key] ?? modelOption.defaultValue ?? '')} disabled={busy} onChange={value => setRuntime(current => current?.model.mode === 'explicit' ? { ...current, model: { ...current.model, options: { ...current.model.options, [modelOption.key]:value } } } : current)} choices={modelOption.values.map(choice => ({value:choice.value,label:choice.label}))}/></label>)}
-            {runtime.adapterKind === 'pi' && <section className="ln-review-card" aria-label="Pi Purge 人格扩展">
-              <div className="ln-panel-title"><h3>Pi Purge · 助手设定</h3></div>
-              <label className="ln-field"><span>启用方式</span><ChoiceMenu label="Pi Purge 模式" theme={theme} value={runtime.piPurge?.mode ?? 'off'} disabled={busy} onChange={value => updatePiPurge({mode: value as 'off' | 'append'})} choices={[{ value:'off', label:'关闭' }, { value:'append', label:'追加助手设定' }]}/></label>
-              <label className="ln-field"><span>角色与偏好</span><textarea aria-label="Pi Purge 人格提示词" rows={4} maxLength={16 * 1024} disabled={busy} value={runtime.piPurge?.persona ?? ''} placeholder="写清这个助手的角色、表达风格和任务偏好" onChange={event => updatePiPurge({persona:event.target.value})}/><small>保存后从下次运行开始生效，仅用于当前助手。</small></label>
-            </section>}
             <div className="ln-panel-title"><h3>权限与确认方式</h3></div>
             {option.permissionOptions.length ? option.permissionOptions.map(permissionField) : <FormMessage>当前运行端没有提供可编辑的权限选项。实际操作仍以运行时授权为准。</FormMessage>}
+            {purgeGrantWarning}
             <FormMessage>运行中需要授权时，会在对话里向你确认。</FormMessage>
           </>}
           {error && <FormMessage error>{error}</FormMessage>}{message && <FormMessage>{message}</FormMessage>}
-          <footer className="ln-form-actions"><small>新配置从下次运行开始生效。</small><button type="button" className="ln-action is-primary" disabled={!runtimeDirty || !runtime || busy || !option?.usable} onClick={() => { if (changedDangerous.length) setDangerConfirm(true); else void saveRuntime() }}>{busy ? '保存中…' : '保存运行配置'}</button></footer>
+          <footer className="ln-form-actions"><small>新配置从下次运行开始生效。{runtime?.adapterKind === 'pi' ? '人格设定在「人格」里。' : ''}</small><button type="button" className="ln-action is-primary" disabled={saveDisabled} onClick={requestSave}>{busy ? '保存中…' : '保存运行配置'}</button></footer>
         </>}
+        {tab === 'persona' && local && (runtime?.adapterKind === 'pi' ? <>
+          <div className="ln-panel-title"><h3>人格 · Pi Purge</h3><small>只作用于这个 Pi 助手</small></div>
+          <p className="ln-native-help">追加（Append）把下面的设定放在 Pi 原始系统提示词前面，不改写宿主提示词，也不扩大工具与文件授权。</p>
+          <section className="ln-review-card" aria-label="Pi Purge 人格扩展">
+            <label className="ln-field"><span>启用方式</span><ChoiceMenu label="Pi Purge 模式" theme={theme} value={runtime.piPurge?.mode ?? 'off'} disabled={busy} onChange={value => updatePiPurge({mode: value as 'off' | 'append'})} choices={[{ value:'off', label:'关闭', description:'Off' }, { value:'append', label:'追加助手设定', description:'Append' }]}/></label>
+            <label className="ln-field"><span>角色与偏好</span><textarea aria-label="Pi Purge 人格提示词" rows={6} maxLength={16 * 1024} disabled={busy} value={runtime.piPurge?.persona ?? ''} placeholder="写清这个助手的角色、表达风格和任务偏好" onChange={event => updatePiPurge({persona:event.target.value})}/><small>{purgeStatus}{purgeDirty ? ' · 有未保存修改，保存后自下次运行开始生效。' : ''}</small></label>
+          </section>
+          {purgeGrantWarning}
+          {error && <FormMessage error>{error}</FormMessage>}{message && <FormMessage>{message}</FormMessage>}
+          <footer className="ln-form-actions"><small>人格只改变表达方式，不改变这个助手的权限。</small><button type="button" className="ln-action is-primary" disabled={saveDisabled} onClick={requestSave}>{busy ? '保存中…' : '保存人格'}</button></footer>
+        </> : <FormMessage>人格扩展只用于 Pi 运行端的内置主助手。请先在「运行与权限」里选择 Pi。</FormMessage>)}
       </div></>}
     </div></div>
     {pendingAction && <UnsavedNotice onKeep={() => setPendingAction(null)} onDiscard={() => { const action = pendingAction; setPendingAction(null); setCapDirty(false); setLocationDirty(false); if (!local) { try { sessionStorage.removeItem('loom.assistant.onboarding.v1'); sessionStorage.removeItem('loom.assistant.onboarding.attempt.v1') } catch { /* browser storage may be disabled */ } } if (local) { const restored = assistantIdentityOf(local); setIdentity(restored); setBaseline(JSON.stringify(restored)); setRuntime(local.runtimeConfiguration); setRuntimeBase(JSON.stringify(local.runtimeConfiguration)); } action() }}/>}
