@@ -379,7 +379,8 @@ pub struct DeliveryWakeCounts {
     pub deferred: usize,
     /// Tickets that can never start: the Camp, membership or profile fact is gone.
     pub failed: usize,
-    /// Tickets deferred `MAX_WAKE_ATTEMPTS` times already: reported, never spun on.
+    /// Tickets deferred `MAX_WAKE_ATTEMPTS` times already: reported, never spun on. The due
+    /// predicate no longer admits them, so this counts the waiting rows the cap holds back.
     pub exhausted: usize,
 }
 
@@ -411,13 +412,52 @@ fn parse_delivery_timestamp(value: &str) -> Option<i64> {
         .map(|value| value.and_utc().timestamp_millis())
 }
 
-/// How many times a minute-cadence sweep has already looked at this ticket.
-/// upstream: Mikka d59c85cb lib/coordinator/wake-recovery.ts:WakeDeadlineTicket(`attempt`)
-fn delivery_wake_attempts(created_at: &str, now_ms: i64) -> i64 {
-    parse_delivery_timestamp(created_at)
-        .map(|created| ((now_ms - created) / DELIVERY_RECOVERY_RECHECK_MS).max(0))
-        // An unreadable deadline never claims exhaustion.
-        .unwrap_or(0)
+/// The stored wake of one Delivery row, as the due scan reads it.
+/// upstream: Mikka 250d2451 lib/coordinator/wake-recovery.ts:WakeDeadlineTicket
+#[derive(Debug, Clone)]
+struct DeliveryWakeTicket {
+    id: String,
+    /// The lane classification of the same row (invalid / claimable / blocked).
+    lane: String,
+    next_wake_at: Option<String>,
+    lease_until: Option<String>,
+}
+
+/// The persistence side of `COORDINATOR_WAKE_DUE_SQL`: a ticket is due only when its stored
+/// `nextWakeAt` has come and no live `wakeLeaseUntil` holds it. The attempt cap is a column
+/// comparison the due scan already made in SQL, so it is not repeated here.
+/// upstream: Mikka 250d2451 lib/coordinator/wake-recovery.ts:COORDINATOR_WAKE_DUE_SQL
+///
+/// A NULL instant is upstream's default (`"nextWakeAt" ... DEFAULT now()`, `"wakeLeaseUntil"`
+/// unset), and an unreadable one stops deferring rather than deferring forever, exactly like
+/// `LoomRecoveryReceipt::defers`.
+fn delivery_wake_due(now_ms: i64, next_wake_at: Option<&str>, lease_until: Option<&str>) -> bool {
+    let has_come = |value: Option<&str>| {
+        value.is_none_or(|value| {
+            parse_delivery_timestamp(value).is_none_or(|at| at <= now_ms)
+        })
+    };
+    has_come(next_wake_at) && has_come(lease_until)
+}
+
+/// Spends one wake attempt on a ticket the sweep could not start, the way upstream's failed
+/// delivery does: the attempt is counted, the lease a start would have held is released, and the
+/// next look is `nextWakeAt` away instead of the next timer tick.
+/// upstream: Mikka 250d2451 lib/coordinator/wake-recovery.ts:COORDINATOR_WAKE_DUE_SQL (`nextWakeAt`
+/// / `wakeLeaseUntil`) and lib/coordinator/wake.ts:retryCoordinatorWakes (`deferred`)
+fn defer_delivery_wake(database: &Database, delivery_id: &str, now_ms: i64) -> Result<()> {
+    // An unrepresentable instant falls back to the present: a ticket is never deferred forever
+    // by a value this Core cannot write.
+    let next_wake_at = chrono::DateTime::from_timestamp_millis(
+        now_ms.saturating_add(DELIVERY_RECOVERY_RECHECK_MS),
+    )
+    .map(|at| at.to_rfc3339())
+    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    database.connection().execute(
+        "UPDATE camp_message_delivery SET wake_attempts = wake_attempts + 1, next_wake_at = ?2,\n                 wake_lease_until = NULL, version = version + 1, updated_at = ?2\n         WHERE id = ?1 AND status = 'waiting'",
+        params![delivery_id, next_wake_at],
+    )?;
+    Ok(())
 }
 
 /// Each sweep's due time, epoch ms, exactly as large as its own condition allows.
@@ -584,50 +624,69 @@ pub fn run_delivery_recovery_pass(
 }
 
 /// The slow reconciliation sweep. It never starts work of its own — the claim sweep of the same
-/// pass does — it walks every ticket still in the durable outbox and reports what became of it, so
-/// a lost wake or a lane no Run may take is visible instead of silent. A ticket held by a live Run
-/// is re-checked at the minute cadence for at most `MAX_WAKE_ATTEMPTS`, then reported exhausted
-/// instead of being spun on.
-/// upstream: Mikka d59c85cb lib/coordinator/wake.ts:retryCoordinatorWakes
+/// pass does — it walks the tickets the wake-due predicate still admits and reports what became of
+/// them, so a lost wake or a lane no Run may take is visible instead of silent. A ticket held by a
+/// live Run spends one attempt and is re-checked when its own `nextWakeAt` comes; once the attempts
+/// are gone it leaves the due set and is only counted, never spun on.
+/// upstream: Mikka 250d2451 lib/coordinator/wake.ts:retryCoordinatorWakes
 pub fn reconcile_pending_delivery_wakes(
     database: &Database,
     deadline_ms: i64,
 ) -> Result<DeliveryWakeCounts> {
     let now = delivery_recovery_now_ms();
+    let mut counts = DeliveryWakeCounts::default();
+    // The cap is not a due term: an exhausted ticket is reported, and no later sweep visits it.
+    counts.exhausted = usize::try_from(database.connection().query_row(
+        "SELECT COUNT(*) FROM camp_message_delivery AS d
+         WHERE d.status = 'waiting' AND d.wake_attempts >= ?1",
+        [MAX_WAKE_ATTEMPTS],
+        |row| row.get::<_, i64>(0),
+    )?)
+    .unwrap_or(usize::MAX);
     let tickets = {
         let mut statement = database.connection().prepare(&format!(
             r#"
-            SELECT d.id, d.created_at,
+            SELECT d.id, d.next_wake_at, d.wake_lease_until,
                    CASE
                        WHEN {DELIVERY_LANE_INVALID_SQL} THEN 'invalid'
                        WHEN {DELIVERY_LANE_ADMISSIBLE_SQL} AND {DELIVERY_LANE_FREE_SQL} THEN 'claimable'
                        ELSE 'blocked'
                    END AS lane
             FROM camp_message_delivery AS d
-            WHERE d.status = 'waiting'
-            ORDER BY d.created_at, d.queue_sequence, d.id
-            LIMIT ?1
+            WHERE d.status = 'waiting' AND d.wake_attempts < ?1
+            ORDER BY d.next_wake_at, d.created_at, d.queue_sequence, d.id
+            LIMIT ?2
             "#
         ))?;
         statement
-            .query_map([MAX_DELIVERY_WAKE_TICKETS], |row| {
-                Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            .query_map(params![MAX_WAKE_ATTEMPTS, MAX_DELIVERY_WAKE_TICKETS], |row| {
+                Ok(DeliveryWakeTicket {
+                    id: row.get(0)?,
+                    next_wake_at: row.get(1)?,
+                    lease_until: row.get(2)?,
+                    lane: row.get(3)?,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    let mut counts = DeliveryWakeCounts::default();
-    for (created_at, lane) in tickets {
+    for ticket in tickets {
+        if !delivery_wake_due(
+            now,
+            ticket.next_wake_at.as_deref(),
+            ticket.lease_until.as_deref(),
+        ) {
+            continue;
+        }
         counts.due += 1;
-        match lane.as_str() {
+        match ticket.lane.as_str() {
             "invalid" => counts.failed += 1,
             "claimable" => counts.started += 1,
             _ => {
-                if now >= deadline_ms
-                    || delivery_wake_attempts(&created_at, now) < MAX_WAKE_ATTEMPTS
-                {
-                    counts.deferred += 1;
-                } else {
-                    counts.exhausted += 1;
+                counts.deferred += 1;
+                // A sweep past its budget starts nothing and spends nothing: upstream defers
+                // without a new attempt when the deadline has come.
+                if now < deadline_ms {
+                    defer_delivery_wake(database, &ticket.id, now)?;
                 }
             }
         }
@@ -1691,6 +1750,20 @@ fn insert_batch_run(
         "queued"
     };
     let ended_at = error_code.map(|_| now);
+    // The claim records the wake it spent and holds the lease a start would otherwise only hold in
+    // memory, so the same row cannot be woken twice by two sweeps. Upstream keeps that in
+    // `wakeAttempts` / `wakeLeaseUntil`; the lease is the recheck cadence this Core already uses.
+    // upstream: Mikka 250d2451 lib/coordinator/wake-recovery.ts:WakeDeadlineTicket
+    let wake_lease_until = parse_delivery_timestamp(now)
+        .and_then(|at| at.checked_add(DELIVERY_RECOVERY_RECHECK_MS))
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|at| at.to_rfc3339());
+    // Migration-owned columns: a fixture without them keeps its original claim behavior.
+    let delivery_wake_ready: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('camp_message_delivery') WHERE name = 'wake_attempts')",
+        [],
+        |row| row.get(0),
+    )?;
     let public_failure = match (error_code, runtime) {
         (Some("context_payload_too_large"), Some(runtime)) => Some(serde_json::to_string(
             &context_payload_too_large_failure(runtime.adapter_kind),
@@ -1822,6 +1895,20 @@ fn insert_batch_run(
                 ended_at,
             ],
         )?;
+        if delivery_wake_ready {
+            // The wake facts are migration-owned; a fixture without them keeps its old claim.
+            transaction.execute(
+                r#"
+                UPDATE camp_message_delivery
+                SET wake_attempts = wake_attempts + 1,
+                    wake_lease_until = CASE WHEN ?2 = 'claimed' THEN coalesce(?3, wake_lease_until)
+                                            ELSE wake_lease_until END,
+                    updated_at = ?4
+                WHERE id = ?1 AND status = ?2
+                "#,
+                params![delivery.id, terminal_status, wake_lease_until, now],
+            )?;
+        }
         if delivery.continuation_source_run_id.is_none() {
             transaction.execute(
                 r#"
@@ -2386,6 +2473,35 @@ mod tests {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap()
+        }
+
+        /// The persisted wake facts of one Delivery row, in upstream column order.
+        /// upstream: Mikka 250d2451 lib/coordinator/wake-recovery.ts:WakeDeadlineTicket
+        fn delivery_wake(&self, message_id: &str) -> (i64, Option<String>, Option<String>) {
+            self.database
+                .connection()
+                .query_row(
+                    "SELECT wake_attempts, next_wake_at, wake_lease_until FROM camp_message_delivery WHERE message_id = ?1",
+                    [message_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+        }
+
+        fn set_delivery_wake(
+            &self,
+            message_id: &str,
+            attempts: i64,
+            next_wake_at: Option<&str>,
+            lease_until: Option<&str>,
+        ) {
+            self.database
+                .connection()
+                .execute(
+                    "UPDATE camp_message_delivery SET wake_attempts = ?2, next_wake_at = ?3, wake_lease_until = ?4 WHERE message_id = ?1",
+                    params![message_id, attempts, next_wake_at, lease_until],
+                )
+                .unwrap();
         }
 
         fn set_delivery_created_at(&self, message_id: &str, created_at: &str) {
@@ -9512,9 +9628,10 @@ mod tests {
         );
     }
 
-    /// upstream: Mikka d59c85cb lib/coordinator/wake.ts:retryCoordinatorWakes
+    /// upstream: Mikka 250d2451 lib/coordinator/wake-recovery.ts:COORDINATOR_WAKE_DUE_SQL
     #[test]
-    fn the_reconciliation_sweep_counts_deferred_and_exhausted_tickets_instead_of_spinning() {
+    fn the_reconciliation_sweep_spends_a_persisted_attempt_and_skips_the_ticket_until_its_wake_is_due()
+    {
         let mut fixture = Fixture::new();
         fixture.enqueue("sweep-ready", "甲");
         let budget = chrono::Utc::now().timestamp_millis() + DELIVERY_WAKE_SWEEP_BUDGET_MS;
@@ -9534,26 +9651,68 @@ mod tests {
             (1, 0, 1, 0, 0),
             "a lane a live Run holds is deferred, not started twice"
         );
+        // The deferral is persisted, not inferred later from the row's age.
+        let (attempts, next_wake_at, lease) = fixture.delivery_wake("sweep-blocked");
+        assert_eq!((attempts, lease), (1, None));
+        let stored_wake = parse_delivery_timestamp(
+            &next_wake_at.expect("a deferred ticket stores its next wake"),
+        )
+        .expect("the stored wake is readable");
+        assert!(
+            stored_wake > chrono::Utc::now().timestamp_millis(),
+            "the next look is the stored nextWakeAt, not the next timer tick"
+        );
 
-        // Eight minute-cadence attempts later the ticket is reported, never spun on.
-        let aged = (chrono::Utc::now()
-            - chrono::Duration::seconds(MAX_WAKE_ATTEMPTS * 60 + 1))
-        .to_rfc3339();
-        fixture.set_delivery_created_at("sweep-blocked", &aged);
+        // The stored wake has not come: the ticket is not visited at all.
         let counts = reconcile_pending_delivery_wakes(&fixture.database, budget).unwrap();
         assert_eq!(
             (counts.due, counts.deferred, counts.exhausted),
-            (1, 0, 1),
+            (0, 0, 0),
+            "a ticket whose nextWakeAt is still ahead is never re-scanned"
+        );
+
+        // Once the stored wake has come, the same ticket is due again.
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        fixture.set_delivery_wake("sweep-blocked", 1, Some(&past), None);
+        let counts = reconcile_pending_delivery_wakes(&fixture.database, budget).unwrap();
+        assert_eq!(
+            (counts.due, counts.deferred),
+            (1, 1),
+            "a due ticket is deferred again, not silently dropped"
+        );
+
+        // A live wake lease holds the ticket even when its own wake has come.
+        let live = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        fixture.set_delivery_wake("sweep-blocked", 2, None, Some(&live));
+        let counts = reconcile_pending_delivery_wakes(&fixture.database, budget).unwrap();
+        assert_eq!(
+            (counts.due, counts.deferred),
+            (0, 0),
+            "a ticket a live wake lease holds is not due"
+        );
+
+        // The attempts are spent: reported once per sweep, never scanned again.
+        fixture.set_delivery_wake("sweep-blocked", MAX_WAKE_ATTEMPTS, None, None);
+        let counts = reconcile_pending_delivery_wakes(&fixture.database, budget).unwrap();
+        assert_eq!(
+            (counts.due, counts.deferred, counts.exhausted),
+            (0, 0, 1),
             "an exhausted ticket is reported, not retried a ninth time"
         );
 
-        // The sweep budget bounds one pass before anything else does.
+        // The sweep budget bounds one pass before anything else does, and spends nothing.
+        fixture.set_delivery_wake("sweep-blocked", MAX_WAKE_ATTEMPTS - 1, None, None);
         let counts = reconcile_pending_delivery_wakes(
             &fixture.database,
             chrono::Utc::now().timestamp_millis() - 1,
         )
         .unwrap();
         assert_eq!((counts.due, counts.deferred, counts.exhausted), (1, 1, 0));
+        assert_eq!(
+            fixture.delivery_wake("sweep-blocked").0,
+            MAX_WAKE_ATTEMPTS - 1,
+            "a pass past its budget spends no attempt"
+        );
 
         // A lane whose membership is gone can never start: that is a failure, not a retry.
         fixture
@@ -9569,6 +9728,26 @@ mod tests {
             (counts.due, counts.started, counts.failed),
             (1, 0, 1),
             "an inadmissible lane is settled visibly instead of woken forever"
+        );
+    }
+
+    /// upstream: Mikka 250d2451 lib/coordinator/wake-recovery.ts:WakeDeadlineTicket
+    /// (`attempt` and `leaseUntil` are what a claim stores with the event)
+    #[test]
+    fn a_claim_spends_the_wake_attempt_and_holds_its_lease_on_the_same_row() {
+        let mut fixture = Fixture::new();
+        fixture.enqueue("claim-lease", "丙");
+        let runs = claim_waiting_delivery_batches(&mut fixture.database, 1).unwrap();
+        assert_eq!(runs.len(), 1);
+        let (attempts, _, lease) = fixture.delivery_wake("claim-lease");
+        assert_eq!(attempts, 1, "the started wake is spent on the row it started");
+        let lease = parse_delivery_timestamp(
+            &lease.expect("a claim holds the wake lease on the row"),
+        )
+        .expect("the stored lease is readable");
+        assert!(
+            lease > chrono::Utc::now().timestamp_millis(),
+            "the claim lease outlives the claim itself"
         );
     }
 
