@@ -4715,5 +4715,8 @@
   "返回输入框": "Back to fields",
   "高级编辑（显示原文）": "Advanced editing (show raw values)",
   "连接信息": "Connection settings",
-  "使用这个运行端的助手会共用这些连接设置。": "Assistants using this runtime share these connection settings."
+  "使用这个运行端的助手会共用这些连接设置。": "Assistants using this runtime share these connection settings.",
+  "配图暂时无法加载。": "The image could not be loaded right now.",
+  "重试配图": "Retry image",
+  "继续了解": "Learn more"
 }
