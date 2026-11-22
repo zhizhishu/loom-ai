@@ -34,9 +34,6 @@ CREATE TABLE execution_node (
     paired_at TEXT NOT NULL,
     revoked_at TEXT,
     last_heartbeat TEXT,
-    session_opened_at TEXT,
-    session_closed_at TEXT,
-    session_socket_id TEXT,
     CHECK(role = 'local' OR token_digest IS NOT NULL),
     CHECK(role <> 'local' OR token_digest IS NULL),
     CHECK(role <> 'local' OR revoked_at IS NULL)
@@ -120,23 +117,13 @@ pub fn shim_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
 /// is online while the session it opened last is not closed; `last_heartbeat` stays a
 /// display-only last-seen for people.
 pub fn session_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
-    let sql: Option<String> = connection
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='execution_node'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(sql.is_some_and(|sql| {
-        let sql = sql.split_whitespace().collect::<String>();
-        [
-            "session_opened_at TEXT",
-            "session_closed_at TEXT",
-            "session_socket_id TEXT",
-        ]
+    let mut statement = connection.prepare("SELECT name, type FROM pragma_table_info('execution_node')")?;
+    let columns = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(["session_opened_at", "session_closed_at", "session_socket_id"]
         .iter()
-        .all(|column| sql.contains(column))
-    }))
+        .all(|wanted| columns.iter().any(|(name, kind)| name == wanted && kind == "TEXT")))
 }
 
 /// One gateway session report. The socket that opened last owns the session, so a late
