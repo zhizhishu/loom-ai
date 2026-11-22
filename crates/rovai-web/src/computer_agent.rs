@@ -90,7 +90,17 @@ const MAX_TOKEN_HEADER: usize = 128;
 const RPC_DEADLINE: Duration = Duration::from_secs(15);
 const RETIRE_DEADLINE: Duration = Duration::from_secs(12);
 const CORE_DEADLINE: Duration = Duration::from_secs(20);
-const GRANT_GATE_MS: u64 = 10_000;
+/// What the transport deadline keeps in reserve, so a request that is still waiting for the
+/// grant gate is answered with `computer_agent_endpoint_busy` instead of being cut off by
+/// `RPC_DEADLINE` and reported as an unaccounted OS outcome.
+///
+/// This is **not** an approval window. Mikka keeps a pending computer review visible until
+/// its own expiry and the run lease end (`LEAST(v."expiresAt", r."leaseExpiresAt")`,
+/// `lib/computer/store.ts`), and LOOM's queued tool request follows that rule through
+/// [`visible`]/[`visible_until`]; the gate only stops waiting when the request stops being
+/// visible. The value below is the transport's own bound, not a deadline of the
+/// authorization.
+const GATE_TRANSPORT_MARGIN: Duration = Duration::from_secs(2);
 const TOOL_CONTROL_TTL_SECONDS: u32 = 30;
 const TOKEN_PREFIX: &str = "grant-";
 const RPC_PATH: &str = "/api/v1/computer-agent/rpc";
@@ -119,6 +129,33 @@ fn wall_clock() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Mikka's pending-review deadline: `LEAST(v."expiresAt", r."leaseExpiresAt")`
+/// (`lib/computer/store.ts`, `state()` — it selects exactly that expression as
+/// `"visibleUntil"`).
+///
+/// LOOM has no `local_computer_reviews` row and no `agent_runs."leaseExpiresAt"`: the
+/// pending computer authorization *is* the grant, `v."expiresAt"` is [`Grant::expires_at`]
+/// and `r."leaseExpiresAt"` is the deadline of the session lease the grant is bound to (the
+/// private session every view, capture and input is authorized against). The earlier of the
+/// two wins, exactly as upstream's `LEAST`.
+pub(crate) fn visible_until(expires_at: u64, lease_expires_at: u64) -> u64 {
+    expires_at.min(lease_expires_at)
+}
+
+/// The other half of the upstream predicate: a review is shown only while it is not decided
+/// (`v.decision IS NULL`) and not stopped (`r."stopRequestedAt" IS NULL`) and its `LEAST`
+/// deadline has not passed. In LOOM a decided authorization is `revoked` and a stopped one is
+/// `closed`, so both are checked by the [`Grant`] caller and this predicate is the deadline.
+pub(crate) fn visible(now: u64, visible_until: u64) -> bool {
+    now < visible_until
+}
+
+/// How long one queued tool request may wait for the grant gate, derived from the transport
+/// deadline alone (see [`GATE_TRANSPORT_MARGIN`]).
+fn gate_budget() -> Duration {
+    RPC_DEADLINE.saturating_sub(GATE_TRANSPORT_MARGIN)
 }
 
 fn http_status(code: &'static str) -> StatusCode {
@@ -520,7 +557,11 @@ pub(crate) fn public_grant(grant: &Grant, now: u64) -> Value {
         "scope": grant.authority.permission.label(),
         "serverId": grant.server_id(),
         "expiresAt": grant.expires_at,
-        "validForSeconds": grant.expires_at.saturating_sub(now) / 1000,
+        // Upstream reports the row's deadline as `LEAST(expiresAt, leaseExpiresAt)`. Additive
+        // here so the page can show the deadline that actually ends the authorization,
+        // whichever of the two is earlier.
+        "visibleUntil": grant.visible_until(),
+        "validForSeconds": grant.visible_until().saturating_sub(now) / 1000,
         "transportOrigin": grant.transport_origin,
         "state": grant.state_label(now),
         // Visible rather than silent: a revocation whose device fence or MCP cleanup could
@@ -620,10 +661,16 @@ impl Grant {
         }
     }
 
+    /// The upstream visibility deadline in wall-clock milliseconds: the earlier of this
+    /// grant's own expiry and the end of the lease that backs it ([`visible_until`]).
+    fn visible_until(&self) -> u64 {
+        visible_until(self.expires_at, self.session.expiry())
+    }
+
     fn state_label(&self, now: u64) -> &'static str {
         if self.revoked.load(Ordering::Acquire) {
             "revoked"
-        } else if now >= self.expires_at {
+        } else if !visible(now, self.visible_until()) {
             "expired"
         } else if !self.owner_sessions.is_live(&self.owner) {
             "owner_session_closed"
@@ -633,13 +680,31 @@ impl Grant {
     }
 
     /// Held across one whole tool call: tool requests of one grant are serialized.
+    ///
+    /// A queued request is *not* cut off by a fixed window any more. It waits for as long as
+    /// it is still a visible authorization — until `LEAST(expiresAt, leaseExpiresAt)`, exactly
+    /// as Mikka shows a pending review — and stops the moment it is not: a decided
+    /// (`revoked`) or stopped (`closed`) grant is never visible again, and neither is one
+    /// whose deadline passed. Upstream says the same thing by simply not selecting the row;
+    /// here the waiting request is refused with the code that names the same fact.
+    ///
+    /// The transport keeps its own bound ([`gate_budget`]): an answer that outlives the
+    /// request it belongs to could never be delivered, and the timeout would be reported as
+    /// `computer_agent_input_unknown` even though nothing reached the OS.
     fn gate(&self) -> Result<MutexGuard<'_, RunState>, &'static str> {
-        let deadline = Instant::now() + Duration::from_millis(GRANT_GATE_MS);
+        let deadline = Instant::now() + gate_budget();
         loop {
             match self.run.try_lock() {
                 Ok(guard) => return Ok(guard),
                 Err(TryLockError::Poisoned(_)) => return Err("computer_agent_endpoint_busy"),
                 Err(TryLockError::WouldBlock) => {}
+            }
+            // Decided or stopped: never visible again, so never worth waiting for.
+            if self.revoked.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
+                return Err("computer_agent_grant_revoked");
+            }
+            if !visible(wall_clock(), self.visible_until()) {
+                return Err("computer_agent_grant_expired");
             }
             if Instant::now() >= deadline {
                 return Err("computer_agent_endpoint_busy");
@@ -675,7 +740,9 @@ fn admit_pending(grant: &Grant, browser: &Sessions) -> Result<(), &'static str> 
     if grant.closed.load(Ordering::Acquire) {
         return Err("computer_agent_grant_revoked");
     }
-    if wall_clock() >= grant.expires_at {
+    // `LEAST(expiresAt, leaseExpiresAt)`, not the grant's own TTL alone: the review stops
+    // being visible when the lease that backs it ends, even if its TTL has not run out.
+    if !visible(wall_clock(), grant.visible_until()) {
         return Err("computer_agent_grant_expired");
     }
     if !browser.is_live(&grant.owner) {
@@ -1332,7 +1399,7 @@ impl AgentGrants {
                 && existing.authority.device_id == grant.authority.device_id
                 && existing.authority.permission == grant.authority.permission
                 && !existing.closed.load(Ordering::Acquire)
-                && wall_clock() < existing.expires_at;
+                && visible(wall_clock(), existing.visible_until());
             if same {
                 // One active grant per assistant+device+scope. Replacing it is an
                 // explicit revoke by the user, never an implicit overwrite.
@@ -1386,7 +1453,7 @@ impl AgentGrants {
                 .filter(|grant| !grant.pending.load(Ordering::Acquire))
                 .filter(|grant| {
                     grant.revoked.load(Ordering::Acquire)
-                        || now >= grant.expires_at
+                        || !visible(now, grant.visible_until())
                         // A logged-out or rotated browser session must retire the MCP
                         // entry too, not only block tool calls, or it stays enabled
                         // until the TTL.
@@ -4153,6 +4220,90 @@ mod tests {
         assert_eq!(owned.len(), 1);
         assert_eq!(public_grant(&owned[0], wall_clock())["state"], json!("expired"));
         assert_eq!(owned[0].id, expired.id);
+    }
+
+    /// Port of Mikka's visibility case (`lib/computer/store.db.test.ts`, the
+    /// `pendingApproval` assertions and the `decideComputerReview` ones): a pending computer
+    /// authorization is visible while it is undecided and still short of its own expiry, and
+    /// the deadline it reports is `LEAST(v."expiresAt", r."leaseExpiresAt")` — whichever of
+    /// the two ends first.
+    #[test]
+    fn pending_authorization_is_visible_until_the_earlier_of_expiry_and_lease() {
+        let grants = AgentGrants::for_test(FakeMcp::new());
+        let (sessions, owner, _token) = browser();
+        let now = wall_clock();
+        // Both orders of the `LEAST`: the earlier deadline always wins.
+        assert_eq!(visible_until(now + 120_000, now + 300_000), now + 120_000);
+        assert_eq!(visible_until(now + 300_000, now + 120_000), now + 120_000);
+
+        // Live lease and an open authorization: the row is visible and reports its own
+        // deadline, which is the earlier of the two here.
+        let grant = grant_for(&sessions, &owner, now + 120_000, false);
+        assert_eq!(grant.visible_until(), now + 120_000);
+        assert_eq!(grant.state_label(now), "active");
+        let shown = public_grant(&grant, now);
+        assert_eq!(shown["state"], json!("active"));
+        assert_eq!(shown["visibleUntil"], json!(now + 120_000));
+        assert_eq!(shown["validForSeconds"], json!(120));
+        grants.reserve(grant.clone()).unwrap();
+        assert_eq!(grants.owned(&owner.client_id, now).len(), 1);
+
+        // The lease behind the authorization ends while its own TTL has not run out: the
+        // earlier deadline wins, so the authorization is already over.
+        grant.session.expires_at.send_replace(now.saturating_sub(1));
+        assert_eq!(grant.visible_until(), now.saturating_sub(1));
+        assert_eq!(grant.state_label(now), "expired");
+        assert_eq!(
+            public_grant(&grant, now)["visibleUntil"],
+            json!(now.saturating_sub(1))
+        );
+        assert_eq!(
+            admit_pending(&grant, &sessions),
+            Err("computer_agent_grant_expired")
+        );
+        // An ended authorization also stops blocking a fresh one for the same scope.
+        let fresh = grant_for(&sessions, &owner, now + 120_000, false);
+        assert!(grants.reserve(fresh).is_ok());
+    }
+
+    /// The other half of the upstream predicate: a decided (`v.decision IS NOT NULL`) or
+    /// stopped (`r."stopRequestedAt" IS NOT NULL`) review is never visible again, and a
+    /// request queued behind another tool call must not keep waiting for one. The fixed
+    /// ten-second window is gone, so the wait is bounded only by the transport.
+    #[test]
+    fn a_decided_or_stopped_authorization_is_not_visible_and_is_not_waited_for() {
+        let (sessions, owner, _token) = browser();
+        let now = wall_clock();
+        assert!(
+            gate_budget() > Duration::from_secs(10),
+            "the approval window is no longer a fixed ten seconds"
+        );
+
+        // Decided: the waiting request is refused at once instead of waiting out a window.
+        let decided = grant_for(&sessions, &owner, now + 120_000, true);
+        let _held = decided.run.lock().unwrap();
+        assert_eq!(
+            decided.gate().map(|_| ()),
+            Err("computer_agent_grant_revoked")
+        );
+
+        // Stopped: same answer, and the deadline is irrelevant once it is closed.
+        let stopped = grant_for(&sessions, &owner, now + 120_000, false);
+        stopped.closed.store(true, Ordering::Release);
+        let _held = stopped.run.lock().unwrap();
+        assert_eq!(
+            stopped.gate().map(|_| ()),
+            Err("computer_agent_grant_revoked")
+        );
+
+        // Lease ended while the request was queued: expiry, not a busy answer.
+        let lapsed = grant_for(&sessions, &owner, now + 120_000, false);
+        lapsed.session.expires_at.send_replace(now.saturating_sub(1));
+        let _held = lapsed.run.lock().unwrap();
+        assert_eq!(
+            lapsed.gate().map(|_| ()),
+            Err("computer_agent_grant_expired")
+        );
     }
 
     #[test]
