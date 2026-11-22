@@ -5,7 +5,7 @@ import type { HostWorkbench } from './host-services'
 import type { AgentProfile, ArtifactSelection, InspectorTab, InspectorMode, LoomReview, WorkBundle, WorkControlFacts, WorkItem } from './types'
 import { Avatar } from './Avatar'
 import { Icon, IconButton, type IconName } from './icons'
-import { Markdown } from './ConversationView'
+import { AgentMarkdown } from './AgentMarkdown'
 import { ChoiceMenu } from './Controls'
 import { WorkMap } from './WorkMap'
 import { ComputerWorkspace } from './ComputerWorkspace'
@@ -191,7 +191,7 @@ export function Inspector({ agents, bundles, agent, mode, tab, onMode, onClose, 
       {panel === 'computer' ? <><div className="ln-dock-agent">{agent ? <><Avatar agent={agent} size={30}/><span><strong>{agent.displayName}</strong><small>查看、手动控制和助手控制分别授权</small></span><button type="button" className="ln-text-action" onClick={() => onManageAssistant?.(agent.agentId)}>配置</button></> : <p>选择助手后可查看对应的执行位置和授权。</p>}</div><ComputerWorkspace workbench={workbench} client={client} agent={agent} theme={theme}/></>
         : panel === 'flow' || panel === 'assets' && assetView === 'lineage' ? client ? <WorkMap bundles={currentBundles} agents={agents} client={client} onArtifact={onArtifact} onConversation={onOpenConversation} focusedTaskId={selectedTaskId} onTaskSelect={setSelectedTaskId} initialView={panel === 'assets' ? 'assets' : 'flow'} hideViewTabs/> : <p className="ln-inspector-empty">当前连接未提供工作关系。</p>
         : panel === 'assets' ? renderAssets(selectedTaskId ?? undefined)
-        : selectedTask ? <section className="ln-task-detail"><button type="button" className="ln-text-action ln-dock-back" onClick={() => setSelectedTaskId(null)}><Icon name="left" size={14}/>所有工作</button><h1>{selectedTask.task.title}</h1><span className="ln-detail-status"><Icon name={workStatus(selectedTask).icon} size={16}/>{workStatus(selectedTask).label}</span><Markdown text={selectedTask.task.description || '此任务没有补充说明。'}/>{selectedTask.task.blockedReason && <p className="ln-inline-error">{selectedTask.task.blockedReason}</p>}<h3>交付成果</h3>{renderAssets(selectedTask.task.taskId)}<button type="button" className="ln-text-action" onClick={() => onOpenConversation(selectedTask.mission.threadId)}><Icon name="chat" size={15}/>打开相关对话</button></section> : renderWork()}
+        : selectedTask ? <section className="ln-task-detail"><button type="button" className="ln-text-action ln-dock-back" onClick={() => setSelectedTaskId(null)}><Icon name="left" size={14}/>所有工作</button><h1>{selectedTask.task.title}</h1><span className="ln-detail-status"><Icon name={workStatus(selectedTask).icon} size={16}/>{workStatus(selectedTask).label}</span><AgentMarkdown text={selectedTask.task.description || '此任务没有补充说明。'}/>{selectedTask.task.blockedReason && <p className="ln-inline-error">{selectedTask.task.blockedReason}</p>}<h3>交付成果</h3>{renderAssets(selectedTask.task.taskId)}<button type="button" className="ln-text-action" onClick={() => onOpenConversation(selectedTask.mission.threadId)}><Icon name="chat" size={15}/>打开相关对话</button></section> : renderWork()}
     </div>
   </aside>
 }
