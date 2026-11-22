@@ -1,15 +1,8 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { AgentProfile, ArtifactSelection, ConversationItem, ThreadSnapshot, WorkBundle } from './types'
+import { AgentMarkdown } from './AgentMarkdown'
 import { Avatar } from './Avatar'
 import { Icon, IconButton } from './icons'
-
-const MARKDOWN_PLUGINS = [remarkGfm]
-/** Expensive GFM parsing must not run for every keystroke in the composer. */
-export const Markdown = memo(function Markdown({ text }: { text: string }) {
-  return <div className="ln-markdown"><ReactMarkdown remarkPlugins={MARKDOWN_PLUGINS} components={{ a: ({ children, href }) => <a href={href} target="_blank" rel="noreferrer noopener">{children}</a>, img: ({ src, alt }) => <img src={src} alt={alt || ''} loading="lazy"/> }}>{text}</ReactMarkdown></div>
-})
 
 export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, onDraft, onFiles, onSend, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager }: {
   item: ConversationItem | null; snapshot: ThreadSnapshot | null; agents: AgentProfile[]; bundles: WorkBundle[]; loading: boolean; sending: boolean
@@ -73,15 +66,15 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
         const handoff = !user && /\[LOOM_HANDOFF|"dispatchId"|"tool_call_id"/.test(message.body)
         return <article className={`ln-message ${user ? 'is-user' : 'is-assistant'} ${handoff ? 'is-record' : ''}`} key={message.id} data-message-id={message.id}>
           {!user && snapshot && snapshot.members.length > 1 && <div className="ln-message-author"><Avatar agent={author} name={message.authorDisplayName || ''} size={16}/><span>{author?.displayName || message.authorDisplayName || '助手'}</span></div>}
-          {handoff ? <details className="ln-execution-record"><summary><Icon name="branch" size={14}/><span>执行记录</span><Icon name="right" size={12}/></summary><Markdown text={message.body}/></details>
-            : <div className="ln-message-content"><Markdown text={message.body}/></div>}
+          {handoff ? <details className="ln-execution-record"><summary><Icon name="branch" size={14}/><span>执行记录</span><Icon name="right" size={12}/></summary><AgentMarkdown text={message.body}/></details>
+            : <div className="ln-message-content"><AgentMarkdown text={message.body}/></div>}
           {message.attachments.length > 0 && <div className="ln-message-files">{message.attachments.map(attachment => <button className="ln-file-card" key={attachment.id} type="button" onClick={() => onAttachment(message.id, attachment.id)} disabled={attachment.availability === 'missing' || attachment.availability === 'unreadable'}><Icon name="file" size={22}/><span><strong>{attachment.displayName}</strong><small>{attachment.byteSize === null ? '附件' : `${Math.max(1, Math.round(attachment.byteSize / 1024))} KB`}</small></span><Icon name="right" size={14}/></button>)}</div>}
           <div className="ln-message-actions"><button type="button" aria-label="复制消息" title="复制消息" onClick={() => { void navigator.clipboard.writeText(message.body).then(() => { setCopied(message.id); window.setTimeout(() => setCopied(null), 1500) }) }}><Icon name={copied === message.id ? 'check' : 'copy'} size={13}/></button><time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time></div>
         </article>
       })}
       {artifacts.length > 0 && <div className="ln-delivered-files">{artifacts.map(selection => <button type="button" className="ln-artifact-card" key={selection.artifact.artifactId} onClick={() => onArtifact(selection)}><span className="ln-document-icon"><Icon name="file" size={22}/></span><span><strong>{selection.artifact.relativePath.split(/[\\/]/).pop()}</strong><small>{selection.candidate?.acceptanceStatus === 'accepted' ? '已接受' : selection.candidate?.acceptanceStatus === 'rejected' ? '已退回' : '等待审阅'}</small></span><Icon name="right" size={15}/></button>)}</div>}
       {running.length > 0 && <div className="ln-running-status" role="status"><span className="ln-working-dots"><i/><i/><i/></span>{running.map(run => agents.find(agent => agent.agentId === run.agentId)?.displayName || '助手').join('、')}正在处理</div>}
-      {systemMessages.length > 0 && <details className="ln-system-records"><summary>会话记录 <span>{systemMessages.length}</span></summary>{systemMessages.map(message => <Markdown key={message.id} text={message.body}/>)}</details>}
+      {systemMessages.length > 0 && <details className="ln-system-records"><summary>会话记录 <span>{systemMessages.length}</span></summary>{systemMessages.map(message => <AgentMarkdown key={message.id} text={message.body}/>)}</details>}
     </div>
     <div className="ln-composer-area">
       {showLatest && <button type="button" className="ln-jump-latest" title="回到最新消息" aria-label="回到最新消息" onClick={jump}><Icon name="down" size={18}/></button>}

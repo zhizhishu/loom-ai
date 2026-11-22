@@ -12,7 +12,7 @@ import type {
 } from '@contracts'
 import type { WorkBundle, LoomArtifact, LoomCandidate, LoomTask, ConversationItem, WorkControlFacts } from './types'
 import { Sidebar } from './Sidebar'
-import { Markdown } from './ConversationView'
+import { AgentMarkdown } from './AgentMarkdown'
 import { workStatus } from './Inspector'
 import { Inspector } from './Inspector'
 import { ArtifactReviewStatus } from './ArtifactView'
@@ -58,11 +58,11 @@ describe('native reference frontend boundaries', () => {
     expect(html).not.toMatch(/unified-sidebar|camp-nav|mission-rail|Rovai|ROVAI|使命板|项目目录/)
   })
   it('keeps rich table/code/list structure instead of flattening messages', () => {
-    const html=renderToStaticMarkup(createElement(Markdown,{text:'| PR | Status |\n|---|---|\n| #1 | Review |\n\n1. First\n2. Next\n\n```ts\nconst a = 1\n```'}))
+    const html=renderToStaticMarkup(createElement(AgentMarkdown,{text:'| PR | Status |\n|---|---|\n| #1 | Review |\n\n1. First\n2. Next\n\n```ts\nconst a = 1\n```'}))
     expect(html).toContain('<table>');expect(html).toContain('<ol>');expect(html).toContain('<pre>')
   })
   it('does not turn arbitrary Markdown scripts into executable HTML', () => {
-    const html=renderToStaticMarkup(createElement(Markdown,{text:'<script>alert(1)</script>'}))
+    const html=renderToStaticMarkup(createElement(AgentMarkdown,{text:'<script>alert(1)</script>'}))
     expect(html).not.toContain('<script>')
   })
   it('does not label ready work as running without actual run state', () => {
