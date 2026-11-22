@@ -56,13 +56,16 @@ pub fn is_device_online(device: &DeviceSessionState) -> bool {
     }
 }
 
-/// SQL form of [`is_device_online`] for a devices row under `alias`.
+/// SQL form of [`is_device_online`] for an `execution_node` row under `alias`.
 ///
 /// This is the same rule written as one predicate, so a query and
-/// [`is_device_online`] cannot drift apart.
+/// [`is_device_online`] cannot drift apart. Migration 239 stores the pair in the snake_case
+/// columns `session_opened_at` / `session_closed_at`; the upstream camelCase field names are
+/// not column names here, so a quoted `"sessionOpenedAt"` would read a column that does not
+/// exist instead of the one the writer updates.
 pub fn device_session_open_sql(alias: &str) -> String {
     format!(
-        "({alias}.\"sessionOpenedAt\" IS NOT NULL AND ({alias}.\"sessionClosedAt\" IS NULL OR {alias}.\"sessionClosedAt\" < {alias}.\"sessionOpenedAt\"))"
+        "({alias}.session_opened_at IS NOT NULL AND ({alias}.session_closed_at IS NULL OR {alias}.session_closed_at < {alias}.session_opened_at))"
     )
 }
 
@@ -193,11 +196,46 @@ mod tests {
         );
     }
 
+    /// The rule as one predicate, and the predicate has to read the columns the store really
+    /// has: a quoted upstream field name names a column no migration ever added.
     #[test]
     fn the_sql_predicate_is_the_same_rule() {
         assert_eq!(
             device_session_open_sql("d"),
-            "(d.\"sessionOpenedAt\" IS NOT NULL AND (d.\"sessionClosedAt\" IS NULL OR d.\"sessionClosedAt\" < d.\"sessionOpenedAt\"))"
+            "(d.session_opened_at IS NOT NULL AND (d.session_closed_at IS NULL OR d.session_closed_at < d.session_opened_at))"
+        );
+        let connection = rusqlite::Connection::open_in_memory().expect("an in-memory store");
+        connection
+            .execute_batch(
+                "CREATE TABLE execution_node (
+                    node_id TEXT PRIMARY KEY,
+                    session_opened_at TEXT,
+                    session_closed_at TEXT
+                 );
+                 INSERT INTO execution_node(node_id,session_opened_at,session_closed_at)
+                 VALUES('open','2026-11-17T10:00:00.000Z',NULL),
+                       ('closed','2026-11-17T10:00:00.000Z','2026-11-17T10:00:20.000Z'),
+                       ('never',NULL,NULL),
+                       ('replaced','2026-11-17T10:00:00.000Z','2026-11-17T09:59:00.000Z');",
+            )
+            .expect("the session columns migration 239 adds");
+        let predicate = device_session_open_sql("n");
+        let online = |id: &str| -> bool {
+            connection
+                .query_row(
+                    &format!("SELECT {predicate} FROM execution_node AS n WHERE n.node_id=?1"),
+                    [id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("the predicate must run against the stored session columns")
+                == 1
+        };
+        assert!(online("open"));
+        assert!(!online("closed"));
+        assert!(!online("never"), "never connected");
+        assert!(
+            online("replaced"),
+            "an older close belongs to a replaced socket"
         );
     }
 }

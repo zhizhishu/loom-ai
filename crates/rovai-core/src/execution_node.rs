@@ -398,6 +398,10 @@ impl NodeStore {
         connection.execute_batch(BUNDLE_SCHEMA_SQL)?;
         // The production columns arrive through migration 231; this is a schema-only fixture.
         connection.execute_batch("ALTER TABLE execution_node_cli ADD COLUMN installation_identity TEXT; ALTER TABLE execution_node_cli ADD COLUMN installation_generation INTEGER CHECK(installation_generation IS NULL OR installation_generation>=1);")?;
+        // Migration 239 adds the device session pair. The fixture applies the same step instead of
+        // 225 alone, so a store test reads the columns a migrated database has.
+        connection.execute_batch("ALTER TABLE execution_node ADD COLUMN session_opened_at TEXT; ALTER TABLE execution_node ADD COLUMN session_closed_at TEXT; ALTER TABLE execution_node ADD COLUMN session_socket_id TEXT;")?;
+        debug_assert!(session_schema_matches(&connection)?, "the fixture must match migration 239");
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })

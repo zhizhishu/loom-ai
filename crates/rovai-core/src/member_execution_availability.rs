@@ -198,7 +198,10 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(
             "CREATE TABLE member_execution_target(member_id TEXT PRIMARY KEY, revision INTEGER, selection_json TEXT);
-             CREATE TABLE execution_node(node_id TEXT PRIMARY KEY,role TEXT,last_heartbeat TEXT,revoked_at TEXT,session_opened_at TEXT,session_closed_at TEXT,session_socket_id TEXT);
+             CREATE TABLE execution_node(node_id TEXT PRIMARY KEY,role TEXT,last_heartbeat TEXT,revoked_at TEXT);
+             ALTER TABLE execution_node ADD COLUMN session_opened_at TEXT;
+             ALTER TABLE execution_node ADD COLUMN session_closed_at TEXT;
+             ALTER TABLE execution_node ADD COLUMN session_socket_id TEXT;
              CREATE TABLE execution_node_cli(node_id TEXT,adapter_kind TEXT,path TEXT,version TEXT,path_present INTEGER,installation_identity TEXT,installation_generation INTEGER);
              CREATE TABLE mission(id TEXT PRIMARY KEY,camp_id TEXT);
              CREATE TABLE mission_workspace(id TEXT PRIMARY KEY,mission_id TEXT,camp_id TEXT,execution_host_id TEXT,worktree_path TEXT,generation INTEGER,preparation_token TEXT,state TEXT);
