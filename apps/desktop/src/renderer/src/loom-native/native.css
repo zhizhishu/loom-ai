@@ -154,3 +154,23 @@
 .ln-agent-code{min-width:0}
 .ln-agent-mermaid{display:flex;min-width:0;flex-direction:column;gap:8px}
 .ln-mermaid-status{font-size:12px;color:var(--ln-muted);margin:0}
+
+/* AgentImage / AgentImageCard (Mikka components/workspace/agent-image.tsx, agent-image-card.tsx): upstream's
+   figure/figcaption shell drawn with spans, because react-markdown puts an image inside a paragraph. */
+.ln-agent-image{display:flex;min-width:0;max-width:100%;flex-direction:column;gap:8px;margin:12px 0}
+.ln-agent-image-media{display:block;max-width:100%;height:auto;border-radius:14px;background:var(--ln-card)}
+.ln-agent-image-caption{display:flex;flex-direction:column;gap:2px;font-size:12px;line-height:1.5;color:var(--ln-muted)}
+.ln-agent-image[data-compact=true]{margin:0}
+.ln-agent-image[data-compact=true] .ln-agent-image-media{border-radius:12px}
+.ln-agent-image-caption a{color:inherit;text-decoration:underline;text-underline-offset:2px;overflow-wrap:anywhere}
+.ln-agent-image-missing,.ln-agent-image-error{display:flex;align-items:center;flex-wrap:wrap;gap:8px;font-size:12px;color:var(--ln-muted);margin:8px 0}
+.ln-agent-image-retry{border:1px solid var(--ln-line);border-radius:8px;padding:3px 9px;font-size:12px;background:var(--ln-card);color:var(--ln-text);cursor:pointer}
+.ln-markdown-image-note{color:var(--ln-muted)}
+.ln-agent-image-card{display:flex;min-width:0;flex-direction:column;gap:8px;padding:12px;border-radius:16px;background:var(--ln-card);margin:12px 0}
+.ln-agent-image-card>h3{font-size:14px;font-weight:600;margin:2px 0 0}
+.ln-agent-image-card>p{font-size:13px;line-height:1.55;margin:0;color:var(--ln-muted)}
+.ln-agent-image-card-tags{display:flex;flex-wrap:wrap;gap:6px;margin:0;padding:0;list-style:none}
+.ln-agent-image-card-tags li{font-size:12px;padding:2px 8px;border-radius:6px;background:var(--ln-bubble);color:var(--ln-muted)}
+.ln-agent-image-card-foot{display:flex;flex-direction:column;align-items:flex-start;gap:6px;margin-top:auto}
+.ln-agent-image-card-ask{border:1px solid var(--ln-line);border-radius:9px;padding:5px 11px;font-size:12px;background:transparent;color:var(--ln-text);cursor:pointer}
+.ln-agent-image-card-ask:disabled{color:var(--ln-muted);cursor:default}
