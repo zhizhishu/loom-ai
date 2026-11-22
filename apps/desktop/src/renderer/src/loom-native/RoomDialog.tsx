@@ -5,18 +5,20 @@ import type { AgentProfile, ThreadSnapshot } from './types'
 import type { NavigationSnapshot, ThreadCreationPreflight, WorkspaceSelection } from '@contracts'
 import { Avatar } from './Avatar'
 import { Icon } from './icons'
-import {readWorkspaceDefault,validateWorkspaceDefault} from './workspace-defaults'
-import { ChoiceMenu, FormMessage, SurfaceDialog, UnsavedNotice } from './Controls'
+import { readWorkspaceDefault,validateWorkspaceDefault } from './workspace-defaults'
+import { FormMessage, SurfaceDialog, UnsavedNotice } from './Controls'
 import {
-  roomPort, emptyRoomDraft, roomDraftProblems, createRoom, chooseRoomWorkspace,
-  readRoomCreationPreflight, addRoomMembers, changeRoomLead, roomDraftProblemMessage,
+  roomPort, emptyRoomDraft, roomSubmitProblem, createRoom, chooseRoomWorkspace,
+  readRoomCreationPreflight, addRoomMembers, changeRoomLead,
   roomWorkspaceChoices, applyKnownWorkspace, type RoomWorkspaceChoice, type RoomDraft
 } from './room-service'
 
-export function RoomDialog({ open, environment, agents, initialAgentId, initialMode = 'group', initialWorkspace, theme = 'day', onClose, onCreated }: {
+export function RoomDialog({ open, environment, agents, initialAgentId, initialMode = 'group', initialWorkspace, theme = 'day', onClose, onCreated, onNewAssistant }: {
   open: boolean; environment: BusinessEnvironment; agents: AgentProfile[]; initialAgentId?: string
   initialMode?: 'direct' | 'group' | 'work'; initialWorkspace?: WorkspaceSelection | null
   theme?: 'day' | 'night'; onClose(): void; onCreated(threadId: string): Promise<void>
+  /** 一个可选助手都没有时就地引导新建助手，不把人赶出弹窗。 */
+  onNewAssistant?(): void
 }) {
   const port = useMemo(() => roomPort(environment), [environment])
   const [draft, setDraft] = useState<RoomDraft>(() => emptyRoomDraft())
@@ -122,8 +124,8 @@ export function RoomDialog({ open, environment, agents, initialAgentId, initialM
       } finally { if (generation === ticket.current) setBusy(false) }
       return
     }
-    const problems = roomDraftProblems(draft, agents)
-    if (problems.length) { setError(roomDraftProblemMessage(problems)); return }
+    const blocker = roomSubmitProblem(draft, agents, preflight)
+    if (blocker !== null) { setError(blocker); return }
     const signature = JSON.stringify(draft)
     if (command.current && command.current.signature !== signature) command.current = null
     command.current ??= { id: crypto.randomUUID(), signature }
@@ -144,10 +146,11 @@ export function RoomDialog({ open, environment, agents, initialAgentId, initialM
       {mode !== 'direct' && <label className="ln-field"><span>{mode === 'work' ? '工作名称' : '群聊名称'}</span><input aria-label={mode === 'work' ? '工作名称' : '群聊名称'} placeholder={mode === 'work' ? '例如：做一个可以使用的网站' : '例如：网站改版小队'} maxLength={mode === 'work' ? 200 : 80} disabled={busy || creationUnknown} value={draft.name ?? ''} onChange={event => patch({ name: event.target.value || null })}/></label>}
       {mode === 'work' && <label className="ln-field"><span>想要什么结果？</span><textarea aria-label="工作目标" rows={4} maxLength={12000} placeholder="描述目标、约束和你希望交付的成果。主助手会组织队友，进度与成果显示在右侧。" disabled={busy || creationUnknown} value={goal} onChange={event => { setGoal(event.target.value); setChanged(true); setError(''); if (!creationUnknown) workAttempt.current = undefined }}/><small>工作会保留目标、任务进展和成果；不是只建一个空群。</small></label>}
       <div className="ln-panel-title"><h3>{mode === 'direct' ? '选择助手' : '邀请助手'}</h3><small>{draft.memberAgentIds.length} 位已选</small></div>
-      <div className="ln-room-people">{people.map(agent => <label className="ln-room-person" key={agent.agentId}><input type={mode === 'direct' ? 'radio' : 'checkbox'} name="room-members" checked={draft.memberAgentIds.includes(agent.agentId)} onChange={() => toggle(agent.agentId)} disabled={busy || creationUnknown}/><Avatar agent={agent} size={32}/><span><strong>{agent.displayName}</strong><small>{agent.teamRole || '助手'}{!agent.runtimeConfiguration ? ' · 待配置运行端' : ''}</small></span></label>)}</div>
-      {mode !== 'direct' && <label className="ln-field"><span>主助手</span><ChoiceMenu label="选择主助手" theme={theme} value={draft.leadAgentId} disabled={busy || creationUnknown} onChange={id => patch({ leadAgentId: id })} choices={people.filter(agent => draft.memberAgentIds.includes(agent.agentId)).map(agent => ({ value: agent.agentId, label: agent.displayName, description: agent.teamRole, icon: <Avatar agent={agent} size={22}/> }))}/><small>默认先接收你的需求并协调队友；其他助手仍可直接对话。</small></label>}
+      {people.length > 0 ? <div className="ln-room-people">{people.map(agent => <label className="ln-room-person" key={agent.agentId}><input type={mode === 'direct' ? 'radio' : 'checkbox'} name="room-members" checked={draft.memberAgentIds.includes(agent.agentId)} onChange={() => toggle(agent.agentId)} disabled={busy || creationUnknown}/><Avatar agent={agent} size={32}/><span><strong>{agent.displayName}</strong><small>{agent.teamRole || '助手'}{!agent.runtimeConfiguration ? ' · 待配置运行端' : ''}</small></span>{mode !== 'direct' && draft.leadAgentId === agent.agentId && <span className="ln-room-lead-badge">负责回复</span>}</label>)}</div>
+        : <div className="ln-room-empty"><p>还没有可选的助手。</p>{onNewAssistant && <button type="button" className="ln-action" onClick={onNewAssistant}>新建助手</button>}</div>}
+      {mode !== 'direct' && draft.memberAgentIds.length > 0 && <p className="ln-native-help">第一个勾选的助手负责回复；群里写 @名字 时由被点名的助手先答。</p>}
       <div className="ln-panel-title"><h3>工作区 · 默认运行目录</h3></div>
-      <p className="ln-native-help">这是助手开始执行文件任务时的项目根目录，不只是聊天附件位置。选择已有项目或通过主机挑选新目录；不会自动开放磁盘上的其他目录。</p>
+      <p className="ln-native-help">助手开始执行文件任务时的项目根目录，不是聊天附件位置。</p>
       <div className="ln-workspace-choice"><Icon name="files" size={23}/><span><strong>{draft.workspace?.name || '快速对话 · 主机默认目录'}</strong><small>{draft.workspace?.projectPath || '未指定项目根；由已连接主机按原有规则安排'}</small></span><button type="button" className="ln-action" disabled={picking || busy || creationUnknown} onClick={() => { void selectWorkspace() }}>{picking ? '选择中…' : '浏览目录'}</button></div>
       {knownWorkspaces.length > 1 && <div className="ln-workspace-presets" aria-label="选择已有工作区">
         <small>已登记的项目</small>
@@ -162,13 +165,13 @@ export function RoomDialog({ open, environment, agents, initialAgentId, initialM
       {workspaceReadError && <p className="ln-native-help">已有项目暂时读取失败，仍可用“浏览目录”从当前 Host 显式选择。</p>}
       {defaultRootError&&<p className="ln-native-help" role="status">已保存的默认项目目录未通过主机重新验证，未自动授权。请重新从主机选择目录。</p>}
       {draft.workspace && <button type="button" className="ln-text-action" disabled={busy || creationUnknown} onClick={() => patch({ workspace: null })}>改用快速对话目录</button>}
-      <p className="ln-native-help">跨目录任务需要目标工具与主机另外授权，不会因为设定默认工作区就获得跨目录写入权限。</p>
+      <details className="ln-room-help"><summary>目录权限说明</summary><p>选择已有项目或通过主机挑选新目录；不会自动开放磁盘上的其他目录。</p><p>跨目录任务需要目标工具与主机另外授权，不会因为设定默认工作区就获得跨目录写入权限。</p></details>
       {error && <FormMessage error>{error}</FormMessage>}
       {mode === 'work' && <label className="ln-work-start-choice"><input type="checkbox" checked={startNow} disabled={busy || creationUnknown} onChange={event => { setStartNow(event.target.checked); setChanged(true) }}/><span><strong>创建后开始执行</strong><small>主助手会接收工作目标。运行可能使用所选模型，工具仍按权限请求授权。</small></span></label>}
       {creationUnknown && <FormMessage>{createdWorkThread ? '工作已创建；开始或打开结果未确认。重试不会重复创建。' : '创建结果尚未确认。当前选择已锁定；重试沿用原请求编号，不会创建第二份。'}</FormMessage>}
       {createdWorkThread && error && <button type="button" className="ln-action" disabled={busy} onClick={() => { void onCreated(createdWorkThread).then(() => { setChanged(false); onClose() }).catch(cause => setError(cause instanceof Error ? cause.message : '未能打开已创建工作。')) }}>打开已创建的工作</button>}
       {preflight && !preflight.admissible && <FormMessage>当前主机的创建检查尚未通过。请先配置或启用至少一位助手。</FormMessage>}
-      <footer className="ln-form-actions"><small>{mode === 'work' ? (startNow ? '将创建可追踪工作并向主助手提交目标。' : '仅创建工作，不启动模型；可随后开始。') : '创建群聊不会自动派工，未配置的助手可稍后配置。'}</small><button type="button" className="ln-action is-primary" disabled={busy || picking || !draft.memberAgentIds.length || preflight?.admissible === false} onClick={() => { void submit() }}>{busy ? '创建中…' : creationUnknown ? '核对上次创建' : mode === 'work' ? (startNow ? '创建并开始' : '创建工作') : mode === 'group' ? '创建群聊' : '开始对话'}</button></footer>
+      <footer className="ln-form-actions"><small>{mode === 'work' ? (startNow ? '将创建可追踪工作并向主助手提交目标。' : '仅创建工作，不启动模型；可随后开始。') : '创建群聊不会自动派工，未配置的助手可稍后配置。'}</small><button type="button" className="ln-action is-primary" disabled={busy || picking} onClick={() => { void submit() }}>{busy ? '创建中…' : creationUnknown ? '核对上次创建' : mode === 'work' ? (startNow ? '创建并开始' : '创建工作') : mode === 'group' ? '创建群聊' : '开始对话'}</button></footer>
     </div>
     {discard && <UnsavedNotice onKeep={() => setDiscard(false)} onDiscard={() => { setChanged(false); onClose() }}/>}
   </SurfaceDialog>

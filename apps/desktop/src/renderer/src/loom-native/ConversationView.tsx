@@ -3,6 +3,8 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import type { AgentProfile, ArtifactSelection, ConversationItem, ThreadSnapshot, WorkBundle } from './types'
 import { Avatar } from './Avatar'
+import { GroupAvatar } from './GroupAvatar'
+import { mentionRecipient } from './group-mentions'
 import { Icon, IconButton } from './icons'
 
 const MARKDOWN_PLUGINS = [remarkGfm]
@@ -25,17 +27,17 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   const composing = useRef(false)
   const pinned = useRef(true)
   const [showLatest, setShowLatest] = useState(false)
-  const [recipient, setRecipient] = useState<string>('')
-  const [menu, setMenu] = useState(false)
   const [copied, setCopied] = useState<string | null>(null)
-  const activeAgent = agents.find(agent => agent.agentId === (recipient || item?.agentId || snapshot?.thread.defaultLeadAgentId))
+  const activeAgent = agents.find(agent => agent.agentId === (item?.agentId || snapshot?.thread.defaultLeadAgentId))
   const messages = useMemo(() => snapshot?.messages.filter(message => !message.withdrawn) ?? [], [snapshot?.messages])
   const visibleMessages = useMemo(() => messages.filter(message => message.authorType !== 'system'), [messages])
   const systemMessages = useMemo(() => messages.filter(message => message.authorType === 'system'), [messages])
   const running = useMemo(() => snapshot?.agentRuns.filter(run => ['running', 'queued', 'waiting'].includes(run.status)) ?? [], [snapshot?.agentRuns])
-  const availableRecipients = useMemo(() => snapshot ? agents.filter(agent => snapshot.members.some(member => member.agentId === agent.agentId && member.membershipStatus === 'active')) : agents, [snapshot?.members,agents])
+  const activeMembers = useMemo(() => snapshot ? agents.filter(agent => snapshot.members.some(member => member.agentId === agent.agentId && member.membershipStatus === 'active')) : agents, [snapshot?.members,agents])
+  // 两位以上在册成员才算群聊。群的称呼挂在群上，不挂在其中某一位助手身上。
+  const isGroup = (snapshot?.members.filter(member => member.membershipStatus === 'active').length ?? 0) > 1
   const lastId = visibleMessages[visibleMessages.length - 1]?.id
-  useEffect(() => { setRecipient(''); setMenu(false); pinned.current = true; setShowLatest(false) }, [item?.id])
+  useEffect(() => { pinned.current = true; setShowLatest(false) }, [item?.id])
   useEffect(() => {
     if (pinned.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight
     else if (lastId) setShowLatest(true)
@@ -47,11 +49,14 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   }, [draft])
   const jump = () => { pinned.current = true; scroll.current?.scrollTo({ top: scroll.current.scrollHeight, behavior: 'smooth' }); setShowLatest(false) }
   const title = item?.title || activeAgent?.displayName || 'LOOM'
+  // 群里说话是「给群名发消息」（Mikka `group-chat-view.tsx:271` 传的是 group.title）；
+  // 只有单聊才写助手名（Mikka `messages/zh-CN.json:212` Nav.messageBot）。
+  const speakerName = isGroup ? title : activeAgent?.displayName || title
   const artifacts = useMemo(() => bundles.filter(bundle => bundle.mission.threadId === snapshot?.thread.id).flatMap(bundle => bundle.artifacts.map(artifact => ({ artifact, bundle, candidate: bundle.candidates.find(candidate => candidate.evidenceIds.includes(artifact.artifactId)) ?? null }))), [bundles,snapshot?.thread.id])
   return <main className="ln-conversation" aria-label={`与${title}的对话`}>
     <header className="ln-chat-header">
       {sidebarHidden && <IconButton icon="panel" label="展开会话列表" onClick={onShowSidebar} className="ln-chat-sidebar-toggle"/>}
-      <button type="button" className="ln-identity-pill" onClick={onProfile}><Avatar agent={activeAgent} name={title} size={23}/><strong>{title}</strong></button>
+      <button type="button" className="ln-identity-pill" onClick={onProfile}>{isGroup ? <GroupAvatar title={title} members={activeMembers} size={23}/> : <Avatar agent={activeAgent} name={title} size={23}/>}<strong>{title}</strong></button>
       {snapshot && onWorkspaceManager && <button type="button" className="ln-chat-root"
         title={'当前工作根：'+snapshot.thread.projectPath+'。点击管理其他项目'}
         aria-label="管理工作根目录" onClick={onWorkspaceManager}><Icon name="files" size={13}/>
@@ -66,7 +71,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
       if (pinned.current) setShowLatest(false)
     }}>
       {loading && !snapshot && <div className="ln-loading" role="status">正在读取对话…</div>}
-      {!loading && !visibleMessages.length && <div className="ln-chat-empty"><Avatar agent={activeAgent} name={title} size={52}/><h1>{title}</h1><p>{item?.threadId ? '从一条消息开始。' : '聊聊想法，或交给我一件事。'}</p></div>}
+      {!loading && !visibleMessages.length && <div className="ln-chat-empty">{isGroup ? <GroupAvatar title={title} members={activeMembers} size={52}/> : <Avatar agent={activeAgent} name={title} size={52}/>}<h1>{title}</h1><p>{item?.threadId ? '从一条消息开始。' : '聊聊想法，或交给我一件事。'}</p></div>}
       {visibleMessages.map(message => {
         const user = message.authorType === 'user' || message.authorType === 'external_principal'
         const author = agents.find(agent => agent.agentId === message.authorId)
@@ -87,15 +92,13 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
       {showLatest && <button type="button" className="ln-jump-latest" title="回到最新消息" aria-label="回到最新消息" onClick={jump}><Icon name="down" size={18}/></button>}
       {error && <div className="ln-send-error" role="alert">{error}</div>}
       {snapshot?.approvals.filter(approval => approval.status === 'pending').map(approval => <section className="ln-approval-request" key={approval.id} aria-label="等待你的授权"><strong><Icon name="hand" size={16}/>需要你确认</strong><p>{approval.actionSummary}</p>{approval.reason && <small>{approval.reason}</small>}<p className="ln-approval-scope">{agents.find(agent => agent.agentId === approval.agentId)?.displayName || '当前助手'} · {approval.options.some(option => option.kind === 'allow_session') ? '持续授权仅限此原生会话，具体范围见选项。' : '本次请求按运行端提供的范围授权。'}</p><div>{approval.options.map(option => <button type="button" disabled={approvalBusy} key={option.optionId} title={option.consequence} className={option.kind === 'allow_once' ? 'is-once' : option.kind === 'allow_session' ? 'is-persistent' : ''} onClick={() => onResolveApproval(approval.id, option.optionId)}>{option.label}</button>)}</div></section>)}
-      <form className="ln-composer" onSubmit={event => { event.preventDefault(); if (!sending && !composing.current && (draft.trim() || files.length)) onSend(recipient || undefined) }}>
+      <form className="ln-composer" onSubmit={event => { event.preventDefault(); if (!sending && !composing.current && (draft.trim() || files.length)) onSend(isGroup ? mentionRecipient(draft, activeMembers) : undefined) }}>
         {files.length > 0 && <div className="ln-pending-files">{files.map((file, index) => <span key={`${file.name}-${index}`}><Icon name="file" size={14}/>{file.name}<button type="button" aria-label={`移除${file.name}`} onClick={() => onFiles(files.filter((_, i) => i !== index))}><Icon name="close" size={12}/></button></span>)}</div>}
-        <textarea ref={input} value={draft} onChange={event => onDraft(event.target.value)} aria-label={`给${activeAgent?.displayName || title}发消息`} placeholder={`给 ${activeAgent?.displayName || title} 发消息`} rows={1} onCompositionStart={() => { composing.current = true }} onCompositionEnd={() => { composing.current = false }} onKeyDown={event => {
+        <textarea ref={input} value={draft} onChange={event => onDraft(event.target.value)} aria-label={`给${speakerName}发消息`} placeholder={`给 ${speakerName} 发消息`} rows={1} onCompositionStart={() => { composing.current = true }} onCompositionEnd={() => { composing.current = false }} onKeyDown={event => {
           if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && !composing.current) { event.preventDefault(); event.currentTarget.form?.requestSubmit() }
         }}/>
-        <footer className="ln-composer-footer"><div className="ln-composer-left"><input ref={fileInput} type="file" multiple hidden onChange={event => { if (event.target.files) onFiles([...files, ...Array.from(event.target.files)]); event.target.value = '' }}/><IconButton icon="plus" label="添加附件" onClick={() => fileInput.current?.click()}/>
-          <div className="ln-recipient-control"><button type="button" className="ln-recipient-chip" aria-expanded={menu} onClick={() => setMenu(!menu)}><Avatar agent={activeAgent} size={17}/><span>{activeAgent?.displayName || 'LOOM'} 默认</span><Icon name="down" size={12}/></button>
-            {menu && <div className="ln-recipient-menu" role="menu">{availableRecipients.map(agent => <button key={agent.agentId} type="button" role="menuitem" onClick={() => { setRecipient(agent.agentId); setMenu(false) }}><Avatar agent={agent} size={22}/><span>{agent.displayName}</span>{activeAgent?.agentId === agent.agentId && <Icon name="check" size={14}/>}</button>)}</div>}
-          </div></div><button className="ln-send-button" type="submit" aria-label={sending ? '正在发送' : '发送消息'} disabled={sending || (!draft.trim() && !files.length)}>{sending ? <span className="ln-spinner"/> : <Icon name="up" size={17}/>}</button></footer>
+        {isGroup && activeMembers.length > 0 && <p className="ln-composer-hint">写 <strong>@名字</strong> 指定谁回复，不 @ 时由服务端挑选。可 @ {activeMembers.map(agent => agent.displayName).join('、')}</p>}
+        <footer className="ln-composer-footer"><div className="ln-composer-left"><input ref={fileInput} type="file" multiple hidden onChange={event => { if (event.target.files) onFiles([...files, ...Array.from(event.target.files)]); event.target.value = '' }}/><IconButton icon="plus" label="添加附件" onClick={() => fileInput.current?.click()}/></div><button className="ln-send-button" type="submit" aria-label={sending ? '正在发送' : '发送消息'} disabled={sending || (!draft.trim() && !files.length)}>{sending ? <span className="ln-spinner"/> : <Icon name="up" size={17}/>}</button></footer>
       </form>
     </div>
   </main>

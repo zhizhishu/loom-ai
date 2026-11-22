@@ -110,6 +110,22 @@ export function roomDraftProblemMessage(problems: readonly RoomDraftProblem[]): 
 }
 
 /**
+ * 主按钮永远可点（Mikka `new-group-dialog.tsx:68-72`：「The primary button always answers a press」）。
+ * 所以“还差什么”不靠置灰表达，而由这里给出点下去要说的那句话。
+ */
+export function roomSubmitProblem(
+  draft: RoomDraft,
+  agents: readonly AgentProfile[],
+  preflight: ThreadCreationPreflight | null
+): string | null {
+  if (preflight !== null && !preflight.admissible) {
+    return uiAttribute('当前主机还没有可用助手。请先新建或启用一位助手。')
+  }
+  const problems = roomDraftProblems(draft, agents)
+  return problems.length === 0 ? null : roomDraftProblemMessage(problems)
+}
+
+/**
  * Default is one Lead only. A saved team may pre-fill several members, but a group is never
  * assembled by selecting every assistant: the user checks each participant explicitly.
  */

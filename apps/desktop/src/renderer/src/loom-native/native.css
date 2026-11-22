@@ -147,3 +147,12 @@
 /* Skip costly layout/paint for long offscreen navigation histories. */
 .ln-conversation-row{content-visibility:auto;contain-intrinsic-size:auto 52px}
 .ln-task-card{content-visibility:auto;contain-intrinsic-size:auto 60px}
+
+/* 群头像：成员头像横向重叠叠放，不是标题首字母（Mikka group-avatar.tsx:29-35 的 -space-x-1.5）。 */
+.ln-group-avatar{display:inline-flex;align-items:center;flex:0 0 auto}
+.ln-group-avatar>.ln-avatar{border-radius:50%;box-shadow:0 0 0 1.5px var(--ln-bg)}
+.ln-group-avatar>.ln-avatar+.ln-avatar{margin-left:calc(var(--ln-avatar-size,23px)*-.34)}
+
+/* 群里的说话对象是 @ 出来的，不需要收件人下拉；只留一行说明。 */
+.ln-composer-hint{margin:0 0 5px;padding:0 2px;font-size:11px;color:var(--ln-muted)}
+.ln-composer-hint strong{font-weight:600}
