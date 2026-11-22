@@ -519,7 +519,7 @@ impl MainThreadMigrationSource {
 }
 
 pub(crate) const CURRENT_DATA_CONTRACT_VERSION: &str = "v1.72";
-pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 188;
+pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 187;
 const V147_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.54";
 const V147_MIGRATION_SOURCE_PROJECTION_SCHEMA_VERSION: i64 = 96;
 const V145_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.53";
@@ -1054,10 +1054,12 @@ impl CurrentMigrationState {
 
     fn admits(&self, contract: &str, schema: i64, classifier: &str) -> bool {
         if self.v238 {
+            // 238 persists Delivery wake facts without moving the projection schema, exactly
+            // like 236 and 237: 187 is the marker both before and after its receipt exists.
             let mut previous = *self;
             previous.v238 = false;
             return contract == CURRENT_DATA_CONTRACT_VERSION
-                && schema == 188
+                && schema == 187
                 && self.v237
                 && previous.admits(CURRENT_DATA_CONTRACT_VERSION, 187, classifier);
         }

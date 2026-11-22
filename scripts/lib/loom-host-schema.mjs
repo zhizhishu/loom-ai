@@ -5,7 +5,7 @@ import { realpath } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-export const CURRENT_HOST_SCHEMA = 188
+export const CURRENT_HOST_SCHEMA = 187
 export const CURRENT_HOST_MIGRATION = 238
 const ARTIFACT_VERSION_MIGRATION = 235
 const LOCAL_HOOK_MIGRATION = 236
@@ -18,9 +18,8 @@ export async function verifyRunningHostSchema ({ request, databasePath,
     expectedProjectionSchema, expectedMigrationVersion, verified: false }
   try {
     assert.ok((expectedProjectionSchema === 186 && expectedMigrationVersion === 236)
-      || (expectedProjectionSchema === 187 && expectedMigrationVersion === 237)
-      || (expectedProjectionSchema === 188 && expectedMigrationVersion === 238),
-      'this acceptance requires a supported projection/migration pair (186/236, 187/237 or 188/238)')
+      || (expectedProjectionSchema === 187 && expectedMigrationVersion === 238),
+      'this acceptance requires a supported projection/migration pair (186/236 or 187/238)')
     assert.ok(typeof databasePath === 'string' && isAbsolute(databasePath),
       'the isolated Host database path must be explicitly selected')
     const health = await request('health.check', {})

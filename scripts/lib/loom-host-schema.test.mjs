@@ -8,11 +8,11 @@ import { verifyRunningHostSchema } from './loom-host-schema.mjs'
 
 // Migration 238 (the Delivery wake persistence) is the current receipt, so a current
 // database also carries 235 (artifact versions), 236 (local Hook snapshots) and 237 (the
-// durable LOOM recovery ledger).
+// durable LOOM recovery ledger). 238 adds columns only, so the projection schema stays 187.
 const priorReceipts = migration => migration >= 238 ? [235, 236, 237]
   : migration >= 237 ? [235, 236] : migration >= 236 ? [235] : []
 
-async function fixture (t, schema = 188, migration = 238, previousReceipts = priorReceipts(migration)) {
+async function fixture (t, schema = 187, migration = 238, previousReceipts = priorReceipts(migration)) {
   const dir = await mkdtemp(join(tmpdir(), 'loom-host-schema-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const path = join(dir, 'rovai.sqlite')
@@ -34,7 +34,7 @@ test('the running Host actual schema is verified read-only, with no runtime or s
   const before = await readFile(f.path)
   const evidence = await verifyRunningHostSchema({ request: f.request, databasePath: f.path })
   assert.equal(evidence.verified, true)
-  assert.equal(evidence.projectionSchema, 188)
+  assert.equal(evidence.projectionSchema, 187)
   assert.equal(evidence.latestMigrationVersion, 238)
   assert.equal(evidence.localHookMigrationPresent, true)
   assert.equal(evidence.recoveryLedgerMigrationPresent, true)
@@ -70,18 +70,18 @@ test('a current schema marker without its immutable-version migration receipt is
   await assert.rejects(verifyRunningHostSchema({ request: f.request, databasePath: f.path,
     expectedProjectionSchema: 186, expectedMigrationVersion: 236 }),
     error => error.hostSchema.projectionSchema === 186 && error.hostSchema.artifactVersionMigrationPresent === false)
-  const missingHistory = await fixture(t, 187, 237, [])
+  const missingHistory = await fixture(t, 187, 238, [])
   await assert.rejects(verifyRunningHostSchema({ request: missingHistory.request, databasePath: missingHistory.path,
-    expectedProjectionSchema: 187, expectedMigrationVersion: 237 }),
-    error => error.hostSchema.latestMigrationVersion === 237 && error.hostSchema.artifactVersionMigrationPresent === false)
+    expectedProjectionSchema: 187, expectedMigrationVersion: 238 }),
+    error => error.hostSchema.latestMigrationVersion === 238 && error.hostSchema.artifactVersionMigrationPresent === false)
   // A current marker whose history stops at the local Hook migration is an old Core.
   const wrongReceipt = await fixture(t, 187, 236, [235])
   await assert.rejects(verifyRunningHostSchema({ request: wrongReceipt.request, databasePath: wrongReceipt.path,
-    expectedProjectionSchema: 187, expectedMigrationVersion: 237 }), /migration history differs/)
+    expectedProjectionSchema: 187, expectedMigrationVersion: 238 }), /migration history differs/)
   // The local Hook receipt is required even when the newest receipt is present.
-  const missingLocalHook = await fixture(t, 187, 237, [235])
+  const missingLocalHook = await fixture(t, 187, 238, [235, 237])
   await assert.rejects(verifyRunningHostSchema({ request: missingLocalHook.request, databasePath: missingLocalHook.path,
-    expectedProjectionSchema: 187, expectedMigrationVersion: 237 }), /local Hook migration is absent/)
+    expectedProjectionSchema: 187, expectedMigrationVersion: 238 }), /local Hook migration is absent/)
 })
 
 test('health from a different database cannot validate the selected isolated Host', async t => {

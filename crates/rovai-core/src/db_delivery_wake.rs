@@ -42,35 +42,35 @@ pub(super) fn migrate(database: &mut Database) -> Result<()> {
     let tx = database
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Like 236 and 237 this migration adds columns and a receipt without moving the
+    // projection schema, so 187 is both the supported source marker and still Current here.
     anyhow::ensure!(
-        matches!(classify_database_contract(&tx)?,
-        DatabaseContractClassification::SupportedMigrationSource(ref marker) if marker.projection_schema_version==187),
+        match classify_database_contract(&tx)? {
+            DatabaseContractClassification::Current(ref marker)
+            | DatabaseContractClassification::SupportedMigrationSource(ref marker) => {
+                marker.projection_schema_version == 187
+            }
+            DatabaseContractClassification::Unknown(_) => false,
+        },
         "Delivery wake migration requires schema 187"
     );
     tx.execute_batch(SCHEMA_SQL)?;
-    tx.execute_batch(
-        "INSERT INTO schema_migration VALUES(238,datetime('now'));
-         UPDATE rovai_data_contract SET projection_schema_version=188,updated_at=datetime('now') WHERE singleton=1;",
-    )?;
+    tx.execute_batch("INSERT INTO schema_migration VALUES(238,datetime('now'));")?;
     validate_migration_foreign_keys(&tx, &["camp_message_delivery"])?;
     anyhow::ensure!(
         schema_matches(&tx)?,
         "Delivery wake schema invalid"
     );
-    anyhow::ensure!(
-        // 188 is only Current while nothing newer exists; a later migration must leave this
-        // receipt admissible as a supported source instead of pinning Current.
-        match classify_database_contract(&tx)? {
-            DatabaseContractClassification::Current(ref marker) => {
-                marker.projection_schema_version == 188
-            }
-            DatabaseContractClassification::SupportedMigrationSource(ref marker) => {
-                marker.projection_schema_version == 188
-            }
-            DatabaseContractClassification::Unknown(_) => false,
-        },
-        "Delivery wake schema admission failed"
-    );
+    // 187 stays Current after 238 because nothing newer owns the marker; a later migration
+    // must keep this receipt admissible as a supported source instead of pinning Current.
+    let admitted = match classify_database_contract(&tx)? {
+        DatabaseContractClassification::Current(_) => true,
+        DatabaseContractClassification::SupportedMigrationSource(ref marker) => {
+            marker.projection_schema_version == 187
+        }
+        DatabaseContractClassification::Unknown(_) => false,
+    };
+    anyhow::ensure!(admitted, "Delivery wake schema admission failed");
     tx.commit()?;
     Ok(())
 }
@@ -100,6 +100,18 @@ mod tests {
         assert_eq!(attempts, 0);
         assert!(next_wake_at.is_none() && lease.is_none());
         assert!(schema_matches(db.connection()).unwrap());
+        // 238 is a receipt-only migration: the projection schema stays at 187, the marker 237
+        // left behind, so a current store never claims a schema no migration owns.
+        assert_eq!(
+            db.connection()
+                .query_row(
+                    "SELECT projection_schema_version FROM rovai_data_contract WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            187
+        );
         assert_eq!(
             db.connection()
                 .query_row(
