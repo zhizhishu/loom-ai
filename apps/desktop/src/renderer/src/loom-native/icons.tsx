@@ -1,6 +1,6 @@
 import type { CSSProperties, ReactNode } from 'react'
 
-export type IconName = 'home' | 'bulb' | 'board' | 'clock' | 'files' | 'settings' | 'search' | 'plus' | 'close' | 'left' | 'right' | 'down' | 'up' | 'panel' | 'expand' | 'chat' | 'globe' | 'download' | 'check' | 'hand' | 'progress' | 'blocked' | 'file' | 'computer' | 'refresh' | 'attach' | 'copy' | 'stop' | 'more' | 'branch' | 'sun' | 'moon' | 'people' | 'minus'
+export type IconName = 'home' | 'bulb' | 'board' | 'clock' | 'files' | 'settings' | 'search' | 'plus' | 'close' | 'left' | 'right' | 'down' | 'up' | 'panel' | 'expand' | 'chat' | 'globe' | 'download' | 'check' | 'hand' | 'progress' | 'blocked' | 'file' | 'image' | 'audio' | 'computer' | 'refresh' | 'attach' | 'copy' | 'stop' | 'more' | 'branch' | 'sun' | 'moon' | 'people' | 'minus'
 const paths: Record<IconName, ReactNode> = {
   minus: <path d="M5 12h14"/>,
   people: <><circle cx="8" cy="7" r="3"/><path d="M2.5 19v-2a5.5 5.5 0 0 1 11 0v2M16 4.5a3 3 0 0 1 0 6M16.5 13a5 5 0 0 1 5 4v2"/></>,
@@ -23,6 +23,9 @@ const paths: Record<IconName, ReactNode> = {
   progress: <path d="M12 3a9 9 0 1 1-8.5 12M3.5 9A9 9 0 0 1 8 4"/>,
   blocked: <><circle cx="12" cy="12" r="9"/><path d="m8 8 8 8m0-8-8 8"/></>,
   file: <><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z"/><path d="M14 3v6h6M8 13h8m-8 4h6"/></>,
+  // Mikka `components/icons` Image / AudioLines, for the two attachment kinds a card names.
+  image: <><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.4"/><path d="m4 17 5-5 4 4 3-3 4 4"/></>,
+  audio: <><path d="M3 11v2m4-6v10m4-13v16m4-11v6m4-4v2"/></>,
   computer: <><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4"/></>,
   refresh: <><path d="M20 10a8 8 0 1 0-1 7M20 4v6h-6"/></>,
   attach: <path d="m8 13 7-7a3 3 0 0 1 4 4L9 20a5 5 0 0 1-7-7L13 2"/>,
