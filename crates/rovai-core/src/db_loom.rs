@@ -3219,7 +3219,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert!(
+            assert_eq!(
                 columns, 10,
                 "assertion the_fixture_is_the_m5b_ledger_migration_237_shipped"
             );
