@@ -20,6 +20,7 @@ import { WorkspaceSearch } from './WorkspaceSearch'
 import { PanelResizeHandle } from './PanelResizeHandle'
 import { WorkspaceManager } from './WorkspaceManager'
 import { RunStatusDialog } from './RunStatusDialog'
+import { RunActivityHistory } from './RunningActivity'
 import { storedPanelWidth, fittedPanelWidths, type PanelSide, type PanelWidths } from './panel-resize'
 
 // Load optional editors only when opened; keep them mounted after first use so
@@ -170,9 +171,8 @@ export function LoomApp({ environment, onLogout }: Props) {
     if (patch.text !== undefined) saveEditorText(draftKey, patch.text)
     setDrafts(current => ({ ...current, [draftKey]: { ...(current[draftKey] ?? { text: '', files: [] }), ...patch } }))
   }
-  const send = async (agentId?: string) => {
+  const submit = async (key: string, submitted: Draft, agentId?: string) => {
     if (sending) return
-    const key = draftKey; const submitted = { ...draft }
     setSending(true); setSendError(null)
     try {
       await data.send(submitted.text, submitted.files, agentId)
@@ -191,6 +191,15 @@ export function LoomApp({ environment, onLogout }: Props) {
       setSendError(error instanceof Error ? error.message : '发送未完成，消息已保留。')
     }
     finally { setSending(false) }
+  }
+  const send = (agentId?: string) => { void submit(draftKey, { ...draft }, agentId) }
+  /** 失败块里的「重试」：把上一条用户消息再发一次（Mikka 失败块同样是重新发起这一轮，不是只换个按钮）。
+   *  输入框里的草稿不属于这次重试，因此不清空。 */
+  const retryLastRun = () => {
+    if (sending) return
+    const last = data.snapshot?.messages.filter(message => (message.authorType === 'user' || message.authorType === 'external_principal') && !message.withdrawn).at(-1)
+    if (!last?.body.trim()) return
+    void submit(draftKey, { text: last.body, files: [] })
   }
   const openWork = (mode: InspectorMode = 'work') => safeInspectorAction(() => { setCapabilityDirty(false); setInspectorMode(mode); setInspectorOpen(true); setExpanded(false) })
 
@@ -264,9 +273,9 @@ export function LoomApp({ environment, onLogout }: Props) {
     </nav>
       <section ref={frameRef} className="ln-frame" aria-label="LOOM 工作空间" style={{ '--ln-sidebar-width': `${panelWidths.sidebar}px`, '--ln-inspector-width': `${panelWidths.inspector}px` } as React.CSSProperties}>
         {sidebarOpen && <Sidebar agents={data.agents} items={data.conversations} selectedId={data.selectedId} loading={data.loading} groupRosters={groupRosters} onSelect={item => safeInspectorAction(() => { setCapabilityDirty(false); void select(item) })} onCreate={beginConversation} onCollapse={() => setSidebarOpen(false)} onEditAssistant={agentId => manageAssistant(agentId)}/>}{sidebarOpen && <PanelResizeHandle side="sidebar" frame={frameRef} widths={panelWidths} sidebarOpen={sidebarOpen} inspectorOpen={inspectorOpen} onResize={resizePanel}/> }
-        <ConversationView item={active} agents={data.agents} snapshot={data.snapshot} bundles={data.bundles} loading={data.loading} sending={sending} draft={draft.text} files={draft.files} error={sendError} onDraft={text => patchDraft({ text })} onFiles={files => patchDraft({ files })} onSend={agentId => { void send(agentId) }} onProfile={() => manageAssistant(activeAgent?.agentId)} onWorkspaceManager={() => setWorkspaceManagerOpen(true)} onMembers={() => setMembersOpen(true)} onArtifact={setArtifact} onShowSidebar={() => setSidebarOpen(true)} sidebarHidden={!sidebarOpen} onShowWork={() => openWork()} inspectorHidden={!inspectorOpen} onAttachment={(messageId,attachmentId) => { void openAttachment(messageId,attachmentId) }} approvalBusy={approvalBusy} onResolveApproval={(approvalId,optionId) => { void resolveApproval(approvalId,optionId) }}/>
+        <ConversationView item={active} agents={data.agents} snapshot={data.snapshot} bundles={data.bundles} loading={data.loading} sending={sending} draft={draft.text} files={draft.files} error={sendError} onDraft={text => patchDraft({ text })} onFiles={files => patchDraft({ files })} onSend={agentId => { void send(agentId) }} onRetryRun={retryLastRun} onConfigureRuntime={() => manageAssistant(activeAgent?.agentId)} onOpenRuntimeSetup={() => setSetupOpen(true)} onProfile={() => manageAssistant(activeAgent?.agentId)} onWorkspaceManager={() => setWorkspaceManagerOpen(true)} onMembers={() => setMembersOpen(true)} onArtifact={setArtifact} onShowSidebar={() => setSidebarOpen(true)} sidebarHidden={!sidebarOpen} onShowWork={() => openWork()} inspectorHidden={!inspectorOpen} onAttachment={(messageId,attachmentId) => { void openAttachment(messageId,attachmentId) }} approvalBusy={approvalBusy} onResolveApproval={(approvalId,optionId) => { void resolveApproval(approvalId,optionId) }}/>
         {inspectorOpen && <PanelResizeHandle side="inspector" frame={frameRef} widths={panelWidths} sidebarOpen={sidebarOpen} inspectorOpen={inspectorOpen} onResize={resizePanel}/>}
-        {inspectorOpen && <Inspector key={capabilityEpoch} selectedTaskId={dockSelection?.threadId === (active?.threadId ?? null) ? dockSelection?.taskId ?? null : null} onTaskSelect={taskId => setDockSelection({ threadId: active?.threadId ?? null, taskId })} threadId={active?.threadId} conversationTitle={active?.title} onCreateWork={beginWork} workbench={environment.workbench} client={environment.client} theme={theme} onManageAssistant={manageAssistant} onCapabilityDirty={setCapabilityDirty} onLibrary={() => safeInspectorAction(() => { setCapabilityDirty(false); setLibraryOpen(true) })} agents={data.agents} bundles={data.bundles} agent={activeAgent} mode={inspectorMode} tab={tab} onTab={value => safeInspectorAction(() => { setTab(value); setCapabilityDirty(false) })} onMode={value => safeInspectorAction(() => { setInspectorMode(value); setCapabilityDirty(false) })} onClose={() => safeInspectorAction(() => { setInspectorOpen(false); setExpanded(false); setCapabilityDirty(false) })} onExpand={() => setExpanded(value => !value)} expanded={expanded} onArtifact={setArtifact} loading={data.loading} onOpenConversation={threadId => { const item = data.conversations.find(item => item.threadId === threadId); if (item) void select(item) }}/>}</section>
+        {inspectorOpen && <Inspector key={capabilityEpoch} selectedTaskId={dockSelection?.threadId === (active?.threadId ?? null) ? dockSelection?.taskId ?? null : null} onTaskSelect={taskId => setDockSelection({ threadId: active?.threadId ?? null, taskId })} threadId={active?.threadId} conversationTitle={active?.title} onCreateWork={beginWork} onConnectDevice={() => setSetupOpen(true)} workbench={environment.workbench} client={environment.client} theme={theme} onManageAssistant={manageAssistant} onCapabilityDirty={setCapabilityDirty} onLibrary={() => safeInspectorAction(() => { setCapabilityDirty(false); setLibraryOpen(true) })} agents={data.agents} bundles={data.bundles} agent={activeAgent} mode={inspectorMode} tab={tab} onTab={value => safeInspectorAction(() => { setTab(value); setCapabilityDirty(false) })} onMode={value => safeInspectorAction(() => { setInspectorMode(value); setCapabilityDirty(false) })} onClose={() => safeInspectorAction(() => { setInspectorOpen(false); setExpanded(false); setCapabilityDirty(false) })} onExpand={() => setExpanded(value => !value)} expanded={expanded} onArtifact={setArtifact} loading={data.loading} onOpenConversation={threadId => { const item = data.conversations.find(item => item.threadId === threadId); if (item) void select(item) }}/>}</section>
     </div>
     {(notice || data.error) && <div className="ln-notice" role="alert"><span>{notice || data.error}</span><IconButton icon="refresh" label="重试读取" onClick={() => { setNotice(null); void data.refresh().catch(report) }}/><IconButton icon="close" label="关闭提示" onClick={() => setNotice(null)}/></div>}
     {visitedPanels.setup&&<Suspense fallback={<span role="status" className="ln-loading">正在打开连接与设备…</span>}><NativeSetup open={setupOpen} environment={environment} theme={theme} threadId={active?.threadId ?? undefined} onClose={() => setSetupOpen(false)} onChanged={() => { setCapabilityEpoch(value => value + 1); void data.refresh().catch(report) }} onManageAssistants={() => manageAssistant(activeAgent?.agentId)}/></Suspense>}
@@ -284,7 +293,7 @@ export function LoomApp({ environment, onLogout }: Props) {
     {artifact && <ArtifactView key={`${artifact.bundle.mission.missionId}:${artifact.artifact.artifactId}:${artifact.candidate?.candidateId ?? "none"}`} theme={theme} fallbackFocus={runSurfaceOpener.current} selection={currentArtifact?.selection ?? artifact} contextAvailable={currentArtifact?.contextAvailable ?? false} onClose={() => setArtifact(null)} onRefresh={data.refresh}/>}
     <Dialog.Root open={modal !== null} onOpenChange={open => { if (!open) setModal(null) }}><Dialog.Portal><div className="ln-portal" data-theme={theme}><Dialog.Overlay className="ln-modal-backdrop"/><Dialog.Content className={`ln-dialog${modal === 'search' ? ' ln-search-dialog' : ''}`} aria-describedby={undefined}><header><Dialog.Title>{modal === 'search' ? '搜索' : modal === 'history' ? '会话活动' : '设置'}</Dialog.Title><Dialog.Close asChild><button type="button" className="ln-icon-button" aria-label="关闭"><Icon name="close"/></button></Dialog.Close></header>
       {modal === 'search' && <><div className="ln-search-field"><Icon name="search"/><input placeholder="搜索对话、助手、工作或文件名…" aria-label="全局搜索" value={query} onChange={event => setQuery(event.target.value)} autoFocus/></div><WorkspaceSearch results={searchResults} query={query} onConversation={item => safeInspectorAction(() => { void select(item); setModal(null) })} onAssistant={agentId => { setModal(null); manageAssistant(agentId) }} onWork={searchWork} onArtifact={searchArtifact}/></>}
-      {modal === 'history' && <div className="ln-dialog-results">{data.snapshot?.agentRuns.slice().reverse().map(run => <div className="ln-settings-row" key={run.id}><span>{data.agents.find(agent => agent.agentId === run.agentId)?.displayName || '助手'}</span><span>{({ queued:'排队中', running:'执行中', waiting:'等待中', succeeded:'已完成', failed:'失败', cancelled:'已取消' })[run.status]}</span></div>)}{!data.snapshot?.agentRuns.length && <p className="ln-inspector-empty">当前对话暂无执行活动</p>}</div>}
+      {modal === 'history' && <div className="ln-dialog-results"><RunActivityHistory runs={data.snapshot?.agentRuns ?? []} agents={data.agents} sending={sending} onRetry={retryLastRun}/></div>}
       {modal === 'settings' && <><div className="ln-settings-row"><span>外观</span><select value={theme} aria-label="外观主题" onChange={event => setTheme(event.target.value as 'day' | 'night')}><option value="day">浅色</option><option value="night">深色</option></select></div><div className="ln-settings-row"><span>工作空间</span><button className="ln-action" type="button" onClick={()=>{setModal(null);setWorkspaceManagerOpen(true)}}>管理工作目录</button></div><div className="ln-settings-row"><span>刷新工作空间</span><IconButton icon="refresh" label="刷新工作空间" onClick={() => { void data.refresh().catch(report) }}/></div>{onLogout && <button className="ln-text-action" type="button" onClick={onLogout}>退出当前连接</button>}</>}
     </Dialog.Content></div></Dialog.Portal></Dialog.Root>
   </div>

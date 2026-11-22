@@ -291,3 +291,35 @@ describe('artifact status never says you are being waited on while the machine r
     expect(assets(observed())).toContain('等你')
   })
 })
+
+// 四个页签的空态：搬 Mikka `components/ui/empty.tsx` 的 `Empty / EmptyHeader /
+// EmptyMedia / EmptyTitle / EmptyContent`，空态里必须带一个下一步动作
+// （`issue-list.tsx:49-51`、`project-workspace.tsx:62` 的用例）。
+describe('workspace dock empty states (Mikka empty.tsx)', () => {
+  const dock = (mode: 'work' | 'assets' | 'map' | 'computer') => renderToStaticMarkup(createElement(Inspector, {
+    agents: [], bundles: [], agent: null, mode, tab: 'details' as const,
+    onTab: () => {}, onMode: () => {}, onClose: () => {}, onExpand: () => {}, expanded: false,
+    onArtifact: () => {}, onOpenConversation: () => {}, loading: false,
+    onCreateWork: () => {}, onConnectDevice: () => {}
+  }))
+  it('gives every tab the same empty structure with a next step', () => {
+    const work = dock('work')
+    expect(work).toContain('data-slot="empty"')
+    expect(work).toContain('data-slot="empty-title"')
+    expect(work).toContain('从一个目标开始')
+    expect(work).toContain('创建一项工作')
+    expect(dock('assets')).toContain('成果会留在这里')
+    const flow = dock('map')
+    expect(flow).toContain('流程和成果关系会连在这里')
+    expect(flow).toContain('创建一项工作')
+    const computer = dock('computer')
+    expect(computer).toContain('还没有可以查看的电脑')
+    expect(computer).toContain('去连接设备')
+  })
+  it('keeps the old flat grey paragraph out of the four tabs', () => {
+    for (const mode of ['work', 'assets', 'map', 'computer'] as const) {
+      expect(dock(mode)).not.toContain('ln-inspector-empty')
+      expect(dock(mode)).not.toContain('ln-dock-empty')
+    }
+  })
+})

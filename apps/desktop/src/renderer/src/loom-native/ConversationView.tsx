@@ -1,18 +1,27 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import type { ActionApprovalView, AgentRunView, HostPlatformKey } from '@contracts'
 import type { AgentProfile, ArtifactSelection, ConversationItem, ThreadSnapshot, WorkBundle } from './types'
 import { AgentMarkdown } from './AgentMarkdown'
 import { Avatar } from './Avatar'
 import { GroupAvatar } from './GroupAvatar'
 import { mentionRecipient } from './group-mentions'
 import { Icon, IconButton } from './icons'
+import { RunActivityLine, RunningActivity } from './RunningActivity'
+import { runtimeFailureMessage } from '../RuntimeFailureNotice'
+import { RuntimeInstallationGuide } from '../RuntimeInstallationGuide'
+import { runtimeInstallGuide } from '../runtime-install-guide'
+import { isNewConversationMemberAvailable, newConversationMemberStatus } from '../new-conversation-availability'
+import { agentRunPresentation } from '../../../shared/execution-presentation'
+import { adapterLabel } from '../runtime-products'
 
-export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, onDraft, onFiles, onSend, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager }: {
+export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, onDraft, onFiles, onSend, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager, onRetryRun, onConfigureRuntime, onOpenRuntimeSetup, hostPlatform = null }: {
   item: ConversationItem | null; snapshot: ThreadSnapshot | null; agents: AgentProfile[]; bundles: WorkBundle[]; loading: boolean; sending: boolean
   draft: string; files: File[]; error: string | null; onDraft(value: string): void; onFiles(files: File[]): void
   onSend(agentId?: string): void; onProfile(): void; onArtifact(selection: ArtifactSelection): void
   onShowSidebar(): void; sidebarHidden: boolean; onShowWork(): void; inspectorHidden: boolean
   onAttachment(messageId: string, attachmentId: string): void
   onResolveApproval(approvalId: string, optionId: string): void; approvalBusy: boolean; onMembers?(): void; onWorkspaceManager?(): void
+  onRetryRun?(): void; onConfigureRuntime?(): void; onOpenRuntimeSetup?(): void; hostPlatform?: HostPlatformKey | null
 }) {
   const scroll = useRef<HTMLDivElement>(null)
   const input = useRef<HTMLTextAreaElement>(null)
@@ -26,6 +35,20 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   const visibleMessages = useMemo(() => messages.filter(message => message.authorType !== 'system'), [messages])
   const systemMessages = useMemo(() => messages.filter(message => message.authorType === 'system'), [messages])
   const running = useMemo(() => snapshot?.agentRuns.filter(run => ['running', 'queued', 'waiting'].includes(run.status)) ?? [], [snapshot?.agentRuns])
+  // 最近一次运行：只有在它已经终止时才在 transcript 末尾留一条状态行（Mikka 的 activityLine）。
+  const latestRun = useMemo(() => {
+    const runs = [...(snapshot?.agentRuns ?? [])]
+      .sort((left, right) => (left.startedAt ?? left.createdAt).localeCompare(right.startedAt ?? right.createdAt))
+    return runs[runs.length - 1] ?? null
+  }, [snapshot?.agentRuns])
+  const endedRun = latestRun && ['succeeded', 'failed', 'cancelled'].includes(latestRun.status) ? latestRun : null
+  // Mikka approval-card `:573-576`：处理完的授权不整块消失，交互区收起后降级成一条结论行。
+  // 这里只留最近一次已处理的请求，避免历史授权把输入区顶走。
+  const resolvedApproval = useMemo(() => {
+    const resolved = (snapshot?.approvals ?? []).filter(approval => approval.status !== 'pending')
+      .sort((left, right) => (left.resolvedAt ?? left.requestedAt).localeCompare(right.resolvedAt ?? right.requestedAt))
+    return resolved[resolved.length - 1] ?? null
+  }, [snapshot?.approvals])
   const activeMembers = useMemo(() => snapshot ? agents.filter(agent => snapshot.members.some(member => member.agentId === agent.agentId && member.membershipStatus === 'active')) : agents, [snapshot?.members,agents])
   // 两位以上在册成员才算群聊。群的称呼挂在群上，不挂在其中某一位助手身上。
   const isGroup = (snapshot?.members.filter(member => member.membershipStatus === 'active').length ?? 0) > 1
@@ -78,13 +101,16 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
         </article>
       })}
       {artifacts.length > 0 && <div className="ln-delivered-files">{artifacts.map(selection => <button type="button" className="ln-artifact-card" key={selection.artifact.artifactId} onClick={() => onArtifact(selection)}><span className="ln-document-icon"><Icon name="file" size={22}/></span><span><strong>{selection.artifact.relativePath.split(/[\\/]/).pop()}</strong><small>{selection.candidate?.acceptanceStatus === 'accepted' ? '已接受' : selection.candidate?.acceptanceStatus === 'rejected' ? '已退回' : '等待审阅'}</small></span><Icon name="right" size={15}/></button>)}</div>}
-      {running.length > 0 && <div className="ln-running-status" role="status"><span className="ln-working-dots"><i/><i/><i/></span>{running.map(run => agents.find(agent => agent.agentId === run.agentId)?.displayName || '助手').join('、')}正在处理</div>}
+      {running.map(run => <RunningActivity key={run.id} label={`${agents.find(agent => agent.agentId === run.agentId)?.displayName || '助手'}正在处理`}/>)}
+      {endedRun && <RunActivityLine run={endedRun}/>}
+      {endedRun?.status === 'failed' && <RunFailure run={endedRun} agent={agents.find(agent => agent.agentId === endedRun.agentId) ?? null} sending={sending} onRetry={onRetryRun} onConfigure={onConfigureRuntime} onOpenRuntimeSetup={onOpenRuntimeSetup} platform={hostPlatform}/>}
       {systemMessages.length > 0 && <details className="ln-system-records"><summary>会话记录 <span>{systemMessages.length}</span></summary>{systemMessages.map(message => <AgentMarkdown key={message.id} text={message.body}/>)}</details>}
     </div>
     <div className="ln-composer-area">
       {showLatest && <button type="button" className="ln-jump-latest" title="回到最新消息" aria-label="回到最新消息" onClick={jump}><Icon name="down" size={18}/></button>}
-      {error && <div className="ln-send-error" role="alert">{error}</div>}
-      {snapshot?.approvals.filter(approval => approval.status === 'pending').map(approval => <section className="ln-approval-request" key={approval.id} aria-label="等待你的授权"><strong><Icon name="hand" size={16}/>需要你确认</strong><p>{approval.actionSummary}</p>{approval.reason && <small>{approval.reason}</small>}<p className="ln-approval-scope">{agents.find(agent => agent.agentId === approval.agentId)?.displayName || '当前助手'} · {approval.options.some(option => option.kind === 'allow_session') ? '持续授权仅限此原生会话，具体范围见选项。' : '本次请求按运行端提供的范围授权。'}</p><div>{approval.options.map(option => <button type="button" disabled={approvalBusy} key={option.optionId} title={option.consequence} className={option.kind === 'allow_once' ? 'is-once' : option.kind === 'allow_session' ? 'is-persistent' : ''} onClick={() => onResolveApproval(approval.id, option.optionId)}>{option.label}</button>)}</div></section>)}
+      {error && <div className="ln-send-error" role="alert" data-slot="send-error"><strong>请求失败，请稍后重试。</strong>{error.trim() && error.trim() !== '请求失败，请稍后重试。' && <small>{error}</small>}<p>你的输入已保留。</p><button type="button" disabled={sending || (!draft.trim() && !files.length)} onClick={() => onSend(isGroup ? mentionRecipient(draft, activeMembers) : undefined)}>{sending ? '正在重试…' : '重试此回复'}</button></div>}
+      {snapshot?.approvals.filter(approval => approval.status === 'pending').map(approval => <section className="ln-approval-request" key={approval.id} aria-label="等待你的授权" data-state={approval.status} aria-busy={approvalBusy}><strong><Icon name="hand" size={16}/>需要你确认<span className="ln-approval-state" data-state={approval.status}>{approvalStatusLabel(approval.status)}</span></strong><p>{approval.actionSummary}</p>{approval.reason && <small>{approval.reason}</small>}<p className="ln-approval-scope">{agents.find(agent => agent.agentId === approval.agentId)?.displayName || '当前助手'} · {approval.options.some(option => option.kind === 'allow_session') ? '持续授权仅限此原生会话，具体范围见选项。' : '本次请求按运行端提供的范围授权。'}</p><div>{approval.options.map(option => <button type="button" disabled={approvalBusy} key={option.optionId} title={option.consequence} className={option.kind === 'allow_once' ? 'is-once' : option.kind === 'allow_session' ? 'is-persistent' : ''} onClick={() => onResolveApproval(approval.id, option.optionId)}>{option.label}</button>)}</div></section>)}
+      {resolvedApproval && <p className="ln-approval-result" data-slot="approval-result" data-state={resolvedApproval.status} aria-label={`${approvalStatusLabel(resolvedApproval.status)}的授权`}><Icon name={resolvedApproval.status === 'approved' ? 'check' : 'blocked'} size={14}/><span>{resolvedApproval.actionSummary}</span><em>{approvalStatusLabel(resolvedApproval.status)}</em></p>}
       <form className="ln-composer" onSubmit={event => { event.preventDefault(); if (!sending && !composing.current && (draft.trim() || files.length)) onSend(isGroup ? mentionRecipient(draft, activeMembers) : undefined) }}>
         {files.length > 0 && <div className="ln-pending-files">{files.map((file, index) => <span key={`${file.name}-${index}`}><Icon name="file" size={14}/>{file.name}<button type="button" aria-label={`移除${file.name}`} onClick={() => onFiles(files.filter((_, i) => i !== index))}><Icon name="close" size={12}/></button></span>)}</div>}
         <textarea ref={input} value={draft} onChange={event => onDraft(event.target.value)} aria-label={`给${speakerName}发消息`} placeholder={`给 ${speakerName} 发消息`} rows={1} onCompositionStart={() => { composing.current = true }} onCompositionEnd={() => { composing.current = false }} onKeyDown={event => {
@@ -95,4 +121,64 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
       </form>
     </div>
   </main>
+}
+
+/**
+ * 复用 `new-conversation-availability.ts` 的判定与文案：同一个「未配置智能体／智能体不可用」
+ * 结论，用在创建入口，也用在**失败的那一刻**（Mikka 的 `agentNoModel`/`agentHarnessMissing`
+ * 两边同一个口径，错误里自带修复入口）。AgentProfile 与 ThreadCreationPreflight 的成员投影
+ * 字段不同名，这里只做一次形状对齐，判定本身还是调那两个函数。
+ */
+export function runRuntimeGuidance(agent: AgentProfile | null): { available: boolean; status: string } | null {
+  if (!agent) return null
+  const candidate = {
+    runtimeConfigured: agent.runtimeConfiguration !== null,
+    runtimeReadiness: agent.runtimeReadiness.status,
+    executionAvailability: agent.executionAvailability
+  }
+  return { available: isNewConversationMemberAvailable(candidate), status: newConversationMemberStatus(candidate) }
+}
+
+/**
+ * Mikka `components/agents/approval-card/index.tsx:49-57` 的状态词：`submitting → 正在继续`、
+ * `approved → 已同意`、`rejected → 已拒绝`、`answered → 已填写意见`，pending 兜底
+ * `awaitingYourChoice`（「等待你的选择」）。LOOM 的授权状态词表与之一一对应。
+ */
+export function approvalStatusLabel(status: ActionApprovalView['status']): string {
+  return ({ pending: '等待你的选择', approved: '已同意', denied: '已拒绝', cancelled: '已取消', expired: '已过期' } as const)[status]
+}
+
+/**
+ * Mikka `components/workspace/issue-thread-panel.tsx:557-562` 的 `thread-failure`：失败是时间线里的
+ * 一个条目，里面是「人话原因 + 错误码折叠 + 修复入口 + 重试」。原因取
+ * `RuntimeFailureNotice.tsx` 的 `runtimeFailureMessage()`；没有结构化 failure 时退回共享的
+ * `agentRunPresentation()` 短词（如「尚未配置 Runtime」），不自己另编一套。
+ */
+export function RunFailure({ run, agent, sending, onRetry, onConfigure, onOpenRuntimeSetup, platform = null }: {
+  run: AgentRunView; agent: AgentProfile | null; sending: boolean
+  onRetry?(): void; onConfigure?(): void; onOpenRuntimeSetup?(): void; platform?: HostPlatformKey | null
+}) {
+  const reason = run.failure ? runtimeFailureMessage(run.failure) : agentRunPresentation(run).label
+  const guidance = runRuntimeGuidance(agent)
+  const adapter = agent?.runtimeConfiguration?.adapterKind ?? null
+  // Mikka `messages/zh-CN.json:1047-1061`（`未检测到 Agent / 还没装 Agent / 怎么装 / 复制 {command}`）
+  // 把「先装再跑」的指南放在卡住的地方，而不是只到「未配置智能体」为止。平台未知时不猜命令，
+  // 只给官方安装说明（`runtimeInstallGuide` 在 platform 为 null 时本来就不下发 shell 命令）。
+  const guide = adapter ? runtimeInstallGuide(adapter, platform) : null
+  const needsLogin = agent?.runtimeReadiness.blockers.some(blocker => /auth|login/.test(blocker.code)) ?? false
+  return <section className="ln-run-failure" role="alert" data-run-id={run.id} data-state="failed" aria-label="这次运行没有完成">
+    <p className="ln-run-failure-reason">{reason}</p>
+    {run.terminalReasonCode && <details className="ln-run-failure-code"><summary>错误码</summary><code>{run.terminalReasonCode}</code></details>}
+    {guidance && !guidance.available && <p className="ln-run-failure-state">{agent?.displayName || '当前助手'} · {guidance.status}。先配置好运行端，再重试这次请求。</p>}
+    {guide && guidance && !guidance.available && <details className="ln-run-failure-guide" data-slot="run-install-guide">
+      <summary>{needsLogin ? '怎么登录' : '还没装 Agent，怎么装'}</summary>
+      <RuntimeInstallationGuide id={`ln-run-failure-guide-${run.id}`} label={adapter ? adapterLabel(adapter) : '运行端'} guide={guide}
+        mode={needsLogin ? 'login' : 'install'} busy={false} checking={false} feedback={null}
+        onCheck={() => onOpenRuntimeSetup?.()}/>
+    </details>}
+    <div className="ln-run-failure-actions">
+      <button type="button" className="ln-action" disabled={sending || !onRetry} onClick={onRetry}>{sending ? '正在重试…' : '重试'}</button>
+      <button type="button" className="ln-action is-primary" disabled={!onConfigure} onClick={onConfigure}>去配置运行端</button>
+    </div>
+  </section>
 }

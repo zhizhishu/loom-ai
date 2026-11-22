@@ -231,3 +231,39 @@
 .ln-chat-root span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ln-chat-root:hover{color:var(--ln-blue)!important}
 @media(max-width:920px){.ln-chat-root{max-width:110px}}
+
+/* 空状态：Mikka `components/ui/empty.tsx` 的结构在 `EmptyState.tsx`，样式在这里。
+   四个页签共用一套（`data-slot="empty"`），不再是同一坨灰字的三种写法。 */
+.ln-empty{display:flex;width:100%;min-width:0;flex:1;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:40px 22px;border:1px dashed var(--ln-soft-line);border-radius:14px;color:var(--ln-muted);text-align:center}
+.ln-empty__header{display:flex;max-width:22rem;min-width:0;flex-direction:column;align-items:center;gap:8px}
+.ln-empty__media{display:flex;flex:0 0 auto;align-items:center;justify-content:center;margin-bottom:4px}
+.ln-empty__media[data-variant="icon"]{width:32px;height:32px;border-radius:9px;background:var(--ln-soft-fill);color:var(--ln-muted)}
+.ln-empty__title{font-size:14px;font-weight:550;color:var(--ln-text);line-height:1.5}
+.ln-empty__description{font-size:13px;line-height:1.8;overflow-wrap:anywhere}
+.ln-empty__content{display:flex;width:100%;max-width:22rem;min-width:0;flex-direction:column;align-items:center;gap:10px;font-size:13px}
+.ln-empty__content .ln-text-action{font-size:12px}
+.ln-empty--dock{padding:46px 24px;border-style:dashed}
+.ln-empty--inline{padding:24px 12px;gap:12px;border:0;background:none}
+@media(max-width:700px){.ln-empty{padding:28px 14px}.ln-empty--dock{padding:32px 16px}}
+
+/* 授权状态词与「处理完降级成结论行」：Mikka `approval-card/index.tsx:49-57,573-576`。 */
+.ln-approval-state{margin-left:auto;font-size:11px;font-weight:500;line-height:18px;padding:0 7px;border-radius:9px;background:var(--ln-soft-fill);color:var(--ln-muted);white-space:nowrap}
+.ln-approval-state[data-state="approved"]{background:#e8f6ec;color:var(--ln-success)}
+.ln-approval-state[data-state="denied"],.ln-approval-state[data-state="expired"]{background:#fdeceb;color:#b63730}
+.ln-approval-result{display:flex;align-items:center;gap:7px;margin:0 0 10px;padding:8px 12px;border:1px solid var(--ln-soft-line);border-radius:10px;background:var(--ln-soft-fill);font-size:12px;color:var(--ln-muted)}
+.ln-approval-result>span{flex:1;min-width:0;overflow-wrap:anywhere}
+.ln-approval-result>em{font-style:normal;color:var(--ln-text);white-space:nowrap}
+.ln-approval-result[data-state="denied"]>em,.ln-approval-result[data-state="expired"]>em{color:#b63730}
+
+/* 「会话活动」行：名字 + 「工作了 2 分 3 秒 · 失败」+ 原因 + 重试。 */
+.ln-activity-row{align-items:flex-start!important;gap:10px!important}
+.ln-activity-who{display:flex;flex:1;min-width:0;flex-direction:column;gap:2px}
+.ln-activity-who>small{font-size:11px;line-height:1.6;color:var(--ln-muted);overflow-wrap:anywhere}
+.ln-activity-state{font-size:12px;color:var(--ln-muted);white-space:nowrap}
+.ln-activity-row[data-state="failed"] .ln-activity-state{color:#b63730}
+.ln-activity-row>.ln-action{font-size:11px;padding:4px 9px}
+
+/* 失败块里的「怎么装」：复用 RuntimeInstallationGuide，折叠在原因下面。 */
+.ln-run-failure-guide{font-size:11px;color:#8d2f28}
+.ln-run-failure-guide>summary{cursor:pointer;font-weight:550}
+.ln-run-failure-guide .runtime-install-guide{margin-top:8px;background:var(--ln-bg);color:var(--ln-text)}
