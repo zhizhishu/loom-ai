@@ -10526,16 +10526,14 @@ impl Core {
                 drop(database);
                 emit_member_roster_if_applied(&self.output, &request.method, &execution);
                 if wake_delivery_scheduler {
-                    // The command already committed, so this is the soon-wake: it is owed only while
-                    // the durable outbox still holds a waiting Delivery.
+                    // The command already committed, so this is the soon-wake: it fires whatever the
+                    // outbox holds at that moment, and the consumers re-read committed state.
                     // upstream: Mikka d59c85cb lib/coordinator/wake-after-commit.ts:wakeCoordinatorSoon
-                    let woke = {
+                    {
                         let database = self.database.lock().await;
-                        rovai_core::delivery_queue::wake_delivery_scheduler_now(&database)
-                    };
-                    if woke {
-                        self.execution_wake.runs.notify_one();
+                        rovai_core::delivery_queue::wake_delivery_scheduler_now(&database);
                     }
+                    self.execution_wake.runs.notify_one();
                 }
                 Ok(serde_json::to_value(execution.result)?)
             }
