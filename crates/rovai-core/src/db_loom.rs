@@ -1048,9 +1048,13 @@ pub(super) fn schema_matches(
             && artifact_schema_matches(connection)?);
     let task_host_recorded =
         projection_schema_version < 178 || task_holds_execution_host(connection)?;
-    // A schema-187 database may be the M5-B ledger (ten columns) or the current one; the M5-B
-    // shape is a supported upgrade source and stays admissible until migration 240 ran.
-    let recovery_recorded = projection_schema_version < 187 || recovery_schema_accepts(connection)?;
+    let recovery_recorded = projection_schema_version < 187 || recovery_schema_matches(connection)?;
+    // Migration 240 appends the Attempt watchdog pair to the ledger 237 built, so a database past
+    // 187 carries either the shape 237 shipped or the one 240 leaves. The line above keeps the
+    // verdict it was written with instead of being rewritten to describe a shape it never built;
+    // a ledger that is neither shape is still refused.
+    let recovery_ledger_recorded =
+        recovery_recorded || recovery_schema_matches_m5c(connection)?;
     Ok(holds(
         PLAN_TABLE,
         &[
@@ -1081,7 +1085,7 @@ pub(super) fn schema_matches(
         && verification_recorded
         && artifact_recorded
         && task_host_recorded
-        && recovery_recorded)
+        && recovery_ledger_recorded)
 }
 
 fn task_holds_execution_host(connection: &Connection) -> rusqlite::Result<bool> {
@@ -1492,60 +1496,7 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
 const RECOVERY_ACTION: &str = "CHECK(action IN ('wait','external_effect','recover_stall',\
      'stop_timeout','reconcile','dispatch','stalled'))";
 
-fn recovery_table_sql() -> String {
-    format!(
-        r#"
-        CREATE TABLE {RECOVERY_TABLE} (
-            task_id TEXT NOT NULL,
-            attempt_id TEXT NOT NULL CHECK(length(attempt_id) BETWEEN 1 AND 120),
-            request_epoch TEXT NOT NULL CHECK(length(request_epoch) BETWEEN 1 AND 120),
-            action TEXT NOT NULL {RECOVERY_ACTION},
-            tries INTEGER NOT NULL CHECK(tries >= 0),
-            recovery_tries INTEGER NOT NULL CHECK(recovery_tries >= 0),
-            blocked INTEGER NOT NULL CHECK(blocked IN (0,1)),
-            progress_at TEXT,
-            observed_at TEXT NOT NULL,
-            next_at TEXT NOT NULL,
-            -- The upstream watchdog state that lives on the Attempt output rather than in the
-            -- `task_watchdog` receipt (`factory_attempts.output->'watchdog'`): the reason the
-            -- Task was held, and the instant its stop was requested. A `wait` receipt refreshes
-            -- `observed_at` but must not move either of them, or the five-minute stop window
-            -- would restart on every observation and never time out.
-            reason_code TEXT CHECK(reason_code IS NULL OR length(reason_code) BETWEEN 1 AND 120),
-            stopped_at TEXT,
-            PRIMARY KEY(task_id, attempt_id, request_epoch),
-            FOREIGN KEY(task_id) REFERENCES {TASK_TABLE}(task_id) ON DELETE CASCADE
-        );
-        "#
-    )
-}
-
-/// The indexes and the budget trigger. They are recreated with the table, because the schema gate
-/// compares SQLite's own SQL text: a rebuilt table keeps the exact strings below, an `ALTER TABLE`
-/// would keep the old column text and silently weaken the comparison.
-fn recovery_index_sql() -> String {
-    format!(
-        r#"
-        CREATE INDEX loom_task_recovery_epoch_idx
-            ON {RECOVERY_TABLE}(task_id, request_epoch);
-        CREATE INDEX loom_task_recovery_next_idx ON {RECOVERY_TABLE}(next_at);
-        CREATE TRIGGER loom_task_recovery_budget_never_shrinks
-            BEFORE UPDATE ON {RECOVERY_TABLE}
-            WHEN NEW.recovery_tries < OLD.recovery_tries
-            BEGIN SELECT RAISE(ABORT,
-                'a recorded LOOM recovery budget is never refunded'); END;
-        "#
-    )
-}
-
 fn recovery_sql() -> String {
-    format!("{}{}", recovery_table_sql(), recovery_index_sql())
-}
-
-/// Migration 237 as M5-B shipped it: ten columns, no Attempt watchdog state. This is a supported
-/// *upgrade source* for [`migrate_recovery_watchdog_state`], never a shape a current Core writes.
-/// It is kept verbatim so the M5-B ledger is recognised exactly, not approximately.
-fn recovery_sql_v187_legacy() -> String {
     format!(
         r#"
         CREATE TABLE {RECOVERY_TABLE} (
@@ -1572,6 +1523,31 @@ fn recovery_sql_v187_legacy() -> String {
                 'a recorded LOOM recovery budget is never refunded'); END;
         "#
     )
+}
+
+/// The Attempt watchdog state upstream keeps on the Attempt rather than in the `task_watchdog`
+/// receipt (`factory_attempts.output->'watchdog'`): the reason the Task was held, and the instant
+/// its stop was requested. Migration 240 appends them to the ledger migration 237 created, so the
+/// declarations below are `ALTER TABLE ... ADD COLUMN` bodies, not a second `CREATE TABLE`. A
+/// `wait` receipt refreshes `observed_at` but must not move either of them, or the five-minute stop
+/// window would restart on every observation and never time out.
+const RECOVERY_WATCHDOG_COLUMNS: [(&str, &str); 2] = [
+    (
+        "reason_code",
+        "reason_code TEXT CHECK(reason_code IS NULL OR length(reason_code) BETWEEN 1 AND 120)",
+    ),
+    ("stopped_at", "stopped_at TEXT"),
+];
+
+/// Migration 240's own DDL over the M5-B ledger, in the order upstream's schema change declares
+/// it. The shape gate replays these same statements over `recovery_sql()`, so both halves are
+/// compared as the SQL text SQLite itself stored.
+fn recovery_watchdog_sql() -> String {
+    RECOVERY_WATCHDOG_COLUMNS
+        .iter()
+        .map(|(_, declaration)| format!("ALTER TABLE {RECOVERY_TABLE} ADD COLUMN {declaration};"))
+        .collect::<Vec<String>>()
+        .join("\n")
 }
 
 /// Every object this module's `recovery_sql()` creates, with SQLite's own SQL text.
@@ -1596,7 +1572,7 @@ fn recovery_schema_objects(
 /// in the same order, the same primary key and cascade, both real indexes over the columns
 /// their names promise, and the real budget trigger body.
 ///
-/// Counting the columns or looking for object names is not enough. Renaming `next_at` keeps the
+/// Counting ten columns or looking for object names is not enough. Renaming `next_at` keeps the
 /// count while `defers` can no longer read the stored backoff, and a trigger called
 /// `loom_task_recovery_budget_never_shrinks` whose body is `SELECT 1` keeps the name while
 /// refunding a spent budget. The comparison therefore runs this module's own SQL in a scratch
@@ -1607,7 +1583,48 @@ fn recovery_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
     expected.execute_batch(&recovery_sql())?;
     if recovery_schema_objects(connection)? != recovery_schema_objects(&expected)? {
         return Ok(false);
-    }    let declared: i64 = connection.query_row(
+    }
+    let declared: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name IN
+             ('task_id','attempt_id','request_epoch','action','tries','recovery_tries',
+              'blocked','progress_at','observed_at','next_at')",
+        [RECOVERY_TABLE],
+        |row| row.get(0),
+    )?;
+    let total: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1)",
+        [RECOVERY_TABLE],
+        |row| row.get(0),
+    )?;
+    let holds =
+        |name: &str, expected_sql: &str| trigger_sql_matches(connection, name, expected_sql);
+    Ok(declared == 10
+        && total == 10
+        && holds(
+            "loom_task_recovery_budget_never_shrinks",
+            &format!(
+                "CREATE TRIGGER loom_task_recovery_budget_never_shrinks
+                 BEFORE UPDATE ON {RECOVERY_TABLE}
+                 WHEN NEW.recovery_tries < OLD.recovery_tries
+                 BEGIN SELECT RAISE(ABORT,
+                     'a recorded LOOM recovery budget is never refunded'); END"
+            ),
+        )?)
+}
+
+/// Whether the ledger is the shape migration 240 leaves: the ten-column ledger migration 237
+/// created with the Attempt watchdog pair appended. Both halves are replayed in a scratch
+/// database — `recovery_sql()` then `recovery_watchdog_sql()` — so the comparison is the SQL text
+/// SQLite stores for exactly the statements the two migrations ran, an `ALTER TABLE` result rather
+/// than a hand-written `CREATE TABLE` that would have to be kept in step by hand.
+fn recovery_schema_matches_m5c(connection: &Connection) -> rusqlite::Result<bool> {
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(&recovery_sql())?;
+    expected.execute_batch(&recovery_watchdog_sql())?;
+    if recovery_schema_objects(connection)? != recovery_schema_objects(&expected)? {
+        return Ok(false);
+    }
+    let declared: i64 = connection.query_row(
         "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name IN
              ('task_id','attempt_id','request_epoch','action','tries','recovery_tries',
               'blocked','progress_at','observed_at','next_at','reason_code','stopped_at')",
@@ -1633,20 +1650,6 @@ fn recovery_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
                      'a recorded LOOM recovery budget is never refunded'); END"
             ),
         )?)
-}
-
-/// Whether the ledger is exactly the M5-B shape (migration 237 as it shipped). It is still a
-/// supported database to open and to upgrade from, but never a shape this Core writes.
-fn recovery_schema_is_legacy(connection: &Connection) -> rusqlite::Result<bool> {
-    let expected = Connection::open_in_memory()?;
-    expected.execute_batch(&recovery_sql_v187_legacy())?;
-    Ok(recovery_schema_objects(connection)? == recovery_schema_objects(&expected)?)
-}
-
-/// What contract admission accepts at schema 187: the current ledger, or the M5-B ledger that
-/// [`migrate_recovery_watchdog_state`] upgrades in place. An unknown third shape stays refused.
-fn recovery_schema_accepts(connection: &Connection) -> rusqlite::Result<bool> {
-    Ok(recovery_schema_matches(connection)? || recovery_schema_is_legacy(connection)?)
 }
 
 /// Migration 237: the durable watchdog recovery ledger. Upstream keeps `tries`,
@@ -1691,15 +1694,14 @@ pub(super) fn migrate_recovery_ledger(database: &mut Database) -> Result<()> {
 
 /// Migration 240: the Attempt's watchdog state (`reasonCode` / `stoppedAt`) on the M5-B ledger.
 ///
-/// M5-B shipped `loom_task_recovery` at projection schema 187 with ten columns; M5-C adds the
-/// upstream `attempt.output.watchdog` pair. A database created by M5-B is therefore upgraded in
-/// place: its rows — every spent recovery try, recorded backoff and hold — are copied into the
-/// current shape, and the receipt is admitted only once the rebuilt ledger is exactly the current
-/// one. A fresh database already has the shape; the step then only records that it ran.
+/// M5-B shipped `loom_task_recovery` at projection schema 187 with ten columns; upstream keeps the
+/// pair on the Attempt output (`factory_attempts.output->'watchdog'`), so M5-C appends it to that
+/// same table. Migration 237 keeps building exactly the ledger it shipped with — this step only
+/// adds, so a database that already spent recovery tries keeps every receipt, backoff and budget
+/// row instead of being rebuilt.
 ///
-/// The table is rebuilt instead of `ALTER TABLE ... ADD COLUMN` because the schema gate compares
-/// SQLite's own SQL text: an `ALTER` would leave the appended columns in a form the exact
-/// comparison refuses, so the gate would silently stop guarding the real shape.
+/// A column that is already there is skipped, so a rolled-back or re-opened database can run the
+/// step again; the shape gate below is what decides whether the result is admissible.
 pub(super) fn migrate_recovery_watchdog_state(database: &mut Database) -> Result<()> {
     let tx = database
         .connection
@@ -1722,31 +1724,24 @@ pub(super) fn migrate_recovery_watchdog_state(database: &mut Database) -> Result
         present,
         "the LOOM recovery ledger must exist before its watchdog state is added"
     );
-    if !recovery_schema_matches(&tx)? {
-        anyhow::ensure!(
-            recovery_schema_is_legacy(&tx)?,
-            "the LOOM recovery ledger is neither the current nor the M5-B shape"
-        );
-        tx.execute_batch("ALTER TABLE loom_task_recovery RENAME TO loom_task_recovery_m5b;")?;
-        tx.execute_batch(&recovery_table_sql())?;
-        tx.execute_batch(
-            "INSERT INTO loom_task_recovery(
-                 task_id,attempt_id,request_epoch,action,tries,recovery_tries,blocked,
-                 progress_at,observed_at,next_at)
-             SELECT task_id,attempt_id,request_epoch,action,tries,recovery_tries,blocked,
-                    progress_at,observed_at,next_at
-             FROM loom_task_recovery_m5b;",
+    anyhow::ensure!(
+        recovery_schema_matches(&tx)? || recovery_schema_matches_m5c(&tx)?,
+        "the LOOM recovery ledger is neither the M5-B nor the M5-C shape"
+    );
+    for (column, declaration) in RECOVERY_WATCHDOG_COLUMNS {
+        let declared: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+            [RECOVERY_TABLE, column],
+            |row| row.get(0),
         )?;
-        tx.execute_batch("DROP TABLE loom_task_recovery_m5b;")?;
-        tx.execute_batch(&recovery_index_sql())?;
-        anyhow::ensure!(
-            recovery_schema_matches(&tx)?,
-            "the rebuilt LOOM recovery ledger is not the current shape"
-        );
+        if declared {
+            continue;
+        }
+        tx.execute_batch(&format!("ALTER TABLE {RECOVERY_TABLE} ADD COLUMN {declaration};"))?;
     }
     tx.execute_batch("INSERT INTO schema_migration VALUES(240,datetime('now'));")?;
     anyhow::ensure!(
-        recovery_schema_matches(&tx)?,
+        recovery_schema_matches_m5c(&tx)?,
         "LOOM recovery ledger schema invalid"
     );
     tx.commit()?;
@@ -1754,7 +1749,8 @@ pub(super) fn migrate_recovery_watchdog_state(database: &mut Database) -> Result
 }
 
 /// Only synthetic migration fixtures reverse the Attempt watchdog state: it rebuilds the exact
-/// M5-B ledger with the rows already recorded, so the upgrade path is tested against real data.
+/// M5-B ledger migration 237 creates with the rows already recorded, so the upgrade path is tested
+/// against real data rather than against an empty table.
 #[cfg(test)]
 pub(super) fn downgrade_recovery_watchdog_state_for_test(connection: &Connection) {
     connection
@@ -1767,9 +1763,9 @@ pub(super) fn downgrade_recovery_watchdog_state_for_test(connection: &Connection
              DROP TABLE loom_task_recovery_m5c;",
         )
         .unwrap();
-    connection
-        .execute_batch(&recovery_sql_v187_legacy())
-        .unwrap();
+    // `recovery_sql()` is still the ten-column ledger migration 237 builds, so reversing the two
+    // appended columns is exactly running it again after the receipt is forgotten.
+    connection.execute_batch(&recovery_sql()).unwrap();
     connection
         .execute_batch(
             "INSERT INTO loom_task_recovery
@@ -3116,7 +3112,7 @@ mod tests {
             3,
             "assertion the_spent_budget_survives_a_restart"
         );
-        assert!(recovery_schema_matches(reopened.connection()).unwrap());
+        assert!(recovery_schema_matches_m5c(reopened.connection()).unwrap());
 
         // A fourth observation continues from the reopened receipt instead of a fresh budget.
         let fourth = record_watchdog_recovery(
@@ -3162,7 +3158,7 @@ mod tests {
             Database::open(&directory).expect("schema 186 must reopen through the product path");
         assert_eq!(projection_version(&reopened), 187);
         assert_eq!(migration_receipts(&reopened, 237), 1);
-        assert!(recovery_schema_matches(reopened.connection()).unwrap());
+        assert!(recovery_schema_matches_m5c(reopened.connection()).unwrap());
         assert!(matches!(
             classify_database_contract(reopened.connection()).unwrap(),
             DatabaseContractClassification::Current(_)
@@ -3223,16 +3219,14 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(
+            assert!(
                 columns, 10,
                 "assertion the_fixture_is_the_m5b_ledger_migration_237_shipped"
             );
-            assert!(!recovery_schema_matches(connection).unwrap());
-            assert!(recovery_schema_is_legacy(connection).unwrap());
-            assert!(
-                recovery_schema_accepts(connection).unwrap(),
-                "assertion the_m5b_ledger_is_a_supported_upgrade_source"
-            );
+            // Migration 237 still builds the ten-column ledger it shipped with; the two appended
+            // columns are migration 240's, so this fixture is exactly the upgrade source.
+            assert!(recovery_schema_matches(connection).unwrap());
+            assert!(!recovery_schema_matches_m5c(connection).unwrap());
             assert_eq!(migration_receipts(&database, 240), 0);
             // The M5-B database still opens: its marker and LOOM shape are the ones it shipped with.
             assert!(matches!(
@@ -3259,7 +3253,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(columns, 12, "assertion the_upgrade_added_the_watchdog_state");
-        assert!(recovery_schema_matches(reopened.connection()).unwrap());
+        assert!(recovery_schema_matches_m5c(reopened.connection()).unwrap());
         assert!(matches!(
             classify_database_contract(reopened.connection()).unwrap(),
             DatabaseContractClassification::Current(_)
@@ -3311,7 +3305,49 @@ mod tests {
         drop(reopened);
         let twice = Database::open(&directory).expect("the upgraded database must reopen");
         assert_eq!(migration_receipts(&twice, 240), 1);
-        assert!(recovery_schema_matches(twice.connection()).unwrap());
+        assert!(recovery_schema_matches_m5c(twice.connection()).unwrap());
+    }
+
+    /// Migration 240 only adds: a database that lost the receipt — a rolled-back or re-opened one
+    /// whose columns are already there — re-runs the step without touching the ledger, and the
+    /// rows it keeps are the ones 237 recorded.
+    #[test]
+    fn recovery_watchdog_state_rerun_skips_columns_that_already_exist() {
+        let mut database = crate::test_support::seeded_runtime_database_owned();
+        let directory = database.directory().to_path_buf();
+        let (_, task_id) =
+            imported_plan_task(&mut database, &directory, "LOOM watchdog state rerun");
+        let recorded = record_watchdog_recovery(
+            database.connection(),
+            &task_id,
+            "run_one",
+            "epoch:rerun",
+            "recover_stall",
+            false,
+            None,
+            instant(0),
+        )
+        .unwrap();
+        assert_eq!(recorded.recovery_tries, 1);
+        database
+            .connection()
+            .execute_batch("DELETE FROM schema_migration WHERE version=240;")
+            .unwrap();
+
+        migrate_recovery_watchdog_state(&mut database).unwrap();
+
+        assert_eq!(migration_receipts(&database, 240), 1);
+        assert!(recovery_schema_matches_m5c(database.connection()).unwrap());
+        assert_eq!(
+            recovery_budget(database.connection(), &task_id, "epoch:rerun").unwrap(),
+            1,
+            "assertion the_rerun_never_refunds_a_recorded_budget"
+        );
+        assert_eq!(
+            recovery_receipt(database.connection(), &task_id, "run_one", "epoch:rerun").unwrap(),
+            Some(recorded),
+            "assertion the_rerun_keeps_the_recorded_receipt"
+        );
     }
 
     /// A refused receipt rolls the whole migration back: no ledger, no half-applied source.
@@ -3357,6 +3393,11 @@ mod tests {
             classify_database_contract(database.connection()).unwrap(),
             DatabaseContractClassification::Current(_)
         ));
+        // The watchdog state is migration 240's own step: the 237 receipt alone leaves the
+        // ten-column ledger, which the twelve-column receipt writer cannot address.
+        migrate_recovery_watchdog_state(&mut database).unwrap();
+        assert_eq!(migration_receipts(&database, 240), 1);
+        assert!(recovery_schema_matches_m5c(database.connection()).unwrap());
         // The retried migration is usable immediately: the Task survived and a receipt lands.
         let recorded = record_watchdog_recovery(
             database.connection(),
@@ -3509,7 +3550,7 @@ mod tests {
     fn recovery_ledger_schema_refuses_a_renamed_column_a_wrong_index_and_a_neutered_trigger() {
         let mut database = crate::test_support::seeded_runtime_database_owned();
         let connection = database.connection();
-        assert!(recovery_schema_matches(connection).unwrap());
+        assert!(recovery_schema_matches_m5c(connection).unwrap());
 
         for (case, breakage) in [
             (
@@ -3538,7 +3579,7 @@ mod tests {
                 .unwrap();
             connection.execute_batch(breakage).unwrap();
             assert!(
-                !recovery_schema_matches(connection).unwrap(),
+                !recovery_schema_matches_m5c(connection).unwrap(),
                 "assertion a ledger with {case} is not admitted as Current"
             );
             // A renamed column must actually break the reader, not only the shape check.
@@ -3557,7 +3598,7 @@ mod tests {
                 )
                 .unwrap();
             assert!(
-                recovery_schema_matches(connection).unwrap(),
+                recovery_schema_matches_m5c(connection).unwrap(),
                 "assertion the restored ledger is admitted again after {case}"
             );
         }
