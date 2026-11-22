@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { AgentProfile, ArtifactSelection, ConversationItem, ThreadSnapshot, WorkBundle } from './types'
 import { AgentMarkdown } from './AgentMarkdown'
+import { AgentOpenUiProvider, type AgentOpenUiHost } from './AgentOpenUiButton'
 import { Avatar } from './Avatar'
 import { Icon, IconButton } from './icons'
 
-export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, onDraft, onFiles, onSend, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager }: {
+export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, onDraft, onFiles, onSend, onPrompt, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager }: {
   item: ConversationItem | null; snapshot: ThreadSnapshot | null; agents: AgentProfile[]; bundles: WorkBundle[]; loading: boolean; sending: boolean
   draft: string; files: File[]; error: string | null; onDraft(value: string): void; onFiles(files: File[]): void
-  onSend(agentId?: string): void; onProfile(): void; onArtifact(selection: ArtifactSelection): void
+  onSend(agentId?: string): void; onPrompt?(text: string): Promise<boolean>; onProfile(): void; onArtifact(selection: ArtifactSelection): void
   onShowSidebar(): void; sidebarHidden: boolean; onShowWork(): void; inspectorHidden: boolean
   onAttachment(messageId: string, attachmentId: string): void
   onResolveApproval(approvalId: string, optionId: string): void; approvalBusy: boolean; onMembers?(): void; onWorkspaceManager?(): void
@@ -41,7 +42,10 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   const jump = () => { pinned.current = true; scroll.current?.scrollTo({ top: scroll.current.scrollHeight, behavior: 'smooth' }); setShowLatest(false) }
   const title = item?.title || activeAgent?.displayName || 'LOOM'
   const artifacts = useMemo(() => bundles.filter(bundle => bundle.mission.threadId === snapshot?.thread.id).flatMap(bundle => bundle.artifacts.map(artifact => ({ artifact, bundle, candidate: bundle.candidates.find(candidate => candidate.evidenceIds.includes(artifact.artifactId)) ?? null }))), [bundles,snapshot?.thread.id])
-  return <main className="ln-conversation" aria-label={`与${title}的对话`}>
+  // An OpenUI card's click continues this conversation through the same send path the composer uses.
+  const openUiHost = useMemo<AgentOpenUiHost | null>(() => onPrompt ? { send: onPrompt } : null, [onPrompt])
+  return <AgentOpenUiProvider value={openUiHost}>
+  <main className="ln-conversation" aria-label={`与${title}的对话`}>
     <header className="ln-chat-header">
       {sidebarHidden && <IconButton icon="panel" label="展开会话列表" onClick={onShowSidebar} className="ln-chat-sidebar-toggle"/>}
       <button type="button" className="ln-identity-pill" onClick={onProfile}><Avatar agent={activeAgent} name={title} size={23}/><strong>{title}</strong></button>
@@ -92,4 +96,5 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
       </form>
     </div>
   </main>
+  </AgentOpenUiProvider>
 }
