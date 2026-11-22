@@ -7045,6 +7045,13 @@ fn watchdog_records_a_long_review_epoch_inside_the_ledger_bound() {
     // against a fixed clock. A healthy review has to be healthy *at the instant the sweep judges*,
     // not merely newer than nothing, so the Task's own persisted progress facts are pinned to that
     // instant — the same facts `backdate_progress` moves for the stalled cases, moved forward here.
+    //
+    // The Candidate row is deliberately not one of them. `loom_candidate_immutable` forbids rewriting
+    // its `created_at`, and the decision does not need it moved: the sweep reads the *newest* of the
+    // persisted facts, so pinning the Task, its claim and its Run to the judged instant already puts
+    // that reading at `now`. The Candidate keeps the real instant its producer recorded, which is
+    // exactly how upstream reads it — `progressAt` is a `GREATEST` over persisted facts, never a
+    // rewritten ledger row (`lib/factory/watchdog.ts`).
     let fresh = now.to_rfc3339();
     database
         .connection()
@@ -7057,13 +7064,6 @@ fn watchdog_records_a_long_review_epoch_inside_the_ledger_bound() {
         .connection()
         .execute(
             "UPDATE loom_claim SET claimed_at=?1 WHERE plan_id=?2 AND task_id=?3",
-            params![&fresh, &plan_id, &long_task],
-        )
-        .unwrap();
-    database
-        .connection()
-        .execute(
-            "UPDATE loom_candidate SET created_at=?1 WHERE plan_id=?2 AND task_id=?3",
             params![&fresh, &plan_id, &long_task],
         )
         .unwrap();

@@ -159,6 +159,10 @@ const WATCHDOG_REASON_EXHAUSTED: &str = "recovery_exhausted";
 /// Upstream `kind: 'task_watchdog'`: the durable "one actionable blocker" the sweep queues for the
 /// Coordinator, and its counterpart once the Task may run again. `event_log.event_id` is unique, so
 /// the same hold of the same epoch is stored once whatever happens in between.
+///
+/// The two identities are per *different* facts, as upstream keys them: a hold is one fact per epoch
+/// (`task-watchdog:${task.id}:${task.sourceEventId}`, `watchdog.ts:214`), while a hand-back is one
+/// fact per Attempt it minted (`run_redispatched:${runId}`, `dispatch-recovery.ts:150`).
 const WATCHDOG_BLOCKED_EVENT: &str = "loom.watchdog_blocked";
 const WATCHDOG_RECOVERED_EVENT: &str = "loom.watchdog_recovered";
 
@@ -1958,8 +1962,14 @@ fn observe_watchdog(
         };
         record_watchdog_fact(
             transaction,
+            // Upstream `run_redispatched:${runId}` (`lib/factory/dispatch-recovery.ts:150`, held to
+            // "exactly one run_redispatched per run" by `dispatch-recovery.db.test.ts:84,97`): the
+            // durable identity of a hand-back is the Attempt it minted, and a dispatch id plays the
+            // part of the Run id here. `tries` cannot: it restarts at this Attempt's own first value
+            // (`watchdog.ts:183`), so keying the fact on it would fold every recovery of one epoch
+            // into the very first row and lose the rest.
             format!(
-                "{WATCHDOG_RECOVERED_EVENT}:{}:{}:{}:{tries}",
+                "{WATCHDOG_RECOVERED_EVENT}:{}:{}:{}:{retry_dispatch_id}",
                 subject.plan_id, subject.task_id, subject.request_epoch
             ),
             WATCHDOG_RECOVERED_EVENT,
