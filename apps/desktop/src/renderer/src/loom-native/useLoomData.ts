@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { AgentProfile, CoreEvent, MissionRecord, ThreadSnapshot } from '@contracts'
+import type { AgentProfile, HiddenThreadItem, CoreEvent, MissionRecord, ThreadSnapshot } from '@contracts'
 import type { BusinessEnvironment } from '../business-environment'
 import { readErrorMessage } from '../error-message'
 import { uiAttribute } from '../interface-language'
@@ -17,6 +17,7 @@ import {
   readWorkBundle,
   sendThreadMessage
 } from './service'
+import { readHiddenRooms, roomPort, setRoomHidden } from './room-service'
 import type { ConversationItem, WorkBundle } from './types'
 
 /** Thread-scoped Core events: the open conversation re-reads itself, nothing else moves. */
@@ -52,6 +53,8 @@ interface LiveState {
 export interface LoomData {
   agents: AgentProfile[]
   conversations: ConversationItem[]
+  /** `已隐藏` 里的群：不在会话列表里，但群、成员与历史都还在。 */
+  hidden: HiddenThreadItem[]
   missions: MissionRecord[]
   bundles: WorkBundle[]
   snapshot: ThreadSnapshot | null
@@ -63,6 +66,8 @@ export interface LoomData {
   send(text: string, files: File[], recipientAgentId?: string): Promise<void>
   createConversation(agentId?: string): Promise<void>
   openConversation(threadId: string): Promise<void>
+  /** 隐藏（从我的列表拿出去）或恢复一个群；恢复后它重新出现在会话列表里。 */
+  setHidden(threadId: string, hidden: boolean): Promise<void>
 }
 
 /** Sole adapter between the authenticated ThreadClient and the native UI. Every read is
@@ -71,6 +76,7 @@ export function useLoomData(environment: BusinessEnvironment): LoomData {
   const client = environment.client
   const [agents, setAgents] = useState<AgentProfile[]>([])
   const [conversations, setConversations] = useState<ConversationItem[]>([])
+  const [hidden, setHiddenList] = useState<HiddenThreadItem[]>([])
   const [missions, setMissions] = useState<MissionRecord[]>([])
   const [bundles, setBundles] = useState<WorkBundle[]>([])
   const [snapshot, setSnapshot] = useState<ThreadSnapshot | null>(null)
@@ -162,7 +168,14 @@ export function useLoomData(environment: BusinessEnvironment): LoomData {
       if (generation !== listGeneration.current) return
       setBundles(previous => previous.length === work.bundles.length && previous.every((bundle,index) => bundle === work.bundles[index]) ? previous : work.bundles)
       const failures = [...work.errors, ...(threadError ? [threadError] : [])]
-      if (failures.length > 0) setError(failures.join(' '))
+      // 已隐藏列表与主列表同一次刷新。读不到就是一条错误，绝不当成「没有隐藏」。
+      let hiddenError: string | null = null
+      try {
+        const nextHidden = await readHiddenRooms(roomPort(environment))
+        if (generation === listGeneration.current) setHiddenList(nextHidden)
+      } catch (nextError) { hiddenError = readErrorMessage(nextError) }
+      const allFailures = hiddenError === null ? failures : [...failures, hiddenError]
+      if (allFailures.length > 0) setError(allFailures.join(' '))
     } catch (nextError) {
       if (generation === listGeneration.current) setError(readErrorMessage(nextError))
       throw nextError
@@ -288,6 +301,18 @@ export function useLoomData(environment: BusinessEnvironment): LoomData {
   const reloadSnapshotRef = useRef(reloadSnapshot)
   reloadSnapshotRef.current = reloadSnapshot
 
+  /** 隐藏／恢复一个群：群本身不动，只改「我的列表」看见它没有。 */
+  const setHidden = useCallback(async (threadId: string, hidden: boolean): Promise<void> => {
+    setError(null)
+    try {
+      await setRoomHidden(roomPort(environment), { threadId, hidden })
+    } catch (nextError) {
+      setError(readErrorMessage(nextError))
+      throw nextError
+    }
+    await loadAllRef.current('explicit').catch(nextError => setError(readErrorMessage(nextError)))
+  }, [environment])
+
   const coordinatorRef = useRef<NavigationRefreshCoordinator | null>(null)
 
   useEffect(() => {
@@ -361,6 +386,7 @@ export function useLoomData(environment: BusinessEnvironment): LoomData {
   return {
     agents,
     conversations,
+    hidden,
     missions,
     bundles,
     snapshot,
@@ -371,6 +397,7 @@ export function useLoomData(environment: BusinessEnvironment): LoomData {
     refresh,
     send,
     createConversation,
-    openConversation: reloadThread
+    openConversation: reloadThread,
+    setHidden
   }
 }

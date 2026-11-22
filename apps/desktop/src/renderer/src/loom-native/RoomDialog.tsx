@@ -9,7 +9,7 @@ import { readWorkspaceDefault,validateWorkspaceDefault } from './workspace-defau
 import { FormMessage, SurfaceDialog, UnsavedNotice } from './Controls'
 import {
   roomPort, emptyRoomDraft, roomSubmitProblem, createRoom, chooseRoomWorkspace,
-  readRoomCreationPreflight, addRoomMembers, changeRoomLead,
+  readRoomCreationPreflight, addRoomMembers, changeRoomLead, removeRoomMembers, setRoomHidden,
   roomWorkspaceChoices, applyKnownWorkspace, type RoomWorkspaceChoice, type RoomDraft
 } from './room-service'
 
@@ -185,30 +185,60 @@ export function RoomMembersDialog({ open, environment, agents, snapshot, theme =
   const [selected, setSelected] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  useEffect(() => { setSelected([]); setError('') }, [open, snapshot?.thread.id])
+  const [notice, setNotice] = useState('')
+  /** 移出先问一句：它结束的是一条成员关系，不是一次开关。 */
+  const [removing, setRemoving] = useState<string | null>(null)
+  const [hiding, setHiding] = useState(false)
+  useEffect(() => { setSelected([]); setError(''); setNotice(''); setRemoving(null); setHiding(false) }, [open, snapshot?.thread.id])
   if (!snapshot) return null
   const active = snapshot.members.filter(member => member.membershipStatus === 'active')
   const available = agents.filter(agent => !agent.removedAt && agent.presence !== 'removed' && !active.some(member => member.agentId === agent.agentId))
   const lead = async (agentId: string) => {
     if (busy) return
-    setBusy(true); setError('')
+    setBusy(true); setError(''); setNotice('')
     try { await changeRoomLead(port, { threadId: snapshot.thread.id, successorAgentId: agentId, expectedVersion: snapshot.thread.version }); await onRefresh() }
     catch (cause) { setError(cause instanceof Error ? cause.message : '变更未完成，请刷新后重试。') } finally { setBusy(false) }
   }
   const add = async () => {
     if (busy || !selected.length) return
-    setBusy(true); setError('')
+    setBusy(true); setError(''); setNotice('')
     try {
       const outcome = await addRoomMembers(port, { threadId: snapshot.thread.id, agentIds: selected, membershipGeneration: snapshot.thread.membershipGeneration })
       await onRefresh(); setSelected([])
       if (outcome.failures.length) setError(outcome.failures.map(item => `${agents.find(agent => agent.agentId === item.agentId)?.displayName || item.agentId}：${item.message}`).join('；'))
+      else if (outcome.addedAgentIds.length) setNotice('已加入群聊；不会自动派工。')
     } catch (cause) { setError(cause instanceof Error ? cause.message : '添加未完成，成员状态需刷新确认。') } finally { setBusy(false) }
   }
+  const remove = async (agentId: string) => {
+    if (busy) return
+    setBusy(true); setError(''); setNotice('')
+    try {
+      const outcome = await removeRoomMembers(port, { threadId: snapshot.thread.id, agentIds: [agentId] })
+      await onRefresh(); setRemoving(null)
+      if (outcome.removedAgentIds.length) setNotice('已移出群聊；需要时可以重新邀请。')
+      if (outcome.failures.length) setError(outcome.failures.map(item => item.message).join('；'))
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '移出未完成，成员状态需刷新确认。') } finally { setBusy(false) }
+  }
+  /** 退出群聊 = 把这个群从我的列表隐藏；群、成员和历史都保留，可在「已隐藏」里恢复。 */
+  const hide = async () => {
+    if (busy) return
+    setBusy(true); setError(''); setNotice('')
+    try {
+      await setRoomHidden(port, { threadId: snapshot.thread.id, hidden: true })
+      setHiding(false)
+      await onRefresh()
+      onClose()
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '隐藏未完成，会话列表尚未更新。') } finally { setBusy(false) }
+  }
+  const removingName = removing === null ? '' : active.find(member => member.agentId === removing)?.displayName || removing
   return <SurfaceDialog open={open} title="群聊成员" description="协调助手协调当前群聊，其他助手是独立参与者。" theme={theme} onClose={() => { if (!busy) onClose() }} className="ln-room-dialog"><div className="ln-room-content">
-    <div className="ln-room-summary">{active.map(member => { const agent = agents.find(row => row.agentId === member.agentId); return <div key={member.agentId}><Avatar agent={agent} name={member.displayName} size={28}/><strong>{member.displayName}</strong><small>{member.agentId === snapshot.thread.defaultLeadAgentId ? '协调助手' : '协作助手'}</small>{member.agentId !== snapshot.thread.defaultLeadAgentId && <button type="button" className="ln-action" disabled={busy} onClick={() => { void lead(member.agentId) }}>设为协调助手</button>}</div> })}</div>
+    <div className="ln-room-summary">{active.map(member => { const agent = agents.find(row => row.agentId === member.agentId); return <div key={member.agentId}><Avatar agent={agent} name={member.displayName} size={28}/><strong>{member.displayName}</strong><small>{member.agentId === snapshot.thread.defaultLeadAgentId ? '协调助手' : '协作助手'}</small>{member.agentId !== snapshot.thread.defaultLeadAgentId && <button type="button" className="ln-action" disabled={busy} onClick={() => { void lead(member.agentId) }}>设为协调助手</button>}<button type="button" className="ln-text-action" disabled={busy} onClick={() => { setRemoving(member.agentId); setError(''); setNotice('') }}>移出</button></div> })}</div>
     <div className="ln-workspace-choice"><Icon name="files" size={22}/><span><strong>当前工作区域</strong><small>{snapshot.thread.projectPath || '主机快速对话目录'}</small></span></div>
     {available.length > 0 && <><div className="ln-panel-title"><h3>添加协作助手</h3><small>不会自动发送消息</small></div><div className="ln-room-people">{available.map(agent => <label className="ln-room-person" key={agent.agentId}><input type="checkbox" checked={selected.includes(agent.agentId)} disabled={busy} onChange={() => setSelected(current => current.includes(agent.agentId) ? current.filter(id => id !== agent.agentId) : [...current, agent.agentId])}/><Avatar agent={agent} size={28}/><span><strong>{agent.displayName}</strong><small>{agent.teamRole}</small></span></label>)}</div></>}
+    {removing !== null && <div className="ln-unsaved-notice" role="alertdialog" aria-label="移出成员"><span>把「{removingName}」移出群聊？移出后 Ta 不再收到群里的消息，需要时可以重新邀请。</span><button type="button" disabled={busy} onClick={() => setRemoving(null)}>取消</button><button type="button" disabled={busy} onClick={() => { void remove(removing) }}>确认移出</button></div>}
+    {hiding && <div className="ln-unsaved-notice" role="alertdialog" aria-label="隐藏群聊"><span>把「{snapshot.thread.title}」从会话列表隐藏？群里的助手、消息和历史全部保留，可以在「已隐藏」里恢复。</span><button type="button" disabled={busy} onClick={() => setHiding(false)}>取消</button><button type="button" disabled={busy} onClick={() => { void hide() }}>确认隐藏</button></div>}
+    {notice && <FormMessage>{notice}</FormMessage>}
     {error && <FormMessage error>{error}</FormMessage>}
-    <footer className="ln-form-actions"><small>{active.length} 位助手</small><button type="button" className="ln-action is-primary" disabled={busy || !selected.length} onClick={() => { void add() }}>{busy ? '更新中…' : '添加到群聊'}</button></footer>
+    <footer className="ln-form-actions"><small>{active.length} 位助手</small><button type="button" className="ln-text-action" disabled={busy} onClick={() => { setHiding(true); setRemoving(null); setError(''); setNotice('') }}>退出群聊</button><button type="button" className="ln-action is-primary" disabled={busy || !selected.length} onClick={() => { void add() }}>{busy ? '更新中…' : '添加到群聊'}</button></footer>
   </div></SurfaceDialog>
 }

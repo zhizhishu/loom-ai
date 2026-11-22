@@ -1,6 +1,7 @@
 import type {
   ActionApprovalView,
   AgentProfile,
+  HiddenThreadItem,
   CoreMethod,
   CreateThreadRequest,
   MemberPresence,
@@ -8,6 +9,7 @@ import type {
   NewConversationDefaults,
   StoredCommandResult,
   ThreadCreationPreflight,
+  ThreadMemberRemovalPreview,
   ThreadSnapshot,
   WorkspaceInspection,
   WorkspaceSelection
@@ -452,6 +454,206 @@ export async function changeRoomLead(port: RoomPort, input: RoomLeadChangeInput)
   ))
   if (outcome.kind === 'unknown') throw new Error(outcome.message)
   if (outcome.kind === 'rejected') throw new LoomCommandRejected(outcome.result)
+}
+
+// --------------------------------------------------------------- removal
+
+/**
+ * Core's read-only impact statement (`camp-membership-v1` §2). It is not an authorization:
+ * the command re-validates inside its transaction, and the CAS values it must carry come from
+ * this exact preview, never from a number the renderer added up itself.
+ */
+export type RoomMemberRemovalPreview = ThreadMemberRemovalPreview
+
+export function roomMemberRemovalPreviewParams(threadId: string, agentId: string): unknown {
+  return { threadId, agentId }
+}
+
+const REMOVAL_PREVIEW_UNREADABLE = uiAttribute('成员影响预览读取结果不可用，请重新读取会话后再试。')
+
+/** A preview that is not provably this member of this Thread is never a usable one. */
+export async function readRoomMemberRemovalPreview(
+  port: RoomPort,
+  threadId: string,
+  agentId: string
+): Promise<RoomMemberRemovalPreview> {
+  const value = await port.request<ThreadMemberRemovalPreview | null>(
+    'threads.members.removalPreview',
+    roomMemberRemovalPreviewParams(threadId, agentId)
+  )
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(REMOVAL_PREVIEW_UNREADABLE)
+  if (value.threadId !== threadId || value.agentId !== agentId) throw new Error(REMOVAL_PREVIEW_UNREADABLE)
+  if (!Number.isInteger(value.membershipGeneration) || value.membershipGeneration < 1) throw new Error(REMOVAL_PREVIEW_UNREADABLE)
+  if (!Number.isInteger(value.membershipVersion) || value.membershipVersion < 1) throw new Error(REMOVAL_PREVIEW_UNREADABLE)
+  if (typeof value.removable !== 'boolean') throw new Error(REMOVAL_PREVIEW_UNREADABLE)
+  return value
+}
+
+/** The primary Lead may not be removed on its own: the group needs another Lead first. */
+export const ROOM_LEAD_REMOVAL_BLOCKED = uiAttribute('当前主助手不能直接移出，请先把另一位助手设为主助手。')
+
+export interface RoomMemberRemoveInput {
+  threadId: string
+  agentIds: readonly string[]
+  /** 批内允许主助手在没有继任者时也移出。M9-1c 后「退出群聊」不再走这里：它只隐藏，
+   * 移出助手始终是逐个人的显式动作，所以这条路径默认关闭，也只有显式调用者才打开。 */
+  allowLeadWithoutSuccessor?: boolean
+}
+
+/** No replacement is ever invented here: `changeRoomLead` hands the group over first. */
+export function roomMemberRemoveParams(commandId: string, preview: RoomMemberRemovalPreview): unknown {
+  return {
+    commandId,
+    command: {
+      threadId: preview.threadId,
+      agentId: preview.agentId,
+      expectedMembershipGeneration: preview.membershipGeneration,
+      expectedMembershipVersion: preview.membershipVersion
+    }
+  }
+}
+
+export interface RoomMemberRemoveFailure {
+  agentId: string
+  message: string
+}
+
+export interface RoomMemberRemoveOutcome {
+  removedAgentIds: string[]
+  failures: RoomMemberRemoveFailure[]
+  /** The assistant Core handed the group to, when the removed member was the Lead. */
+  nextDefaultLeadAgentId: string | null
+}
+
+function roomMemberRemovalConflict(code: string): boolean {
+  return roomMembershipConflict(code)
+    || code === 'camp.default_lead_unavailable'
+    || code === 'camp.default_lead_replacement_not_applicable'
+}
+
+function removalAdvanced(step: StoredCommandResult, preview: RoomMemberRemovalPreview): boolean {
+  const next = step.payload.membershipGeneration
+  return typeof next === 'number' && Number.isInteger(next) && next > preview.membershipGeneration
+}
+
+/**
+ * Removing is not dispatch. Every removal advances the Camp generation, so each step reads a fresh
+ * preview and submits exactly its generation and the member's own version. A conflict or an
+ * unreadable receipt stops the batch instead of guessing what the roster now is.
+ */
+export async function removeRoomMembers(
+  port: RoomPort,
+  input: RoomMemberRemoveInput
+): Promise<RoomMemberRemoveOutcome> {
+  const threadId = input.threadId.trim()
+  if (threadId === '') throw new Error(uiAttribute('当前会话尚未准备好。'))
+  const agentIds = [...new Set(input.agentIds.filter(agentId => typeof agentId === 'string' && agentId !== ''))]
+  const outcome: RoomMemberRemoveOutcome = { removedAgentIds: [], failures: [], nextDefaultLeadAgentId: null }
+  for (let index = 0; index < agentIds.length; index += 1) {
+    const agentId = agentIds[index]
+    const stop = (message: string): void => {
+      outcome.failures.push({ agentId, message })
+      for (const remaining of agentIds.slice(index + 1)) outcome.failures.push({ agentId: remaining, message })
+    }
+    // Every removal advances the Camp generation, so the CAS values come from a fresh preview;
+    // an unreadable preview stops the batch instead of guessing the roster.
+    const read: { preview: RoomMemberRemovalPreview } | { failure: string } =
+      await readRoomMemberRemovalPreview(port, threadId, agentId).then(
+        value => ({ preview: value }),
+        error => ({ failure: readErrorMessage(error) })
+      )
+    if ('failure' in read) {
+      stop(read.failure)
+      break
+    }
+    const preview = read.preview
+    if (!preview.removable) {
+      outcome.failures.push({ agentId, message: uiAttribute('该助手已不在群里，请刷新后重试。') })
+      continue
+    }
+    if (preview.isDefaultLead && input.allowLeadWithoutSuccessor !== true) {
+      stop(ROOM_LEAD_REMOVAL_BLOCKED)
+      break
+    }
+    let step: RoomCommandOutcome
+    try {
+      step = classifyRoomCommand(await port.request<StoredCommandResult | null>(
+        'threads.members.remove',
+        roomMemberRemoveParams(newCommandId(), preview)
+      ))
+    } catch (error) {
+      step = { kind: 'unknown', message: readErrorMessage(error) }
+    }
+    if (step.kind === 'unknown') {
+      stop(step.message)
+      break
+    }
+    if (step.kind === 'rejected') {
+      if (roomMemberRemovalConflict(step.result.code)) {
+        stop(uiAttribute('名册已发生变化，请在刷新后重试。'))
+        break
+      }
+      outcome.failures.push({ agentId, message: loomCommandMessage(step.result) })
+      continue
+    }
+    if (!removalAdvanced(step.result, preview)) {
+      stop(uiAttribute('名册版本未确认，已停止继续移出。请重新读取会话后再试。'))
+      break
+    }
+    outcome.removedAgentIds.push(agentId)
+    const nextLead = step.result.payload.nextDefaultLeadAgentId
+    if (typeof nextLead === 'string' && nextLead !== '') outcome.nextDefaultLeadAgentId = nextLead
+  }
+  return outcome
+}
+
+// ----------------------------------------------------------------- hidden
+
+/**
+ * 退出群聊 = 把这个群从**我的列表**隐藏（M9-1c，Hark 拍板；即 Mikka 群行的 `hidden`）。
+ *
+ * 群、成员、消息、附件与历史全部保留；助手不会因此离队 —— 把一个助手移出群聊仍然走
+ * `threads.members.remove`（`camp_member.status = 'left'`），不经过这里。
+ * 恢复就是同一个开关的 `hidden:false`，`已隐藏`列表由 `threads.hiddenList` 只读给出。
+ */
+export interface RoomHideInput {
+  threadId: string
+  hidden: boolean
+}
+
+export function roomHideParams(commandId: string, input: RoomHideInput): unknown {
+  return { commandId, command: { threadId: input.threadId, hidden: input.hidden } }
+}
+
+/**
+ * Core's answer is the only proof the list changed: a receipt that does not carry back the exact
+ * flag that was asked for is unknown, never success.
+ */
+export async function setRoomHidden(port: RoomPort, input: RoomHideInput): Promise<void> {
+  const threadId = input.threadId.trim()
+  if (threadId === '') throw new Error(uiAttribute('当前会话尚未准备好。'))
+  const outcome = classifyRoomCommand(await port.request<StoredCommandResult | null>(
+    'threads.setHidden',
+    roomHideParams(newCommandId(), { ...input, threadId })
+  ))
+  if (outcome.kind === 'unknown') throw new Error(outcome.message)
+  if (outcome.kind === 'rejected') throw new LoomCommandRejected(outcome.result)
+  const hidden = outcome.result.payload.hidden
+  if (typeof hidden !== 'boolean' || hidden !== input.hidden) {
+    throw new Error(uiAttribute('隐藏结果未确认，请刷新会话列表后重试。'))
+  }
+}
+
+const HIDDEN_LIST_UNREADABLE = uiAttribute('已隐藏列表读取结果不可用，请重试。')
+
+/** `已隐藏` 列表：只读。回执不是数组时是读取失败，不是一个空列表。 */
+export async function readHiddenRooms(port: RoomPort): Promise<HiddenThreadItem[]> {
+  const rows = await port.request<HiddenThreadItem[] | null>('threads.hiddenList')
+  if (!Array.isArray(rows)) throw new Error(HIDDEN_LIST_UNREADABLE)
+  return rows.filter(row => Boolean(row)
+    && typeof row.id === 'string' && row.id !== ''
+    && typeof row.title === 'string'
+    && typeof row.hiddenAt === 'string')
 }
 
 // ----------------------------------------------------------------- roster

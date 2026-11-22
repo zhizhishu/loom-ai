@@ -6,16 +6,17 @@ import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 import { verifyRunningHostSchema } from './loom-host-schema.mjs'
 
-// Migration 240 (the LOOM watchdog state on the durable recovery ledger) is the current receipt,
-// so a current database also carries 235, 236, 237, 238 (the Delivery wake persistence) and 239
-// (the device session columns).
-// 238, 239 and 240 add columns only, so the projection schema stays 187.
-const priorReceipts = migration => migration >= 240 ? [235, 236, 237, 238, 239]
+// Migration 241 (the LOOM camp hidden timestamp that「退出群聊」writes) is the current receipt,
+// so a current database also carries 235, 236, 237, 238 (the Delivery wake persistence), 239
+// (the device session columns) and 240 (the watchdog state on the durable recovery ledger).
+// 238, 239, 240 and 241 add columns only, so the projection schema stays 187.
+const priorReceipts = migration => migration >= 241 ? [235, 236, 237, 238, 239, 240]
+  : migration >= 240 ? [235, 236, 237, 238, 239]
   : migration >= 239 ? [235, 236, 237, 238]
   : migration >= 238 ? [235, 236, 237]
   : migration >= 237 ? [235, 236] : migration >= 236 ? [235] : []
 
-async function fixture (t, schema = 187, migration = 240, previousReceipts = priorReceipts(migration)) {
+async function fixture (t, schema = 187, migration = 241, previousReceipts = priorReceipts(migration)) {
   const dir = await mkdtemp(join(tmpdir(), 'loom-host-schema-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const path = join(dir, 'rovai.sqlite')
@@ -38,10 +39,11 @@ test('the running Host actual schema is verified read-only, with no runtime or s
   const evidence = await verifyRunningHostSchema({ request: f.request, databasePath: f.path })
   assert.equal(evidence.verified, true)
   assert.equal(evidence.projectionSchema, 187)
-  assert.equal(evidence.latestMigrationVersion, 240)
+  assert.equal(evidence.latestMigrationVersion, 241)
   assert.equal(evidence.localHookMigrationPresent, true)
   assert.equal(evidence.recoveryLedgerMigrationPresent, true)
   assert.equal(evidence.watchdogStateMigrationPresent, true)
+  assert.equal(evidence.campHiddenMigrationPresent, true)
   assert.equal(evidence.deviceSessionMigrationPresent, true)
   assert.equal(evidence.deliveryWakeMigrationPresent, true)
   assert.equal(evidence.source, 'running-host-health-and-read-only-database')

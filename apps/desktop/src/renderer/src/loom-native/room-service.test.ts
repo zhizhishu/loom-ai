@@ -6,6 +6,7 @@ import type {
   NavigationSnapshot,
   StoredCommandResult,
   ThreadCreationPreflight,
+  ThreadMemberRemovalPreview,
   ThreadSnapshot
 } from '@contracts'
 import type { BusinessEnvironment } from '../business-environment'
@@ -19,11 +20,16 @@ import {
   emptyRoomDraft,
   initialRoomDraft,
   QUICK_CHAT_CHOICE,
+  readHiddenRooms,
+  readRoomMemberRemovalPreview,
+  removeRoomMembers,
   resolveRoomPermission,
+  ROOM_LEAD_REMOVAL_BLOCKED,
   roomDraftProblems,
   roomPort,
   roomPermissionChoices,
   roomRoster,
+  setRoomHidden,
   roomSubmitProblem,
   roomWorkspaceChoices,
   type RoomDraft,
@@ -98,6 +104,18 @@ function preflightOf(ids: readonly string[], lead: string | null = null): Thread
     initialLeadAgentId: lead,
     blockers: []
   }
+}
+
+function previewOf(agentId: string, over: Record<string, unknown> = {}): ThreadMemberRemovalPreview {
+  return {
+    threadId: 't', agentId, displayName: agentId.toUpperCase(),
+    membershipGeneration: 3, membershipVersion: 1, isDefaultLead: false,
+    remainingMemberCount: 1, nextDefaultLeadAgentId: null,
+    nonTerminalAgentRunCount: 0, openAssignedTaskCount: 0,
+    pendingDeliveryCount: 0, runningDeliveryCount: 0,
+    removable: true, blockerCode: null,
+    ...over
+  } as unknown as ThreadMemberRemovalPreview
 }
 
 function approvalOf(over: Record<string, unknown> = {}): ActionApprovalView {
@@ -272,6 +290,174 @@ describe('changeRoomLead', () => {
     const denied = fakePort({ 'threads.changeDefaultLead': () => rejected('camp.member_not_active') })
     await expect(changeRoomLead(denied.port, { threadId: 't', successorAgentId: 'b', expectedVersion: 1 }))
       .rejects.toBeInstanceOf(LoomCommandRejected)
+  })
+})
+
+describe('readRoomMemberRemovalPreview', () => {
+  it('reads the exact member of this Thread and returns Core\'s preview verbatim', async () => {
+    const preview = previewOf('b', { membershipGeneration: 5, membershipVersion: 2 })
+    const { port, calls } = fakePort({ 'threads.members.removalPreview': () => preview })
+    await expect(readRoomMemberRemovalPreview(port, 't', 'b')).resolves.toEqual(preview)
+    expect(calls).toEqual([{ method: 'threads.members.removalPreview', params: { threadId: 't', agentId: 'b' } }])
+  })
+
+  it('refuses a preview that is not provably this member with usable revisions', async () => {
+    const otherMember = fakePort({ 'threads.members.removalPreview': () => previewOf('someone-else') })
+    await expect(readRoomMemberRemovalPreview(otherMember.port, 't', 'b')).rejects.toThrow()
+    const otherThread = fakePort({ 'threads.members.removalPreview': () => previewOf('b', { threadId: 'other' }) })
+    await expect(readRoomMemberRemovalPreview(otherThread.port, 't', 'b')).rejects.toThrow()
+    const noVersion = fakePort({ 'threads.members.removalPreview': () => previewOf('b', { membershipVersion: 0 }) })
+    await expect(readRoomMemberRemovalPreview(noVersion.port, 't', 'b')).rejects.toThrow()
+    const noGeneration = fakePort({ 'threads.members.removalPreview': () => previewOf('b', { membershipGeneration: null }) })
+    await expect(readRoomMemberRemovalPreview(noGeneration.port, 't', 'b')).rejects.toThrow()
+    const missing = fakePort({ 'threads.members.removalPreview': () => null })
+    await expect(readRoomMemberRemovalPreview(missing.port, 't', 'b')).rejects.toThrow()
+  })
+})
+
+describe('removeRoomMembers', () => {
+  it('submits the previewed generation and the member version for one member', async () => {
+    const { port, calls } = fakePort({
+      'threads.members.removalPreview': () => previewOf('b', { membershipGeneration: 3, membershipVersion: 2 }),
+      'threads.members.remove': () => applied({ membershipGeneration: 4, membershipStatus: 'left', changed: true })
+    })
+    const outcome = await removeRoomMembers(port, { threadId: 't', agentIds: ['b'] })
+    expect(outcome).toEqual({ removedAgentIds: ['b'], failures: [], nextDefaultLeadAgentId: null })
+    expect(calls[1].params).toMatchObject({
+      command: { threadId: 't', agentId: 'b', expectedMembershipGeneration: 3, expectedMembershipVersion: 2 }
+    })
+    expect((calls[1].params?.command as Record<string, unknown>).replacementDefaultLeadAgentId).toBeUndefined()
+  })
+
+  it('never removes the primary Lead before another assistant takes over', async () => {
+    const { port, calls } = fakePort({
+      'threads.members.removalPreview': () => previewOf('a', { isDefaultLead: true })
+    })
+    const outcome = await removeRoomMembers(port, { threadId: 't', agentIds: ['a', 'b'] })
+    expect(outcome.removedAgentIds).toEqual([])
+    expect(outcome.failures.map(failure => failure.message)).toEqual([ROOM_LEAD_REMOVAL_BLOCKED, ROOM_LEAD_REMOVAL_BLOCKED])
+    expect(calls.some(call => call.method === 'threads.members.remove')).toBe(false)
+  })
+
+  it('stops the batch when Core reports a stale roster', async () => {
+    const { port, calls } = fakePort({
+      'threads.members.removalPreview': params => previewOf(String(params?.agentId)),
+      'threads.members.remove': () => rejected('camp.membership_generation_conflict')
+    })
+    const outcome = await removeRoomMembers(port, { threadId: 't', agentIds: ['b', 'c'] })
+    expect(outcome.removedAgentIds).toEqual([])
+    expect(outcome.failures.map(failure => failure.agentId)).toEqual(['b', 'c'])
+    expect(calls.filter(call => call.method === 'threads.members.remove')).toHaveLength(1)
+  })
+
+  it('refuses to remove a Lead whose successor was refused by Core', async () => {
+    const { port } = fakePort({
+      'threads.members.removalPreview': () => previewOf('b'),
+      'threads.members.remove': () => rejected('camp.default_lead_unavailable')
+    })
+    const outcome = await removeRoomMembers(port, { threadId: 't', agentIds: ['b'] })
+    expect(outcome.removedAgentIds).toEqual([])
+    expect(outcome.failures).toHaveLength(1)
+  })
+
+  it('treats an unreadable preview or receipt as unconfirmed, never as removed', async () => {
+    const unreadable = fakePort({ 'threads.members.removalPreview': () => null })
+    const blocked = await removeRoomMembers(unreadable.port, { threadId: 't', agentIds: ['b', 'c'] })
+    expect(blocked.removedAgentIds).toEqual([])
+    expect(blocked.failures.map(failure => failure.agentId)).toEqual(['b', 'c'])
+
+    const unknown = fakePort({
+      'threads.members.removalPreview': () => previewOf('b'),
+      'threads.members.remove': () => new Error('connection lost')
+    })
+    const lost = await removeRoomMembers(unknown.port, { threadId: 't', agentIds: ['b'] })
+    expect(lost.removedAgentIds).toEqual([])
+    expect(lost.failures).toHaveLength(1)
+  })
+
+  it('stops when the receipt did not advance the generation', async () => {
+    const { port } = fakePort({
+      'threads.members.removalPreview': () => previewOf('b', { membershipGeneration: 3 }),
+      'threads.members.remove': () => applied({ membershipGeneration: 3, changed: true })
+    })
+    const outcome = await removeRoomMembers(port, { threadId: 't', agentIds: ['b'] })
+    expect(outcome.removedAgentIds).toEqual([])
+    expect(outcome.failures).toHaveLength(1)
+  })
+
+  it('reports an ended membership instead of pretending it removed the member', async () => {
+    const { port, calls } = fakePort({
+      'threads.members.removalPreview': params => previewOf(String(params?.agentId), { removable: false, blockerCode: 'camp.member_not_active' }),
+      'threads.members.remove': () => applied({ membershipGeneration: 4 })
+    })
+    const outcome = await removeRoomMembers(port, { threadId: 't', agentIds: ['b'] })
+    expect(outcome.removedAgentIds).toEqual([])
+    expect(outcome.failures).toEqual([{ agentId: 'b', message: '该助手已不在群里，请刷新后重试。' }])
+    expect(calls.some(call => call.method === 'threads.members.remove')).toBe(false)
+  })
+
+  it('refuses an empty target set without sending anything', async () => {
+    const { port, calls } = fakePort({})
+    await expect(removeRoomMembers(port, { threadId: ' ', agentIds: ['b'] })).rejects.toThrow()
+    await expect(removeRoomMembers(port, { threadId: 't', agentIds: ['', ''] })).resolves.toEqual({
+      removedAgentIds: [], failures: [], nextDefaultLeadAgentId: null
+    })
+    expect(calls).toEqual([])
+  })
+})
+
+describe('setRoomHidden', () => {
+  it('hides by one Core command and never removes a single assistant', async () => {
+    const { port, calls } = fakePort({
+      'threads.setHidden': () => applied({ threadId: 't', hidden: true, hiddenAt: '2026-01-01T00:00:00Z' })
+    })
+    await setRoomHidden(port, { threadId: 't', hidden: true })
+    expect(calls.map(call => call.method)).toEqual(['threads.setHidden'])
+    expect(calls[0].params).toEqual({ commandId: expect.any(String), command: { threadId: 't', hidden: true } })
+    // 退出群聊不再是「把助手全部移出」：一个人都不动。
+    expect(calls.some(call => call.method === 'threads.members.remove')).toBe(false)
+    expect(calls.some(call => call.method === 'threads.members.removalPreview')).toBe(false)
+    expect(calls.some(call => call.method === 'thread.messages.send')).toBe(false)
+  })
+
+  it('restores with the same switch', async () => {
+    const { port, calls } = fakePort({
+      'threads.setHidden': () => applied({ threadId: 't', hidden: false, hiddenAt: null })
+    })
+    await setRoomHidden(port, { threadId: 't', hidden: false })
+    expect((calls[0].params?.command as { hidden: boolean }).hidden).toBe(false)
+  })
+
+  it('treats a receipt that does not carry back the flag as unconfirmed', async () => {
+    const { port } = fakePort({ 'threads.setHidden': () => applied({ threadId: 't' }) })
+    await expect(setRoomHidden(port, { threadId: 't', hidden: true })).rejects.toThrow('隐藏结果未确认')
+  })
+
+  it('surfaces a rejected receipt and never reports success', async () => {
+    const { port } = fakePort({
+      'threads.setHidden': () => rejected('camp.not_found')
+    })
+    await expect(setRoomHidden(port, { threadId: 't', hidden: true })).rejects.toThrow()
+  })
+
+  it('refuses a blank Thread id without touching Core', async () => {
+    const { port, calls } = fakePort({})
+    await expect(setRoomHidden(port, { threadId: ' ', hidden: true })).rejects.toThrow()
+    expect(calls).toEqual([])
+  })
+})
+
+describe('readHiddenRooms', () => {
+  it('reads the hidden list verbatim', async () => {
+    const rows = [{ id: 't', title: '旧群', projectPath: '/local', hiddenAt: '2026-01-01T00:00:00Z' }]
+    const { port, calls } = fakePort({ 'threads.hiddenList': () => rows })
+    await expect(readHiddenRooms(port)).resolves.toEqual(rows)
+    expect(calls.map(call => call.method)).toEqual(['threads.hiddenList'])
+  })
+
+  it('never turns an unreadable receipt into an empty list', async () => {
+    const { port } = fakePort({ 'threads.hiddenList': () => ({ rows: [] }) })
+    await expect(readHiddenRooms(port)).rejects.toThrow('已隐藏列表读取结果不可用')
   })
 })
 

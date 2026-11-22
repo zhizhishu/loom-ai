@@ -95,6 +95,12 @@ pub enum Operation {
 
     #[serde(rename = "threads.rename", alias = "camps.rename")]
     CampRename,
+    /// M9-1c: 「退出群聊」= 从我的列表隐藏；恢复用同一个开关。
+    #[serde(rename = "threads.setHidden", alias = "camps.setHidden")]
+    CampSetHidden,
+    /// M9-1c: 「已隐藏」列表（只读）。
+    #[serde(rename = "threads.hiddenList", alias = "camps.hiddenList")]
+    CampHiddenList,
     #[serde(rename = "threads.delete", alias = "camps.delete")]
     CampDelete,
     #[serde(rename = "threads.deletionIssues", alias = "camps.deletionIssues")]
@@ -598,6 +604,8 @@ impl Operation {
             Self::LoomControlConfigure => "loom.control.configure",
             Self::LoomControlPause => "loom.control.pause",
             Self::CampRename => "camps.rename",
+            Self::CampSetHidden => "camps.setHidden",
+            Self::CampHiddenList => "camps.hiddenList",
             Self::CampDelete => "camps.delete",
             Self::CampDeletionIssues => "camps.deletionIssues",
             Self::CampRetryDeletion => "camps.retryDeletion",

@@ -150,7 +150,8 @@ use rovai_core::{
         CreateThreadCommand, DeleteThreadCommand, DiscardPendingThreadCommand, ExecutionRequest,
         ProjectBindingKind, ReconcileDefaultLeadCommand, RemoveThreadMemberCommand,
         RenameThreadCommand, SendUserAutomationThreadMessageCommand, SendUserThreadMessageCommand,
-        TaskAssigneeFilter, TaskAssigneeUpdate, TaskListQuery, TaskStatus, ThreadActivationState,
+        SetThreadHiddenCommand, TaskAssigneeFilter, TaskAssigneeUpdate, TaskListQuery,
+        TaskStatus, ThreadActivationState,
         ThreadCollaborationMode, UpdateTaskCommand, WithdrawThreadMessageCommand,
     },
     command::{
@@ -1302,6 +1303,7 @@ fn request_invalidates_navigation(method: &str) -> bool {
             | "camps.create"
             | "camps.discardPending"
             | "camps.rename"
+            | "camps.setHidden"
             | "camps.members.add"
             | "camps.members.remove"
             | "camps.changeDefaultLead"
@@ -11518,6 +11520,19 @@ impl Core {
                 )?;
                 Ok(serde_json::to_value(execution.result)?)
             }
+            // M9-1c：「退出群聊」只把这个群从我的会话列表隐藏，群、成员和历史都保留。
+            // 把助手移出群聊仍走 `camps.members.remove`（camp_member.status='left'），不走这里。
+            "camps.setHidden" => {
+                let params: UserCommandParams<SetThreadHiddenCommand> =
+                    serde_json::from_value(request.params.clone())?;
+                let camp_id = params.command.camp_id.clone();
+                let mut database = self.database.lock().await;
+                let execution = CollaborationService::default().set_camp_hidden(
+                    &mut database,
+                    &user_camp_command_envelope(params.command_id, camp_id, params.command),
+                )?;
+                Ok(serde_json::to_value(execution.result)?)
+            }
             // Kept as a read-only compatibility alias; Fast no longer launches qualification probes.
             "camps.members.fast.check" => {
                 let params: ThreadMemberRemovalPreviewParams =
@@ -11914,6 +11929,13 @@ impl Core {
                 let database = self.database.lock().await;
                 Ok(serde_json::to_value(
                     ThreadDeletionService::default().issues(&database)?,
+                )?)
+            }
+            // M9-1c：「已隐藏」列表。只读，一个群一行，最新隐藏在前。
+            "camps.hiddenList" => {
+                let mut database = self.database.lock().await;
+                Ok(serde_json::to_value(
+                    ReadModelService.hidden_camps(&mut database)?,
                 )?)
             }
             "camps.retryDeletion" => {

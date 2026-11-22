@@ -1125,6 +1125,17 @@ export interface NavigationThreadRows {
   threads: NavigationThreadItem[]
 }
 
+/**
+ * M9-1c `threads.hiddenList` 的一行：这个群被我从会话列表隐藏了（Mikka 群行的 `hidden`）。
+ * 它只描述隐藏这一个事实；群、成员与历史都还在，恢复只是把 `hiddenAt` 清空。
+ */
+export interface HiddenThreadItem {
+  id: string
+  title: string
+  projectPath: string
+  hiddenAt: string
+}
+
 export interface ThreadViewedAcknowledgement {
   threadId: string
   lastSeenGlobalSequence: number
@@ -4512,6 +4523,8 @@ export type CoreMethod =
   | 'threads.discardPending'
   | 'threads.pendingDraft.setPresence'
   | 'threads.rename'
+  | 'threads.setHidden'
+  | 'threads.hiddenList'
   | 'threads.members.fast.check'
   | 'threads.members.fast.set'
   | 'threads.members.add'
