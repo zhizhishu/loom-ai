@@ -24,6 +24,7 @@ import {
   roomPort,
   roomPermissionChoices,
   roomRoster,
+  roomSubmitProblem,
   roomWorkspaceChoices,
   type RoomDraft,
   type RoomPort
@@ -369,5 +370,34 @@ describe('roomPort', () => {
     await web.registerProject('/repo')
     expect(registerProjects).toHaveBeenCalledWith(['/repo'])
     expect(roomPort({ ...base, desktop: {} } as unknown as BusinessEnvironment).nativeDirectoryPicker).toBe(true)
+  })
+})
+
+// 主按钮永远可点，点下去说缺什么（Mikka `new-group-dialog.tsx:68-72,151`）。
+describe('roomSubmitProblem', () => {
+  it('names the missing member instead of leaving the primary button dead', () => {
+    const agents = [member('a')]
+    const draft: RoomDraft = emptyRoomDraft()
+    expect(roomSubmitProblem(draft, agents, preflightOf(['a']))).toBe('请至少选择一位队员。')
+  })
+
+  it('says nothing when the draft can actually be created', () => {
+    const agents = [member('a')]
+    const draft: RoomDraft = { ...emptyRoomDraft(), memberAgentIds: ['a'], leadAgentId: 'a' }
+    expect(roomSubmitProblem(draft, agents, preflightOf(['a']))).toBeNull()
+    // 还没读到 preflight（null）时不能凭空报错。
+    expect(roomSubmitProblem(draft, agents, null)).toBeNull()
+  })
+
+  it('sends the person to create an assistant when the host has none', () => {
+    expect(roomSubmitProblem(emptyRoomDraft(), [], preflightOf([]))).toBe('当前主机还没有可用助手。请先新建或启用一位助手。')
+  })
+
+  it('keeps the existing member problems unchanged', () => {
+    const agents = [member('a'), member('b')]
+    const leadMissing: RoomDraft = { ...emptyRoomDraft(), memberAgentIds: ['a'], leadAgentId: 'b' }
+    expect(roomSubmitProblem(leadMissing, agents, preflightOf(['a', 'b']))).toBe('队长必须是已选队员之一。')
+    const unavailable: RoomDraft = { ...emptyRoomDraft(), memberAgentIds: ['gone'], leadAgentId: 'gone' }
+    expect(roomSubmitProblem(unavailable, agents, preflightOf(['a']))).toBe('所选队员已不可用，请重新选择。')
   })
 })

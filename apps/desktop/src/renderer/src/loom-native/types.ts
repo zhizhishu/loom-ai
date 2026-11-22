@@ -24,7 +24,10 @@ export type {
   MissionRecord,
   ThreadSnapshot
 }
-export type ConversationItem = { id: string; title: string; subtitle: string; agentId: string | null; threadId: string | null; missionId: string | null; unread: boolean; updatedAt: string | null }
+/** 侧栏一行。`pinned` / `pinOrder` 是 Mikka 侧栏已有的两级（`bot-list.tsx:46-52`）；
+ * LOOM 的 Core 导航投影还没下发这两个事实，缺省即「没置顶」，排序退化成
+ * 时间 → 名字。等 Core 带上这两列时，前端排序不用再改。 */
+export type ConversationItem = { id: string; title: string; subtitle: string; agentId: string | null; threadId: string | null; missionId: string | null; unread: boolean; updatedAt: string | null; pinned?: boolean; pinOrder?: number | null }
 export type WorkItem = { task: LoomTask; mission: MissionRecord; candidate: LoomCandidate | null }
 
 /**

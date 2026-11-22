@@ -75,7 +75,10 @@ export function LoomApp({ environment, onLogout }: Props) {
   const [runSurfaceOpen, setRunSurfaceOpen] = useState(false)
   const runSurfaceOpener = useRef<HTMLElement | null>(null)
   const [roomInitialWorkspace,setRoomInitialWorkspace] = useState<WorkspaceSelection|null>(null)
-  const [roomMode, setRoomMode] = useState<'group' | 'work'>('group')
+  const [roomMode, setRoomMode] = useState<'direct' | 'group' | 'work'>('group')
+  // 两个 ＋ 分工（Mikka `rail-items.ts:29` / `rail-items.ts:37`）：左侧 rail 那个开新单聊，
+  // 会话列表头那个开新群聊；共用一个弹窗，只换 mode。没有第三个入口。
+  const beginDirectConversation = () => { setRoomInitialWorkspace(null);setRoomMode('direct'); setNewRoom(true) }
   const beginConversation = () => { setRoomInitialWorkspace(null);setRoomMode('group'); setNewRoom(true) }
   const beginWork = () => { setRoomInitialWorkspace(null);setRoomMode('work'); setNewRoom(true) }
   const beginWorkIn = (root:WorkspaceSelection) => {setRoomInitialWorkspace(root);setRoomMode('work');setNewRoom(true)}
@@ -113,6 +116,20 @@ export function LoomApp({ environment, onLogout }: Props) {
   const selectedRunBundle = data.bundles.find(bundle => bundle.mission.missionId === active?.missionId) ?? null
   const currentArtifact = useMemo(() => artifact === null ? null : refreshArtifactSelection(artifact, data.bundles), [artifact, data.bundles])
   const activeAgent = data.agents.find(agent => agent.agentId === (active?.agentId || data.snapshot?.thread.defaultLeadAgentId)) ?? null
+  // 群里叠成员头像用的是「已经读过的」成员名单：挂一行不发请求（Mikka CachedGroupAvatar，
+  // `components/nav/group-avatar.tsx:44-47`）。没读过的群仍退回标题首字母。
+  const [groupRosters, setGroupRosters] = useState<Record<string, readonly string[]>>({})
+  useEffect(() => {
+    const snapshot = data.snapshot
+    if (!snapshot) return
+    const ids = snapshot.members.filter(member => member.membershipStatus === 'active').map(member => member.agentId)
+    if (ids.length < 2) return
+    setGroupRosters(current => {
+      const previous = current[snapshot.thread.id]
+      if (previous && previous.length === ids.length && previous.every((id, index) => id === ids[index])) return current
+      return { ...current, [snapshot.thread.id]: ids }
+    })
+  }, [data.snapshot])
   const draftKey = data.selectedId || 'new'
   const latestDraftKey = useRef(draftKey)
   latestDraftKey.current = draftKey
@@ -229,7 +246,8 @@ export function LoomApp({ environment, onLogout }: Props) {
     </header>
     <div className="ln-window-body"><nav className="ln-rail" aria-label="主要页面">
       <IconButton icon="home" label="对话" active={!studioOpen && !setupOpen} onClick={() => { setExpanded(false); setSidebarOpen(true); if (!active) beginConversation() }}/>
-      <IconButton icon="plus" label="开始新对话" onClick={beginConversation}/>
+      {/* rail 的 ＋ 只开新单聊；label 保持「开始新对话」（scripts/lib/loom-browser-live-mode.mjs 的 newConversation 选择器）。 */}
+      <IconButton icon="plus" label="开始新对话" onClick={beginDirectConversation}/>
       <IconButton icon="board" label="工作空间" onClick={() => openWork()}/>
       <IconButton icon="branch" label="运行与成果" active={runSurfaceOpen} onClick={() => {
         runSurfaceOpener.current=document.activeElement instanceof HTMLElement?document.activeElement:null
@@ -245,7 +263,7 @@ export function LoomApp({ environment, onLogout }: Props) {
       <div className="ln-rail-bottom"><IconButton icon="clock" label="会话活动" onClick={() => setModal('history')}/><IconButton icon="settings" label="设置" onClick={() => setModal('settings')}/><button type="button" className="ln-user-button" aria-label="个人与连接设置" onClick={() => setModal('settings')}>L</button></div>
     </nav>
       <section ref={frameRef} className="ln-frame" aria-label="LOOM 工作空间" style={{ '--ln-sidebar-width': `${panelWidths.sidebar}px`, '--ln-inspector-width': `${panelWidths.inspector}px` } as React.CSSProperties}>
-        {sidebarOpen && <Sidebar agents={data.agents} items={data.conversations} selectedId={data.selectedId} loading={data.loading} onSelect={item => safeInspectorAction(() => { setCapabilityDirty(false); void select(item) })} onCreate={beginConversation} onCollapse={() => setSidebarOpen(false)} onEditAssistant={agentId => manageAssistant(agentId)}/>}{sidebarOpen && <PanelResizeHandle side="sidebar" frame={frameRef} widths={panelWidths} sidebarOpen={sidebarOpen} inspectorOpen={inspectorOpen} onResize={resizePanel}/> }
+        {sidebarOpen && <Sidebar agents={data.agents} items={data.conversations} selectedId={data.selectedId} loading={data.loading} groupRosters={groupRosters} onSelect={item => safeInspectorAction(() => { setCapabilityDirty(false); void select(item) })} onCreate={beginConversation} onCollapse={() => setSidebarOpen(false)} onEditAssistant={agentId => manageAssistant(agentId)}/>}{sidebarOpen && <PanelResizeHandle side="sidebar" frame={frameRef} widths={panelWidths} sidebarOpen={sidebarOpen} inspectorOpen={inspectorOpen} onResize={resizePanel}/> }
         <ConversationView item={active} agents={data.agents} snapshot={data.snapshot} bundles={data.bundles} loading={data.loading} sending={sending} draft={draft.text} files={draft.files} error={sendError} onDraft={text => patchDraft({ text })} onFiles={files => patchDraft({ files })} onSend={agentId => { void send(agentId) }} onProfile={() => manageAssistant(activeAgent?.agentId)} onWorkspaceManager={() => setWorkspaceManagerOpen(true)} onMembers={() => setMembersOpen(true)} onArtifact={setArtifact} onShowSidebar={() => setSidebarOpen(true)} sidebarHidden={!sidebarOpen} onShowWork={() => openWork()} inspectorHidden={!inspectorOpen} onAttachment={(messageId,attachmentId) => { void openAttachment(messageId,attachmentId) }} approvalBusy={approvalBusy} onResolveApproval={(approvalId,optionId) => { void resolveApproval(approvalId,optionId) }}/>
         {inspectorOpen && <PanelResizeHandle side="inspector" frame={frameRef} widths={panelWidths} sidebarOpen={sidebarOpen} inspectorOpen={inspectorOpen} onResize={resizePanel}/>}
         {inspectorOpen && <Inspector key={capabilityEpoch} selectedTaskId={dockSelection?.threadId === (active?.threadId ?? null) ? dockSelection?.taskId ?? null : null} onTaskSelect={taskId => setDockSelection({ threadId: active?.threadId ?? null, taskId })} threadId={active?.threadId} conversationTitle={active?.title} onCreateWork={beginWork} workbench={environment.workbench} client={environment.client} theme={theme} onManageAssistant={manageAssistant} onCapabilityDirty={setCapabilityDirty} onLibrary={() => safeInspectorAction(() => { setCapabilityDirty(false); setLibraryOpen(true) })} agents={data.agents} bundles={data.bundles} agent={activeAgent} mode={inspectorMode} tab={tab} onTab={value => safeInspectorAction(() => { setTab(value); setCapabilityDirty(false) })} onMode={value => safeInspectorAction(() => { setInspectorMode(value); setCapabilityDirty(false) })} onClose={() => safeInspectorAction(() => { setInspectorOpen(false); setExpanded(false); setCapabilityDirty(false) })} onExpand={() => setExpanded(value => !value)} expanded={expanded} onArtifact={setArtifact} loading={data.loading} onOpenConversation={threadId => { const item = data.conversations.find(item => item.threadId === threadId); if (item) void select(item) }}/>}</section>
@@ -255,7 +273,7 @@ export function LoomApp({ environment, onLogout }: Props) {
     {visitedPanels.studio&&<Suspense fallback={<span role="status" className="ln-loading">正在打开助手编辑…</span>}><AssistantStudio threadId={active?.threadId ?? undefined} onCreatedConversation={data.openConversation} onOpenConnections={() => setSetupOpen(true)} catalogEpoch={capabilityEpoch} open={studioOpen} environment={environment} agents={data.agents} initialAgentId={studioAgent} theme={theme} onClose={() => setStudioOpen(false)} onRefresh={data.refresh} onLibrary={() => setLibraryOpen(true)}/></Suspense>}
     <WorkspaceManager open={workspaceManagerOpen} environment={environment} theme={theme}
       onClose={()=>setWorkspaceManagerOpen(false)} onStart={beginWorkIn}/>
-    {visitedPanels.room&&<Suspense fallback={<span role="status" className="ln-loading">正在打开新工作…</span>}><RoomDialog open={newRoom} initialMode={roomMode} initialWorkspace={roomInitialWorkspace} environment={environment} agents={data.agents} initialAgentId={activeAgent?.agentId} theme={theme} onClose={() => setNewRoom(false)} onCreated={data.openConversation}/></Suspense>}
+    {visitedPanels.room&&<Suspense fallback={<span role="status" className="ln-loading">正在打开新工作…</span>}><RoomDialog open={newRoom} initialMode={roomMode} initialWorkspace={roomInitialWorkspace} environment={environment} agents={data.agents} initialAgentId={activeAgent?.agentId} theme={theme} onClose={() => setNewRoom(false)} onCreated={data.openConversation} onNewAssistant={() => manageAssistant()}/></Suspense>}
     {visitedPanels.members&&<Suspense fallback={null}><RoomMembersDialog open={membersOpen} environment={environment} agents={data.agents} snapshot={data.snapshot} theme={theme} onClose={() => setMembersOpen(false)} onRefresh={data.refresh}/></Suspense>}
     {visitedPanels.library&&<Suspense fallback={<span role="status" className="ln-loading">正在打开能力库…</span>}><CapabilityLibrary open={libraryOpen} environment={environment} theme={theme} onClose={() => setLibraryOpen(false)} onChanged={() => { setCapabilityEpoch(value => value + 1); void data.refresh() }}/></Suspense>}
     <SurfaceDialog open={pendingInspectorAction !== null} title="保留能力修改？" theme={theme} onClose={() => setPendingInspectorAction(null)} className="ln-room-dialog"><UnsavedNotice onKeep={() => setPendingInspectorAction(null)} onDiscard={() => { const action = pendingInspectorAction; setPendingInspectorAction(null); setCapabilityDirty(false); action?.() }}/></SurfaceDialog>
