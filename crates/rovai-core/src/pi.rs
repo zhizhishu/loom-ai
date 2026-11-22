@@ -1252,11 +1252,13 @@ mod managed_workflow_source_tests {
         .unwrap()
         .unwrap();
         let path = config_root.join("guard-grant.json");
-        std::fs::write(
-            &path,
-            serde_json::to_vec(&launched.to_document().unwrap()).unwrap(),
-        )
-        .unwrap();
+        let bytes = serde_json::to_vec(&launched.to_document().unwrap()).unwrap();
+        // An elevated CI token makes a plain write owned by Administrators, which the private file
+        // admission rejects; pre-write the document the way the product does.
+        #[cfg(windows)]
+        crate::platform::atomic_write_private_bytes(&path, &bytes).unwrap();
+        #[cfg(not(windows))]
+        std::fs::write(&path, &bytes).unwrap();
         let published = || -> Value {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
         };
