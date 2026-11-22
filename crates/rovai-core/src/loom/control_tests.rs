@@ -7101,8 +7101,18 @@ fn watchdog_records_a_long_review_epoch_inside_the_ledger_bound() {
         "assertion the_reviewing_task_is_observed_once: {ticked:?}"
     );
     let (dispatch_id, _, _) = latest_dispatch_and_run(&database, &long_task);
+    let stored: Option<String> = database
+        .connection()
+        .query_row(
+            "SELECT action FROM loom_task_recovery
+             WHERE task_id=?1 AND attempt_id=?2 AND request_epoch=?3",
+            params![&long_task, &dispatch_id, &epoch],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
     assert_eq!(
-        watchdog_receipt(&database, &dispatch_id, &epoch).map(|receipt| receipt.0),
+        stored,
         Some("wait".into()),
         "assertion the_long_epoch_receipt_is_actually_stored"
     );
