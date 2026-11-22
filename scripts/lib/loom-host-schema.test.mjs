@@ -6,11 +6,11 @@ import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 import { verifyRunningHostSchema } from './loom-host-schema.mjs'
 
-// Migration 237 (the durable LOOM recovery ledger) is the current receipt, so a current
-// database also carries 235 (artifact versions) and 236 (local Hook snapshots).
-const priorReceipts = migration => migration >= 237 ? [235, 236] : migration >= 236 ? [235] : []
+// Migration 239 (the device session columns) is the current receipt, so a current database also
+// carries 235 (artifact versions), 236 (local Hook snapshots) and 237 (LOOM recovery ledger).
+const priorReceipts = migration => migration >= 239 ? [235, 236, 237] : migration >= 237 ? [235, 236] : migration >= 236 ? [235] : []
 
-async function fixture (t, schema = 187, migration = 237, previousReceipts = priorReceipts(migration)) {
+async function fixture (t, schema = 187, migration = 239, previousReceipts = priorReceipts(migration)) {
   const dir = await mkdtemp(join(tmpdir(), 'loom-host-schema-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const path = join(dir, 'rovai.sqlite')
@@ -33,9 +33,10 @@ test('the running Host actual schema is verified read-only, with no runtime or s
   const evidence = await verifyRunningHostSchema({ request: f.request, databasePath: f.path })
   assert.equal(evidence.verified, true)
   assert.equal(evidence.projectionSchema, 187)
-  assert.equal(evidence.latestMigrationVersion, 237)
+  assert.equal(evidence.latestMigrationVersion, 239)
   assert.equal(evidence.localHookMigrationPresent, true)
   assert.equal(evidence.recoveryLedgerMigrationPresent, true)
+  assert.equal(evidence.deviceSessionMigrationPresent, true)
   assert.equal(evidence.source, 'running-host-health-and-read-only-database')
   assert.deepEqual(f.methods, ['health.check'])
   assert.deepEqual(await readFile(f.path), before)
@@ -49,6 +50,7 @@ test('the running Host actual schema is verified read-only, with no runtime or s
   assert.equal(hookEvidence.latestMigrationVersion, 236)
   assert.equal(hookEvidence.localHookMigrationPresent, true)
   assert.equal(hookEvidence.recoveryLedgerMigrationPresent, false)
+  assert.equal(hookEvidence.deviceSessionMigrationPresent, false)
   assert.equal(hookEvidence.artifactVersionMigrationPresent, true)
   assert.deepEqual(await readFile(hook.path), hookBefore)
 })

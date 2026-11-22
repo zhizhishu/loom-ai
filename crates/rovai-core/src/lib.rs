@@ -59,6 +59,7 @@ pub mod current_user;
 pub mod database_admission;
 pub mod db;
 pub mod delivery_queue;
+pub mod device_presence;
 pub mod diagnostics;
 pub mod dsh;
 pub mod execution_budget;

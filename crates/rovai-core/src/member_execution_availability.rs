@@ -126,15 +126,15 @@ fn evaluate_at(
         workspace_id: Some(selection.workspace_id.clone()),
         target_revision: target.revision,
     };
-    let node: Option<(String, Option<String>, Option<String>)> = connection
+    let node: Option<(String, Option<String>, Option<String>, Option<String>)> = connection
         .query_row(
-            "SELECT role,last_heartbeat,revoked_at FROM execution_node WHERE node_id=?1",
+            "SELECT role,session_opened_at,session_closed_at,revoked_at FROM execution_node WHERE node_id=?1",
             [&selection.node_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(|_| RemoteCatalogError::CatalogUnavailable)?;
-    let Some((role, last_heartbeat, revoked_at)) = node else {
+    let Some((role, session_opened_at, session_closed_at, revoked_at)) = node else {
         return Ok(blocked(view, RemoteCatalogError::NodeNotFound.code()));
     };
     if role != "remote" {
@@ -151,7 +151,13 @@ fn evaluate_at(
         Ok(false) => return Ok(blocked(view, "remote_target_revision_conflict")),
         Err(error) => return Ok(blocked(view, RemoteTargetError::from_error(error).code())),
     }
-    if !crate::execution_node::fresh_heartbeat(last_heartbeat.as_deref(), now) {
+    // Presence is the session pair the Node's socket opened and closed, not a heartbeat
+    // window (decision 2026-11-17-2215). `now` no longer decides whether it is present.
+    let _ = now;
+    if !crate::device_presence::is_device_online(&crate::device_presence::device_session_state(
+        session_opened_at.as_deref(),
+        session_closed_at.as_deref(),
+    )) {
         return Ok(blocked(view, "remote_node_offline"));
     }
     Ok(MemberExecutionAvailability {
@@ -192,7 +198,7 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(
             "CREATE TABLE member_execution_target(member_id TEXT PRIMARY KEY, revision INTEGER, selection_json TEXT);
-             CREATE TABLE execution_node(node_id TEXT PRIMARY KEY,role TEXT,last_heartbeat TEXT,revoked_at TEXT);
+             CREATE TABLE execution_node(node_id TEXT PRIMARY KEY,role TEXT,last_heartbeat TEXT,revoked_at TEXT,session_opened_at TEXT,session_closed_at TEXT,session_socket_id TEXT);
              CREATE TABLE execution_node_cli(node_id TEXT,adapter_kind TEXT,path TEXT,version TEXT,path_present INTEGER,installation_identity TEXT,installation_generation INTEGER);
              CREATE TABLE mission(id TEXT PRIMARY KEY,camp_id TEXT);
              CREATE TABLE mission_workspace(id TEXT PRIMARY KEY,mission_id TEXT,camp_id TEXT,execution_host_id TEXT,worktree_path TEXT,generation INTEGER,preparation_token TEXT,state TEXT);
@@ -200,7 +206,7 @@ mod tests {
              INSERT INTO mission VALUES('mission-source','camp-source');
              INSERT INTO mission_workspace VALUES('workspace-b','mission-source','camp-source','node-b','B:/prepared/worktree',1,'fixture-preparation','ready');
              INSERT INTO camp_member VALUES('camp-source','member','active',NULL);
-             INSERT INTO execution_node VALUES('node-b','remote','2026-11-05T05:00:00Z',NULL);",
+             INSERT INTO execution_node VALUES('node-b','remote','2026-11-05T05:00:00Z',NULL,'2026-11-05T05:00:00Z',NULL,'fixture-socket');",
         ).unwrap();
         connection.execute(
             "INSERT INTO execution_node_cli VALUES('node-b','claude-code-cli','B:/native/claude.exe','2.1.241',1,?1,1)",
@@ -286,11 +292,15 @@ mod tests {
         let connection = fixture();
         select_remote(&connection);
         let local = local_configuration();
-        for heartbeat in [None, Some("invalid"), Some("2026-11-05T04:59:39Z")] {
+        for (opened, closed) in [
+            (None, None),
+            (Some("2026-11-05T05:00:00Z"), Some("2026-11-05T05:00:00Z")),
+            (Some("2026-11-05T05:00:00Z"), Some("2026-11-05T06:00:00Z")),
+        ] {
             connection
                 .execute(
-                    "UPDATE execution_node SET last_heartbeat=?1",
-                    params![heartbeat],
+                    "UPDATE execution_node SET session_opened_at=?1, session_closed_at=?2",
+                    params![opened, closed],
                 )
                 .unwrap();
             let view = evaluate_at(

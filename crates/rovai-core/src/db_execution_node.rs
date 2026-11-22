@@ -3,6 +3,42 @@
 //! Remote nodes are not the default execution host.
 use super::*;
 
+/// Migration 239: the device session pair. A device is online while the session its own socket
+/// opened last is not closed (decision 2026-11-17-2215), so presence stops being a heartbeat
+/// window. Only columns are added and `last_heartbeat` stays a display-only last-seen, so the
+/// projection schema version does not change; the receipt is what a reopening Host checks.
+pub(super) fn migrate_device_session(database: &mut Database) -> Result<()> {
+    let mut missing: Vec<&str> = Vec::new();
+    for column in ["session_opened_at", "session_closed_at", "session_socket_id"] {
+        if !database.table_has_column("execution_node", column)? {
+            missing.push(column);
+        }
+    }
+    let tx = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        matches!(
+            classify_database_contract(&tx)?,
+            DatabaseContractClassification::Current(_)
+                | DatabaseContractClassification::SupportedMigrationSource(_)
+        ),
+        "device session migration requires the current data contract"
+    );
+    for column in missing {
+        tx.execute_batch(&format!(
+            "ALTER TABLE execution_node ADD COLUMN {column} TEXT;"
+        ))?;
+    }
+    tx.execute_batch("INSERT INTO schema_migration VALUES(239,datetime('now'));")?;
+    anyhow::ensure!(
+        crate::execution_node::session_schema_matches(&tx)?,
+        "device session migration did not add the session columns"
+    );
+    tx.commit()?;
+    Ok(())
+}
+
 pub(super) fn migrate(database: &mut Database) -> Result<()> {
     let tx = database
         .connection

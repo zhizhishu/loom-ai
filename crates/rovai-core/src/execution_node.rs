@@ -34,6 +34,9 @@ CREATE TABLE execution_node (
     paired_at TEXT NOT NULL,
     revoked_at TEXT,
     last_heartbeat TEXT,
+    session_opened_at TEXT,
+    session_closed_at TEXT,
+    session_socket_id TEXT,
     CHECK(role = 'local' OR token_digest IS NOT NULL),
     CHECK(role <> 'local' OR token_digest IS NULL),
     CHECK(role <> 'local' OR revoked_at IS NULL)
@@ -110,6 +113,49 @@ pub fn shim_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
     ]
     .iter()
     .all(|token| sql.contains(&compact(token))))
+}
+
+/// Migration 239. The device session pair the gateway reports when a socket opens and
+/// closes, ported from the Mikka `devices` session columns (`2026-11-17-2215`). The node
+/// is online while the session it opened last is not closed; `last_heartbeat` stays a
+/// display-only last-seen for people.
+pub fn session_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
+    let sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='execution_node'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(sql.is_some_and(|sql| {
+        let sql = sql.split_whitespace().collect::<String>();
+        [
+            "session_opened_at TEXT",
+            "session_closed_at TEXT",
+            "session_socket_id TEXT",
+        ]
+        .iter()
+        .all(|column| sql.contains(column))
+    }))
+}
+
+/// One gateway session report. The socket that opened last owns the session, so a late
+/// report from a replaced socket changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionReportState {
+    Connected,
+    Disconnected,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceSessionReport {
+    pub state: SessionReportState,
+    pub at: DateTime<Utc>,
+    pub socket_id: String,
+}
+
+fn report_stamp(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 pub fn schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
@@ -758,8 +804,11 @@ impl NodeStore {
         })
     }
 
+    /// Presence of every node. A remote node is online while the session its own socket
+    /// opened last is not closed (decision 2026-11-17-2215); `last_heartbeat` is kept as a
+    /// display-only last-seen and no longer decides status. The local node has no socket of
+    /// its own to open a session, and it is at most the Host this process runs in.
     pub fn list_nodes(&self) -> Result<Vec<NodeRecord>> {
-        let now = Utc::now();
         let stamp = now_stamp();
         let connection = self.lock()?;
         connection.execute(
@@ -768,7 +817,8 @@ impl NodeStore {
         )?;
         let mut nodes = Vec::new();
         let mut statement = connection.prepare(
-            "SELECT node_id, display_name, role, os, arch, paired_at, revoked_at, last_heartbeat
+            "SELECT node_id, display_name, role, os, arch, paired_at, revoked_at, last_heartbeat,
+                    session_opened_at, session_closed_at
                FROM execution_node
               ORDER BY CASE role WHEN 'local' THEN 0 ELSE 1 END, paired_at, node_id",
         )?;
@@ -782,13 +832,31 @@ impl NodeStore {
                 row.get::<_, String>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
         for row in rows {
-            let (node_id, display_name, role, os, arch, paired_at, revoked_at, last_heartbeat) =
-                row?;
+            let (
+                node_id,
+                display_name,
+                role,
+                os,
+                arch,
+                paired_at,
+                revoked_at,
+                last_heartbeat,
+                session_opened_at,
+                session_closed_at,
+            ) = row?;
             let online = revoked_at.is_none()
-                && (role == "local" || fresh_heartbeat(last_heartbeat.as_deref(), now));
+                && (role == "local"
+                    || crate::device_presence::is_device_online(
+                        &crate::device_presence::device_session_state(
+                            session_opened_at.as_deref(),
+                            session_closed_at.as_deref(),
+                        ),
+                    ));
             nodes.push(NodeRecord {
                 node_id,
                 display_name,
@@ -845,6 +913,81 @@ impl NodeStore {
                 .collect::<Result<Vec<_>, _>>()?;
         }
         Ok(nodes)
+    }
+
+    /// One gateway session report, the only writer of the session columns on
+    /// `execution_node`. Connected opens the session of the reporting socket; a report for an
+    /// older socket, and a retried connect of a socket whose close is recorded, change
+    /// nothing. Disconnected closes only the session its own socket opened, so a late close
+    /// of a replaced socket is ignored. Returns whether the report was applied.
+    pub fn apply_device_session_report(
+        &self,
+        node_id: &str,
+        report: &DeviceSessionReport,
+    ) -> Result<bool> {
+        let at = report_stamp(report.at);
+        let connection = self.lock()?;
+        let applied = match report.state {
+            SessionReportState::Connected => connection.execute(
+                "UPDATE execution_node
+                    SET session_opened_at=?2, session_socket_id=?3, session_closed_at=NULL,
+                        last_heartbeat=CASE WHEN last_heartbeat IS NULL OR last_heartbeat < ?2
+                                            THEN ?2 ELSE last_heartbeat END
+                  WHERE node_id=?1 AND revoked_at IS NULL
+                    AND (session_opened_at IS NULL OR session_opened_at < ?2
+                         OR (session_opened_at=?2 AND session_closed_at IS NULL))",
+                params![node_id, at, report.socket_id],
+            )?,
+            SessionReportState::Disconnected => connection.execute(
+                "UPDATE execution_node
+                    SET session_closed_at=CASE WHEN session_opened_at IS NOT NULL
+                                                    AND session_opened_at > ?2
+                                               THEN session_opened_at ELSE ?2 END,
+                        last_heartbeat=CASE WHEN last_heartbeat IS NULL OR last_heartbeat < ?2
+                                            THEN ?2 ELSE last_heartbeat END
+                  WHERE node_id=?1 AND session_socket_id=?3
+                    AND session_opened_at IS NOT NULL AND session_closed_at IS NULL",
+                params![node_id, at, report.socket_id],
+            )?,
+        };
+        Ok(applied == 1)
+    }
+
+    /// Open this socket's session now. One Host clock stamps every report.
+    pub fn open_device_session(&self, node_id: &str, socket_id: &str) -> Result<bool> {
+        self.apply_device_session_report(
+            node_id,
+            &DeviceSessionReport {
+                state: SessionReportState::Connected,
+                at: Utc::now(),
+                socket_id: socket_id.to_owned(),
+            },
+        )
+    }
+
+    /// Close the session this socket opened, and only that one.
+    pub fn close_device_session(&self, node_id: &str, socket_id: &str) -> Result<bool> {
+        self.apply_device_session_report(
+            node_id,
+            &DeviceSessionReport {
+                state: SessionReportState::Disconnected,
+                at: Utc::now(),
+                socket_id: socket_id.to_owned(),
+            },
+        )
+    }
+
+    /// Whether this node's session is open, read from the session pair alone. A dispatch or a
+    /// claim that needs a present node asks this, never a heartbeat window.
+    pub fn device_session_held(&self, node_id: &str) -> Result<bool> {
+        let connection = self.lock()?;
+        let predicate = crate::device_presence::device_session_open_sql("n");
+        let held: bool = connection.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM execution_node n WHERE n.node_id=?1 AND {predicate})"),
+            [node_id],
+            |row| row.get(0),
+        )?;
+        Ok(held)
     }
 
     pub fn begin_dispatch(
@@ -1151,6 +1294,148 @@ fn read_dispatch(row: &rusqlite::Row<'_>) -> rusqlite::Result<DispatchRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(text: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(text)
+            .expect("a legal RFC 3339 instant")
+            .with_timezone(&Utc)
+    }
+
+    fn report(state: SessionReportState, text: &str, socket_id: &str) -> DeviceSessionReport {
+        DeviceSessionReport {
+            state,
+            at: at(text),
+            socket_id: socket_id.to_owned(),
+        }
+    }
+
+    /// Ported from the upstream `device session reports` database test: the socket that opened
+    /// last owns the session, reports are idempotent, and only the owning socket closes it.
+    #[test]
+    fn the_newest_socket_owns_the_session_and_reports_are_idempotent() {
+        let store = NodeStore::open_ephemeral().unwrap();
+        store.insert_remote("node_a", "desk", &"ab".repeat(32)).unwrap();
+        let t0 = "2026-11-17T10:00:00.000Z";
+        let t1 = "2026-11-17T10:00:10.000Z";
+        let t2 = "2026-11-17T10:00:20.000Z";
+        assert!(!store.device_session_held("node_a").unwrap(), "never connected");
+
+        assert!(store
+            .apply_device_session_report(
+                "node_a",
+                &report(SessionReportState::Connected, t0, "socket-aaaaaaaa")
+            )
+            .unwrap());
+        assert!(store.device_session_held("node_a").unwrap());
+        assert!(
+            store
+                .apply_device_session_report(
+                    "node_a",
+                    &report(SessionReportState::Connected, t0, "socket-aaaaaaaa")
+                )
+                .unwrap(),
+            "a retried report is idempotent"
+        );
+
+        assert!(
+            store
+                .apply_device_session_report(
+                    "node_a",
+                    &report(SessionReportState::Connected, t1, "socket-bbbbbbbb")
+                )
+                .unwrap(),
+            "a newer socket replaces it"
+        );
+        assert!(
+            !store
+                .apply_device_session_report(
+                    "node_a",
+                    &report(SessionReportState::Connected, t0, "socket-aaaaaaaa")
+                )
+                .unwrap(),
+            "a late connect of the old socket is ignored"
+        );
+        assert!(
+            !store
+                .apply_device_session_report(
+                    "node_a",
+                    &report(SessionReportState::Disconnected, t2, "socket-aaaaaaaa")
+                )
+                .unwrap(),
+            "a late close of the replaced socket is ignored"
+        );
+        assert!(store.device_session_held("node_a").unwrap());
+        let listed = store.list_nodes().unwrap();
+        let node = listed.iter().find(|node| node.node_id == "node_a").unwrap();
+        assert_eq!(node.status, "online", "an open session is presence");
+
+        assert!(
+            store
+                .apply_device_session_report(
+                    "node_a",
+                    &report(SessionReportState::Disconnected, t2, "socket-bbbbbbbb")
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .apply_device_session_report(
+                    "node_a",
+                    &report(SessionReportState::Disconnected, t2, "socket-bbbbbbbb")
+                )
+                .unwrap(),
+            "idempotent"
+        );
+        assert!(
+            !store
+                .apply_device_session_report(
+                    "node_a",
+                    &report(SessionReportState::Connected, t1, "socket-bbbbbbbb")
+                )
+                .unwrap(),
+            "a retried connect cannot reopen a closed socket"
+        );
+        assert!(!store.device_session_held("node_a").unwrap());
+        let listed = store.list_nodes().unwrap();
+        let node = listed.iter().find(|node| node.node_id == "node_a").unwrap();
+        assert_eq!(node.status, "offline");
+        assert_eq!(
+            node.last_heartbeat.as_deref(),
+            Some(t2),
+            "last seen is the session time, for people only"
+        );
+    }
+
+    /// A node whose socket never opened a session is offline, and a report for an unknown or
+    /// revoked node is never applied.
+    #[test]
+    fn a_session_is_opened_only_for_a_live_paired_node() {
+        let store = NodeStore::open_ephemeral().unwrap();
+        store.insert_remote("node_a", "desk", &"ab".repeat(32)).unwrap();
+        assert!(
+            !store
+                .apply_device_session_report(
+                    "node_missing",
+                    &report(SessionReportState::Connected, "2026-11-17T10:00:00.000Z", "socket-aaaaaaaa")
+                )
+                .unwrap(),
+            "an unknown node gains no session"
+        );
+        assert!(matches!(
+            store.revoke("node_a").unwrap(),
+            RevokeResult::Revoked { .. }
+        ));
+        assert!(
+            !store
+                .apply_device_session_report(
+                    "node_a",
+                    &report(SessionReportState::Connected, "2026-11-17T10:00:00.000Z", "socket-aaaaaaaa")
+                )
+                .unwrap(),
+            "a revoked node gains no session"
+        );
+        assert!(!store.device_session_held("node_a").unwrap());
+    }
 
     #[test]
     fn legacy_no_process_requires_zero_cursor_and_no_output_and_reads_exact_attempt() {
