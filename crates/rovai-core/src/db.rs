@@ -533,6 +533,13 @@ impl MainThreadMigrationSource {
 
 pub(crate) const CURRENT_DATA_CONTRACT_VERSION: &str = "v1.72";
 pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 187;
+
+/// Immutable slug reserved for the single built-in Pi lead member.
+///
+/// User-created profiles always store their Agent ID in `slug`, so this
+/// constant never collides with a custom profile.
+pub(crate) const BUILTIN_PI_PRIMARY_SLUG: &str = "loom-builtin-pi-primary";
+
 const V147_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.54";
 const V147_MIGRATION_SOURCE_PROJECTION_SCHEMA_VERSION: i64 = 96;
 const V145_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.53";
@@ -8042,6 +8049,14 @@ impl Database {
                 DatabaseInitializeError(DatabaseOpenError::operation(
                     "authority_initialize_seed_failed",
                     "initialize built-in agents in",
+                    &temporary,
+                    error,
+                ))
+            })?;
+            staged.allocate_builtin_lead_member().map_err(|error| {
+                DatabaseInitializeError(DatabaseOpenError::operation(
+                    "authority_initialize_lead_member_failed",
+                    "allocate built-in lead member in",
                     &temporary,
                     error,
                 ))
@@ -35898,6 +35913,55 @@ impl Database {
             .execute("UPDATE agent_profile SET runtime_enabled = 0", [])?;
         Ok(())
     }
+
+    /// Allocate one additional independent built-in lead member (Pi 主助手) on a
+    /// staged authority database. The four built-in agents are never rewritten,
+    /// no Runtime binding is created, and the caller receives the newly
+    /// allocated Agent ID directly so no display-name lookup is required.
+    ///
+    /// The profile stores the immutable [`BUILTIN_PI_PRIMARY_SLUG`] constant and
+    /// leaves `handle` NULL, mirroring user-created profiles. Callers gate on a
+    /// fresh decision, so the reserved slug is written exactly once.
+    pub(crate) fn allocate_builtin_lead_member(&mut self) -> Result<String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let transaction = self.connection.transaction()?;
+        let agent_id = crate::agent_identity::allocate_agent_id(&transaction)?;
+        let member_order: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(member_order), -1) + 1 FROM agent_profile",
+            [],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            r#"
+            INSERT INTO agent_profile (
+                uuid, id, slug, handle, display_name, avatar_ref,
+                team_role, professional_responsibilities, personality_traits_json,
+                working_principles, growth_topic, default_capabilities_json,
+                accent, runtime_enabled, profile_status, member_order,
+                created_at, updated_at
+            ) VALUES (
+                ?1, ?2, ?5, NULL, 'Pi 主助手', NULL,
+                '内置主助手',
+                '负责把用户目标拆解为可执行的成员任务，跟踪执行结果并如实回报，不代替用户接受成果。',
+                '[]',
+                '先确认目标与边界，再派工；只报告已核实的结果。',
+                '持续改进派工与验收流程。',
+                '["task.create","task.update","agent_run.create","agent_run.retry","agent_run.cancel","member.call"]',
+                '#5A6B7C', 0, 'present', ?3,
+                ?4, ?4
+            )
+            "#,
+            params![
+                Uuid::new_v4().to_string(),
+                agent_id,
+                member_order,
+                now,
+                BUILTIN_PI_PRIMARY_SLUG
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(agent_id)
+    }
 }
 
 #[cfg(all(test, feature = "extended-tests"))]
@@ -57101,6 +57165,185 @@ mod tests {
             "agent_6"
         );
         transaction.commit().unwrap();
+
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn builtin_lead_member_allocation_keeps_the_seeded_four_and_appends_one_member() {
+        let directory =
+            std::env::temp_dir().join(format!("rovai-lead-member-test-{}", Uuid::new_v4()));
+        let mut database = crate::test_support::fresh_schema_database_fast_at(&directory);
+        let before: Vec<(String, i64)> = {
+            let connection = database.connection();
+            let mut statement = connection
+                .prepare("SELECT id, member_order FROM agent_profile ORDER BY member_order, id")
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            before,
+            vec![
+                (LUOKE_AGENT_ID.to_string(), 0),
+                (MUWA_AGENT_ID.to_string(), 1),
+                (MIANZHI_AGENT_ID.to_string(), 2),
+                (QILU_AGENT_ID.to_string(), 3),
+            ]
+        );
+        let next_ordinal_before: i64 = database
+            .connection()
+            .query_row(
+                "SELECT next_value FROM agent_id_sequence WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let agent_id = database.allocate_builtin_lead_member().unwrap();
+
+        assert_eq!(agent_id, format_agent_id(next_ordinal_before).unwrap());
+        assert!(!before.iter().any(|(id, _)| *id == agent_id));
+        let member: (String, String, i64, Option<String>, i64, String) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT display_name, team_role, member_order, handle, runtime_enabled,
+                       profile_status
+                FROM agent_profile WHERE id = ?1
+                "#,
+                [&agent_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            member,
+            (
+                "Pi 主助手".to_string(),
+                "内置主助手".to_string(),
+                4,
+                None,
+                0,
+                "present".to_string(),
+            )
+        );
+        let runtime_bindings: i64 = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT COUNT(*) FROM agent_profile
+                WHERE id = ?1 AND (selected_runtime_adapter_kind IS NOT NULL
+                    OR default_runtime_installation_id IS NOT NULL
+                    OR default_model_selection_json IS NOT NULL
+                    OR default_permission_config_json IS NOT NULL)
+                "#,
+                [&agent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(runtime_bindings, 0);
+        let profile_count: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM agent_profile", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(profile_count, 5);
+        let next_ordinal_after: i64 = database
+            .connection()
+            .query_row(
+                "SELECT next_value FROM agent_id_sequence WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(next_ordinal_after, next_ordinal_before + 1);
+
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn builtin_lead_member_slug_does_not_collide_with_an_existing_custom_profile() {
+        let directory =
+            std::env::temp_dir().join(format!("rovai-lead-member-slug-test-{}", Uuid::new_v4()));
+        let mut database = crate::test_support::fresh_schema_database_fast_at(&directory);
+        // Mirrors the user-create path (agent_profile::create_profile), which
+        // stores the allocated Agent ID as the immutable slug.
+        let custom_id = {
+            let transaction = database.connection_mut().transaction().unwrap();
+            let custom_id = crate::agent_identity::allocate_agent_id(&transaction).unwrap();
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO agent_profile(
+                        uuid, id, slug, handle, display_name, avatar_ref,
+                        team_role, professional_responsibilities, personality_traits_json,
+                        working_principles, growth_topic,
+                        default_capabilities_json, accent,
+                        runtime_enabled, visual_state_json, profile_status, member_order, version,
+                        created_at, updated_at, archived_at
+                    ) VALUES (
+                        ?1, ?2, ?2, NULL, '自定义成员', NULL,
+                        '工程师', '负责自定义实现。', '[]',
+                        '', '',
+                        '[]', '',
+                        0, '{}', 'present', 4, 1,
+                        '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', NULL
+                    )
+                    "#,
+                    params![Uuid::new_v4().to_string(), custom_id],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+            custom_id
+        };
+
+        let lead_id = database.allocate_builtin_lead_member().unwrap();
+
+        assert_ne!(lead_id, custom_id);
+        let lead: (String, Option<String>) = database
+            .connection()
+            .query_row(
+                "SELECT slug, handle FROM agent_profile WHERE id = ?1",
+                [&lead_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lead, (BUILTIN_PI_PRIMARY_SLUG.to_string(), None));
+        let custom: (String, Option<String>) = database
+            .connection()
+            .query_row(
+                "SELECT slug, handle FROM agent_profile WHERE id = ?1",
+                [&custom_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(custom, (custom_id.clone(), None));
+        let distinct_slugs: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(DISTINCT slug) FROM agent_profile",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let profile_count: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM agent_profile", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(distinct_slugs, profile_count);
 
         drop(database);
         std::fs::remove_dir_all(directory).expect("temporary database should be removable");

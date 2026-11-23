@@ -4721,6 +4721,74 @@ where
     })
 }
 
+/// Immutable slug reserved for the single seeded LOOM 主助手 member.
+///
+/// The seed allocates the real Agent ID and stores this slug beside it, while
+/// every ordinary profile stores its own Agent ID in `slug`. Core must resolve
+/// the seeded member by this slug and never treat it as an `agent_profile.id`.
+pub const LOOM_BUILTIN_PI_PRIMARY_SLUG: &str = crate::db::BUILTIN_PI_PRIMARY_SLUG;
+
+/// A4 fail-closed guard for the seeded LOOM 主助手 member.
+///
+/// A managed default Installation keeps its row id while later discovery advances its
+/// `generation` in place, so the saved installation id alone never proves that a Run
+/// would launch the executable the member was bound to. Compare the saved
+/// `default_runtime_generation` with the Installation's current generation and refuse
+/// the Run instead of launching whatever the row now points at. A manual reselect
+/// stores the new generation through the ordinary `set_runtime` path.
+fn startup_bound_pi_generation_blocker(
+    connection: &Connection,
+    agent_id: &str,
+    binding: &ResolvedRuntimeBinding,
+) -> Result<Option<RuntimeConfigurationBlocker>> {
+    if binding.adapter_kind != AdapterKind::Pi {
+        return Ok(None);
+    }
+    // The seed allocates the real Agent ID, so the row id alone never identifies it:
+    // only the reserved slug paired with that id marks the seeded member. Ordinary
+    // profiles store their own Agent ID in `slug`, so they never match this marker.
+    let seeded_member = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_profile WHERE id = ?1 AND slug = ?2)",
+            params![agent_id, LOOM_BUILTIN_PI_PRIMARY_SLUG],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+    if !seeded_member {
+        // An ordinary or pre-guard profile is never asked about the guard column.
+        return Ok(None);
+    }
+    // Every authority that can hold the seeded member also carries
+    // `default_runtime_generation`, so the marker above is the only proof needed.
+    let saved_generation = connection.query_row(
+        "SELECT default_runtime_generation FROM agent_profile WHERE id = ?1",
+        [agent_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    let current_generation = connection
+        .query_row(
+            "SELECT generation FROM adapter_installation WHERE id = ?1",
+            [&binding.installation_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(current_generation) = current_generation else {
+        // A missing Installation keeps its existing blocker.
+        return Ok(None);
+    };
+    if saved_generation == Some(current_generation) {
+        return Ok(None);
+    }
+    Ok(Some(runtime_blocker(
+        "runtime_startup_binding_generation_changed",
+        json!({
+            "agentId": agent_id,
+            "installationId": binding.installation_id,
+            "savedGeneration": saved_generation,
+            "currentGeneration": current_generation,
+        }),
+    )))
+}
+
 pub fn resolve_frozen_runtime(
     transaction: &Transaction<'_>,
     conversation_id: &str,
@@ -4864,6 +4932,9 @@ pub fn resolve_frozen_runtime(
                 "adapterKind": selected_runtime_adapter_kind,
             }),
         )));
+    }
+    if let Some(blocker) = startup_bound_pi_generation_blocker(transaction, agent_id, &binding)? {
+        return Ok(Err(blocker));
     }
     let mut result = resolve_frozen_runtime_binding_with_snapshot(
         transaction,
@@ -6466,6 +6537,140 @@ fn pi_purge_selection_roundtrips_without_entering_runtime_permissions() {
         // Off and an absent selection keep their saved meaning under every policy.
         assert!(!pi_purge_append_without_file_grant(Some(&off), &candidate));
         assert!(!pi_purge_append_without_file_grant(None, &candidate));
+    }
+}
+
+// A4 owner test: the seeded member is marked by the reserved slug stored beside
+// the allocated Agent ID, never by that slug used as an id. Hermetic in-memory
+// schema so the guard is exercised without a slow database fixture.
+#[cfg(test)]
+mod startup_bound_pi_generation_guard_tests {
+    use super::*;
+
+    fn connection() -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE agent_profile(
+                     id TEXT PRIMARY KEY,
+                     slug TEXT NOT NULL UNIQUE,
+                     default_runtime_generation INTEGER
+                 );
+                 CREATE TABLE adapter_installation(
+                     id TEXT PRIMARY KEY,
+                     generation INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        connection
+    }
+
+    fn insert_profile(connection: &Connection, id: &str, slug: &str, generation: Option<i64>) {
+        connection
+            .execute(
+                "INSERT INTO agent_profile(id, slug, default_runtime_generation)
+                 VALUES (?1, ?2, ?3)",
+                params![id, slug, generation],
+            )
+            .unwrap();
+    }
+
+    fn pi_binding(installation_id: &str) -> ResolvedRuntimeBinding {
+        ResolvedRuntimeBinding {
+            adapter_kind: AdapterKind::Pi,
+            installation_id: installation_id.to_string(),
+            model: ModelSelection::RuntimeDefault,
+            permissions: AdapterPermissionConfig {
+                adapter_kind: AdapterKind::Pi,
+                schema_version: 1,
+                values: json!({}),
+            },
+        }
+    }
+
+    #[test]
+    fn seeded_slug_guards_generation_while_ordinary_profiles_stay_unchanged() {
+        let connection = connection();
+        connection
+            .execute(
+                "INSERT INTO adapter_installation(id, generation) VALUES ('pi-install', 3)",
+                [],
+            )
+            .unwrap();
+        // The seed allocates a real Agent ID and keeps the reserved slug beside it.
+        insert_profile(
+            &connection,
+            "agent_seeded",
+            LOOM_BUILTIN_PI_PRIMARY_SLUG,
+            Some(2),
+        );
+        // Ordinary members store their own Agent ID in `slug`.
+        insert_profile(&connection, "agent_ordinary", "agent_ordinary", Some(1));
+        // The reserved slug used as an id is not the seeded row.
+        insert_profile(
+            &connection,
+            LOOM_BUILTIN_PI_PRIMARY_SLUG,
+            "agent_swapped",
+            Some(1),
+        );
+
+        let binding = pi_binding("pi-install");
+        let blocker = startup_bound_pi_generation_blocker(&connection, "agent_seeded", &binding)
+            .unwrap()
+            .expect("a changed Installation generation must block the seeded member");
+        assert_eq!(blocker.code, "runtime_startup_binding_generation_changed");
+        assert_eq!(blocker.payload["savedGeneration"], json!(2));
+        assert_eq!(blocker.payload["currentGeneration"], json!(3));
+
+        // A missing saved generation is refused instead of launching whatever the
+        // Installation row now points at.
+        connection
+            .execute(
+                "UPDATE agent_profile SET default_runtime_generation = NULL
+                 WHERE id = 'agent_seeded'",
+                [],
+            )
+            .unwrap();
+        let blocker = startup_bound_pi_generation_blocker(&connection, "agent_seeded", &binding)
+            .unwrap()
+            .expect("a missing saved generation must block the seeded member");
+        assert_eq!(blocker.code, "runtime_startup_binding_generation_changed");
+        assert_eq!(blocker.payload["savedGeneration"], Value::Null);
+
+        // A matching generation is the ordinary launch path.
+        connection
+            .execute(
+                "UPDATE agent_profile SET default_runtime_generation = 3
+                 WHERE id = 'agent_seeded'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            startup_bound_pi_generation_blocker(&connection, "agent_seeded", &binding)
+                .unwrap()
+                .is_none()
+        );
+
+        // Ordinary members keep their original behavior with a stale generation.
+        for agent_id in ["agent_ordinary", LOOM_BUILTIN_PI_PRIMARY_SLUG] {
+            assert!(
+                startup_bound_pi_generation_blocker(&connection, agent_id, &binding)
+                    .unwrap()
+                    .is_none(),
+                "{agent_id} is not the seeded member"
+            );
+        }
+
+        // A missing selected Installation keeps its existing blocker.
+        assert!(
+            startup_bound_pi_generation_blocker(
+                &connection,
+                "agent_seeded",
+                &pi_binding("missing-installation")
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 }
 

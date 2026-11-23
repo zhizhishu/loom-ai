@@ -71,7 +71,8 @@ use rovai_core::{
         AdapterCapabilitySnapshot, AdapterInstallationView, AdapterKind, AdapterProbeAttempt,
         AgentProfileService, ClearMemberRuntimeConfigurationCommand,
         CreateAdapterInstallationCommand, CreateAgentProfileCommand, DiscoveredManagedInstallation,
-        FrozenAgentRuntimeConfig, InstallationClass, InstallationSource, ManagedProbeFailure,
+        FrozenAgentRuntimeConfig, InstallationClass, InstallationSource,
+        LOOM_BUILTIN_PI_PRIMARY_SLUG, ManagedProbeFailure,
         RecordAdapterCapabilitySnapshotCommand, RemoveMemberCommand, ReorderAgentProfilesCommand,
         RuntimeEntrypointLocatorIdentity, RuntimeModelCatalogCacheStatus, RuntimeReadinessStatus,
         SetAgentProfileAvatarCommand, SetMemberPresenceCommand,
@@ -3701,6 +3702,175 @@ impl Core {
 
     async fn run_runtime_discovery(&self) {
         self.discover_runtime_installations(false).await;
+    }
+
+    /// A4 startup binding for the seeded LOOM 主助手 member.
+    ///
+    /// Runs after startup Runtime discovery, so the managed default Pi Installation
+    /// already exists, and before any other automatic binding looks at the member. The
+    /// Runtime update lock and one database lock are held while the decision is taken,
+    /// so a concurrent rescan or save cannot interleave with it.
+    async fn bind_startup_pi_primary_member(&self) {
+        let update = self.runtime_search_update.lock().await;
+        let outcome = self.bind_startup_pi_primary_member_locked().await;
+        drop(update);
+        match outcome {
+            Ok(Some(agent_id)) => eprintln!(
+                "[startup] stage=pi_primary_binding bound member={agent_id} adapter=pi"
+            ),
+            Ok(None) => {}
+            Err(error) => eprintln!("[startup] stage=pi_primary_binding skipped: {error:#}"),
+        }
+    }
+
+    async fn bind_startup_pi_primary_member_locked(&self) -> Result<Option<String>> {
+        // One mutable database lock covers the eligibility read, the Installation and
+        // evidence check and the CAS write, so a concurrent save cannot slip between the
+        // decision and the set.
+        let mut database = self.database.lock().await;
+        // Only the freshly seeded member is eligible: its identity comes from its slug,
+        // and every existing binding, later version and other member is left as it is.
+        let Some(agent_id) = Self::startup_pi_primary_eligible_member(database.connection())?
+        else {
+            return Ok(None);
+        };
+        // Which Pi did startup discovery actually select for this Core?
+        let installation = AgentProfileService::default().managed_installation(
+            &*database,
+            AdapterKind::Pi,
+            "default",
+        )?;
+        let Some(installation) = installation else {
+            return Ok(None);
+        };
+        // Identity proof, never the discovered source: only the canonical verified
+        // bundle launcher of a usable managed default Pi can be bound.
+        if let Some(reason) = Self::startup_pi_binding_refusal(&*database, &installation)? {
+            anyhow::bail!("the selected Pi is not the verified Pi package: {reason}");
+        }
+        let applied = {
+            AgentProfileService::default().set_runtime(
+                &mut *database,
+                &CommandEnvelope {
+                    command_id: uuid::Uuid::new_v4().to_string(),
+                    actor: ActorRef::System {
+                        component_id: "loom-startup-pi-binding".to_string(),
+                    },
+                    camp_id: None,
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: SetMemberRuntimeConfigurationCommand {
+                        environment_update: None,
+                        agent_id: agent_id.clone(),
+                        expected_version: 1,
+                        adapter_kind: AdapterKind::Pi,
+                        model: rovai_core::agent_profile::ModelSelection::RuntimeDefault,
+                        permissions: rovai_core::agent_profile::AdapterPermissionConfig {
+                            adapter_kind: AdapterKind::Pi,
+                            schema_version: 1,
+                            values: json!({
+                                "loom_file_access": pi::PI_FILE_ACCESS_WORKSPACE_READ_WRITE,
+                            }),
+                        },
+                        // An absent Pi Purge is Off; a seeded member never starts with one.
+                        pi_purge: None,
+                    },
+                },
+            )?
+        };
+        if applied.result.status != CommandResultStatus::Applied {
+            anyhow::bail!("startup Pi binding was refused: {}", applied.result.code);
+        }
+        Ok(Some(agent_id))
+    }
+
+    /// The seeded member is found by slug, never by an ID literal, so the saved binding
+    /// targets the row that actually exists.
+    fn startup_pi_primary_eligible_member(
+        connection: &rusqlite::Connection,
+    ) -> Result<Option<String>> {
+        connection
+            .query_row(
+                "SELECT id FROM agent_profile
+                 WHERE slug = ?1 AND version = 1 AND profile_status = 'present'
+                   AND selected_runtime_adapter_kind IS NULL
+                   AND default_runtime_installation_id IS NULL",
+                [LOOM_BUILTIN_PI_PRIMARY_SLUG],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("failed to read the seeded Pi member eligibility")
+    }
+
+    /// Proof that the Pi Installation startup discovery selected is the verified Pi
+    /// package this process admits.
+    ///
+    /// The saved Installation source (`env`, PATH, login shell, known location) only
+    /// records where a path came from, and a discovery result only says what is on disk
+    /// now, so neither is proof. The canonical packaged launcher, its observed file
+    /// identity and the absence of an entrypoint locator must all agree.
+    fn startup_pi_binding_refusal(
+        database: &Database,
+        installation: &AdapterInstallationView,
+    ) -> Result<Option<String>> {
+        // Only a verified packaged bundle is admitted: an unset or refused bundle never
+        // falls back to an environment-configured Pi executable.
+        let package_launcher = match rovai_core::embedded_pi::explicit_embedded_pi(
+            std::env::var_os(rovai_core::embedded_pi::EMBEDDED_PI_ROOT_ENV).as_deref(),
+        ) {
+            rovai_core::embedded_pi::ExplicitEmbeddedPi::Verified(bundle) => bundle.launcher,
+            rovai_core::embedded_pi::ExplicitEmbeddedPi::Refused(reason) => {
+                return Ok(Some(format!("the packaged Pi was refused: {reason}")));
+            }
+            rovai_core::embedded_pi::ExplicitEmbeddedPi::Unset => {
+                return Ok(Some("no packaged Pi bundle was verified for this Core".to_string()));
+            }
+        };
+        if !installation.enabled || installation.path_state != "valid" {
+            return Ok(Some(format!(
+                "the managed default Pi installation {} is not usable",
+                installation.id
+            )));
+        }
+        if canonical_runtime_path(Path::new(&installation.executable_path))
+            != canonical_runtime_path(&package_launcher)
+        {
+            return Ok(Some(format!(
+                "the installed executable {} is not the verified Pi {}",
+                installation.executable_path,
+                package_launcher.display()
+            )));
+        }
+        // A verified bundle launcher is launched directly, so a saved entrypoint locator
+        // would mean this Installation is a resolved shim instead of that launcher.
+        if AgentProfileService::default()
+            .runtime_entrypoint_locator_identity(database, &installation.id)?
+            .is_some()
+        {
+            return Ok(Some(format!(
+                "the installation {} was resolved through an entrypoint locator",
+                installation.id
+            )));
+        }
+        let recorded = AgentProfileService::default().recorded_executable_identity(
+            database,
+            &installation.id,
+            &installation.executable_path,
+        )?;
+        let Some((_fingerprint, recorded_identity)) = recorded else {
+            return Ok(Some(format!(
+                "the installation {} has no verified executable identity",
+                installation.id
+            )));
+        };
+        if observe_executable_file_identity(&package_launcher)? != recorded_identity {
+            return Ok(Some(format!(
+                "the verified Pi {} changed after the installation {} was verified",
+                package_launcher.display(),
+                installation.id
+            )));
+        }
+        Ok(None)
     }
 
     async fn discover_runtime_installations(&self, read_versions: bool) {
@@ -16907,6 +17077,36 @@ impl Core {
         workspace: &AgentRunWorkspace,
         drift_reason: &str,
     ) -> std::result::Result<(FrozenAgentRuntimeConfig, i64), RuntimeDispatchFailure> {
+        // A4 fail-closed: the seeded 主助手 member is bound to the verified Pi package at
+        // startup, so a drifted Installation must fail this dispatch instead of being
+        // re-resolved from the search environment, which could launch another Pi.
+        if frozen_runtime.adapter_kind == AdapterKind::Pi {
+            let seeded_pi_member = {
+                let database = self.database.lock().await;
+                database
+                    .connection()
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM agent_profile WHERE id = ?1 AND slug = ?2)",
+                        rusqlite::params![candidate.agent_id, LOOM_BUILTIN_PI_PRIMARY_SLUG],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(|error| RuntimeDispatchFailure {
+                        code: "runtime_integrity_failed".to_string(),
+                        error: anyhow::Error::from(error)
+                            .context("failed to read the seeded Pi member identity"),
+                        effective_version: None,
+                    })?
+            };
+            if seeded_pi_member {
+                return Err(RuntimeDispatchFailure {
+                    code: "runtime_startup_binding_drift".to_string(),
+                    error: anyhow::anyhow!(
+                        "the seeded Pi member refuses a Runtime drift rebind ({drift_reason})"
+                    ),
+                    effective_version: None,
+                });
+            }
+        }
         let effective_runtime = self
             .refresh_runtime_for_launch(frozen_runtime, workspace)
             .await?;
@@ -21551,6 +21751,11 @@ async fn run_core(
             .initialize_optional_subsystems()
             .await;
         runtime_discovery_core.run_runtime_discovery().await;
+        // A4: only a freshly initialized authority seeds the 主助手 member, so an
+        // existing or migrated authority never gains a startup binding.
+        if authority_origin == "initialized" {
+            runtime_discovery_core.bind_startup_pi_primary_member().await;
+        }
         runtime_discovery_core
             .recover_pending_execution_intents()
             .await;
