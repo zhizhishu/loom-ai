@@ -9506,6 +9506,7 @@ mod tests {
 #[cfg(all(test, feature = "slow-tests"))]
 mod slow_tests {
     use super::*;
+    use crate::context::claim::BootstrapContents;
     use crate::{
         agent_profile::{
             AdapterCapabilitySnapshot, AdapterKind, AdapterPermissionConfig, AgentProfileService,
