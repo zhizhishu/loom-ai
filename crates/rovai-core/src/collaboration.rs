@@ -3133,6 +3133,19 @@ impl CollaborationService {
         Self::validate_send_message_input(command)?;
         let camp_message_id = Uuid::new_v4().to_string();
         self.gateway.execute(database, envelope, |transaction| {
+            let camp_hidden = transaction
+                .query_row(
+                    "SELECT list_hidden_at IS NOT NULL FROM camp WHERE id = ?1",
+                    [&command.camp_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?;
+            if camp_hidden == Some(true) && matches!(envelope.actor, ActorRef::User { .. }) {
+                return Ok(rejected(
+                    "camp.hidden",
+                    "Thread is hidden; restore before sending",
+                ));
+            }
             // A rejected command receipt is committed by the gateway. Roll back
             // tentative first-send membership even on a normal business rejection.
             let pending_submission = matches!(
@@ -3161,14 +3174,7 @@ impl CollaborationService {
             };
             let result = match prepared {
                 Ok(submission) => (|| -> Result<CommandHandlerResult> {
-                    let camp_exists = transaction
-                        .query_row(
-                            "SELECT 1 FROM camp WHERE id = ?1",
-                            [&command.camp_id],
-                            |row| row.get::<_, i64>(0),
-                        )
-                        .optional()?;
-                    if camp_exists.is_none() {
+                    if camp_hidden.is_none() {
                         return Ok(rejected("camp.not_found", "Thread does not exist"));
                     }
                     if !actor_can_write_camp(
@@ -7760,6 +7766,182 @@ mod routing_tests {
             .err()
             .expect("an empty mention list is not a Lead route");
         assert_eq!(rejection.reason, AddressRejectionReason::EmptyMention);
+    }
+}
+
+#[cfg(test)]
+mod hidden_camp_tests {
+    use super::*;
+    use crate::{
+        camp_attachment::ThreadAttachmentStore,
+        camp_content::StructuredThreadMessageSegment as Segment,
+        command::CommandResultStatus,
+    };
+
+    fn user_envelope<P>(id: &str, camp_id: Option<&str>, payload: P) -> CommandEnvelope<P> {
+        CommandEnvelope {
+            command_id: id.to_string(),
+            actor: ActorRef::User {
+                user_id: crate::current_user::CURRENT_USER_ID.to_string(),
+            },
+            camp_id: camp_id.map(str::to_string),
+            expected_versions: Vec::new(),
+            execution_epoch: None,
+            payload,
+        }
+    }
+
+    fn row_count(database: &Database, table: &str) -> i64 {
+        database
+            .connection()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn hidden_camp_rejects_new_user_sends_until_restored() {
+        let (mut database, directory) = crate::test_support::seeded_runtime_database();
+        let service = CollaborationService::default();
+        let members = ["agent_1", "agent_2"];
+        let created = service
+            .create_camp(
+                &mut database,
+                &user_envelope(
+                    "hidden-guard-create",
+                    None,
+                    CreateThreadCommand::for_test_with_members(
+                        directory.join("workspace").to_string_lossy().into_owned(),
+                        &members,
+                        members[0],
+                    ),
+                ),
+            )
+            .unwrap();
+        let camp_id = created.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        crate::agent_profile::configure_test_runtime(&database, &members);
+        let inline = |id| {
+            user_envelope(
+                id,
+                Some(&camp_id),
+                SendUserThreadMessageCommand {
+                    delivery_mode: Default::default(),
+                    steer_targets: None,
+                    camp_id: camp_id.clone(),
+                    content: composer_document_from_content(&[Segment::Text {
+                        text: "A user message".to_string(),
+                    }])
+                    .unwrap(),
+                    source_attachments: Vec::new(),
+                    quotes: Vec::new(),
+                    reply_to_camp_message_id: None,
+                    execution: None,
+                },
+            )
+        };
+        let set_hidden = |id, hidden| {
+            user_envelope(
+                id,
+                Some(&camp_id),
+                SetThreadHiddenCommand {
+                    camp_id: camp_id.clone(),
+                    hidden,
+                },
+            )
+        };
+        let automation = |id| {
+            user_envelope(
+                id,
+                Some(&camp_id),
+                SendUserAutomationThreadMessageCommand {
+                    camp_id: camp_id.clone(),
+                    agent_id: "agent_1".to_string(),
+                    body: "Run a user-triggered automation".to_string(),
+                    execution: Some(ExecutionRequest {
+                        task_id: None,
+                        purpose: "Check automation admission".to_string(),
+                        completion_role: "required".to_string(),
+                        budget: None,
+                    }),
+                },
+            )
+        };
+        let first = inline("hidden-guard-first-send");
+        let admitted = service
+            .send_user_camp_message(&mut database, &first)
+            .unwrap();
+        assert_eq!(admitted.result.status, CommandResultStatus::Applied);
+        let store = ThreadAttachmentStore::new(&directory);
+        let draft = store
+            .save_body(&mut database, &camp_id, "Keep my draft")
+            .unwrap();
+        let draft_send = |id| {
+            user_envelope(
+                id,
+                Some(&camp_id),
+                SendUserThreadDraftCommand {
+                    draft_client: DraftClient::default(),
+                    camp_id: camp_id.clone(),
+                    draft_revision: draft.revision,
+                    execution: None,
+                },
+            )
+        };
+        let hide = service
+            .set_camp_hidden(&mut database, &set_hidden("hidden-guard-hide", true))
+            .unwrap();
+        assert_eq!(hide.result.payload["hidden"], json!(true));
+
+        let replay = service.send_user_camp_message(&mut database, &first).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.result.code, admitted.result.code);
+        assert_eq!(replay.result.payload, admitted.result.payload);
+
+        let rejected_inline = service
+            .send_user_camp_message(&mut database, &inline("hidden-guard-inline"))
+            .unwrap();
+        let rejected_draft = service
+            .send_user_camp_draft(&mut database, &draft_send("hidden-guard-draft"))
+            .unwrap();
+        let rejected_automation = service
+            .send_user_automation_camp_message(
+                &mut database,
+                &automation("hidden-guard-automation"),
+            )
+            .unwrap();
+        for rejected in [rejected_inline, rejected_draft, rejected_automation] {
+            assert_eq!(rejected.result.status, CommandResultStatus::Rejected);
+            assert_eq!(rejected.result.code, "camp.hidden");
+        }
+        assert_eq!(row_count(&database, "camp_message"), 1);
+        assert_eq!(row_count(&database, "camp_message_delivery"), 0);
+        assert_eq!(row_count(&database, "agent_run"), 0);
+        assert_eq!(row_count(&database, "camp_composer_draft"), 1);
+
+        let restored = service
+            .set_camp_hidden(&mut database, &set_hidden("hidden-guard-restore", false))
+            .unwrap();
+        assert_eq!(restored.result.payload["hidden"], json!(false));
+        let sent = service
+            .send_user_camp_draft(&mut database, &draft_send("hidden-guard-restored-draft"))
+            .unwrap();
+        assert_eq!(sent.result.status, CommandResultStatus::Applied);
+        let sent = service
+            .send_user_automation_camp_message(
+                &mut database,
+                &automation("hidden-guard-restored-automation"),
+            )
+            .unwrap();
+        assert_eq!(sent.result.status, CommandResultStatus::Accepted);
+        assert_eq!(row_count(&database, "camp_message"), 3);
+        assert_eq!(row_count(&database, "camp_message_delivery"), 1);
+
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
     }
 }
 
