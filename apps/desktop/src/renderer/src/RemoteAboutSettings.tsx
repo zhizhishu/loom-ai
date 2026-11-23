@@ -1,3 +1,4 @@
+// rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 import { useEffect, useState } from 'react'
 import type { AppUpdateSnapshot, AppUpdatesApi } from '@contracts'
 import { useThreadClient } from './camp-client'
@@ -36,5 +37,6 @@ export function RemoteAboutSettings({ updatesApi }: { updatesApi?: AppUpdatesApi
   return <AboutUpdatesSettingsView snapshot={snapshot} product={desktopHosted ? 'desktop' : 'server'} readOnly={desktopHosted}
     canUpdate={!desktopHosted && !!updatesApi} loading={desktopHosted ? !current && !failed : updates.loading}
     loadError={desktopHosted ? failed : updates.loadError} actionError={desktopHosted ? null : updates.actionError}
+    onSetAutoCheck={desktopHosted ? undefined : updates.setAutoCheck}
     onCheck={() => { void updates.check() }} onDownload={() => { void updates.download() }} onInstall={() => { void updates.install() }} />
 }

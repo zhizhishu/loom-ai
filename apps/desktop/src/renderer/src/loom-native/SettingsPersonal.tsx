@@ -1,3 +1,4 @@
+// rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 // 抄自 mikka-current@250d2451（Win11 loom\_artifacts\reference-repos\mikka-current，或 Bero /bundles/refs/mikka-current）：components/slots/settings-account.tsx、settings-preferences.tsx、settings-notifications.tsx、settings-memory.tsx（快捷键、关于两区 Mikka 没有，见各函数注释）
 import { Suspense, lazy, useState } from 'react'
 import { currentUserDisplayName, type InterfaceLanguagePreference } from '@contracts'
@@ -9,6 +10,7 @@ import { WindowCloseSettings } from '../WindowCloseSettings'
 import { useCurrentUserProfile } from '../CurrentUserProfile'
 import { useInterfaceLanguageSnapshot } from '../interface-language'
 import { useAppUpdates } from '../useAppUpdates'
+import { RemoteAboutSettings } from '../RemoteAboutSettings'
 import { SettingRow, SettingsLoading, SettingsSection } from './SettingsPrimitives'
 
 // The 5 sections whose content is an existing whole-page surface are loaded only when
@@ -125,5 +127,6 @@ export function DiagnosticsSection({ onConnections, onRuntime }: SettingsPersona
  * LOOM's own and only the row/title shape follows the settings page. */
 export function AboutSection({ environment }: SettingsPersonalProps) {
   const updates = useAppUpdates(environment.desktop?.appUpdates ?? null)
+  if (!environment.desktop?.appUpdates) return <RemoteAboutSettings updatesApi={environment.serverUpdates}/>
   return <Suspense fallback={<SettingsLoading label="正在读取版本…" rows={3}/>}><AboutUpdatesSettingsLazy updates={updates}/></Suspense>
 }

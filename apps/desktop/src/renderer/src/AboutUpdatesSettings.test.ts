@@ -1,10 +1,11 @@
+// rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 import { languageTestApi } from './interface-language-test-api'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AppUpdateRelease, AppUpdateSnapshot, GeneralPreferencesApi } from '@contracts'
 import { changeInterfaceLanguage } from './interface-language'
-import { AboutUpdatesSettingsView } from './AboutUpdatesSettings'
+import { AboutUpdatesSettingsView, UpdateCheckControls } from './AboutUpdatesSettings'
 import { displayReleaseNotes } from './release-notes-display'
 import { SafeMarkdown } from './SafeMarkdown'
 import type { AppUpdateActionError } from './useAppUpdates'
@@ -57,6 +58,7 @@ function render(value: AppUpdateSnapshot | null, options: {
     readOnly: options.readOnly ?? false,
     product: options.product ?? 'desktop',
     onCheck: () => undefined,
+    onSetAutoCheck: async () => true,
     onDownload: () => undefined,
     onInstall: () => undefined
   }))
@@ -67,6 +69,25 @@ const languageApi = languageTestApi
 afterEach(async () => { await changeInterfaceLanguage(languageApi, 'zh-CN') })
 
 describe('AboutUpdatesSettingsView', () => {
+  it('toggles the saved setting and checks manually with automatic checks off', () => {
+    const onCheck = vi.fn(), onSetAutoCheck = vi.fn(async () => undefined)
+    const controls = UpdateCheckControls({autoCheck:false,disabled:false,checkDisabled:false,onCheck,onSetAutoCheck})
+    const [toggle, check] = controls.props.children
+    toggle.props.onClick()
+    expect(onSetAutoCheck).toHaveBeenCalledWith(true)
+    expect(check.props.disabled).toBe(false)
+    check.props.onClick()
+    expect(onCheck).toHaveBeenCalledOnce()
+  })
+  it('renders an accessible default-off switch and an independent check-now action', () => {
+    expect(render(snapshot({autoCheck:false}))).toContain('aria-checked="false"')
+    const enabled=render(snapshot({autoCheck:true}))
+    expect(enabled).toContain('role="switch"')
+    expect(enabled).toContain('aria-label="自动检查更新"')
+    expect(enabled).toContain('aria-checked="true"')
+    expect(render(snapshot({autoCheck:false}))).toContain('立即检查')
+    expect(render(snapshot(),{actionError:'save'})).toContain('保存失败')
+  })
   it('links Server update fallback to the exact bridge or unified release tag', () => {
     const markup = render(snapshot({
       status: 'download_failed',

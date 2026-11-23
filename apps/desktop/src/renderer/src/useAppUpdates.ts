@@ -1,7 +1,8 @@
+// rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 import { useCallback, useEffect, useState } from 'react'
 import type { AppUpdateSnapshot, AppUpdatesApi } from '@contracts'
 
-export type AppUpdateActionError = 'check' | 'download' | 'install' | 'dismiss' | null
+export type AppUpdateActionError = 'check' | 'download' | 'install' | 'dismiss' | 'save' | null
 
 export interface AppUpdatesController {
   snapshot: AppUpdateSnapshot | null
@@ -12,6 +13,7 @@ export interface AppUpdatesController {
   download(): Promise<boolean>
   install(): Promise<boolean>
   dismissPrompt(promptId: string): Promise<boolean>
+  setAutoCheck?(enabled: boolean): Promise<boolean>
 }
 
 export function useAppUpdates(api?: AppUpdatesApi | null): AppUpdatesController {
@@ -20,6 +22,15 @@ export function useAppUpdates(api?: AppUpdatesApi | null): AppUpdatesController 
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState(false)
   const [actionError, setActionError] = useState<AppUpdateActionError>(null)
+  const setAutoCheck = useCallback(async (enabled: boolean): Promise<boolean> => {
+    if (!resolvedApi?.setAutoCheck) return false
+    try {
+      const next = await resolvedApi.setAutoCheck(enabled)
+      setSnapshot(next)
+      setActionError(null)
+      return true
+    } catch { setActionError('save'); return false }
+  }, [resolvedApi])
 
   useEffect(() => {
     let active = true
@@ -117,6 +128,7 @@ export function useAppUpdates(api?: AppUpdatesApi | null): AppUpdatesController 
     check,
     download,
     install,
-    dismissPrompt
+    dismissPrompt,
+    setAutoCheck
   }
 }

@@ -1,3 +1,4 @@
+// rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 import type { AppUpdateSnapshot, AppUpdatesApi } from '@contracts'
 import type { ConsoleClient } from './client'
 
@@ -9,10 +10,11 @@ export function createServerUpdates(transport: ConsoleClient, reload = () => loc
   let polling = false
   let issued = 0, accepted = 0
   const listeners = new Set<(value: AppUpdateSnapshot) => void>()
-  const request = async (operation: 'get' | 'check' | 'download' | 'install'): Promise<AppUpdateSnapshot> => {
+  const request = async (operation: 'get' | 'check' | 'download' | 'install' | 'setAutoCheck', enabled?: boolean): Promise<AppUpdateSnapshot> => {
     const generation = ++issued
     const version = operation === 'download' || operation === 'install' ? snapshot?.availableRelease?.version : undefined
-    const next = normalizeServerReleaseIdentity(await transport.updates(operation, version), snapshot)
+    const next = normalizeServerReleaseIdentity(await (operation === 'setAutoCheck'
+      ? transport.updates(operation, undefined, enabled) : transport.updates(operation, version)), snapshot)
     if (generation < accepted && snapshot) return snapshot
     accepted = generation
     if ((restartingFrom && next.currentVersion !== restartingFrom) || (snapshot && next.currentVersion !== snapshot.currentVersion)) {
@@ -28,6 +30,7 @@ export function createServerUpdates(transport: ConsoleClient, reload = () => loc
     return next
   }
   return {
+    setAutoCheck: enabled => request('setAutoCheck', enabled),
     get: () => request('get'),
     check: () => request(snapshot?.failureReason === 'restart_unconfirmed' ? 'get' : 'check'),
     download: () => request('download'),

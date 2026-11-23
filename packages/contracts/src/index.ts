@@ -1,3 +1,4 @@
+// rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 import type { CurrentUserProfileApi } from './current-user-profile'
 
 import type { BuiltinMemberAvatarRole } from './member-avatar'
@@ -3168,6 +3169,8 @@ export interface AppUpdatePrompt {
 }
 
 export interface AppUpdateSnapshot {
+  /** Absent on older Hosts; treated as off and unsupported for editing. */
+  autoCheck?: boolean
   currentVersion: string
   /** Desktop supplies this from its bundled notes; older and Server snapshots may omit it. */
   currentRelease?: AppUpdateRelease | null
@@ -3185,6 +3188,7 @@ export interface AppUpdateSnapshot {
 }
 
 export interface AppUpdatesApi {
+  setAutoCheck(enabled: boolean): Promise<AppUpdateSnapshot>
   get(): Promise<AppUpdateSnapshot>
   check(): Promise<AppUpdateSnapshot>
   download(): Promise<AppUpdateSnapshot>

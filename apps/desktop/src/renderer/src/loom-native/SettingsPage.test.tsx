@@ -1,3 +1,4 @@
+// rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 import { createElement } from 'react'
 import { readFileSync } from 'node:fs'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -9,6 +10,11 @@ import { SETTINGS_SECTIONS } from './settings-sections'
 const sidebar = (query: string) => renderToStaticMarkup(createElement(SettingsSidebar, { sections: SETTINGS_SECTIONS, current: 'devices', query, onQuery() {}, onSelect() {} }))
 
 describe('settings page parts', () => {
+  it('routes native About to the Desktop provider or the existing remote Server surface',()=>{
+    const source=readFileSync(new URL('./SettingsPersonal.tsx',import.meta.url),'utf8')
+    expect(source).toContain('environment.desktop?.appUpdates')
+    expect(source).toContain('<RemoteAboutSettings updatesApi={environment.serverUpdates}')
+  })
   it('renders two groups, search and one current item', () => {
     const html = sidebar('')
     expect(html.match(/class="ln-settings-item/g)).toHaveLength(11)

@@ -1,4 +1,8 @@
+// rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 import { EventEmitter } from 'node:events'
+import { mkdtemp, readFile, writeFile, mkdir, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { parseUpdateInfo } from 'electron-updater/out/providers/Provider'
 import { describe, expect, it, vi } from 'vitest'
 import {
@@ -59,6 +63,42 @@ function emitAvailable(updater: FakeUpdater, overrides: Record<string, unknown> 
 }
 
 describe('AppUpdatesService', () => {
+  it('persists opt-in, cancels timers, keeps manual checks and preserves state on failed writes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'update-policy-'))
+    const path = join(root, 'update-check.json')
+    const updater = new FakeUpdater()
+    const scheduleTimer = vi.fn(() => 1 as unknown as ReturnType<typeof setTimeout>)
+    const clearTimer = vi.fn()
+    const make = (automaticChecksEnabled = true) => new AppUpdatesService({currentVersion:()=> '0.0.2',isPackaged:()=>true,
+      updater:updater as unknown as DesktopAutoUpdater,preferencePath:path,automaticChecksEnabled,scheduleTimer,clearTimer})
+    try {
+      const updates = make()
+      expect(updates.get().autoCheck).toBe(false)
+      expect(updates.startAutomaticChecks()).toBe(false)
+      await updates.check()
+      expect(updater.checkForUpdates).toHaveBeenCalledOnce()
+      await updates.setAutoCheck(true)
+      expect(scheduleTimer).toHaveBeenCalledOnce()
+      expect(make().get().autoCheck).toBe(true)
+      updater.emit('update-not-available', {version:'0.0.2'})
+      expect(updates.get().autoCheck).toBe(true)
+      expect(JSON.parse(await readFile(path,'utf8'))).toEqual({autoCheckEnabled:true})
+      await updates.setAutoCheck(false)
+      expect(clearTimer).toHaveBeenCalledOnce()
+      expect(make().get().autoCheck).toBe(false)
+      await writeFile(path,'corrupt')
+      expect(make().get().autoCheck).toBe(false)
+      await writeFile(path,JSON.stringify({autoCheckEnabled:true}))
+      const forced = make(false)
+      expect(forced.get().autoCheck).toBe(false)
+      await expect(forced.setAutoCheck(true)).rejects.toThrow('environment')
+      await rm(path)
+      await mkdir(path)
+      await expect(updates.setAutoCheck(true)).rejects.toThrow()
+      expect(updates.get().autoCheck).toBe(false)
+      updates.dispose()
+    } finally { await rm(root,{recursive:true,force:true}) }
+  })
   it('falls back to an unavailable service when updater binding throws', async () => {
     const updater = new FakeUpdater()
     const reportFailure = vi.fn()
@@ -92,6 +132,7 @@ describe('AppUpdatesService', () => {
     const updates = service(updater)
 
     expect(updates.get()).toEqual({
+      autoCheck: false,
       currentVersion: '0.0.2',
       currentRelease: {
         version: '0.0.2',
@@ -222,7 +263,8 @@ describe('AppUpdatesService', () => {
       return {}
     })
 
-    expect(updates.startAutomaticChecks()).toBe(true)
+    expect(updates.startAutomaticChecks()).toBe(false)
+    await updates.setAutoCheck(true)
     expect(updates.startAutomaticChecks()).toBe(false)
     expect(timers).toHaveLength(1)
     expect(timers[0].delayMs).toBe(FIRST_CHECK_DELAY_MS)

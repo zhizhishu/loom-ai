@@ -1,3 +1,4 @@
+// rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 //! Server-owned update state. The browser can select an action, never a URL or filesystem path.
 mod install;
 #[cfg(test)]
@@ -7,7 +8,10 @@ use chrono::Utc;
 use rovai_web::{UpdateFuture, UpdateHost, UpdateRequest};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
+    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -58,6 +62,9 @@ impl ServerUpdates {
         Ok(Self(Arc::new(Inner {
             state: Mutex::new(State {
                 snapshot: json!({
+                    "autoCheck": std::fs::read(data.join("update-check.json")).ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        .is_some_and(|value| value["autoCheckEnabled"] == true),
                     "currentVersion": env!("CARGO_PKG_VERSION"), "status": if failed_install { "check_failed" } else { "idle" },
                     "currentRelease":null, "availableRelease":null,
                     "lastCheckSource":null,"checkedAt":null,"lastSuccessfulCheckAt":null,
@@ -128,16 +135,7 @@ impl ServerUpdates {
             loop {
                 {
                     let mut state = service.0.state.lock().unwrap();
-                    if !matches!(
-                        state.snapshot["status"].as_str(),
-                        Some(
-                            "checking"
-                                | "downloading"
-                                | "ready_to_install"
-                                | "installing"
-                                | "install_failed"
-                        )
-                    ) {
+                    if Self::automatic_check_allowed(&state) {
                         service.begin_check(&mut state, source);
                     }
                 }
@@ -145,6 +143,20 @@ impl ServerUpdates {
                 tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
             }
         });
+    }
+
+    fn automatic_check_allowed(state: &State) -> bool {
+        state.snapshot["autoCheck"] == true
+            && !matches!(
+                state.snapshot["status"].as_str(),
+                Some(
+                    "checking"
+                        | "downloading"
+                        | "ready_to_install"
+                        | "installing"
+                        | "install_failed"
+                )
+            )
     }
 
     async fn check(&self) -> Result<()> {
@@ -291,11 +303,42 @@ impl UpdateHost for ServerUpdates {
                 return Ok(self.snapshot());
             }
             let mut state = self.0.state.lock().unwrap();
+            if let UpdateRequest::SetAutoCheck { enabled } = request {
+                let save = || -> Result<()> {
+                    rovai_core::platform::prepare_private_directory(&self.0.data)?;
+                    let temporary = self
+                        .0
+                        .data
+                        .join(format!("update-check-{}.tmp", rovai_web::new_token()?));
+                    let result = (|| -> Result<()> {
+                        let mut options = std::fs::OpenOptions::new();
+                        options.write(true).create_new(true);
+                        #[cfg(unix)]
+                        options.mode(0o600);
+                        let mut file = options.open(&temporary)?;
+                        file.write_all(
+                            serde_json::to_string(&json!({"autoCheckEnabled":enabled}))?.as_bytes(),
+                        )?;
+                        file.sync_all()?;
+                        drop(file);
+                        std::fs::rename(&temporary, self.0.data.join("update-check.json"))?;
+                        Ok(())
+                    })();
+                    if result.is_err() {
+                        let _ = std::fs::remove_file(temporary);
+                    }
+                    result
+                };
+                save().map_err(|_| "update_preference_write_failed")?;
+                state.snapshot["autoCheck"] = json!(enabled);
+                return Ok(state.snapshot.clone());
+            }
             let status = state.snapshot["status"].as_str().unwrap_or("idle");
             if matches!(status, "checking" | "downloading" | "installing") {
                 return Ok(state.snapshot.clone());
             }
             match request {
+                UpdateRequest::SetAutoCheck { .. } => unreachable!(),
                 UpdateRequest::Check {} => {
                     if status == "ready_to_install" {
                         return Ok(state.snapshot.clone());

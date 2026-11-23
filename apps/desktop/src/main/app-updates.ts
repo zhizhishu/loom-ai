@@ -1,4 +1,7 @@
+// rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { writePrivateJson } from './general-preferences'
 import type {
   AppUpdateCheckSource,
   AppUpdateFailureReason,
@@ -51,6 +54,7 @@ interface AppUpdatesServiceOptions {
   isPackaged(): boolean
   updater: DesktopAutoUpdater | null
   automaticChecksEnabled?: boolean
+  preferencePath?: string
   now?: () => Date
   nextPromptId?: () => string
   scheduleTimer?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>
@@ -80,6 +84,9 @@ export class AppUpdatesService {
   readonly #isPackaged: () => boolean
   readonly #updater: DesktopAutoUpdater | null
   readonly #automaticChecksEnabled: boolean
+  readonly #preferencePath: string | undefined
+  #preferenceTail: Promise<unknown> = Promise.resolve()
+  #timerEpoch = 0
   readonly #now: () => Date
   readonly #nextPromptId: () => string
   readonly #scheduleTimer: AppUpdatesServiceOptions['scheduleTimer']
@@ -101,12 +108,18 @@ export class AppUpdatesService {
     this.#isPackaged = options.isPackaged
     this.#updater = options.updater
     this.#automaticChecksEnabled = options.automaticChecksEnabled ?? true
+    this.#preferencePath = options.preferencePath
     this.#now = options.now ?? (() => new Date())
     this.#nextPromptId = options.nextPromptId ?? randomUUID
     this.#scheduleTimer = options.scheduleTimer ?? setTimeout
     this.#clearTimer = options.clearTimer ?? clearTimeout
     this.#warn = options.warn ?? ((message) => console.warn(message))
     this.#snapshot = idleSnapshot(this.#currentVersion(), this.#bundledReleaseNotes, this.#bundledReleaseMetadata)
+    let autoCheck = false
+    try {
+      if (options.preferencePath) autoCheck = JSON.parse(readFileSync(options.preferencePath, 'utf8')).autoCheckEnabled === true
+    } catch { /* Missing or corrupt preferences never opt in. */ }
+    this.#snapshot.autoCheck = this.#automaticChecksEnabled && autoCheck
 
     if (!this.#updater) return
     this.#updater.autoDownload = false
@@ -159,6 +172,7 @@ export class AppUpdatesService {
       }
       this.#replace({
         ...idleSnapshot(this.#currentVersion(), this.#bundledReleaseNotes, this.#bundledReleaseMetadata),
+        autoCheck: this.#snapshot.autoCheck,
         status: 'up_to_date',
         lastCheckSource: this.#snapshot.lastCheckSource,
         checkedAt: this.#snapshot.checkedAt ?? this.#nowIso(),
@@ -203,11 +217,32 @@ export class AppUpdatesService {
     if (this.#automaticChecksStarted
         || this.#disposed
         || !this.#automaticChecksEnabled
+        || !this.#snapshot.autoCheck
         || !this.#isPackaged()
         || !this.#updater) return false
     this.#automaticChecksStarted = true
     this.#scheduleAutomaticCheck('startup', FIRST_CHECK_DELAY_MS)
     return true
+  }
+
+  setAutoCheck(enabled: boolean): Promise<AppUpdateSnapshot> {
+    const save = async () => {
+      if (typeof enabled !== 'boolean') throw new Error('Invalid update-check preference')
+      if (enabled && !this.#automaticChecksEnabled) throw new Error('Automatic update checks are disabled by environment')
+      if (this.#preferencePath) await writePrivateJson(this.#preferencePath, { autoCheckEnabled: enabled })
+      this.#replace({ ...this.#snapshot, autoCheck: enabled })
+      if (enabled) this.startAutomaticChecks()
+      else {
+        this.#timerEpoch++
+        if (this.#automaticTimer !== null) this.#clearTimer?.(this.#automaticTimer)
+        this.#automaticTimer = null
+        this.#automaticChecksStarted = false
+      }
+      return this.get()
+    }
+    const result = this.#preferenceTail.then(save, save)
+    this.#preferenceTail = result.catch(() => undefined)
+    return result
   }
 
   dispose(): void {
@@ -383,9 +418,11 @@ export class AppUpdatesService {
   }
 
   #scheduleAutomaticCheck(source: 'startup' | 'interval', delayMs: number): void {
-    if (this.#disposed || this.#automaticTimer !== null) return
+    if (this.#disposed || !this.#snapshot.autoCheck || this.#automaticTimer !== null) return
+    const epoch = this.#timerEpoch
     this.#automaticTimer = this.#scheduleTimer?.(() => {
       this.#automaticTimer = null
+      if (!this.#snapshot.autoCheck || epoch !== this.#timerEpoch) return
       void this.check(source)
         .then((snapshot) => {
           if (snapshot.status === 'check_failed') {
@@ -396,7 +433,7 @@ export class AppUpdatesService {
           this.#warn(`[rovai] Automatic update check failed (${String(error)}).`)
         })
         .finally(() => {
-          if (!this.#disposed) this.#scheduleAutomaticCheck('interval', CHECK_INTERVAL_MS)
+          if (!this.#disposed && epoch === this.#timerEpoch) this.#scheduleAutomaticCheck('interval', CHECK_INTERVAL_MS)
         })
     }, delayMs) ?? null
   }

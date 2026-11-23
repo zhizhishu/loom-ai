@@ -1,3 +1,4 @@
+// rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import { createCloseTabShortcutHandler } from '../shared/close-tab-shortcut'
 import { createWindowCloseApi } from './window-close-api'
@@ -172,6 +173,9 @@ const api: RovaiApi = {
     }
   },
   appUpdates: {
+    setAutoCheck(enabled: boolean) {
+      return ipcRenderer.invoke('rovai:app-updates-set-auto-check', enabled)
+    },
     get() {
       return ipcRenderer.invoke('rovai:app-updates-get')
     },

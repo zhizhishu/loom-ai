@@ -1,3 +1,4 @@
+// rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 import { isInterfaceLanguage } from '../shared/general-preferences-model'
 import { creationPreferences, withHostConversationPreferences } from '../shared/host-general-preferences'
 import { createHostChannelHandler } from './host-channels'
@@ -722,10 +723,8 @@ async function initializeAppUpdates(): Promise<void> {
     bundledReleaseMetadata,
     isPackaged: () => app.isPackaged,
     updater: autoUpdater as unknown as DesktopAutoUpdater | null,
-    automaticChecksEnabled: !(
-      isolatedAcceptanceInstance
-      && process.env.ROVAI_DISABLE_AUTO_UPDATE_CHECKS === '1'
-    )
+    preferencePath: join(app.getPath('userData'), 'update-check.json'),
+    automaticChecksEnabled: process.env.ROVAI_DISABLE_AUTO_UPDATE_CHECKS !== '1'
   }, (error) => {
     console.warn('[rovai] Application updater initialization failed; startup will continue.', error)
   })
@@ -1471,6 +1470,12 @@ ipcMain.handle('rovai:appearance-update', async (event, patch: unknown) => {
 ipcMain.handle('rovai:app-updates-get', (event) => {
   requireMainWindow(event.sender)
   return requireAppUpdates().get()
+})
+
+ipcMain.handle('rovai:app-updates-set-auto-check', (event, enabled: unknown) => {
+  requireMainWindow(event.sender)
+  if (typeof enabled !== 'boolean') throw new Error('Invalid update-check preference')
+  return requireAppUpdates().setAutoCheck(enabled)
 })
 
 ipcMain.handle('rovai:app-updates-check', (event) => {

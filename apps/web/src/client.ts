@@ -1,3 +1,4 @@
+// rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 import type { HostWorkbench, ComputerPort, ComputerFrame, NativeCatalog, NativePreview } from '../../desktop/src/renderer/src/loom-native/host-services'
 import { TAB_AUTH_KEY, type AuthStorage, type BrowserSession } from './auth-storage'
 import { browserEditingRecovery } from './editing-recovery'
@@ -981,9 +982,9 @@ export class ConsoleClient {
   async files<T>(action: string, request: unknown): Promise<T> {
     return this.#json('files', { method: 'POST', body: JSON.stringify({ action, request }) })
   }
-  async updates(operation: 'get' | 'check' | 'download' | 'install', version?: string): Promise<import('@contracts').AppUpdateSnapshot> {
+  async updates(operation: 'get' | 'check' | 'download' | 'install' | 'setAutoCheck', version?: string, enabled?: boolean): Promise<import('@contracts').AppUpdateSnapshot> {
     const response = await this.#json<{ result: import('@contracts').AppUpdateSnapshot }>('updates', {
-      method: 'POST', body: JSON.stringify({ operation, ...(version ? { version } : {}) })
+      method: 'POST', body: JSON.stringify({ operation, ...(version ? { version } : {}), ...(enabled !== undefined ? { enabled } : {}) })
     })
     return response.result
   }

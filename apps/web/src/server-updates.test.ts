@@ -1,3 +1,4 @@
+// rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AppUpdateSnapshot } from '@contracts'
 import type { ConsoleClient } from './client'
@@ -5,6 +6,14 @@ import { createServerUpdates } from './server-updates'
 
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
 describe('Server updates transport', () => {
+  it('saves the Server opt-in through the existing transport and propagates failures', async () => {
+    const updates=vi.fn().mockResolvedValue({currentVersion:'1.0.0',autoCheck:true,status:'idle'})
+    const api=createServerUpdates({updates} as unknown as ConsoleClient)
+    expect((await api.setAutoCheck(true)).autoCheck).toBe(true)
+    expect(updates).toHaveBeenLastCalledWith('setAutoCheck',undefined,true)
+    updates.mockRejectedValue(new Error('write failed'))
+    await expect(api.setAutoCheck(false)).rejects.toThrow('write failed')
+  })
   it('uses version identity for installed notes while retaining a newer candidate after a failed check', async () => {
     const installed = { version: '0.2.6', releaseName: 'Server 0.2.6', releaseNotes: 'Installed notes' }
     const newer = { version: '0.2.7', releaseName: 'Server 0.2.7', releaseNotes: 'Newer notes' }

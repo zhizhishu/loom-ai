@@ -1,9 +1,52 @@
+// rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 use super::*;
 #[cfg(unix)]
 use std::{collections::HashMap, fs};
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[tokio::test]
+async fn automatic_checks_are_persisted_opt_in_and_live_gated() {
+    let data =
+        std::env::temp_dir().join(format!("update-policy-{}", rovai_web::new_token().unwrap()));
+    std::fs::create_dir_all(&data).unwrap();
+    let updates = ServerUpdates::new(&data, vec![]).unwrap();
+    assert_eq!(updates.snapshot()["autoCheck"], false);
+    assert!(!ServerUpdates::automatic_check_allowed(
+        &updates.0.state.lock().unwrap()
+    ));
+    updates
+        .call(UpdateRequest::SetAutoCheck { enabled: true })
+        .await
+        .unwrap();
+    assert!(ServerUpdates::automatic_check_allowed(
+        &updates.0.state.lock().unwrap()
+    ));
+    let reopened = ServerUpdates::new(&data, vec![]).unwrap();
+    assert_eq!(reopened.snapshot()["autoCheck"], true);
+    updates
+        .call(UpdateRequest::SetAutoCheck { enabled: false })
+        .await
+        .unwrap();
+    assert!(!ServerUpdates::automatic_check_allowed(
+        &updates.0.state.lock().unwrap()
+    ));
+    std::fs::write(data.join("update-check.json"), "corrupt").unwrap();
+    assert_eq!(
+        ServerUpdates::new(&data, vec![]).unwrap().snapshot()["autoCheck"],
+        false
+    );
+    std::fs::remove_file(data.join("update-check.json")).unwrap();
+    std::fs::create_dir(data.join("update-check.json")).unwrap();
+    assert!(
+        updates
+            .call(UpdateRequest::SetAutoCheck { enabled: true })
+            .await
+            .is_err()
+    );
+    assert_eq!(updates.snapshot()["autoCheck"], false);
+    std::fs::remove_dir_all(data).unwrap();
+}
 // Owns release admission and action fencing; no Core/database/model fixture is needed.
 #[test]
 fn release_coordinates_and_checksums_admit_only_exact_stable_server_assets() {
@@ -176,6 +219,8 @@ async fn update_pipeline_keeps_the_running_program_until_verified_and_durably_se
     };
     updates.call(UpdateRequest::Check {}).await.unwrap();
     wait_status(&updates, "check_failed").await;
+    assert_eq!(updates.snapshot()["autoCheck"], false);
+    assert_eq!(updates.snapshot()["lastCheckSource"], "manual");
     assert_eq!(updates.snapshot()["failureReason"], "release_unpublished");
     routes.lock().unwrap().insert(
         "/channel".into(),

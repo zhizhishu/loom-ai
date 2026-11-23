@@ -1,3 +1,4 @@
+// rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { AppUpdateRelease, AppUpdateSnapshot } from '@contracts'
 import { currentReleaseFromBundledSources } from '../../shared/app-current-release'
@@ -20,6 +21,7 @@ export function AboutUpdatesSettings({
       loadError={updates.loadError}
       actionError={updates.actionError}
       onCheck={() => void updates.check()}
+      onSetAutoCheck={updates.setAutoCheck}
       onDownload={() => void updates.download()}
       onInstall={() => void updates.install()}
       onDismissPrompt={updates.dismissPrompt}
@@ -37,6 +39,7 @@ export function AboutUpdatesSettingsView({
   onDownload,
   onInstall,
   onDismissPrompt,
+  onSetAutoCheck,
   product = 'desktop',
   readOnly = false
 }: {
@@ -49,10 +52,20 @@ export function AboutUpdatesSettingsView({
   onDownload(): void
   onInstall(): void
   onDismissPrompt?(promptId: string): Promise<boolean>
+  onSetAutoCheck?(enabled: boolean): Promise<boolean>
   product?: 'desktop' | 'server'
   readOnly?: boolean
 }): React.JSX.Element {
   useInterfaceLanguage()
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState(false)
+  const changeAutoCheck = async (enabled: boolean) => {
+    if (!onSetAutoCheck || saving) return
+    setSaving(true)
+    try { setSaveError(!await onSetAutoCheck(enabled)) }
+    catch { setSaveError(true) }
+    finally { setSaving(false) }
+  }
   const [showCurrentForVersion, setShowCurrentForVersion] = useState<string | null>(null)
   const availableTabRef = useRef<HTMLButtonElement>(null)
   const currentTabRef = useRef<HTMLButtonElement>(null)
@@ -150,6 +163,10 @@ export function AboutUpdatesSettingsView({
               </div>
             </div>
             {!readOnly && <div className="about-update-actions">
+              <UpdateCheckControls autoCheck={snapshot?.autoCheck}
+                disabled={saving || typeof snapshot?.autoCheck !== 'boolean' || !onSetAutoCheck}
+                checkDisabled={!canUpdate || busy} onSetAutoCheck={changeAutoCheck} onCheck={onCheck}/>
+              {(saveError || actionError === 'save') && <p role="alert"><UiText zh="自动检查更新设置保存失败，请重试。" /></p>}
               {showManualCheck && (
                 <button className="quiet-button" type="button" disabled={!canUpdate || busy} onClick={onCheck}>
                   <UiText zh={"重新检查"} />
@@ -274,6 +291,20 @@ function ReleaseNotesBody({ release, installed }: {
         ? uiAttribute("此版本暂无内置更新日志。")
         : uiAttribute("此版本没有提供更新日志。版本号与下载操作仍以正式发布信息为准。")}</p>}
   </div>
+}
+
+export function UpdateCheckControls({ autoCheck, disabled, checkDisabled, onSetAutoCheck, onCheck }: {
+  autoCheck: boolean | undefined
+  disabled: boolean
+  checkDisabled: boolean
+  onSetAutoCheck(enabled: boolean): Promise<void>
+  onCheck(): void
+}): React.JSX.Element {
+  return <>
+    <button type="button" role="switch" aria-label="自动检查更新" aria-checked={autoCheck === true}
+      disabled={disabled} onClick={() => { void onSetAutoCheck(!autoCheck) }}><UiText zh="自动检查更新" /></button>
+    <button type="button" disabled={checkDisabled} onClick={onCheck}><UiText zh="立即检查" /></button>
+  </>
 }
 
 function updatePrimaryAction(
