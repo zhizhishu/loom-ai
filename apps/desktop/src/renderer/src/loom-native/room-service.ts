@@ -57,7 +57,16 @@ export interface RoomDraft {
   collaborationMode: typeof ROOM_COLLABORATION_MODE
 }
 
-export type RoomDraftProblem = 'no_members' | 'lead_not_member' | 'member_unavailable' | 'name_too_long'
+export type RoomDraftProblem =
+  | 'no_members'
+  | 'lead_not_member'
+  | 'member_unavailable'
+  | 'name_too_long'
+  | 'name_required'
+  | 'group_members_required'
+  | 'direct_single_member'
+
+export type RoomCreationMode = 'direct' | 'group'
 
 export function emptyRoomDraft(): RoomDraft {
   return {
@@ -101,29 +110,54 @@ export function roomDraftProblems(draft: RoomDraft, agents: readonly AgentProfil
 }
 
 export function roomDraftProblemMessage(problems: readonly RoomDraftProblem[]): string {
-  const messages = problems.map(problem => problem === 'no_members'
-    ? uiAttribute('请至少选择一位队员。')
-    : problem === 'lead_not_member'
-      ? uiAttribute('队长必须是已选队员之一。')
-      : problem === 'member_unavailable'
-        ? uiAttribute('所选队员已不可用，请重新选择。')
-        : uiAttribute('对话名称最多 80 个字符。'))
+  const messages = problems.map(problem => {
+    switch (problem) {
+      case 'no_members': return uiAttribute('请至少选择一位队员。')
+      case 'lead_not_member': return uiAttribute('队长必须是已选队员之一。')
+      case 'member_unavailable': return uiAttribute('所选队员已不可用，请重新选择。')
+      case 'name_required': return uiAttribute('请填写群聊名称。')
+      case 'group_members_required': return uiAttribute('群聊至少需要 2 位不同的助手。')
+      case 'direct_single_member': return uiAttribute('单聊只能选择一位助手，多位助手请使用群聊。')
+      case 'name_too_long': return uiAttribute('对话名称最多 80 个字符。')
+    }
+  })
   return messages.join(' ')
 }
 
-/**
- * 主按钮永远可点（Mikka `new-group-dialog.tsx:68-72`：「The primary button always answers a press」）。
- * 所以“还差什么”不靠置灰表达，而由这里给出点下去要说的那句话。
- */
+/** 省略 `mode` 时按名单推断：一位助手是单聊（新建助手后直开对话），多位才是群聊。 */
+function inferredRoomMode(draft: RoomDraft): RoomCreationMode {
+  return new Set(draft.memberAgentIds).size > 1 ? 'group' : 'direct'
+}
+
+/** 群聊多一层：至少两位不同助手、名称不能为空。显式单聊只能是 1:1，多位不同助手必须走群聊，不能借单聊绕过群聊校验。 */
+export function roomDraftProblemsForMode(
+  mode: RoomCreationMode,
+  draft: RoomDraft,
+  agents: readonly AgentProfile[]
+): RoomDraftProblem[] {
+  const problems = roomDraftProblems(draft, agents)
+  const distinctMembers = new Set(draft.memberAgentIds).size
+  if (mode === 'group') {
+    const groupProblems = problems.filter(problem => problem !== 'no_members')
+    if (distinctMembers < 2) groupProblems.push('group_members_required')
+    if (normalizeRoomName(draft.name) === null) groupProblems.push('name_required')
+    return groupProblems
+  }
+  if (distinctMembers > 1) problems.push('direct_single_member')
+  return problems
+}
+
+/** 群聊缺东西时主按钮置灰，这句原因同时写在按钮旁边；`mode` 为 null 只跑通用规则。 */
 export function roomSubmitProblem(
   draft: RoomDraft,
   agents: readonly AgentProfile[],
-  preflight: ThreadCreationPreflight | null
+  preflight: ThreadCreationPreflight | null,
+  mode: RoomCreationMode | null = null
 ): string | null {
   if (preflight !== null && !preflight.admissible) {
     return uiAttribute('当前主机还没有可用助手。请先新建或启用一位助手。')
   }
-  const problems = roomDraftProblems(draft, agents)
+  const problems = mode === null ? roomDraftProblems(draft, agents) : roomDraftProblemsForMode(mode, draft, agents)
   return problems.length === 0 ? null : roomDraftProblemMessage(problems)
 }
 
@@ -292,15 +326,19 @@ export interface RoomCreateResult {
 /**
  * `commandId` is reusable: after an ambiguous outcome the UI resubmits the same identity instead
  * of creating a second Thread. Validation runs against the actual member profiles first, so an
- * invalid draft never reaches Core.
+ * invalid draft never reaches Core. Omitting `mode` infers it from the roster, so the mode-less
+ * one-assistant onboarding call stays 1:1 while several assistants get the group rules. An explicit
+ * `direct` mode with more than one distinct assistant is rejected here, before `threads.create`, so
+ * it can never smuggle a multi-assistant Thread past the group validation.
  */
 export async function createRoom(
   port: RoomPort,
   draft: RoomDraft,
   agents: readonly AgentProfile[],
-  commandId?: string
+  commandId?: string,
+  mode?: RoomCreationMode
 ): Promise<RoomCreateResult> {
-  const problems = roomDraftProblems(draft, agents)
+  const problems = roomDraftProblemsForMode(mode ?? inferredRoomMode(draft), draft, agents)
   if (problems.length > 0) throw new Error(roomDraftProblemMessage(problems))
   const params = roomCreateParams(draft, commandId ?? newCommandId())
   const outcome = classifyRoomCommand(await port.request<StoredCommandResult | null>('threads.create', params))

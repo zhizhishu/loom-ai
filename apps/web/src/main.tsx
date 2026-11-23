@@ -12,6 +12,7 @@ import { LanguagePreferenceReadNotice } from '../../desktop/src/renderer/src/Lan
 import type { InterfaceLanguageApi, WorkspaceSelection } from '@contracts'
 import { createRoot } from 'react-dom/client'
 import { LoomApp } from '../../desktop/src/renderer/src/loom-native/LoomApp'
+import { readSettingsSectionLink, settingsSectionHref, type SettingsSectionId } from '../../desktop/src/renderer/src/loom-native/settings-sections'
 import { ThreadClientProvider } from '../../desktop/src/renderer/src/camp-client'
 import { CurrentUserProfileProvider } from '../../desktop/src/renderer/src/CurrentUserProfile'
 import { ConsoleClient, HttpRequestError, type ConnectionState } from './client'
@@ -53,6 +54,24 @@ const entryKind = document.querySelector<HTMLMetaElement>('meta[name="rovai-host
 const hostKind = entryKind === 'desktop' || entryKind === 'server' ? entryKind : null
 document.documentElement.dataset.platform = browserPlatform()
 document.documentElement.dataset.rovaiSurface = 'web'
+// Web-only route state: `/?section=` opens the named settings page, and the page keeps it in step.
+// The server serves this entry at `/` alone (`crates/rovai-web`), so the browser gate mirrors it:
+// any other pathname reads and writes no settings link at all.
+function onSettingsEntryPath(): boolean {
+  return window.location.pathname === '/'
+}
+// Read the link when the app mounts, not at module load: a shell remount after the user opened a
+// section keeps that section instead of resetting it to whatever the first address said.
+function readLinkedSettingsSection(): SettingsSectionId | null {
+  return onSettingsEntryPath() ? readSettingsSectionLink(window.location.search) : null
+}
+function syncSettingsSectionUrl(section: SettingsSectionId | null): void {
+  if (!onSettingsEntryPath()) return
+  const search = settingsSectionHref(section)
+  if (search === window.location.search) return
+  // Replace, never push: one history entry, and the fragment stays (`login-ticket.ts` strips its own).
+  window.history.replaceState(window.history.state, '', window.location.pathname + search + window.location.hash)
+}
 const loginTheme = matchMedia('(prefers-color-scheme: dark)')
 function applyLoginTheme(): void {
   document.documentElement.dataset.theme = loginTheme.matches ? 'night' : 'day'
@@ -213,7 +232,7 @@ function WebEntry() {
     <WebConnectionRecovery transport={transport} enabled={authenticated} onNotice={setError}>
       {current && <div className="web-authenticated-shell" hidden={!authenticated} inert={!authenticated}><ThreadClientProvider client={current.environment.client}>
         <CurrentUserProfileProvider api={current.profile}>
-          <LoomApp environment={current.environment} onLogout={() => { setError(null); void transport.logout().catch(e => setError(e instanceof Error ? e.message : '退出未完成，请重试。')) }} />
+          <LoomApp environment={current.environment} initialSettingsSection={readLinkedSettingsSection()} onSettingsSectionChange={syncSettingsSectionUrl} onLogout={() => { setError(null); void transport.logout().catch(e => setError(e instanceof Error ? e.message : '退出未完成，请重试。')) }} />
         </CurrentUserProfileProvider>
       </ThreadClientProvider></div>}
       {authenticated && <UploadStatus transport={transport} />}

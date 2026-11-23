@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { SETTINGS_SECTIONS, SETTINGS_GROUP_LABELS, SETTINGS_GROUP_TITLES, resolveSettingsSection } from './settings-sections'
+import { SETTINGS_SECTIONS, SETTINGS_GROUP_LABELS, SETTINGS_GROUP_TITLES, readSettingsSectionLink, resolveSettingsSection, settingsSectionHref } from './settings-sections'
 import { settingsItemVisible } from './settings-sidebar-search'
 import { ICON_NAMES } from './icons'
 
@@ -31,5 +31,34 @@ describe('settings sections table', () => {
     expect(visible('本机与运行')).toEqual(['workspace', 'runtime', 'connections', 'devices'])
     expect(visible('mcp')).toContain('connections')
     expect(visible('zzzz')).toEqual([])
+  })
+})
+
+describe('settings address-bar links', () => {
+  it('opens each of the eleven current sections from a link', () => {
+    for (const section of SETTINGS_SECTIONS) expect(readSettingsSectionLink(`?section=${section.id}`)).toBe(section.id)
+  })
+  it('reads back the link it writes, so a refresh keeps the section', () => {
+    for (const section of SETTINGS_SECTIONS) expect(readSettingsSectionLink(settingsSectionHref(section.id))).toBe(section.id)
+    expect(readSettingsSectionLink(settingsSectionHref(null))).toBeNull()
+  })
+  it('falls back to preferences for an unknown name and defaults an empty selection', () => {
+    expect(readSettingsSectionLink('?section=not-a-section')).toBe('preferences')
+    expect(readSettingsSectionLink('?section=')).toBe('preferences')
+  })
+  it('refuses duplicates, extra keys and encoded delimiters instead of picking one', () => {
+    expect(readSettingsSectionLink('')).toBeNull()
+    expect(readSettingsSectionLink('?section')).toBeNull()
+    expect(readSettingsSectionLink('?thread=1')).toBeNull()
+    expect(readSettingsSectionLink('?section=account&section=devices')).toBeNull()
+    expect(readSettingsSectionLink('?section=account&token=secret')).toBeNull()
+    expect(readSettingsSectionLink('?token=secret&section=account')).toBeNull()
+    expect(readSettingsSectionLink('?section=%2F')).toBeNull()
+    expect(readSettingsSectionLink('?section=a%26b')).toBeNull()
+    expect(readSettingsSectionLink('?section=account+1')).toBeNull()
+  })
+  it('writes and clears the section query', () => {
+    expect(settingsSectionHref('account')).toBe('?section=account')
+    expect(settingsSectionHref(null)).toBe('')
   })
 })

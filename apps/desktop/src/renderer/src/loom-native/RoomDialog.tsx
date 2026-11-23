@@ -73,6 +73,10 @@ export function RoomDialog({ open, environment, agents, initialAgentId, initialM
     return () => { ticket.current++ }
   }, [open, initialAgentId, initialMode, initialWorkspace?.projectPath, port])
   const people = agents.filter(agent => !agent.removedAt && agent.presence !== 'removed')
+  const groupBlocker = mode === 'group' ? roomSubmitProblem(draft, agents, preflight, 'group') : null
+  const blockerHint = groupBlocker !== null && !creationUnknown && (preflight === null || preflight.admissible)
+    ? groupBlocker
+    : null
   const patch = (next: Partial<RoomDraft>) => { if (creationUnknown) return; if (!workAttempt.current?.missionId) workAttempt.current = undefined; setChanged(true); setError(''); setDraft(value => ({ ...value, ...next })) }
   const toggle = (id: string) => {
     const members = mode === 'direct' ? [id] : draft.memberAgentIds.includes(id) ? draft.memberAgentIds.filter(value => value !== id) : [...draft.memberAgentIds, id]
@@ -124,15 +128,15 @@ export function RoomDialog({ open, environment, agents, initialAgentId, initialM
       } finally { if (generation === ticket.current) setBusy(false) }
       return
     }
-    const blocker = roomSubmitProblem(draft, agents, preflight)
-    if (blocker !== null) { setError(blocker); return }
+    const blocker = mode === 'group' ? groupBlocker : roomSubmitProblem(draft, agents, preflight)
+    if (blocker !== null && !creationUnknown) { setError(blocker); return }
     const signature = JSON.stringify(draft)
     if (command.current && command.current.signature !== signature) command.current = null
     command.current ??= { id: crypto.randomUUID(), signature }
     const generation = ticket.current
     setBusy(true); setError('')
     try {
-      const result = await createRoom(port, draft, agents, command.current.id)
+      const result = await createRoom(port, draft, agents, command.current.id, mode)
       if (generation !== ticket.current) return
       await onCreated(result.threadId)
       setChanged(false); onClose()
@@ -171,7 +175,8 @@ export function RoomDialog({ open, environment, agents, initialAgentId, initialM
       {creationUnknown && <FormMessage>{createdWorkThread ? '工作已创建；开始或打开结果未确认。重试不会重复创建。' : '创建结果尚未确认。当前选择已锁定；重试沿用原请求编号，不会创建第二份。'}</FormMessage>}
       {createdWorkThread && error && <button type="button" className="ln-action" disabled={busy} onClick={() => { void onCreated(createdWorkThread).then(() => { setChanged(false); onClose() }).catch(cause => setError(cause instanceof Error ? cause.message : '未能打开已创建工作。')) }}>打开已创建的工作</button>}
       {preflight && !preflight.admissible && <FormMessage>当前主机的创建检查尚未通过。请先配置或启用至少一位助手。</FormMessage>}
-      <footer className="ln-form-actions"><small>{mode === 'work' ? (startNow ? '将创建可追踪工作并向协调助手提交目标。' : '仅创建工作，不启动模型；可随后开始。') : '创建群聊不会自动派工，未配置的助手可稍后配置。'}</small><button type="button" className="ln-action is-primary" disabled={busy || picking} onClick={() => { void submit() }}>{busy ? '创建中…' : creationUnknown ? '核对上次创建' : mode === 'work' ? (startNow ? '创建并开始' : '创建工作') : mode === 'group' ? '创建群聊' : '开始对话'}</button></footer>
+      {blockerHint !== null && <p className="ln-native-help" id="ln-room-blocker">{blockerHint}</p>}
+      <footer className="ln-form-actions"><small>{mode === 'work' ? (startNow ? '将创建可追踪工作并向协调助手提交目标。' : '仅创建工作，不启动模型；可随后开始。') : '创建群聊不会自动派工，未配置的助手可稍后配置。'}</small><button type="button" className="ln-action is-primary" disabled={busy || picking || (groupBlocker !== null && !creationUnknown)} aria-describedby={blockerHint !== null ? 'ln-room-blocker' : undefined} onClick={() => { void submit() }}>{busy ? '创建中…' : creationUnknown ? '核对上次创建' : mode === 'work' ? (startNow ? '创建并开始' : '创建工作') : mode === 'group' ? '创建群聊' : '开始对话'}</button></footer>
     </div>
     {discard && <UnsavedNotice onKeep={() => setDiscard(false)} onDiscard={() => { setChanged(false); onClose() }}/>}
   </SurfaceDialog>

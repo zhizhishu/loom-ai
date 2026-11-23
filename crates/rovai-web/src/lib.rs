@@ -22,7 +22,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Extension, Path, Request, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response, Sse,
@@ -347,6 +347,10 @@ async fn boundary(State(state): State<WebState>, req: Request, next: Next) -> Re
             *req.method(),
             axum::http::Method::GET | axum::http::Method::HEAD
         );
+    // The Web entry's only address-bar state: `/?section=<id>`. Every other query
+    // is still refused below.
+    let settings_query = req.uri().query().unwrap_or_default();
+    let settings_link = is_settings_deep_link(req.method(), req.uri().path(), settings_query);
     let checked_origin = if preview_asset && origin.is_some_and(|v| v == "null") {
         None
     } else {
@@ -356,9 +360,10 @@ async fn boundary(State(state): State<WebState>, req: Request, next: Next) -> Re
         || origin.is_some_and(|value| value.to_str().is_err())
     {
         error(StatusCode::FORBIDDEN, "origin_not_allowed")
-    } else if req.uri().query().is_some() && !preview_asset {
+    } else if req.uri().query().is_some() && !preview_asset && !settings_link {
         // Ordinary credentials and API parameters have no query representation.
-        // Download capabilities use a separate, short-lived token route.
+        // Download capabilities use a separate, short-lived token route. The one
+        // exception is the bounded settings link admitted above.
         error(StatusCode::BAD_REQUEST, "query_not_allowed")
     } else {
         next.run(req).await
@@ -407,6 +412,23 @@ async fn boundary(State(state): State<WebState>, req: Request, next: Next) -> Re
         HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
     );
     response
+}
+
+/// The one query the Web entry accepts: `/` with `GET`/`HEAD` and exactly one `section`
+/// key whose value is a bounded identifier. Unknown or empty names resolve in the page, so
+/// the server keeps no copy of the section list; everything else stays `query_not_allowed`.
+fn is_settings_deep_link(method: &Method, path: &str, query: &str) -> bool {
+    if path != "/" || !matches!(*method, Method::GET | Method::HEAD) {
+        return false;
+    }
+    let Some(section) = query.strip_prefix("section=") else {
+        return false;
+    };
+    if section.len() > 32 {
+        return false;
+    }
+    // `%`, `&`, `+`, `=`, `#`, `.`, `/` and non-ASCII never match: no encoded delimiter.
+    section.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 async fn authenticate(State(state): State<WebState>, mut req: Request, next: Next) -> Response {
@@ -912,4 +934,73 @@ async fn load_asset_cache(root: &std::path::Path) -> std::collections::HashMap<S
             && digest.bytes().all(|b| b.is_ascii_hexdigit())
     });
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Method, is_settings_deep_link};
+
+    fn get(query: &str) -> bool {
+        is_settings_deep_link(&Method::GET, "/", query)
+    }
+
+    #[test]
+    fn settings_deep_link_admits_one_bounded_section_key() {
+        for query in [
+            "section=account",
+            "section=preferences",
+            "section=notifications",
+            "section=shortcuts",
+            "section=memory",
+            "section=diagnostics",
+            "section=about",
+            "section=workspace",
+            "section=runtime",
+            "section=connections",
+            "section=devices",
+            // No name is not an unknown name: the page resolves it to its default.
+            "section=",
+        ] {
+            assert!(get(query), "{query}");
+        }
+        // An unknown identifier is still a well-formed link; the page falls back.
+        assert!(get("section=zzz"));
+        assert!(is_settings_deep_link(&Method::HEAD, "/", "section=about"));
+    }
+
+    #[test]
+    fn settings_deep_link_refuses_everything_else() {
+        for query in [
+            "",
+            "section",
+            "sections=account",
+            "api=v1",
+            "access_token=abc",
+            "administratorToken=abc",
+            "section=account&token=secret",
+            "token=secret&section=account",
+            "section=account&section=devices",
+            "section=account=1",
+            "section=%2F",
+            "section=a%26b",
+            "section=account%20",
+            "section=account+1",
+            "section=a.b",
+            "section=../etc",
+            "section=account/../x",
+            "section=account#frag",
+            "section=账户",
+            "section=0123456789012345678901234567890123",
+            "Section=account",
+            "section=account ",
+        ] {
+            assert!(!get(query), "{query}");
+        }
+        // Only the entry document carries the link: not another path, not another method.
+        assert!(!is_settings_deep_link(&Method::POST, "/", "section=account"));
+        assert!(!is_settings_deep_link(&Method::GET, "", "section=account"));
+        assert!(!is_settings_deep_link(&Method::GET, "/preview.html", "section=account"));
+        assert!(!is_settings_deep_link(&Method::GET, "/api/v1/capabilities", "section=account"));
+        assert!(!is_settings_deep_link(&Method::GET, "/assets/index.js", "section=account"));
+    }
 }

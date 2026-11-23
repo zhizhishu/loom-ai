@@ -35,7 +35,9 @@ const CapabilityLibrary = lazy(() => import('./CapabilityLibrary').then(v => ({d
 const RoomDialog = lazy(() => import('./RoomDialog').then(v => ({default:v.RoomDialog})))
 const RoomMembersDialog = lazy(() => import('./RoomDialog').then(v => ({default:v.RoomMembersDialog})))
 
-type Props = { environment: BusinessEnvironment; remoteConnection?: ReactNode; onLogout?(): void; initialStartupSnapshot?: unknown; startupStartedAtMs?: number }
+type Props = { environment: BusinessEnvironment; remoteConnection?: ReactNode; onLogout?(): void; initialStartupSnapshot?: unknown; startupStartedAtMs?: number;
+  /** Web only: the linked section and the hook that keeps `?section=` in step; Desktop passes neither. */
+  initialSettingsSection?: SettingsSectionId | null; onSettingsSectionChange?(section: SettingsSectionId | null): void }
 type Draft = { text: string; files: File[] }
 
 /** PiBot-style React/Vite application frame with a new Mikka-reference component
@@ -44,7 +46,7 @@ export function RailBottom({ children }: { children: React.ReactNode }) {
   return <div className="ln-rail-bottom">{children}</div>
 }
 
-export function LoomApp({ environment, onLogout }: Props) {
+export function LoomApp({ environment, onLogout, initialSettingsSection = null, onSettingsSectionChange }: Props) {
   const data = useLoomData(environment)
   const [boardOpen,setBoardOpen] = useState(false)
   const [pendingOpen,setPendingOpen] = useState(false)
@@ -92,9 +94,11 @@ export function LoomApp({ environment, onLogout }: Props) {
   const [theme, setTheme] = useState<'day' | 'night'>(() => sessionStorage.getItem('loom.native.theme') === 'night' ? 'night' : 'day')
   const [modal, setModal] = useState<'search' | 'history' | null>(null)
   const [newRoom, setNewRoom] = useState(false)
-  const [settingsSection, setSettingsSection] = useState<SettingsSectionId | null>(null)
+  const [settingsSection, setSettingsSection] = useState<SettingsSectionId | null>(initialSettingsSection)
   // Same guard as the inspector (`safeInspectorAction`): unsaved capability edits ask before the settings page covers them.
   const openSettings = (id?: SettingsSectionId) => safeInspectorAction(() => { setCapabilityDirty(false); setSettingsSection(id ?? readStoredSettingsSection(typeof localStorage === 'undefined' ? null : localStorage)) })
+  // The page owns the section; the Web entry mirrors it into `?section=` and clears it again.
+  useEffect(() => { onSettingsSectionChange?.(settingsSection) }, [settingsSection, onSettingsSectionChange])
   const [runSurfaceOpen, setRunSurfaceOpen] = useState(false)
   const runSurfaceOpener = useRef<HTMLElement | null>(null)
   const [roomInitialWorkspace,setRoomInitialWorkspace] = useState<WorkspaceSelection|null>(null)

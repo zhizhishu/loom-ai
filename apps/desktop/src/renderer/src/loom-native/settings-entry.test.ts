@@ -29,6 +29,23 @@ describe('settings entry points', () => {
     expect(app).toMatch(/const leaveSettings = [^\n]*settingsLeaveGuard\.current/)
     expect(app).toContain('onLeaveGuard={registerSettingsLeave}')
   })
+  it('keeps address-bar state in the Web entry, not in the app frame', () => {
+    // Desktop passes no link and no hook, so only the Web entry writes `?section=`.
+    expect(app).not.toContain('history.replaceState')
+    expect(app).toContain('onSettingsSectionChange?.(settingsSection)')
+    const web = readFileSync(new URL('../../../../../web/src/main.tsx', import.meta.url), 'utf8')
+    expect(web).toContain('initialSettingsSection={readLinkedSettingsSection()}')
+    expect(web).toContain('onSettingsSectionChange={syncSettingsSectionUrl}')
+  })
+  it('reads and writes the settings link only on the entry pathname', () => {
+    const web = readFileSync(new URL('../../../../../web/src/main.tsx', import.meta.url), 'utf8')
+    // The server serves this entry at `/` only, so the browser gate mirrors it.
+    expect(web).toContain("return window.location.pathname === '/'")
+    expect(web).toMatch(/function readLinkedSettingsSection\(\): SettingsSectionId \| null \{\n\s*return onSettingsEntryPath\(\) \? readSettingsSectionLink\(window\.location\.search\) : null\n\}/)
+    expect(web).toMatch(/function syncSettingsSectionUrl\(section: SettingsSectionId \| null\): void \{\n\s*if \(!onSettingsEntryPath\(\)\) return/)
+    // Mount-time read, never a module-load snapshot a later shell remount would restore.
+    expect(web).not.toMatch(/^const \w*[Ss]ettingsSection\w* = readSettingsSectionLink/m)
+  })
   it('moves the setup dialog content into settings', () => {
     const machine = read('SettingsMachine.tsx')
     for (const part of ['RuntimeConnectionSettings', 'McpConnections', 'environment.nodes', 'export function RuntimeSection', 'export function DeviceSection']) expect(machine).toContain(part)

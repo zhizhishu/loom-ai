@@ -112,6 +112,24 @@ export function isSettingsSection(value: string | null | undefined): value is Se
   return Boolean(value) && known.has(value as string)
 }
 
+/** The entry's only query: a settings link is `/?section=<id>` (Mikka `settingsHref`, `lib/settings-sections.ts:91`). */
+export const SETTINGS_SECTION_QUERY = 'section'
+
+/** The Host's raw grammar rather than `URLSearchParams`: exactly one `section` key with a
+ * bounded identifier, so extra keys, duplicates and encoded delimiters read as no link at all.
+ * An unknown or empty name falls back to preferences; `null` opens no page. */
+export function readSettingsSectionLink(search: string): SettingsSectionId | null {
+  const query = search.startsWith('?') ? search.slice(1) : search
+  if (!query.startsWith(`${SETTINGS_SECTION_QUERY}=`)) return null
+  const value = query.slice(SETTINGS_SECTION_QUERY.length + 1)
+  return /^[A-Za-z0-9-]{0,32}$/.test(value) ? resolveSettingsSection(value) : null
+}
+
+/** The exact inverse of `readSettingsSectionLink`: the section's query, or none when closed. */
+export function settingsSectionHref(section: SettingsSectionId | null): string {
+  return section ? `?${SETTINGS_SECTION_QUERY}=${section}` : ''
+}
+
 export function settingsSectionDef(id: SettingsSectionId): SettingsSectionDef {
   return SETTINGS_SECTIONS.find(section => section.id === id) ?? SETTINGS_SECTIONS[1]
 }

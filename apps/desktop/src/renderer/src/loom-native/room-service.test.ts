@@ -26,6 +26,7 @@ import {
   resolveRoomPermission,
   ROOM_LEAD_REMOVAL_BLOCKED,
   roomDraftProblems,
+  roomDraftProblemsForMode,
   roomPort,
   roomPermissionChoices,
   roomRoster,
@@ -559,7 +560,7 @@ describe('roomPort', () => {
   })
 })
 
-// 主按钮永远可点，点下去说缺什么（Mikka `new-group-dialog.tsx:68-72,151`）。
+// 主按钮在缺东西时真的置灰（B2/B5），同一份判定也说出还缺什么。
 describe('roomSubmitProblem', () => {
   it('names the missing member instead of leaving the primary button dead', () => {
     const agents = [member('a')]
@@ -585,5 +586,122 @@ describe('roomSubmitProblem', () => {
     expect(roomSubmitProblem(leadMissing, agents, preflightOf(['a', 'b']))).toBe('队长必须是已选队员之一。')
     const unavailable: RoomDraft = { ...emptyRoomDraft(), memberAgentIds: ['gone'], leadAgentId: 'gone' }
     expect(roomSubmitProblem(unavailable, agents, preflightOf(['a']))).toBe('所选队员已不可用，请重新选择。')
+  })
+})
+
+// B2：群聊要两位不同助手；B5：名称为空/只有空白同样拦住。单聊仍走通用规则。
+describe('roomDraftProblemsForMode', () => {
+  const agents = [member('a'), member('b')]
+  const two: RoomDraft = { ...emptyRoomDraft(), memberAgentIds: ['a', 'b'], leadAgentId: 'a' }
+
+  it('blocks a group whose name is null or only whitespace', () => {
+    expect(roomDraftProblemsForMode('group', two, agents)).toEqual(['name_required'])
+    expect(roomDraftProblemsForMode('group', { ...two, name: '   ' }, agents)).toEqual(['name_required'])
+    expect(roomDraftProblemsForMode('group', { ...two, name: '\n\t ' }, agents)).toEqual(['name_required'])
+    expect(roomDraftProblemsForMode('group', { ...two, name: '新群' }, agents)).toEqual([])
+  })
+
+  it('blocks a group with fewer than two distinct assistants', () => {
+    const one: RoomDraft = { ...two, name: '新群', memberAgentIds: ['a'], leadAgentId: 'a' }
+    expect(roomDraftProblemsForMode('group', one, agents)).toEqual(['group_members_required'])
+    expect(roomDraftProblemsForMode('group', { ...one, memberAgentIds: ['a', 'a'] }, agents))
+      .toEqual(['group_members_required'])
+    expect(roomDraftProblemsForMode('group', { ...one, memberAgentIds: [], leadAgentId: '' }, agents))
+      .toEqual(['group_members_required'])
+    // 不可用的第二位由通用规则拦住，不必在计数里再算一次。
+    expect(roomDraftProblemsForMode('group', { ...one, memberAgentIds: ['a', 'removed'] },
+      [...agents, member('removed', { presence: 'removed' })]))
+      .toEqual(['member_unavailable'])
+  })
+
+  it('keeps direct on the generic rules for a single assistant', () => {
+    const direct: RoomDraft = { ...emptyRoomDraft(), memberAgentIds: ['a'], leadAgentId: 'a' }
+    expect(roomDraftProblemsForMode('direct', direct, agents)).toEqual([])
+    expect(roomDraftProblemsForMode('direct', { ...direct, name: '  ' }, agents)).toEqual([])
+  })
+
+  it('rejects an explicit direct draft with more than one distinct assistant', () => {
+    const direct: RoomDraft = { ...emptyRoomDraft(), memberAgentIds: ['a'], leadAgentId: 'a' }
+    // 显式单聊只能是 1:1：多位不同助手必须走群聊校验，不能被单聊绕过。
+    expect(roomDraftProblemsForMode('direct', { ...direct, memberAgentIds: ['a', 'b'] }, agents))
+      .toEqual(['direct_single_member'])
+    // 同一位助手重复不算「多位」：仍是合法 1:1。
+    expect(roomDraftProblemsForMode('direct', { ...direct, memberAgentIds: ['a', 'a'] }, agents)).toEqual([])
+  })
+})
+
+describe('createRoom with the dialog mode', () => {
+  const agents = [member('a'), member('b')]
+  const twoNamed: RoomDraft = { ...emptyRoomDraft(), name: '新群', memberAgentIds: ['a', 'b'], leadAgentId: 'a' }
+
+  it('creates a group with two distinct assistants and a real name', async () => {
+    const { port, calls } = fakePort({ 'threads.create': () => applied({ threadId: 'g1' }) })
+    await expect(createRoom(port, twoNamed, agents, 'fixed', 'group'))
+      .resolves.toEqual({ threadId: 'g1', registrationWarning: null })
+    expect(calls.map(call => call.method)).toEqual(['threads.create'])
+    expect(calls[0].params).toMatchObject({ name: '新群', memberAgentIds: ['a', 'b'], defaultLeadAgentId: 'a' })
+  })
+
+  it('never issues threads.create for a blank name or fewer than two distinct assistants', async () => {
+    const { port, calls } = fakePort({ 'threads.create': () => applied({ threadId: 'nope' }) })
+    await expect(createRoom(port, { ...twoNamed, name: null }, agents, 'c1', 'group'))
+      .rejects.toThrow('请填写群聊名称')
+    await expect(createRoom(port, { ...twoNamed, name: '   ' }, agents, 'c1', 'group'))
+      .rejects.toThrow('请填写群聊名称')
+    await expect(createRoom(port, { ...twoNamed, memberAgentIds: ['a'], leadAgentId: 'a' }, agents, 'c1', 'group'))
+      .rejects.toThrow('群聊至少需要 2 位不同的助手')
+    await expect(createRoom(port, { ...twoNamed, memberAgentIds: ['a', 'a'] }, agents, 'c1', 'group'))
+      .rejects.toThrow('群聊至少需要 2 位不同的助手')
+    expect(calls).toEqual([])
+  })
+
+  it('applies the group rules when a multi-member caller omits the mode', async () => {
+    const { port, calls } = fakePort({ 'threads.create': () => applied({ threadId: 'nope' }) })
+    await expect(createRoom(port, { ...twoNamed, name: null }, agents, 'c3')).rejects.toThrow('请填写群聊名称')
+    await expect(createRoom(port, { ...twoNamed, name: '  ' }, agents, 'c3')).rejects.toThrow('请填写群聊名称')
+    expect(calls).toEqual([])
+  })
+
+  it('keeps a mode-less one-member unnamed call as direct', async () => {
+    const { port, calls } = fakePort({ 'threads.create': () => applied({ threadId: 'o1' }) })
+    const onboarding: RoomDraft = { ...emptyRoomDraft(), memberAgentIds: ['a'], leadAgentId: 'a' }
+    await expect(createRoom(port, onboarding, [agents[0]], 'onboarding')).resolves.toMatchObject({ threadId: 'o1' })
+    expect(calls[0].params).toMatchObject({ name: null, memberAgentIds: ['a'], defaultLeadAgentId: 'a' })
+  })
+
+  it('still creates a true 1:1 through the same threads.create contract', async () => {
+    const { port, calls } = fakePort({ 'threads.create': () => applied({ threadId: 'd1' }) })
+    const direct: RoomDraft = { ...emptyRoomDraft(), memberAgentIds: ['a'], leadAgentId: 'a' }
+    await expect(createRoom(port, direct, agents, 'c2', 'direct')).resolves.toMatchObject({ threadId: 'd1' })
+    expect(calls.map(call => call.method)).toEqual(['threads.create'])
+    expect(calls[0].params).toMatchObject({ name: null, memberAgentIds: ['a'], collaborationMode: 'peer' })
+  })
+
+  it('rejects an explicit direct draft with more than one distinct assistant before threads.create', async () => {
+    const { port, calls } = fakePort({ 'threads.create': () => applied({ threadId: 'leak' }) })
+    const multi: RoomDraft = { ...emptyRoomDraft(), memberAgentIds: ['a', 'b'], leadAgentId: 'a' }
+    await expect(createRoom(port, multi, agents, 'd-multi', 'direct'))
+      .rejects.toThrow('单聊只能选择一位助手')
+    expect(calls).toEqual([])
+  })
+})
+
+describe('roomSubmitProblem with the dialog mode', () => {
+  const agents = [member('a'), member('b')]
+
+  it('names what a disabled group primary button still needs', () => {
+    const one: RoomDraft = { ...emptyRoomDraft(), memberAgentIds: ['a'], leadAgentId: 'a' }
+    expect(roomSubmitProblem(one, agents, preflightOf(['a', 'b']), 'group'))
+      .toBe('群聊至少需要 2 位不同的助手。 请填写群聊名称。')
+    expect(roomSubmitProblem({ ...one, name: '新群' }, agents, preflightOf(['a', 'b']), 'group'))
+      .toBe('群聊至少需要 2 位不同的助手。')
+    expect(roomSubmitProblem({ ...one, name: '   ' }, agents, preflightOf(['a', 'b']), 'group'))
+      .toBe('群聊至少需要 2 位不同的助手。 请填写群聊名称。')
+  })
+
+  it('leaves direct and the generic callers unchanged', () => {
+    const one: RoomDraft = { ...emptyRoomDraft(), memberAgentIds: ['a'], leadAgentId: 'a' }
+    expect(roomSubmitProblem(one, agents, preflightOf(['a', 'b']), 'direct')).toBeNull()
+    expect(roomSubmitProblem(one, agents, preflightOf(['a', 'b']))).toBeNull()
   })
 })
