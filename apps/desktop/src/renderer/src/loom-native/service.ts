@@ -1,4 +1,4 @@
-import { enqueueOutbox, type PendingRecord } from './pending-outbox-store'
+import { enqueueOutbox, updateOutbox, type PendingRecord } from './pending-outbox-store'
 import { observeUnconfirmedThreadSend } from '../camp-client'
 import type {
   AgentProfile,
@@ -576,6 +576,7 @@ export async function sendThreadMessage(
   if (!command) throw new Error(uiAttribute('消息提交结果暂时不可用，消息与附件已保留。'))
   if (command.status === 'rejected') { settleSendAttempt(client, input.threadId); throw new LoomCommandRejected(command) }
   if (command.status !== 'applied' && command.status !== 'accepted') throw new Error('消息提交状态未知，草稿已保留。')
+  if (queued) updateOutbox({ id: params.commandId, threadId: input.threadId } as PendingRecord, 'accepted')
   settleSendAttempt(client, input.threadId)
   clearLocalThreadComposerDraft(input.threadId)
   return { threadMessageId: stringField(command.payload, 'threadMessageId') }

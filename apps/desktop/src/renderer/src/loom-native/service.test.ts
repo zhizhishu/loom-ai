@@ -52,6 +52,7 @@ it.each(['text', 'attachment', 'storage failure'])('observes an in-flight Web %s
   recorded = true
   await vi.waitFor(async () => { await transport.reconcilePending(); expect(transport.pendingCommandCount).toBe(0) })
   await expect(sending).resolves.toEqual({ threadMessageId: 'msg1' })
+  if (mode === 'text') expect(readOutbox(threadId)).toMatchObject([{ state: 'accepted' }])
   expect(dispatches).toHaveLength(1)
   transport.clear()
 })

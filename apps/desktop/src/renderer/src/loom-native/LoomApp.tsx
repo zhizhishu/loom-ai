@@ -40,6 +40,10 @@ type Draft = { text: string; files: File[] }
 
 /** PiBot-style React/Vite application frame with a new Mikka-reference component
  * tree. Only the authenticated adapter, domain types and animated avatar are shared. */
+export function RailBottom({ children }: { children: React.ReactNode }) {
+  return <div className="ln-rail-bottom">{children}</div>
+}
+
 export function LoomApp({ environment, onLogout }: Props) {
   const data = useLoomData(environment)
   const [boardOpen,setBoardOpen] = useState(false)
@@ -314,8 +318,7 @@ export function LoomApp({ environment, onLogout }: Props) {
       }}/>
       <IconButton icon="files" label="工作目录" active={settingsSection === 'workspace'} onClick={() => openSettings('workspace')}/>
       <IconButton icon="people" label="管理助手" active={studioOpen} onClick={() => manageAssistant(activeAgent?.agentId)}/>
-      <div className="ln-rail-bottom"><IconButton icon="inbox" label="待发送" active={pendingOpen} onClick={() => setPendingOpen(true)}/>{pendingCount>0&&<small aria-label={`待发送 ${pendingCount} 条`}>{pendingCount}</small>}</div>
-      <div className="ln-rail-bottom"><IconButton icon="clock" label="会话活动" onClick={() => setModal('history')}/><ProfileMenu theme={theme} shortcutKey={shortcutKey} onSettings={() => openSettings()} onHistory={() => setModal('history')} onLogout={onLogout}/></div>
+      <RailBottom><IconButton icon="inbox" label="待发送" active={pendingOpen} onClick={() => setPendingOpen(true)}/>{pendingCount>0&&<small aria-label={`待发送 ${pendingCount} 条`}>{pendingCount}</small>}<IconButton icon="clock" label="会话活动" onClick={() => setModal('history')}/><ProfileMenu theme={theme} shortcutKey={shortcutKey} onSettings={() => openSettings()} onHistory={() => setModal('history')} onLogout={onLogout}/></RailBottom>
     </nav>
       <section ref={frameRef} className="ln-frame" aria-label="LOOM 工作空间" style={{ '--ln-sidebar-width': `${panelWidths.sidebar}px`, '--ln-inspector-width': `${panelWidths.inspector}px` } as React.CSSProperties}>
         {settingsSection ? <SettingsPage section={settingsSection} onLeaveGuard={registerSettingsLeave} onSection={setSettingsSection} environment={environment} agents={data.agents} theme={theme} onTheme={setTheme} threadId={active?.threadId ?? undefined} onLogout={onLogout} onRefreshWorkspace={() => { void data.refresh().catch(report) }} onManageAssistants={() => manageAssistant(activeAgent?.agentId)} onStartWorkspace={root => { setSettingsSection(null); beginWorkIn(root) }} onChanged={() => { setCapabilityEpoch(value => value + 1); void data.refresh().catch(report) }}/>

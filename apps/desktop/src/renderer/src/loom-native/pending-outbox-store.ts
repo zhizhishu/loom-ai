@@ -1,4 +1,4 @@
-// Adapted from PiBot pending-store.js: one client ledger, no automatic flush.
+// PiBot@6741737 host-core/pending-store.js:14 (STATES), 复制改写 of the state set.
 export type PendingState = 'pending' | 'sending' | 'unconfirmed' | 'rejected' | 'accepted'
 export type PendingRecord = { id:string; threadId:string; text:string; fingerprint:string; commandId:string;
   params:Record<string,unknown>; state:PendingState; createdAt:string; error?:string }

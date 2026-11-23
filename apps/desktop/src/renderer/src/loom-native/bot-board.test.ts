@@ -1,10 +1,20 @@
 import { expect,it,vi } from 'vitest'
+import { readFileSync } from 'node:fs'
 import { createElement, type ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { AgentProfile, MissionRecord } from './types'
 import { BotBoard } from './BotBoard'
 import { botBoardBucket,botBoardTargets,deriveTaskStatusLine,type BoardTarget } from './bot-board'
 import { markViewed,readSeen } from './bot-board-seen'
+import { RailBottom } from './LoomApp'
+it('renders inbox, badge and profile in one bottom rail',()=>{
+ const html=renderToStaticMarkup(createElement(RailBottom,{children:[createElement('button',{key:'inbox'},'待发送'),createElement('small',{key:'badge'},'2'),createElement('button',{key:'profile'},'设置')]}))
+ expect(html.match(/class="ln-rail-bottom"/g)).toHaveLength(1)
+ const source=readFileSync(new URL('./LoomApp.tsx',import.meta.url),'utf8')
+ expect(source.match(/<RailBottom>/g)).toHaveLength(1)
+ expect(source.match(/className="ln-rail-bottom"/g)).toHaveLength(1)
+ expect(html).toContain('待发送');expect(html).toContain('<small>2</small>');expect(html).toContain('设置')
+})
 vi.mock('./Controls',async original=>({...await original<typeof import('./Controls')>(),SurfaceDialog:({children}:{children:ReactNode})=>children}))
 it('renders exactly three main columns, collapsed idle rows, and an honest read failure',()=>{
  const html=renderToStaticMarkup(createElement(BotBoard,{open:true,agents:[],conversations:[],missions:[],bundles:[],error:'offline',refresh:async()=>{},onOpen:()=>{},onClose:()=>{}}))

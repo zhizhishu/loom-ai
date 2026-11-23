@@ -1,3 +1,4 @@
+// PiBot@6741737 web/src/BotBoard.tsx:15-24 columns, 结构对照。
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { AgentProfile, ConversationItem, MissionRecord, WorkBundle } from './types'
 import { botBoardBucket, botBoardTargets, type BoardBucket, type BoardTarget } from './bot-board'

@@ -4415,7 +4415,6 @@ export type CoreMethod =
   | 'skills.import.github.inspect'
   | 'skills.import.commit'
   | 'skills.metadata.set'
-  | 'commands.reconcile'
   | 'skills.setEnabled'
   | 'skills.setGroupAssignments'
   | 'skills.delete'

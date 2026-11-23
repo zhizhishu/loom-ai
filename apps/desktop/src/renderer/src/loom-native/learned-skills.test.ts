@@ -5,6 +5,12 @@ import type { SkillView } from '@contracts'
 import type { BusinessEnvironment } from '../business-environment'
 import { canManageLearned,learnedBadges,learnedSkills } from './learned-skills'
 import { LearnedSkillsPanel } from './LearnedSkillsPanel'
+import { AssistantLearnedTab } from './AssistantStudio'
+it('renders nothing when the learned tab loses its selected assistant',()=>{
+  const environment={client:{}} as BusinessEnvironment
+  expect(renderToStaticMarkup(createElement(AssistantLearnedTab,{environment,agent:null}))).toBe('')
+  expect(renderToStaticMarkup(createElement(AssistantLearnedTab,{environment,agent:{agentId:'bot'} as import('./types').AgentProfile}))).toContain('还没有学到技能')
+})
 it('never substitutes imported skills for learned facts',()=>{
   const imported={id:'i',name:'Imported'} as SkillView
   expect(learnedSkills([imported],'bot')).toEqual([])

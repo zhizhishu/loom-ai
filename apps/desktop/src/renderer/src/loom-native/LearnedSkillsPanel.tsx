@@ -1,3 +1,4 @@
+// 无参考，按用户定（学到只读空态）
 import { useEffect, useRef, useState } from 'react'
 import type { SkillView } from '@contracts'
 import type { BusinessEnvironment } from '../business-environment'

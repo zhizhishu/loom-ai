@@ -1,8 +1,21 @@
-import { beforeEach,expect,it } from 'vitest'
+import { beforeEach,expect,it,vi } from 'vitest'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { deleteOutbox,enqueueOutbox,readOutbox,updateOutbox,type PendingRecord } from './pending-outbox-store'
-import { PendingInboxList } from './PendingInbox'
+import { checkOutboxDelivery,PendingInboxList } from './PendingInbox'
+it('checks delivery by replaying the exact saved send identity and params',async()=>{
+ const record=row()
+ const command={status:'accepted'}
+ const request=vi.fn().mockResolvedValue({commandResult:command})
+ const client={request} as unknown as import('../camp-client').ThreadClient
+ expect(await checkOutboxDelivery(client,record)).toBe(command)
+ expect(request).toHaveBeenCalledWith('thread.messages.send',record.params)
+ expect(request.mock.calls[0]![1]).toBe(record.params)
+ request.mockResolvedValue(null)
+ await expect(checkOutboxDelivery(client,record)).rejects.toThrow('可能已送达')
+ request.mockRejectedValue(new Error('offline'))
+ await expect(checkOutboxDelivery(client,record)).rejects.toThrow('offline')
+})
 
 it('rechecks durable state before deleting a stale pending card',()=>{
  const r=row();enqueueOutbox(r,storage);updateOutbox(r,'sending',undefined,storage);updateOutbox(r,'accepted',undefined,storage)

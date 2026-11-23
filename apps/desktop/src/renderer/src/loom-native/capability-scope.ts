@@ -1,3 +1,5 @@
+// PiBot@6741737 web/src/bot-settings/BotSkillsPage.tsx:49-61 (visibilityScope), 结构对照。
+// 三档标签：无参考，按用户定（2026-11-22 23:04）
 import type { SkillVisibilityScope } from '@contracts'
 export const DEFAULT_SKILL_SCOPE: SkillVisibilityScope = 'private'
 export const visibilityChoices = [

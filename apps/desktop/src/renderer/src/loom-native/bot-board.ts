@@ -1,3 +1,4 @@
+// PiBot@6741737 host-core/runtime-bot-board.js:116 deriveTaskStatusLine, 复制改写。
 import type { AgentProfile, ConversationItem, MissionRecord, WorkBundle } from './types'
 import { flattenWork, workStatus } from './Inspector'
 export type BoardBucket = 'attention' | 'working' | 'review' | 'idle' | 'offline'

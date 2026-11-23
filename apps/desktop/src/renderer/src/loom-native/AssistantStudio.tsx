@@ -18,6 +18,9 @@ import {
 } from './assistant-service'
 
 const blankIdentity = (): AssistantIdentity => ({ name: '', role: '', purpose: '', style: [], instructions: '' })
+export function AssistantLearnedTab({ environment, agent }: { environment: BusinessEnvironment; agent: AgentProfile | null }) {
+  return agent ? <LearnedSkillsPanel environment={environment} agentId={agent.agentId}/> : null
+}
 const purposeTemplates = ASSISTANT_PRESETS.map(preset => ({ value:preset.id, label:`${preset.name} · ${preset.role}`, role:preset.role, purpose:preset.purpose }))
 
 export function AssistantStudio({ open, environment, agents, initialAgentId, threadId, theme = 'day', onClose, onRefresh, onLibrary, catalogEpoch = 0, onCreatedConversation, onOpenConnections }: {
@@ -161,7 +164,7 @@ export function AssistantStudio({ open, environment, agents, initialAgentId, thr
       onCreated={async (created, threadId) => { choose(created); await onRefresh(); if (threadId && onCreatedConversation) { onClose(); await onCreatedConversation(threadId) } }} /> : <><div className="ln-studio-identity"><Avatar agent={local} name={identity.name || '新助手'} size={48}/><div><h3>{local?.displayName || '新助手'}</h3><p>{local ? local.teamRole || '定义职责，配好能力，再开始协作。' : '从用途开始，不需要写很长的提示词。'}</p></div></div>
       <nav className="ln-segment-tabs ln-studio-tabs" aria-label="助手配置分区">{(['identity','capabilities','runtime','persona','location','learned'] as const).map((value,index) => <button type="button" key={value} className={tab === value ? 'is-selected' : ''} disabled={!local && value !== 'identity'} onClick={() => guard(() => setTab(value))}>{['资料','能力','运行与权限','人格','工作位置','学到'][index]}</button>)}</nav>
       <div className="ln-studio-content">
-        {tab === 'learned' && <LearnedSkillsPanel environment={environment} agentId={local.agentId}/>}
+        {tab === 'learned' && <AssistantLearnedTab environment={environment} agent={local}/>}
         {tab === 'identity' && <>
           <div className="ln-field-grid"><label className="ln-field"><span>名称</span><input aria-label="助手名称" value={identity.name} maxLength={40} onChange={event => patch({ name: event.target.value })} placeholder="给它一个名字"/></label><label className="ln-field"><span>职责</span><input aria-label="助手职责" value={identity.role} maxLength={120} onChange={event => patch({ role: event.target.value })} placeholder="例如：前端工程师"/></label></div>
           <label className="ln-field"><span>它主要帮助你做什么</span><textarea aria-label="助手用途" rows={4} value={identity.purpose} onChange={event => patch({ purpose: event.target.value })} placeholder="写清目标和分工，不需要列出平台内部规则。"/></label>

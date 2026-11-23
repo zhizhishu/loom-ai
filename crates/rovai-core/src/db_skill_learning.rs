@@ -1,4 +1,4 @@
-//! Additive metadata adapted from PiBot center-server/data/index.js and BotSkillsPage.tsx.
+//! PiBot@6741737 center-server/data/index.js:33-34 (VISIBILITY_SCOPES, isVisibleToBot), 结构对照。
 //! LOOM keeps SQLite facts in Core; no learning producer is introduced.
 use super::*;
 const SCHEMA_SQL: &str = r#"ALTER TABLE skill ADD COLUMN learned_by_agent_id TEXT;
@@ -9,7 +9,13 @@ pub(super) fn schema_matches(connection: &Connection) -> rusqlite::Result<bool> 
     let columns: i64 = connection.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('skill') WHERE name IN ('learned_by_agent_id','learned_state','learned_pinned','learned_locked')",
         [], |r| r.get(0))?;
-    Ok(columns == 4)
+    let defaults: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM pragma_table_info('skill') WHERE
+          (name='learned_by_agent_id' AND type='TEXT' AND "notnull"=0) OR
+          (name='learned_state' AND type='TEXT' AND "notnull"=1 AND dflt_value="'active'") OR
+          (name IN ('learned_pinned','learned_locked') AND type='INTEGER' AND "notnull"=1 AND dflt_value='0')"#,
+        [], |r| r.get(0))?;
+    Ok(columns == 4 && defaults == 4)
 }
 pub(super) fn migrate(database: &mut Database) -> Result<()> {
     let tx = database.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -34,6 +40,14 @@ pub(super) fn migrate(database: &mut Database) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn metadata_schema_243_rejects_wrong_defaults() {
+        let connection = Connection::open_in_memory().unwrap();
+        assert!(!schema_matches(&connection).unwrap());
+        connection.execute_batch("CREATE TABLE skill(id TEXT PRIMARY KEY);").unwrap();
+        connection.execute_batch(&SCHEMA_SQL.replace("DEFAULT 'active'", "DEFAULT 'stale'")).unwrap();
+        assert!(!schema_matches(&connection).unwrap());
+    }
     #[test]
     fn metadata_migration_243_upgrades_existing_rows_and_preserves_projection() {
         let root = std::env::temp_dir().join(format!("loom-meta-243-{}",uuid::Uuid::new_v4()));

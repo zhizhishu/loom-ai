@@ -1,4 +1,4 @@
-// One list, no state filter or device selector. Keep transport terminology out of UI.
+// PiBot@6741737 host-core/pending-store.js:14 (STATES), 复制改写 of the state set.
 import { useEffect, useRef, useState } from 'react'
 import type { StoredCommandResult } from '@contracts'
 import type { ThreadClient } from '../camp-client'
@@ -6,6 +6,11 @@ import { SurfaceDialog } from './Controls'
 import { deleteOutbox, readOutbox, updateOutbox, type PendingRecord } from './pending-outbox-store'
 import { settleOutboxAttempt } from './service'
 import './pending-inbox.css'
+export async function checkOutboxDelivery(client: ThreadClient, row: PendingRecord): Promise<StoredCommandResult> {
+  const result=await client.request<{commandResult:StoredCommandResult}>('thread.messages.send',row.params)
+  if(!result?.commandResult)throw new Error('可能已送达，请检查。')
+  return result.commandResult
+}
 export function PendingInbox({open,client,threadIds,onClose,theme='day'}:{
   open:boolean;client:ThreadClient;threadIds:string[];onClose():void;theme?:'day'|'night'
 }) {
@@ -35,20 +40,8 @@ export function PendingInbox({open,client,threadIds,onClose,theme='day'}:{
     try{
       if(action==='delete')deleteOutbox(row)
       else {
-        let command:StoredCommandResult|null=null
-        if(action==='send'){
-          updateOutbox(row,'sending')
-          const result=await client.request<{commandResult:StoredCommandResult}>('thread.messages.send',row.params)
-          command=result?.commandResult??null
-          if(!command)throw new Error('可能已送达，请检查。')
-        }else{
-          const result=await client.request<{state:string;result?:{commandResult:StoredCommandResult}}>('commands.reconcile',{operation:'thread.messages.send',params:row.params})
-          command=result.state==='recorded'?result.result?.commandResult??null:null
-          if(!command){
-            if(current===epoch.current)updateOutbox(row,'pending')
-            return
-          }
-        }
+        if(action==='send')updateOutbox(row,'sending')
+        const command=await checkOutboxDelivery(client,row)
         if(current!==epoch.current)return
         const state=command.status==='accepted'||command.status==='applied'?'accepted':command.status==='rejected'?'rejected':'unconfirmed'
         updateOutbox(row,state,state==='rejected'?'发送未被接受，请检查消息内容。':undefined)

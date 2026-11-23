@@ -1,4 +1,4 @@
-//! Additive metadata adapted from PiBot center-server/data/index.js and BotSkillsPage.tsx.
+//! PiBot@6741737 center-server/data/index.js:33-34 (VISIBILITY_SCOPES, isVisibleToBot), 结构对照。
 //! LOOM keeps SQLite facts in Core; no learning producer is introduced.
 use super::*;
 const SCHEMA_SQL: &str = r#"ALTER TABLE member_skill_source ADD COLUMN owner_agent_id TEXT;
