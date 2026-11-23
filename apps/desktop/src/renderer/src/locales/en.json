@@ -2238,6 +2238,7 @@
   "当前版本或必要能力不受支持，请更新后重试。": "The current version or required capabilities are unsupported. Update and retry.",
   "当前版本 {0} 不受支持，请更新后重试。": "Version {0} is unsupported. Update and retry.",
   "该智能体不支持当前平台。": "This Agent does not support the current platform.",
+  "该智能体已按产品策略禁用：只识别，不启动。": "This Agent is disabled by product policy. It is detected but not launched.",
   "该智能体尚未完成当前平台资格验证；这不是本机安装、登录或扫描故障。": "This Agent has not completed qualification on this platform. This is unrelated to local installation, sign-in, or scanning.",
   "该智能体尚未完成 Windows 资格验证；这不是本机安装、登录或扫描故障。": "This Agent has not completed Windows qualification. This is unrelated to local installation, sign-in, or scanning.",
   "每个标签最多 16 个字符，且不能包含换行或控制字符。": "Each trait allows up to 16 characters, with no line breaks or control characters.",
