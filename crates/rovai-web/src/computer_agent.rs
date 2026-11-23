@@ -1492,34 +1492,38 @@ fn definition_json(
     authority: &Authority,
 ) -> String {
     let mut servers = serde_json::Map::new();
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut server = json!({
+        "command": config.python.display().to_string(),
+        "args": [config.bridge.display().to_string()],
+        "env": {
+            "LOOM_COMPUTER_AGENT_GRANT": grant_id,
+            "LOOM_COMPUTER_AGENT_ENDPOINT": format!("http://{bridge_authority}{RPC_PATH}"),
+            "LOOM_COMPUTER_AGENT_ORIGIN": config.origin,
+            // Non-secret identity, in the shape Mikka's lease guard checks
+            // (`driver.mjs`): who the reviewed member is, which runtime it runs and
+            // which permission the user granted. The bridge refuses to start when the
+            // runtime is not the Pi family or the identity is malformed, so a
+            // definition minted for another runtime can never serve tool calls. The
+            // Host still re-derives all of this from its own state on every call.
+            "LOOM_COMPUTER_AGENT_RUNTIME": authority.runtime,
+            "LOOM_COMPUTER_AGENT_SUBJECT": authority.bot_id,
+            "LOOM_COMPUTER_AGENT_SCOPE": authority.permission.label(),
+            // Non-secret: the reviewed configuration revision (the authority's
+            // `policyVersion`), which the bridge echoes on every tool call.
+            "LOOM_COMPUTER_AGENT_DIGEST": authority.policy_version,
+            // Path only. The secret never enters a Core-stored configuration.
+            "LOOM_COMPUTER_AGENT_TOKEN_FILE": token_path.display().to_string(),
+        },
+    });
+    // Windows process creation only (Winsock and TLS need it); never a bridge input.
+    #[cfg(windows)]
+    if let Ok(root) = std::env::var("SystemRoot") {
+        server["env"]["SystemRoot"] = json!(root);
+    }
     servers.insert(
-        format!(
-            "loom-computer-agent-{}",
-            &grant_id[..grant_id.len().min(8)]
-        ),
-        json!({
-            "command": config.python.display().to_string(),
-            "args": [config.bridge.display().to_string()],
-            "env": {
-                "LOOM_COMPUTER_AGENT_GRANT": grant_id,
-                "LOOM_COMPUTER_AGENT_ENDPOINT": format!("http://{bridge_authority}{RPC_PATH}"),
-                "LOOM_COMPUTER_AGENT_ORIGIN": config.origin,
-                // Non-secret identity, in the shape Mikka's lease guard checks
-                // (`driver.mjs`): who the reviewed member is, which runtime it runs and
-                // which permission the user granted. The bridge refuses to start when the
-                // runtime is not the Pi family or the identity is malformed, so a
-                // definition minted for another runtime can never serve tool calls. The
-                // Host still re-derives all of this from its own state on every call.
-                "LOOM_COMPUTER_AGENT_RUNTIME": authority.runtime,
-                "LOOM_COMPUTER_AGENT_SUBJECT": authority.bot_id,
-                "LOOM_COMPUTER_AGENT_SCOPE": authority.permission.label(),
-                // Non-secret: the reviewed configuration revision (the authority's
-                // `policyVersion`), which the bridge echoes on every tool call.
-                "LOOM_COMPUTER_AGENT_DIGEST": authority.policy_version,
-                // Path only. The secret never enters a Core-stored configuration.
-                "LOOM_COMPUTER_AGENT_TOKEN_FILE": token_path.display().to_string(),
-            },
-        }),
+        format!("loom-computer-agent-{}", &grant_id[..grant_id.len().min(8)]),
+        server,
     );
     json!({"mcpServers": servers}).to_string()
 }
@@ -3445,18 +3449,21 @@ mod tests {
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
+        let mut expected_keys = vec![
+            "LOOM_COMPUTER_AGENT_DIGEST",
+            "LOOM_COMPUTER_AGENT_ENDPOINT",
+            "LOOM_COMPUTER_AGENT_GRANT",
+            "LOOM_COMPUTER_AGENT_ORIGIN",
+            "LOOM_COMPUTER_AGENT_RUNTIME",
+            "LOOM_COMPUTER_AGENT_SCOPE",
+            "LOOM_COMPUTER_AGENT_SUBJECT",
+            "LOOM_COMPUTER_AGENT_TOKEN_FILE",
+        ];
+        if cfg!(windows) {
+            expected_keys.push("SystemRoot");
+        }
         assert_eq!(
-            keys,
-            vec![
-                "LOOM_COMPUTER_AGENT_DIGEST",
-                "LOOM_COMPUTER_AGENT_ENDPOINT",
-                "LOOM_COMPUTER_AGENT_GRANT",
-                "LOOM_COMPUTER_AGENT_ORIGIN",
-                "LOOM_COMPUTER_AGENT_RUNTIME",
-                "LOOM_COMPUTER_AGENT_SCOPE",
-                "LOOM_COMPUTER_AGENT_SUBJECT",
-                "LOOM_COMPUTER_AGENT_TOKEN_FILE",
-            ],
+            keys, expected_keys,
             "the toolchain environment is a closed set"
         );
         assert!(!definition.contains(&"ab".repeat(32)));
