@@ -1,6 +1,7 @@
 import type { ThreadClient } from '../camp-client'
 import type { AgentProfile } from './types'
 import { ComputerAgentAccess } from './ComputerAgentAccess'
+import { ComputerUnavailableHint } from './ComputerUnavailableHint'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ComputerControl, ComputerEvent, ComputerFrame, ComputerPort, ComputerStatus, ComputerView } from './host-services'
 import { hostFeatureError, screenPoint } from './host-services'
@@ -11,13 +12,14 @@ const KEYS: Record<string, string> = { Enter:'enter', Tab:'tab', Backspace:'back
 
 /** A user-consented live Host view. Capture and input are separate grants.
  * No automatic reacquisition, invisible heartbeat, credential or screenshot storage. */
-export function ComputerPanel({ port, client, agent = null, theme = 'day' }: { port?: ComputerPort; client?: ThreadClient; agent?: AgentProfile | null; theme?: 'day' | 'night' }) {
+export function ComputerPanel({ port, client, agent = null, theme = 'day', retryDiscovery, openSettings }: { port?: ComputerPort; client?: ThreadClient; agent?: AgentProfile | null; theme?: 'day' | 'night'; retryDiscovery?: () => void | Promise<void>; openSettings?: () => void }) {
   const [status, setStatus] = useState<ComputerStatus | null>(null)
   const [view, setView] = useState<ComputerView | null>(null)
   const [control, setControl] = useState<ComputerControl | null>(null)
   const [frame, setFrame] = useState<(Omit<ComputerFrame, 'blob'> & { url: string }) | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [statusCheckFailed, setStatusCheckFailed] = useState(false)
   const [consentOpen, setConsentOpen] = useState(false)
   const [text, setText] = useState('')
   const [tick, setTick] = useState(Date.now())
@@ -55,8 +57,8 @@ export function ComputerPanel({ port, client, agent = null, theme = 'day' }: { p
   const refreshStatus = useCallback(async () => {
     if (!port) return
     setBusy(true); setError('')
-    try { const value = await port.status(); setStatus(value); clockSkew.current = value.serverTime - Date.now(); if (!value.ready && value.reason) setError(hostFeatureError({ code: value.reason })) }
-    catch (cause) { setError(hostFeatureError(cause)) }
+    try { const value = await port.status(); setStatus(value); setStatusCheckFailed(false); clockSkew.current = value.serverTime - Date.now(); if (!value.ready && value.reason) setError(hostFeatureError({ code: value.reason })) }
+    catch (cause) { setStatusCheckFailed(true); setError(hostFeatureError(cause)) }
     finally { setBusy(false) }
   }, [port])
   useEffect(() => { void refreshStatus() }, [refreshStatus])
@@ -174,6 +176,7 @@ export function ComputerPanel({ port, client, agent = null, theme = 'day' }: { p
     <div className="ln-computer-title"><div><strong>电脑</strong><span>{control ? '由你控制' : view ? '仅查看' : '未连接'}</span></div><IconButton icon="refresh" label="检查电脑连接" disabled={busy || !!view} onClick={() => { void refreshStatus() }}/></div>
     <p className="ln-computer-scope">先允许查看屏幕，再按需接管鼠标和键盘。</p>
     {error && <FormMessage error>{error}</FormMessage>}
+    <ComputerUnavailableHint status={status} viewActive={!!view} busy={busy} hasPort={!!port} statusFailed={statusCheckFailed} refreshStatus={port ? refreshStatus : undefined} retryDiscovery={retryDiscovery} openSettings={openSettings}/>
     <div ref={screen} className={`ln-computer-screen${control ? ' is-controlled' : ''}`} tabIndex={control ? 0 : -1} role={control ? 'application' : undefined} aria-label={control ? '远程桌面输入区域；Escape归还控制' : '所选电脑屏幕'} onKeyDown={event => {
       if (!controlRef.current) return
       if (event.key === 'Escape') { event.preventDefault(); void dropControl(); return }

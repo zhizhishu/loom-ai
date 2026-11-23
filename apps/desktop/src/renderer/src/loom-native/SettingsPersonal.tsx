@@ -7,6 +7,7 @@ import type { AgentProfile } from './types'
 import { ChoiceMenu } from './Controls'
 import { LanguagePreferenceOptions } from '../LanguagePreferenceControl'
 import { WindowCloseSettings } from '../WindowCloseSettings'
+import { ComposerSendPreference } from './ComposerSendPreference'
 import { useCurrentUserProfile } from '../CurrentUserProfile'
 import { useInterfaceLanguageSnapshot } from '../interface-language'
 import { useAppUpdates } from '../useAppUpdates'
@@ -94,6 +95,7 @@ export function PreferencesSection({ environment, theme, onTheme }: SettingsPers
     {windowClose && <SettingsSection id="settings-window" title="窗口">
       <div className="ln-settings-surface"><WindowCloseSettings api={windowClose}/></div>
     </SettingsSection>}
+    <ComposerSendPreference/>
   </>
 }
 

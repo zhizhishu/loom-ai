@@ -6,6 +6,9 @@ import { AgentOpenUiProvider, type AgentOpenUiHost } from './AgentOpenUiButton'
 import { Avatar } from './Avatar'
 import { GroupAvatar } from './GroupAvatar'
 import { mentionRecipient } from './group-mentions'
+import { MentionPopup } from './MentionPopup'
+import { completeMention, liveMentionQuery, mentionOptions, mentionQuery, mentionScope, type MentionMember, type MentionQuery } from './mention-completion'
+import { useComposerSendPreference } from './ComposerSendPreference'
 import { Icon, IconButton } from './icons'
 import { MessageAttachments, PendingAttachments, addPickedAttachments, pasteAttachments, type AttachmentPreviewLoader } from './UserAttachments'
 import { USER_ATTACHMENT_ACCEPT } from './user-attachments'
@@ -15,6 +18,7 @@ import { RuntimeInstallationGuide } from '../RuntimeInstallationGuide'
 import { runtimeInstallGuide } from '../runtime-install-guide'
 import { isNewConversationMemberAvailable, newConversationMemberStatus } from '../new-conversation-availability'
 import { agentRunPresentation } from '../../../shared/execution-presentation'
+import { shouldSendComposerKey } from '../../../shared/shortcuts'
 import { adapterLabel } from '../runtime-products'
 
 export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, onDraft, onFiles, onSend, onPrompt, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onPreviewAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager, onRetryRun, onConfigureRuntime, onOpenRuntimeSetup, hostPlatform = null }: {
@@ -35,6 +39,13 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   const pinned = useRef(true)
   const [showLatest, setShowLatest] = useState(false)
   const [copied, setCopied] = useState<string | null>(null)
+  // 发送方式（回车 / Ctrl+Enter）：桌面端由 ShortcutProvider 托管，Web 直连走 localStorage。
+  const sendPreference = useComposerSendPreference()
+  // @ 候选状态带着作用域：换会话/换快照时旧候选同步失效，不可能被显示，也不可能被选中。
+  const [mention, setMention] = useState<{ scope: string; query: MentionQuery } | null>(null)
+  const [mentionIndex, setMentionIndex] = useState(0)
+  const mentionToken = useRef<string | null>(null)
+  const pendingCaret = useRef<number | null>(null)
   const activeAgent = agents.find(agent => agent.agentId === (item?.agentId || snapshot?.thread.defaultLeadAgentId))
   const messages = useMemo(() => snapshot?.messages.filter(message => !message.withdrawn) ?? [], [snapshot?.messages])
   const visibleMessages = useMemo(() => messages.filter(message => message.authorType !== 'system'), [messages])
@@ -57,7 +68,24 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   const activeMembers = useMemo(() => snapshot ? agents.filter(agent => snapshot.members.some(member => member.agentId === agent.agentId && member.membershipStatus === 'active')) : agents, [snapshot?.members,agents])
   // 两位以上在册成员才算群聊。群的称呼挂在群上，不挂在其中某一位助手身上。
   const isGroup = (snapshot?.members.filter(member => member.membershipStatus === 'active').length ?? 0) > 1
+  // @ 补全只在群聊、且会话条目与快照同步时开：单聊、快照缺失、两者不同步一律没有候选。
+  const scope = mentionScope(item, snapshot, isGroup)
+  // 草稿在别处被改写（发送后清空、换会话）时上一轮的区间立刻作废，不留悬空候选。
+  const openMention = scope && mention && mention.scope === scope && mention.query.end <= draft.length && draft.startsWith('@', mention.query.start) ? mention.query : null
+  // 候选只来自当前会话的在册成员，不造 everyone/别名，最多 10 个。
+  const mentionChoices = useMemo(() => openMention ? mentionOptions(activeMembers, openMention.query) : [], [openMention, activeMembers])
+  const mentionOpen = openMention && mentionChoices.length > 0 ? openMention : null
+  const mentionActiveIndex = Math.min(mentionIndex, Math.max(0, mentionChoices.length - 1))
   const lastId = visibleMessages[visibleMessages.length - 1]?.id
+  // 换会话就是换候选范围：上一轮的候选和光标区间一律丢掉。
+  useEffect(() => { mentionToken.current = null; setMention(null); setMentionIndex(0) }, [item?.id, snapshot?.thread.id])
+  // 补全后把光标放回正文：受控 textarea 要等新值渲染完再设区间。
+  useEffect(() => {
+    if (pendingCaret.current === null || !input.current) return
+    const caret = pendingCaret.current
+    pendingCaret.current = null
+    input.current.setSelectionRange(caret, caret)
+  }, [draft])
   useEffect(() => { pinned.current = true; setShowLatest(false) }, [item?.id])
   useEffect(() => {
     if (pinned.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight
@@ -76,6 +104,30 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   const artifacts = useMemo(() => bundles.filter(bundle => bundle.mission.threadId === snapshot?.thread.id).flatMap(bundle => bundle.artifacts.map(artifact => ({ artifact, bundle, candidate: bundle.candidates.find(candidate => candidate.evidenceIds.includes(artifact.artifactId)) ?? null }))), [bundles,snapshot?.thread.id])
   // An OpenUI card's click continues this conversation through the same send path the composer uses.
   const openUiHost = useMemo<AgentOpenUiHost | null>(() => onPrompt ? { send: onPrompt } : null, [onPrompt])
+  // 按 textarea 的真实光标重算 @ 查询；只有换了一个 token 才把高亮归零，↑↓ 浏览时不清零。
+  const syncMention = (element: HTMLTextAreaElement): void => {
+    // 输入法组合中、或当前作用域没有候选（单聊/快照不同步）时不开候选。
+    if (composing.current || !scope) { mentionToken.current = null; setMention(null); setMentionIndex(0); return }
+    const next = mentionQuery(element.value, element.selectionStart ?? element.value.length, element.selectionEnd ?? element.value.length, activeMembers)
+    const token = next ? `${next.start}:${next.end}:${next.query}` : null
+    setMention(next ? { scope, query: next } : null)
+    if (mentionToken.current !== token) { mentionToken.current = token; setMentionIndex(0) }
+  }
+  // 选中候选人：只替换 `@查询` 这一段，前后正文原样保留，收件人解析仍由 mentionRecipient 决定。
+  // 点选也要按 textarea 的实时正文与选区复核：弹层是上一帧的状态，全选/光标移走/草稿被改写后
+  // 旧区间已经作废，不能拿它去替换正文；复核不过就只关弹层，什么都不改。
+  const pickMention = (member: MentionMember): void => {
+    const element = input.current
+    const text = element?.value ?? draft
+    const live = liveMentionQuery(mentionOpen, text, element?.selectionStart ?? -1, element?.selectionEnd ?? -1)
+    if (!live) { mentionToken.current = null; setMention(null); setMentionIndex(0); return }
+    const next = completeMention(text, live, member)
+    onDraft(next.text)
+    if (next.text === text) element?.setSelectionRange(next.caret, next.caret)
+    else pendingCaret.current = next.caret
+    mentionToken.current = null
+    setMention(null); setMentionIndex(0)
+  }
   return <AgentOpenUiProvider value={openUiHost}>
   <main className="ln-conversation" aria-label={`与${title}的对话`}>
     <header className="ln-chat-header">
@@ -121,9 +173,40 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
       {resolvedApproval && <p className="ln-approval-result" data-slot="approval-result" data-state={resolvedApproval.status} aria-label={`${approvalStatusLabel(resolvedApproval.status)}的授权`}><Icon name={resolvedApproval.status === 'approved' ? 'check' : 'blocked'} size={14}/><span>{resolvedApproval.actionSummary}</span><em>{approvalStatusLabel(resolvedApproval.status)}</em></p>}
       <form className="ln-composer" onPaste={event => { if (pasteAttachments(event.clipboardData, files, onFiles)) { event.preventDefault(); event.stopPropagation() } }} onSubmit={event => { event.preventDefault(); if (!sending && !composing.current && (draft.trim() || files.length)) onSend(isGroup ? mentionRecipient(draft, activeMembers) : undefined) }}>
         <PendingAttachments files={files} onRemove={onFiles}/>
-        <textarea ref={input} value={draft} onChange={event => onDraft(event.target.value)} aria-label={`给${speakerName}发消息`} placeholder={`给 ${speakerName} 发消息`} rows={1} onCompositionStart={() => { composing.current = true }} onCompositionEnd={() => { composing.current = false }} onKeyDown={event => {
-          if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && !composing.current) { event.preventDefault(); event.currentTarget.form?.requestSubmit() }
-        }}/>
+        {mentionOpen && <MentionPopup id="ln-mention-options" options={mentionChoices} activeIndex={mentionActiveIndex} onPick={pickMention} onHover={setMentionIndex}/>}
+        <textarea ref={input} value={draft}
+          onChange={event => { onDraft(event.target.value); syncMention(event.target) }}
+          aria-label={`给${speakerName}发消息`} placeholder={`给 ${speakerName} 发消息`} rows={1}
+          aria-expanded={mentionOpen ? true : undefined} aria-controls={mentionOpen ? 'ln-mention-options' : undefined}
+          aria-activedescendant={mentionOpen ? `ln-mention-options-option-${mentionActiveIndex}` : undefined}
+          onCompositionStart={() => { composing.current = true; mentionToken.current = null; setMention(null); setMentionIndex(0) }}
+          onCompositionEnd={event => { composing.current = false; syncMention(event.currentTarget) }}
+          onClick={event => syncMention(event.currentTarget)}
+          onKeyUp={event => { if (event.key.startsWith('Arrow') || event.key === 'Home' || event.key === 'End') syncMention(event.currentTarget) }}
+          onBlur={() => { mentionToken.current = null; setMention(null); setMentionIndex(0) }}
+          onKeyDown={event => {
+            // 输入法组合中的按键（含 keyCode 229）一个都不拦：回车/方向键/Tab 交给 IME。
+            const composingNow = composing.current || event.nativeEvent.isComposing || event.keyCode === 229
+            if (composingNow) return
+            // 弹层状态是上一帧的：Ctrl/Cmd+A 全选、光标移走、草稿在别处被改写之后它可能已经过期。
+            // 拦键前按 textarea 的实时正文与选区复核，只有折叠光标仍在显示的查询里才算数；
+            // 过期就关掉弹层，Tab/Enter 照常走焦点与发送，不拿旧区间替换正文。
+            const live = liveMentionQuery(mentionOpen, event.currentTarget.value, event.currentTarget.selectionStart ?? -1, event.currentTarget.selectionEnd ?? -1)
+            if (mentionOpen && !live) { mentionToken.current = null; setMention(null); setMentionIndex(0) }
+            if (live) {
+              if (event.key === 'ArrowDown') { event.preventDefault(); setMentionIndex(index => (index + 1) % mentionChoices.length); return }
+              if (event.key === 'ArrowUp') { event.preventDefault(); setMentionIndex(index => (index - 1 + mentionChoices.length) % mentionChoices.length); return }
+              if (event.key === 'Escape') { event.preventDefault(); setMention(null); setMentionIndex(0); return }
+              // 候选展开时普通回车 / Tab 是「选人」而不是发送；带修饰键的回车仍交给发送方式判定。
+              const plain = !event.shiftKey && !event.altKey && !event.metaKey && !event.ctrlKey
+              if (plain && (event.key === 'Enter' || event.key === 'Tab')) { event.preventDefault(); pickMention(mentionChoices[mentionActiveIndex]); return }
+            }
+            // Shift+Enter 换行；发送键由共享的 shouldSendComposerKey 按偏好判定，不另立规则。
+            if (shouldSendComposerKey({ key: event.key, isComposing: composingNow, repeat: event.repeat, metaKey: event.metaKey, ctrlKey: event.ctrlKey, altKey: event.altKey, shiftKey: event.shiftKey }, sendPreference.platform, sendPreference.sendMode)) {
+              event.preventDefault()
+              event.currentTarget.form?.requestSubmit()
+            }
+          }}/>
         {isGroup && activeMembers.length > 0 && <p className="ln-composer-hint">写 <strong>@名字</strong> 指定谁回复，不 @ 时由服务端挑选。可 @ {activeMembers.map(agent => agent.displayName).join('、')}</p>}
         <footer className="ln-composer-footer"><div className="ln-composer-left"><input ref={fileInput} type="file" multiple accept={USER_ATTACHMENT_ACCEPT} hidden onChange={event => { addPickedAttachments(event.target.files, files, onFiles); event.target.value = '' }}/><IconButton icon="plus" label="添加图片或附件（也可直接粘贴图片）" onClick={() => fileInput.current?.click()}/></div><button className="ln-send-button" type="submit" aria-label={sending ? '正在发送' : '发送消息'} disabled={sending || (!draft.trim() && !files.length)}>{sending ? <span className="ln-spinner"/> : <Icon name="up" size={17}/>}</button></footer>
       </form>

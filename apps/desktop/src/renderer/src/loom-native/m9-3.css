@@ -1,0 +1,13 @@
+/* M9-3：发送方式偏好 + 群聊 @ 补全。只排文本、间距和边框，颜色全部取自 native.css 的 ln token。 */
+
+/* 候选浮层挂在 .ln-composer-area（native.css:70 已是 position:relative/z-index:5）里，
+   向上贴在输入区顶边，不挤压会话正文。 */
+.ln-mention-popup{position:absolute;left:24px;right:24px;bottom:calc(100% - 8px);z-index:6;display:flex;flex-direction:column;gap:1px;max-height:min(240px,40vh);overflow-y:auto;padding:5px;border-radius:12px;border:1px solid var(--ln-line);background:var(--ln-bg);box-shadow:0 10px 26px #00000029}
+.ln-mention-option{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;height:30px;padding:0 9px!important;border-radius:8px;color:var(--ln-text);font-size:13px;text-align:left}
+.ln-mention-option:hover,.ln-mention-option.is-active{background:var(--ln-hover)}
+.ln-mention-option-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ln-mention-option[aria-selected=true] .ln-mention-option-name{font-weight:600}
+
+/* 「回车发送」开关本体沿用 product.css 的 .ln-toggle，这里只管它所在的一行。 */
+.ln-composer-preference{display:flex;flex-direction:column;gap:6px}
+.ln-composer-preference-error{margin:0;padding:0 2px;font-size:12px;color:#b63730}
