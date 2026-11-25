@@ -6763,6 +6763,237 @@ fn watchdog_server_stop_counts_only_at_the_full_execute_window_on_the_current_ep
 }
 
 /// The dispatch row and Delivery run of the newest Attempt of one Task.
+fn persist_retry_fixture_terminal(database: &OwnedTestDatabase, run_id: &str, status: &str) {
+    let delivery = if status == "succeeded" {
+        "settled"
+    } else {
+        "failed"
+    };
+    let failure = (status == "failed").then_some(r#"{"retryable":true}"#);
+    let now = chrono::Utc::now().to_rfc3339();
+    let tx = database.connection().unchecked_transaction().unwrap();
+    assert_eq!(
+        tx.execute(
+            "UPDATE agent_run SET status=?1, ended_at=?2, updated_at=?2,
+            terminal_resolution_source='runtime_terminal', public_runtime_failure_json=?3,
+            execution_lease_owner=NULL, execution_lease_expires_at=NULL WHERE id=?4",
+            params![status, &now, failure, run_id],
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        tx.execute(
+            "UPDATE camp_message_delivery SET status=?1, ended_at=?2, updated_at=?2
+            WHERE claimed_agent_run_id=?3 AND status='claimed'",
+            params![delivery, &now, run_id],
+        )
+        .unwrap(),
+        1
+    );
+    tx.commit().unwrap();
+}
+
+fn retry_test_task(
+    database: &mut OwnedTestDatabase,
+    now: chrono::DateTime<chrono::Utc>,
+) -> DispatchedTask {
+    dispatched_running_task(
+        database,
+        "ordinary terminal retry",
+        "approve_terminal_retry",
+        now,
+        chrono::Duration::zero(),
+    )
+}
+
+fn retry_test_rework_run(database: &mut OwnedTestDatabase, task: &DispatchedTask) -> String {
+    let (claim_id, fence_generation) =
+        open_claim_of(database, &task.plan_id, "task_a", &task.run_id);
+    let candidate = candidate_record(
+        database,
+        LoomCandidateRecordInput {
+            mission_id: task.mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: task.run_id.clone(),
+            claim_id,
+            fence_generation,
+            command_id: "retry_original_candidate".into(),
+            content_hash: "sha256:original-candidate".into(),
+            evidence_ids: vec![],
+            acceptance_criteria_version: "ac-v1".into(),
+            previous_candidate_id: None,
+        },
+    )
+    .unwrap();
+    persist_retry_fixture_terminal(database, &task.run_id, "succeeded");
+    let review_run = dispatched_review_run(database, &task.camp_id, &candidate.candidate_id);
+    let manifest =
+        control::candidate_manifest_hash(database.connection(), &candidate.candidate_id).unwrap();
+    let mut input = stage_input(
+        &candidate.candidate_id,
+        1,
+        &manifest,
+        LoomStageVerdict::RequestChanges,
+    );
+    input.criteria_results[1].satisfied = false;
+    control::stage_review_record(
+        database,
+        &task.mission_id,
+        REVIEWER_AGENT,
+        &review_run,
+        "retry_request_changes",
+        input,
+    )
+    .unwrap();
+    persist_retry_fixture_terminal(database, &review_run, "succeeded");
+    assert_eq!(control::admit_due_dispatches(database).unwrap(), 1);
+    let mut runs = claim_mission_lane(database, &task.camp_id, 1);
+    assert_eq!(runs.len(), 1);
+    let run_id = runs.pop().unwrap();
+    assert_eq!(
+        claim_the_run(database, &task.camp_id, &run_id)
+            .result
+            .status,
+        crate::command::CommandResultStatus::Accepted,
+    );
+    run_id
+}
+
+#[test]
+fn retryable_failure_redispatches_once() {
+    for kind in ["REWORK", "EXECUTE"] {
+        let mut database = fixture();
+        let now = chrono::Utc::now();
+        let task = retry_test_task(&mut database, now);
+        let run_id = if kind == "REWORK" {
+            retry_test_rework_run(&mut database, &task)
+        } else {
+            task.run_id
+        };
+        let (old_dispatch, old_run, old_key) = latest_dispatch_and_run(&database, "task_a");
+        assert_eq!(old_run.as_deref(), Some(run_id.as_str()));
+        let mut expected: Vec<String> = serde_json::from_str(&old_key).unwrap();
+        assert_eq!(expected[0], kind);
+        expected.extend(["watchdog_retry".into(), "2".into()]);
+        persist_retry_fixture_terminal(&database, &run_id, "failed");
+
+        let count_before = loom_deliveries(&database);
+        let judged = chrono::Utc::now() + chrono::Duration::seconds(1);
+        assert_eq!(tick_at(&mut database, judged).admitted, 1);
+        assert_eq!(loom_deliveries(&database), count_before + 1);
+        let (retry_dispatch, retry_run, retry_key) = latest_dispatch_and_run(&database, "task_a");
+        assert_ne!(old_dispatch, retry_dispatch);
+        assert_eq!(retry_run, None);
+        assert_eq!(
+            control::request_epoch(&retry_key),
+            control::request_epoch(&old_key)
+        );
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&retry_key).unwrap(),
+            expected
+        );
+        let retry_kind: String = database
+            .connection()
+            .query_row(
+                "SELECT kind FROM loom_control_dispatch WHERE dispatch_id=?1",
+                [&retry_dispatch],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retry_kind, kind);
+    }
+}
+
+#[test]
+fn retry_stops_at_epoch_cap() {
+    let mut database = fixture();
+    let now = chrono::Utc::now();
+    let task = retry_test_task(&mut database, now);
+    database
+        .connection()
+        .execute(
+            "INSERT INTO loom_task_recovery(task_id,attempt_id,request_epoch,action,tries,
+             recovery_tries,blocked,observed_at,next_at)
+         VALUES('task_a',?1,?2,'recover_stall',1,?3,0,?4,?4)",
+            params![
+                &task.dispatch_id,
+                task.epoch(&database),
+                super::watchdog::WATCHDOG_MAX_RECOVERIES,
+                now.to_rfc3339()
+            ],
+        )
+        .unwrap();
+    persist_retry_fixture_terminal(&database, &task.run_id, "failed");
+
+    let before = loom_deliveries(&database);
+    assert_eq!(
+        tick_at(&mut database, now + chrono::Duration::seconds(5)).admitted,
+        0
+    );
+    assert_eq!(loom_deliveries(&database), before);
+    assert_eq!(run_status(&database, &task.run_id), "failed");
+    let status: String = database
+        .connection()
+        .query_row(
+            "SELECT status FROM loom_control_dispatch WHERE dispatch_id=?1",
+            [&task.dispatch_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "BLOCKED");
+}
+
+#[test]
+fn no_retry_when_cancelled_or_successor_exists() {
+    for stopped in [true, false] {
+        let mut database = fixture();
+        let now = chrono::Utc::now();
+        let task = retry_test_task(&mut database, now);
+        persist_retry_fixture_terminal(&database, &task.run_id, "failed");
+        if stopped {
+            database
+                .connection()
+                .execute(
+                    "UPDATE agent_run SET cancel_requested_at=?1,
+                        cancel_reason_code='user_requested_agent_run_stop' WHERE id=?2",
+                    params![now.to_rfc3339(), &task.run_id],
+                )
+                .unwrap();
+        } else {
+            seed_run(
+                &database,
+                &task.camp_id,
+                PRODUCER_AGENT,
+                "retry_existing_successor",
+            );
+            set_predecessor(&database, "retry_existing_successor", Some(&task.run_id));
+            finish_run(&database, "retry_existing_successor");
+        }
+        let before = loom_deliveries(&database);
+        assert_eq!(
+            tick_at(&mut database, now + chrono::Duration::seconds(5)).admitted,
+            0
+        );
+        assert_eq!(loom_deliveries(&database), before, "stopped={stopped}");
+    }
+}
+
+#[test]
+fn replay_same_terminal_event_is_idempotent() {
+    let mut database = fixture();
+    let now = chrono::Utc::now();
+    let task = retry_test_task(&mut database, now);
+    persist_retry_fixture_terminal(&database, &task.run_id, "failed");
+    let before = loom_deliveries(&database);
+    let judged = now + chrono::Duration::seconds(5);
+
+    assert_eq!(tick_at(&mut database, judged).admitted, 1);
+    assert_eq!(loom_deliveries(&database), before + 1);
+    assert_eq!(tick_at(&mut database, judged).admitted, 0);
+    assert_eq!(loom_deliveries(&database), before + 1);
+}
+
 fn latest_dispatch_and_run(
     database: &OwnedTestDatabase,
     task_id: &str,

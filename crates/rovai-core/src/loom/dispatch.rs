@@ -86,7 +86,8 @@ use sha2::{Digest, Sha256};
 
 use super::super::blocking_dependencies;
 use super::super::watchdog::{
-    WatchdogDecision, WatchdogProgress, WatchdogState, factory_watchdog_decision,
+    WATCHDOG_MAX_RECOVERIES, WatchdogDecision, WatchdogProgress, WatchdogState,
+    factory_watchdog_decision,
 };
 use super::{LoomControlPolicy, active_member, read_policy};
 use crate::agent_profile::{AdapterKind, RuntimeReadiness, RuntimeReadinessStatus};
@@ -281,7 +282,7 @@ pub(crate) fn admit_due_dispatches_at(
         }
     }
 
-    let mut admitted = 0usize;
+    let mut admitted = watchdog.admitted;
     for (plan_id, mission_id) in plans {
         if admitted >= MAX_DISPATCHES_PER_TICK {
             break;
@@ -1417,6 +1418,12 @@ fn sweep_watchdog(transaction: &Transaction<'_>, now: DateTime<Utc>) -> Result<L
     let mut outcome = LoomTickOutcome::default();
     for subject in watchdog_subjects(transaction, now)? {
         outcome.scanned += 1;
+        if outcome.admitted < MAX_DISPATCHES_PER_TICK
+            && retry_terminal_failure(transaction, &subject, now)?
+        {
+            outcome.admitted += 1;
+            continue;
+        }
         match observe_watchdog(transaction, &subject, now)? {
             Observation::Wait | Observation::HandedOff => {}
             Observation::Deferred => outcome.deferred += 1,
@@ -1653,7 +1660,7 @@ fn watchdog_task_facts(
         stage: watchdog_stage(event_kind.as_deref()),
         run_status,
         active_run,
-        uncertain_effect: watchdog_uncertain_effect(transaction, &runs, now)?,
+        uncertain_effect: watchdog_uncertain_effect(transaction, &runs, Some(now))?,
         progress_at,
     }))
 }
@@ -1798,7 +1805,7 @@ fn latest_instant(candidates: impl IntoIterator<Item = Option<String>>) -> Optio
 fn watchdog_uncertain_effect(
     transaction: &Transaction<'_>,
     runs: &[(String, String)],
-    now: DateTime<Utc>,
+    now: Option<DateTime<Utc>>,
 ) -> Result<bool> {
     if runs.is_empty()
         || !crate::remote_execution::authority_table_available(
@@ -1820,7 +1827,7 @@ fn watchdog_uncertain_effect(
           WHERE run_id IN (SELECT value FROM json_each(?1))",
     )?;
     let mut rows = statement.query(params![&run_ids])?;
-    let now_ms = now.timestamp_millis();
+    let now_ms = now.map(|now| now.timestamp_millis());
     while let Some(row) = rows.next()? {
         // `RequestState`: queued 0, dispatched 1, running 2, cancel requested 3, completed 4,
         // failed 5, cancelled 6, unknown 7. A terminal request has a settled receipt.
@@ -1840,14 +1847,93 @@ fn watchdog_uncertain_effect(
         if settled || !changes_workspace {
             continue;
         }
-        let deadline_passed = i64::try_from(dispatch.deadline_unix_ms)
-            .map(|deadline| deadline <= now_ms)
-            .unwrap_or(true);
+        let deadline_passed = now_ms.is_none_or(|now| {
+            i64::try_from(dispatch.deadline_unix_ms).map_or(true, |deadline| deadline <= now)
+        });
         if matches!(state, 7 | 3) || deadline_passed {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn retry_terminal_failure(
+    transaction: &Transaction<'_>,
+    subject: &WatchdogSubject,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    if subject.run_status.as_deref() != Some("failed")
+        || subject.task_status == "blocked"
+        || subject.active_run
+        || subject.uncertain_effect
+    {
+        return Ok(false);
+    }
+    let run_id: Option<String> = transaction
+        .query_row(
+            "SELECT run.id
+             FROM loom_control_dispatch dispatch
+             JOIN camp_message_delivery delivery ON delivery.id=dispatch.delivery_id
+             JOIN agent_run run ON run.id=delivery.claimed_agent_run_id
+             WHERE dispatch.dispatch_id=?1 AND dispatch.status='BLOCKED'
+               AND dispatch.kind IN ('EXECUTE','REVIEW','REWORK')
+               AND delivery.status='failed' AND run.status='failed'
+               AND run.ended_at IS NOT NULL AND run.terminal_resolution_source='runtime_terminal'
+               AND run.terminal_reason_code IS NULL
+               AND run.cancel_requested_at IS NULL AND run.retry_declined_at IS NULL
+               AND CASE WHEN json_valid(run.public_runtime_failure_json)
+                        THEN json_type(run.public_runtime_failure_json, '$.retryable')='true'
+                        ELSE FALSE END
+               AND NOT EXISTS (
+                   SELECT 1 FROM agent_run successor WHERE successor.predecessor_agent_run_id=run.id)
+               AND NOT EXISTS (
+                   SELECT 1 FROM runtime_input_delivery input WHERE input.agent_run_id=run.id
+                   AND (input.status IN ('accepted','delivery_unknown')
+                        OR (input.status='prepared' AND input.dispatch_started_at IS NOT NULL)))
+               AND NOT EXISTS (
+                   SELECT 1 FROM loom_claim claim
+                   WHERE claim.plan_id=dispatch.plan_id AND claim.task_id=dispatch.task_id
+                     AND claim.released_at IS NULL AND claim.agent_run_id<>run.id)
+               AND NOT EXISTS (
+                   SELECT 1 FROM loom_control_dispatch other
+                   JOIN camp_message_delivery pending ON pending.id=other.delivery_id
+                   WHERE other.plan_id=dispatch.plan_id AND other.task_id=dispatch.task_id
+                     AND other.dispatch_id<>dispatch.dispatch_id
+                     AND pending.status IN ('waiting','claimed'))",
+            [&subject.attempt_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(run_id) = run_id else {
+        return Ok(false);
+    };
+    if prior_dispatch_outcome(transaction, &subject.attempt_id)? != PriorOutcome::Failed
+        || watchdog_uncertain_effect(transaction, &[(run_id, "failed".into())], None)?
+        || shared_recovery_budget(transaction, subject)? >= WATCHDOG_MAX_RECOVERIES
+    {
+        return Ok(false);
+    }
+    Ok(retry_watchdog_attempt(transaction, subject, now, true)?.is_some())
+}
+
+fn attempts_in_epoch(connection: &Connection, subject: &WatchdogSubject) -> Result<i64> {
+    let mut statement = connection
+        .prepare("SELECT dedupe_key FROM loom_control_dispatch WHERE plan_id=?1 AND task_id=?2")?;
+    let keys = statement.query_map(params![&subject.plan_id, &subject.task_id], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut attempts = 0;
+    for key in keys {
+        if request_epoch(&key?) == subject.request_epoch {
+            attempts += 1;
+        }
+    }
+    Ok(attempts)
+}
+
+fn shared_recovery_budget(connection: &Connection, subject: &WatchdogSubject) -> Result<i64> {
+    let recorded = recovery_budget(connection, &subject.task_id, &subject.request_epoch)?;
+    Ok(recorded.max(attempts_in_epoch(connection, subject)? - 1))
 }
 
 /// Observe one Task once and apply what the decision table answered.
@@ -1932,7 +2018,7 @@ fn observe_watchdog(
         }
     };
     let tries = next_watchdog_tries(previous.as_ref().map(|receipt| receipt.tries), action);
-    let budget = recovery_budget(transaction, &subject.task_id, &subject.request_epoch)?;
+    let budget = shared_recovery_budget(transaction, subject)?;
     let exhausted = recovery_exhausted(tries, action, budget);
     // Upstream `recoverable`: only a stalled Task in an execution stage can be replayed. LOOM has no
     // question-continuation attempt (`originalSessionOnly`), so the stage is the whole condition.
@@ -1952,7 +2038,8 @@ fn observe_watchdog(
         // epoch spent, release the fence the dead Run still holds, clear this module's own hold, and
         // mint the next Attempt of the *same* epoch — the retried delivery then starts through the
         // ordinary Delivery/Run path, exactly like the first one did.
-        let Some((retry_dispatch_id, _)) = retry_watchdog_attempt(transaction, subject, now)?
+        let Some((retry_dispatch_id, _)) =
+            retry_watchdog_attempt(transaction, subject, now, false)?
         else {
             // No room for another Attempt — the plan's dispatch budget or the Task's rework budget
             // is spent, or the recipient can no longer be addressed. That is upstream's deferred
@@ -2219,9 +2306,10 @@ fn retry_watchdog_attempt(
     transaction: &Transaction<'_>,
     subject: &WatchdogSubject,
     now: DateTime<Utc>,
+    check_event: bool,
 ) -> Result<Option<(String, String)>> {
     transaction.execute_batch("SAVEPOINT watchdog_retry")?;
-    match write_watchdog_retry(transaction, subject, now) {
+    match write_watchdog_retry(transaction, subject, now, check_event) {
         Ok(Some(retry)) => {
             transaction.execute_batch("RELEASE SAVEPOINT watchdog_retry")?;
             Ok(Some(retry))
@@ -2252,6 +2340,7 @@ fn write_watchdog_retry(
     transaction: &Transaction<'_>,
     subject: &WatchdogSubject,
     now: DateTime<Utc>,
+    check_event: bool,
 ) -> Result<Option<(String, String)>> {
     let Some(policy) = read_policy(transaction, &subject.plan_id)? else {
         return Ok(None);
@@ -2294,6 +2383,25 @@ fn write_watchdog_retry(
     if policy_revision != policy.authorization_revision {
         return Ok(None);
     }
+    if check_event
+        && event_problem(
+            transaction,
+            &policy,
+            &subject.mission_id,
+            &subject.plan_id,
+            &subject.task_id,
+            &kind,
+            candidate_id.as_deref(),
+            &recipient,
+            policy_revision,
+            Some(&old_dispatch_id),
+            None,
+            false,
+        )?
+        .is_some()
+    {
+        return Ok(None);
+    }
     // Upstream `checkFactoryRepairBudget`: the dispatch budget and the per-Task rework budget bound
     // automatic repair exactly like they bound the first attempt.
     let spent: i64 = transaction.query_row(
@@ -2324,22 +2432,7 @@ fn write_watchdog_retry(
     // second copy of the same retry.
     let base = base_event_identity(&old_key);
     let epoch = request_epoch(&base);
-    let mut attempts = 0_i64;
-    {
-        let mut statement = transaction.prepare(
-            "SELECT dedupe_key FROM loom_control_dispatch
-             WHERE plan_id=?1 AND task_id=?2 AND kind=?3",
-        )?;
-        let keys = statement.query_map(
-            params![&subject.plan_id, &subject.task_id, &kind],
-            |row| row.get::<_, String>(0),
-        )?;
-        for key in keys {
-            if base_event_identity(&key?) == base {
-                attempts += 1;
-            }
-        }
-    }
+    let attempts = attempts_in_epoch(transaction, subject)?;
     let retry_key = retry_dedupe_key(&base, attempts + 1)?;
     let now_text = now.to_rfc3339();
 
