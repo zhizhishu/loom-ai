@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { ActionApprovalView, AgentRunView, HostPlatformKey } from '@contracts'
+import type { ActionApprovalView, AgentRunView, DomainEventView, HostPlatformKey, ThreadMessageView } from '@contracts'
 import type { AgentProfile, ArtifactSelection, ConversationItem, ThreadSnapshot, WorkBundle } from './types'
 import { AgentMarkdown } from './AgentMarkdown'
 import { AgentOpenUiProvider, type AgentOpenUiHost } from './AgentOpenUiButton'
@@ -20,6 +20,71 @@ import { isNewConversationMemberAvailable, newConversationMemberStatus } from '.
 import { agentRunPresentation } from '../../../shared/execution-presentation'
 import { shouldSendComposerKey } from '../../../shared/shortcuts'
 import { adapterLabel } from '../runtime-products'
+
+/** 群成员系统行（验收 C2）：由 timeline 的群成员变更事件生成，是聊天流条目，不写库、不进「会话记录」。 */
+export type MemberSystemLine = {
+  key: string
+  eventId: string | null
+  agentId: string | null
+  kind: 'added' | 'removed'
+  text: string
+  createdAt: string
+}
+
+/** 聊天流条目：消息与群成员系统行按时间合并后的统一形状。 */
+type ChatFlowEntry =
+  | { kind: 'message'; key: string; at: string; message: ThreadMessageView }
+  | { kind: 'member-line'; key: string; at: string; line: MemberSystemLine }
+
+/** DomainEventView.payload 是 unknown：只有能在 payload 里归属到 agentId 的事件才出系统行，不做猜测。 */
+function memberEventPayloadAgentId(payload: unknown): string | null {
+  if (typeof payload !== 'object' || payload === null) return null
+  const agentId = (payload as { agentId?: unknown }).agentId
+  return typeof agentId === 'string' && agentId !== '' ? agentId : null
+}
+
+function memberEventKind(eventType: string): 'added' | 'removed' | null {
+  if (eventType === 'camp.member_added') return 'added'
+  if (eventType === 'camp.member_removed') return 'removed'
+  return null
+}
+
+/**
+ * 验收 C2：`snapshot.timeline` 里的 `camp.member_added` / `camp.member_removed`（`payload.agentId`
+ * 归属）生成聊天流系统行，文案固定 `{助手名}已加入群聊` / `{助手名}已移出群聊`。助手名优先
+ * agents 的 displayName，其次 snapshot.members，缺失用「助手」。按事件 id 去重（eventId 可空时
+ * 退回 globalSequence 兜底），同一条事件重复出现在 timeline 里也只出一行；本文件没有
+ * memberCreation 卡片，不会与新助手的 memberCreation 重复出第二行。
+ */
+export function memberSystemLines(
+  timeline: readonly DomainEventView[],
+  agents: readonly AgentProfile[],
+  members: readonly { agentId: string; displayName: string }[]
+): MemberSystemLine[] {
+  const seen = new Set<string>()
+  const lines: MemberSystemLine[] = []
+  for (const event of timeline) {
+    const kind = memberEventKind(event.eventType)
+    if (!kind) continue
+    const dedupeKey = event.eventId ?? `seq:${event.globalSequence}`
+    if (seen.has(dedupeKey)) continue
+    seen.add(dedupeKey)
+    const agentId = memberEventPayloadAgentId(event.payload)
+    if (!agentId) continue
+    const name = agents.find(agent => agent.agentId === agentId)?.displayName
+      || members.find(member => member.agentId === agentId)?.displayName
+      || '助手'
+    lines.push({
+      key: `member:${dedupeKey}`,
+      eventId: event.eventId,
+      agentId,
+      kind,
+      text: kind === 'added' ? `${name}已加入群聊` : `${name}已移出群聊`,
+      createdAt: event.createdAt
+    })
+  }
+  return lines
+}
 
 export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, onDraft, onFiles, onSend, onPrompt, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onPreviewAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager, onRetryRun, onConfigureRuntime, onOpenRuntimeSetup, hostPlatform = null }: {
   item: ConversationItem | null; snapshot: ThreadSnapshot | null; agents: AgentProfile[]; bundles: WorkBundle[]; loading: boolean; sending: boolean
@@ -76,7 +141,19 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   const mentionChoices = useMemo(() => openMention ? mentionOptions(activeMembers, openMention.query) : [], [openMention, activeMembers])
   const mentionOpen = openMention && mentionChoices.length > 0 ? openMention : null
   const mentionActiveIndex = Math.min(mentionIndex, Math.max(0, mentionChoices.length - 1))
-  const lastId = visibleMessages[visibleMessages.length - 1]?.id
+  // 聊天流（验收 C2）：timeline 的群成员系统行与消息按时间并入同一条流；不写库、不进
+  // systemMessages 的「会话记录」折叠区。空态判断和滚动锚点 lastId 都按这条流算，不含它们会漏。
+  const memberLines = useMemo(
+    () => memberSystemLines(snapshot?.timeline ?? [], agents, snapshot?.members ?? []),
+    [snapshot?.timeline, agents, snapshot?.members]
+  )
+  const flowEntries = useMemo<ChatFlowEntry[]>(() => {
+    const entries: ChatFlowEntry[] = visibleMessages.map(message => ({ kind: 'message' as const, key: `message:${message.id}`, at: message.createdAt, message }))
+    for (const line of memberLines) entries.push({ kind: 'member-line', key: line.key, at: line.createdAt, line })
+    // ISO 时间字符串按字典序即按时间序；等值时 sort 稳定，消息保持原序，系统行排在同刻消息之后。
+    return entries.sort((left, right) => left.at.localeCompare(right.at))
+  }, [visibleMessages, memberLines])
+  const lastId = flowEntries[flowEntries.length - 1]?.key
   // 换会话就是换候选范围：上一轮的候选和光标区间一律丢掉。
   useEffect(() => { mentionToken.current = null; setMention(null); setMentionIndex(0) }, [item?.id, snapshot?.thread.id])
   // 补全后把光标放回正文：受控 textarea 要等新值渲染完再设区间。
@@ -147,8 +224,12 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
       if (pinned.current) setShowLatest(false)
     }}>
       {loading && !snapshot && <div className="ln-loading" role="status">正在读取对话…</div>}
-      {!loading && !visibleMessages.length && <div className="ln-chat-empty">{isGroup ? <GroupAvatar title={title} members={activeMembers} size={52}/> : <Avatar agent={activeAgent} name={title} size={52}/>}<h1>{title}</h1><p>{item?.threadId ? '从一条消息开始。' : '聊聊想法，或交给我一件事。'}</p></div>}
-      {visibleMessages.map(message => {
+      {!loading && !flowEntries.length && <div className="ln-chat-empty">{isGroup ? <GroupAvatar title={title} members={activeMembers} size={52}/> : <Avatar agent={activeAgent} name={title} size={52}/>}<h1>{title}</h1><p>{item?.threadId ? '从一条消息开始。' : '聊聊想法，或交给我一件事。'}</p></div>}
+      {flowEntries.map(entry => {
+        if (entry.kind === 'member-line') {
+          return <p key={entry.key} className="ln-member-system-line" data-member-event-kind={entry.line.kind} data-event-id={entry.line.eventId ?? undefined} data-agent-id={entry.line.agentId ?? undefined}>{entry.line.text}</p>
+        }
+        const message = entry.message
         const user = message.authorType === 'user' || message.authorType === 'external_principal'
         const author = agents.find(agent => agent.agentId === message.authorId)
         const handoff = !user && /\[LOOM_HANDOFF|"dispatchId"|"tool_call_id"/.test(message.body)

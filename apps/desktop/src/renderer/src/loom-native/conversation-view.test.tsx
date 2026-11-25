@@ -2,6 +2,7 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import type { AgentProfile, ConversationItem, ThreadSnapshot } from './types'
+import type { DomainEventView } from '@contracts'
 import { ConversationView } from './ConversationView'
 
 vi.mock('../MemberAvatar', async () => {
@@ -78,5 +79,42 @@ describe('composer address names the group, not the lead assistant', () => {
     expect(group).toContain('ln-group-avatar')
     expect(group).toContain('data-agent="a1"')
     expect(group).toContain('data-agent="a2"')
+  })
+})
+
+// 验收 C2：timeline 的群成员事件投影成聊天流系统行（不写库、不进「会话记录」），
+// 按 eventId 去重、eventId 空用 globalSequence 兜底，与消息按 createdAt 并入同一条流。
+const memberEvent = (eventId: string, agentId: string, eventType: 'camp.member_added' | 'camp.member_removed'): DomainEventView =>
+  ({
+    globalSequence: 1, eventId, eventType, threadId: 'th-1', entityType: null, entityId: null,
+    actorType: null, actorId: null, sourceAgentRunId: null, executionEpoch: null,
+    payload: { agentId }, createdAt: '2026-02-03T10:00:00.000Z'
+  } as DomainEventView)
+
+describe('member timeline system lines', () => {
+  const occurrences = (html: string, marker: string): number => html.split(marker).length - 1
+
+  it('timeline shows a system line when an existing agent is added', () => {
+    const thread = {
+      ...snapshot('发版群', [member('a1', 'Hanzi'), member('a2', 'Muwa')]),
+      timeline: [memberEvent('evt-add-1', 'a2', 'camp.member_added')]
+    }
+    for (const html of [view(thread), view(thread)]) {
+      expect(occurrences(html, 'data-member-event-kind="added"')).toBe(1)
+      expect(occurrences(html, 'Muwa已加入群聊')).toBe(1)
+      expect(html).toContain('data-event-id="evt-add-1"')
+    }
+  })
+
+  it('timeline shows a system line when an existing agent is removed', () => {
+    const thread = {
+      ...snapshot('发版群', [member('a1', 'Hanzi'), member('a2', 'Muwa')]),
+      timeline: [memberEvent('evt-add-1', 'a2', 'camp.member_added'), memberEvent('evt-remove-1', 'a2', 'camp.member_removed')]
+    }
+    const html = view(thread)
+    expect(html.split('data-member-event-kind="added"').length - 1).toBe(1)
+    expect(html.split('Muwa已加入群聊').length - 1).toBe(1)
+    expect(html.split('data-member-event-kind="removed"').length - 1).toBe(1)
+    expect(html.split('Muwa已移出群聊').length - 1).toBe(1)
   })
 })
