@@ -27,7 +27,7 @@ test('real CLI preserves projected receipts for the native bridge and ordinary C
   const contracts = workflowContracts(JSON.parse(await readFile(new URL('../fixtures/pi-workflow/core-input-contract.json', import.meta.url), 'utf8')))
   const grant = { schema: FILE_GRANT_SCHEMA, runId: 'synthetic-run', botId: 'synthetic-bot', executionEpoch: 1,
     workspaceReal: root, allowedTools: ['read', 'write', 'edit', 'rovai_loom'], expiresAtEpochMs: Date.now() + 60_000, logPath: join(root, 'guard.jsonl') }
-  const business = { missionId: 'synthetic-mission', plan: null, tasks: [], dependencies: [], claims: [], evaluatedAt: '2026-11-18T00:00:00Z' }
+  const business = { missionId: 'synthetic-mission', missionTitle: 'Synthetic mission', missionGoal: 'Verify CLI projection', missionStatus: 'active', plan: null, tasks: [], dependencies: [], claims: [], evaluatedAt: '2026-11-18T00:00:00Z' }
   let replyMode = 'ok'
   const requests = [], sockets = new Set()
   const server = createServer(socket => {
