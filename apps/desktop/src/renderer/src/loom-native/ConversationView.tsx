@@ -23,6 +23,8 @@ import { isNewConversationMemberAvailable, newConversationMemberStatus } from '.
 import { agentRunPresentation } from '../../../shared/execution-presentation'
 import { shouldSendComposerKey } from '../../../shared/shortcuts'
 import { adapterLabel } from '../runtime-products'
+import { hasThreadResults, resultStatusLabel, threadResultEntries, type ThreadSegment } from './thread-artifacts'
+import { ThreadResults } from './ThreadResults'
 
 /** 群成员系统行（验收 C2）：由 timeline 的群成员变更事件生成，是聊天流条目，不写库、不进「会话记录」。 */
 export type MemberSystemLine = {
@@ -109,6 +111,11 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   const composing = useRef(false)
   const pinned = useRef(true)
   const [showLatest, setShowLatest] = useState(false)
+  // 「成果」段（Mikka 的 Artifact 段）：这条线程实际产出的一切，按 计划/改动/报告/截图 分组。
+  // 会话流尾部的产物卡与成果段读同一份 entries，打开的是同一个既有预览入口（成果浮层）。
+  const resultEntries = useMemo(() => threadResultEntries(bundles, snapshot?.thread.id), [bundles, snapshot?.thread.id])
+  const hasResults = hasThreadResults(resultEntries)
+  const [segment, setSegment] = useState<ThreadSegment>('chat')
   const [copied, setCopied] = useState<string | null>(null)
   // 发送方式（回车 / Ctrl+Enter）：桌面端由 ShortcutProvider 托管，Web 直连走 localStorage。
   const sendPreference = useComposerSendPreference()
@@ -165,7 +172,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   }, [visibleMessages, memberLines, terminalRuns])
   const lastId = flowEntries[flowEntries.length - 1]?.key
   // 换会话就是换候选范围：上一轮的候选和光标区间一律丢掉。
-  useEffect(() => { mentionToken.current = null; setMention(null); setMentionIndex(0) }, [item?.id, snapshot?.thread.id])
+  useEffect(() => { mentionToken.current = null; setMention(null); setMentionIndex(0); setSegment('chat') }, [item?.id, snapshot?.thread.id])
   // 补全后把光标放回正文：受控 textarea 要等新值渲染完再设区间。
   useEffect(() => {
     if (pendingCaret.current === null || !input.current) return
@@ -177,7 +184,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   useEffect(() => {
     if (pinned.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight
     else if (lastId) setShowLatest(true)
-  }, [lastId, item?.id, snapshot?.throughGlobalSequence])
+  }, [lastId, item?.id, snapshot?.throughGlobalSequence, segment])
   useEffect(() => {
     if (!input.current) return
     input.current.style.height = 'auto'
@@ -195,7 +202,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   // 群里说话是「给群名发消息」（Mikka `group-chat-view.tsx:271` 传的是 group.title）；
   // 只有单聊才写助手名（Mikka `messages/zh-CN.json:212` Nav.messageBot）。
   const speakerName = isGroup ? title : activeAgent?.displayName || title
-  const artifacts = useMemo(() => bundles.filter(bundle => bundle.mission.threadId === snapshot?.thread.id).flatMap(bundle => bundle.artifacts.map(artifact => ({ artifact, bundle, candidate: bundle.candidates.find(candidate => candidate.evidenceIds.includes(artifact.artifactId)) ?? null }))), [bundles,snapshot?.thread.id])
+  const artifacts = useMemo(() => resultEntries.map(entry => entry.selection), [resultEntries])
   // An OpenUI card's click continues this conversation through the same send path the composer uses.
   const openUiHost = useMemo<AgentOpenUiHost | null>(() => onPrompt ? { send: onPrompt } : null, [onPrompt])
   // 按 textarea 的真实光标重算 @ 查询；只有换了一个 token 才把高亮归零，↑↓ 浏览时不清零。
@@ -236,7 +243,14 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
       {onMembers && snapshot && <button type="button" className="ln-chat-members-trigger" aria-label="管理群聊成员" onClick={onMembers}><Icon name="people" size={15}/><span>{snapshot.members.filter(member => member.membershipStatus === 'active').length} 位助手</span></button>}
       {inspectorHidden && <IconButton icon="board" label="打开工作面板" onClick={onShowWork} className="ln-chat-work-toggle"/>}
     </header>
-    <div className="ln-transcript" ref={scroll} onScroll={event => {
+    {/* 聊天 | 成果（Mikka ThreadSegments）：线程产出过什么才出现，否则顶栏保持原样。 */}
+    {hasResults && <div className="ln-thread-tabs-row">
+      <div className="ln-segment-tabs ln-thread-tabs" role="tablist" aria-label="对话或成果">
+        <button type="button" role="tab" aria-selected={segment === 'chat'} className={segment === 'chat' ? 'is-selected' : ''} onClick={() => { pinned.current = true; setSegment('chat') }}>聊天</button>
+        <button type="button" role="tab" aria-selected={segment === 'results'} className={segment === 'results' ? 'is-selected' : ''} onClick={() => setSegment('results')}>成果</button>
+      </div>
+    </div>}
+    {segment === 'chat' ? <div className="ln-transcript" ref={scroll} onScroll={event => {
       const el = event.currentTarget; pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 90
       if (pinned.current) setShowLatest(false)
     }}>
@@ -263,7 +277,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
           <div className="ln-message-actions"><button type="button" aria-label="复制消息" title="复制消息" onClick={() => { void navigator.clipboard.writeText(message.body).then(() => { setCopied(message.id); window.setTimeout(() => setCopied(null), 1500) }) }}><Icon name={copied === message.id ? 'check' : 'copy'} size={13}/></button><time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time></div>
         </article>
       })}
-      {artifacts.length > 0 && <div className="ln-delivered-files">{artifacts.map(selection => <button type="button" className="ln-artifact-card" key={selection.artifact.artifactId} onClick={() => onArtifact(selection)}><span className="ln-document-icon"><Icon name="file" size={22}/></span><span><strong>{selection.artifact.relativePath.split(/[\\/]/).pop()}</strong><small>{selection.candidate?.acceptanceStatus === 'accepted' ? '已接受' : selection.candidate?.acceptanceStatus === 'rejected' ? '已退回' : '等待审阅'}</small></span><Icon name="right" size={15}/></button>)}</div>}
+      {artifacts.length > 0 && <div className="ln-delivered-files">{artifacts.map(selection => <button type="button" className="ln-artifact-card" key={selection.artifact.artifactId} onClick={() => onArtifact(selection)}><span className="ln-document-icon"><Icon name="file" size={22}/></span><span><strong>{selection.artifact.relativePath.split(/[\\/]/).pop()}</strong><small>{resultStatusLabel(selection.candidate)}</small></span><Icon name="right" size={15}/></button>)}</div>}
       {pendingQuestions.map(question => onAnswerQuestion && <PiQuestionCard key={questionKey(question)} question={question} name={agents.find(agent => agent.agentId === question.agentId)?.displayName || '助手'} onAnswer={onAnswerQuestion}/>)}
       {running.map(run => waitingRuns.has(run.id)
         ? <p key={run.id} role="status">{agents.find(agent => agent.agentId === run.agentId)?.displayName || '助手'} · 等你回答</p>
@@ -272,13 +286,13 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
           onStop={onStopRun ? () => onStopRun(run) : undefined}/>)}
       {endedRun?.status === 'failed' && <RunFailure run={endedRun} runs={snapshot?.agentRuns ?? []} agent={agents.find(agent => agent.agentId === endedRun.agentId) ?? null} sending={sending} onRetry={onRetryRun} onConfigure={onConfigureRuntime} onOpenRuntimeSetup={onOpenRuntimeSetup} platform={hostPlatform}/>}
       {systemMessages.length > 0 && <details className="ln-system-records"><summary>会话记录 <span>{systemMessages.length}</span></summary>{systemMessages.map(message => <AgentMarkdown key={message.id} text={message.body}/>)}</details>}
-    </div>
+    </div> : <ThreadResults entries={resultEntries} onArtifact={onArtifact}/>}
     <div className="ln-composer-area">
-      {showLatest && <button type="button" className="ln-jump-latest" title="回到最新消息" aria-label="回到最新消息" onClick={jump}><Icon name="down" size={18}/></button>}
+      {segment === 'chat' && showLatest && <button type="button" className="ln-jump-latest" title="回到最新消息" aria-label="回到最新消息" onClick={jump}><Icon name="down" size={18}/></button>}
       {error && <div className="ln-send-error" role="alert" data-slot="send-error"><strong>请求失败，请稍后重试。</strong>{error.trim() && error.trim() !== '请求失败，请稍后重试。' && <small>{error}</small>}<p>你的输入已保留。</p><button type="button" disabled={sending || (!draft.trim() && !files.length)} onClick={() => onSend(isGroup ? mentionRecipient(draft, activeMembers) : undefined)}>{sending ? '正在重试…' : '重试此回复'}</button></div>}
       {snapshot?.approvals.filter(approval => approval.status === 'pending').map(approval => <section className="ln-approval-request" key={approval.id} aria-label="等待你的授权" data-state={approval.status} aria-busy={approvalBusy}><strong><Icon name="hand" size={16}/>需要你确认<span className="ln-approval-state" data-state={approval.status}>{approvalStatusLabel(approval.status)}</span></strong><p>{approval.actionSummary}</p>{approval.reason && <small>{approval.reason}</small>}<p className="ln-approval-scope">{agents.find(agent => agent.agentId === approval.agentId)?.displayName || '当前助手'} · {approval.options.some(option => option.kind === 'allow_session') ? '持续授权仅限此原生会话，具体范围见选项。' : '本次请求按运行端提供的范围授权。'}</p><div>{approval.options.map(option => <button type="button" disabled={approvalBusy} key={option.optionId} title={option.consequence} className={option.kind === 'allow_once' ? 'is-once' : option.kind === 'allow_session' ? 'is-persistent' : ''} onClick={() => onResolveApproval(approval.id, option.optionId)}>{option.label}</button>)}</div></section>)}
       {resolvedApproval && <p className="ln-approval-result" data-slot="approval-result" data-state={resolvedApproval.status} aria-label={`${approvalStatusLabel(resolvedApproval.status)}的授权`}><Icon name={resolvedApproval.status === 'approved' ? 'check' : 'blocked'} size={14}/><span>{resolvedApproval.actionSummary}</span><em>{approvalStatusLabel(resolvedApproval.status)}</em></p>}
-      <form className="ln-composer" onPaste={event => { if (pasteAttachments(event.clipboardData, files, onFiles)) { event.preventDefault(); event.stopPropagation() } }} onSubmit={event => { event.preventDefault(); if (!sending && !composing.current && (draft.trim() || files.length)) onSend(isGroup ? mentionRecipient(draft, activeMembers) : undefined) }}>
+      {segment === 'chat' && <form className="ln-composer" onPaste={event => { if (pasteAttachments(event.clipboardData, files, onFiles)) { event.preventDefault(); event.stopPropagation() } }} onSubmit={event => { event.preventDefault(); if (!sending && !composing.current && (draft.trim() || files.length)) onSend(isGroup ? mentionRecipient(draft, activeMembers) : undefined) }}>
         <PendingAttachments files={files} onRemove={onFiles}/>
         {mentionOpen && <MentionPopup id="ln-mention-options" options={mentionChoices} activeIndex={mentionActiveIndex} onPick={pickMention} onHover={setMentionIndex}/>}
         <textarea ref={input} value={draft}
@@ -316,7 +330,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
           }}/>
         {isGroup && activeMembers.length > 0 && <p className="ln-composer-hint">写 <strong>@名字</strong> 指定谁回复，不 @ 时由服务端挑选。可 @ {activeMembers.map(agent => agent.displayName).join('、')}</p>}
         <footer className="ln-composer-footer"><div className="ln-composer-left"><input ref={fileInput} type="file" multiple accept={USER_ATTACHMENT_ACCEPT} hidden onChange={event => { addPickedAttachments(event.target.files, files, onFiles); event.target.value = '' }}/><IconButton icon="plus" label="添加图片或附件（也可直接粘贴图片）" onClick={() => fileInput.current?.click()}/></div><button className="ln-send-button" type="submit" aria-label={sending ? '正在发送' : '发送消息'} disabled={sending || (!draft.trim() && !files.length)}>{sending ? <span className="ln-spinner"/> : <Icon name="up" size={17}/>}</button></footer>
-      </form>
+      </form>}
     </div>
   </main>
   </AgentOpenUiProvider>

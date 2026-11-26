@@ -2,8 +2,9 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import type { AgentProfile, ConversationItem, ThreadSnapshot } from './types'
-import type { DomainEventView } from '@contracts'
+import type { DomainEventView, LoomArtifact, LoomCandidate, MissionRecord } from '@contracts'
 import { ConversationView } from './ConversationView'
+import type { WorkBundle } from './types'
 
 vi.mock('../MemberAvatar', async () => {
   const { createElement: h } = await import('react')
@@ -116,5 +117,48 @@ describe('member timeline system lines', () => {
     expect(html.split('Muwa已加入群聊').length - 1).toBe(1)
     expect(html.split('data-member-event-kind="removed"').length - 1).toBe(1)
     expect(html.split('Muwa已移出群聊').length - 1).toBe(1)
+  })
+})
+
+// 聊天 | 成果（Mikka ThreadSegments）：线程产出过成果才出现切换；默认停在聊天段，
+// 成果分组与打开入口在 ThreadResults/thread-artifacts 的测试里覆盖。
+const artifact = (over: Partial<LoomArtifact>): LoomArtifact => ({
+  artifactId: 'a1', planId: 'p1', taskId: 't1', agentRunId: 'r1',
+  relativePath: 'out/report.md', sha256: 's', sizeBytes: 2048, contentType: null,
+  creatorId: 'host', createdAt: '2026-11-26T10:00:00.000Z', ...over
+})
+
+const bundleWith = (threadId: string | null, artifacts: LoomArtifact[]): WorkBundle => ({
+  mission: { missionId: 'm1', title: '发版', threadId } as unknown as MissionRecord,
+  plan: null, tasks: [], candidates: [] as LoomCandidate[], artifacts, reviews: [], verifications: []
+})
+
+const viewWithBundles = (thread: ThreadSnapshot, bundles: WorkBundle[]): string =>
+  renderToStaticMarkup(createElement(ConversationView, {
+    item: item(), snapshot: thread, agents: [hanzi, muwa], bundles, loading: false, sending: false,
+    draft: '', files: [], error: null, onDraft: () => {}, onFiles: () => {}, onSend: () => {}, onProfile: () => {},
+    onArtifact: () => {}, onShowSidebar: () => {}, sidebarHidden: false, onShowWork: () => {}, inspectorHidden: false,
+    onAttachment: () => {}, onResolveApproval: () => {}, approvalBusy: false, onMembers: () => {}, onWorkspaceManager: () => {}
+  }))
+
+describe('聊天 | 成果 segmented toggle', () => {
+  const thread = snapshot('发版群', [member('a1', 'Hanzi'), member('a2', 'Muwa')])
+
+  it('shows the 聊天/成果 toggle only when this thread produced artifacts', () => {
+    const withResults = viewWithBundles(thread, [bundleWith('th-1', [artifact({})])])
+    expect(withResults).toContain('ln-thread-tabs')
+    expect(withResults).toContain('>聊天</button>')
+    expect(withResults).toContain('>成果</button>')
+    expect(withResults).toContain('aria-selected="true"') // 默认停在聊天段
+    const withoutResults = viewWithBundles(thread, [bundleWith('th-2', [artifact({})])])
+    expect(withoutResults).not.toContain('ln-thread-tabs')
+  })
+
+  it('keeps the chat transcript as the default segment', () => {
+    const html = viewWithBundles(thread, [bundleWith('th-1', [artifact({})])])
+    expect(html).toContain('ln-transcript')
+    expect(html).toContain('ln-composer')
+    // 成果段本体此刻未展开（默认聊天段），切换后的分组渲染在 ThreadResults 测试覆盖。
+    expect(html).not.toContain('ln-result-group')
   })
 })
