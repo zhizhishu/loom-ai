@@ -1425,7 +1425,9 @@ fn user_envelope<P>(payload: P) -> CommandEnvelope<P> {
 mod tests {
     use super::*;
     use crate::context::{self, render_session_bootstrap};
-    use crate::skill::{CommitSkillImportCommand, SetSkillEnabledCommand, SetSkillMetadataCommand, SkillMetadataPatch};
+    use crate::skill::{
+        CommitSkillImportCommand, SetSkillEnabledCommand, SetSkillMetadataCommand, SkillMetadataPatch,
+    };
     use std::path::{Path, PathBuf};
 
     fn write_skill_folder(root: &Path, name: &str, body: &str) -> PathBuf {
