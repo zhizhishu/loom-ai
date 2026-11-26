@@ -140,6 +140,7 @@
 .ln-computer-grant-row>span { display:flex; flex-direction:column; gap:3px; }
 .ln-computer-grant-row strong { font-size:12px; }
 .ln-computer-grant-row small { font-size:12px; color:var(--ln-muted); }
+.ln-computer-mode{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin:10px 0}.ln-computer-mode>span{font-size:12px;color:var(--ln-muted);margin-right:auto}
 
 /* A single contextual workspace; readable materials instead of repeated drawers. */
 .ln-workspace-dock .ln-inspector-header{height:62px;flex-basis:62px;gap:12px;padding:10px 16px}
