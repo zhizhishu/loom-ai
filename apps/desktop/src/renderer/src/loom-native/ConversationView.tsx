@@ -16,6 +16,7 @@ import { MessageAttachments, PendingAttachments, addPickedAttachments, pasteAtta
 import { USER_ATTACHMENT_ACCEPT } from './user-attachments'
 import { RunEventLine, RunningActivity } from './RunningActivity'
 import { manualRetryUx } from './retry-ux'
+import { wakeRestoreLines } from './wake-restore'
 import { approvalAging, approvalAgingText } from './approval-aging'
 import { runtimeFailureMessage } from '../RuntimeFailureNotice'
 import { RuntimeInstallationGuide } from '../RuntimeInstallationGuide'
@@ -139,6 +140,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   const pendingQuestions = questions.filter(question => question.threadId === snapshot?.thread.id)
   const waitingRuns = new Set(pendingQuestions.map(question => question.agentRunId))
   const running = useMemo(() => snapshot?.agentRuns.filter(run => ['running', 'queued', 'waiting'].includes(run.status)) ?? [], [snapshot?.agentRuns])
+  const wakeLines = useMemo(() => snapshot ? wakeRestoreLines(snapshot, agents) : [], [snapshot, agents])
   const terminalRuns = useMemo(() => snapshot?.agentRuns.filter(run => ['succeeded', 'failed', 'cancelled'].includes(run.status)) ?? [], [snapshot?.agentRuns])
   // 最近一次运行：失败时仍在末尾保留可操作的失败卡；终态事实本身进入上面的时间流。
   const latestRun = useMemo(() => {
@@ -292,6 +294,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
         : <RunningActivity key={run.id} label={`${agents.find(agent => agent.agentId === run.agentId)?.displayName || '助手'}正在处理`}
           stopping={stoppingRunIds.includes(run.id) || run.cancelRequestedAt !== null}
           onStop={onStopRun ? () => onStopRun(run) : undefined}/>)}
+      {wakeLines.map(line => <p key={`wake:${line.recipientAgentId}`} className="ln-wake-restore" role={line.working ? 'status' : 'alert'} data-state={line.state}>{line.label}</p>)}
       {endedRun?.status === 'failed' && <RunFailure run={endedRun} runs={snapshot?.agentRuns ?? []} agent={agents.find(agent => agent.agentId === endedRun.agentId) ?? null} sending={sending} onRetry={onRetryRun} onConfigure={onConfigureRuntime} onOpenRuntimeSetup={onOpenRuntimeSetup} platform={hostPlatform}/>}
       {systemMessages.length > 0 && <details className="ln-system-records"><summary>会话记录 <span>{systemMessages.length}</span></summary>{systemMessages.map(message => <AgentMarkdown key={message.id} text={message.body}/>)}</details>}
     </div> : <ThreadResults entries={resultEntries} onArtifact={onArtifact}/>}
