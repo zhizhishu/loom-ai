@@ -119,6 +119,7 @@ fn http_status(code: &'static str) -> StatusCode {
         "computer_node_unsupported" => StatusCode::CONFLICT,
         "computer_device_mismatch"
         | "computer_control_held"
+        | "computer_human_control"
         | "computer_control_required"
         | "computer_lease_expired"
         | "computer_input_stale"
@@ -611,6 +612,7 @@ struct Control {
     total_deadline: u64,
     seq_high: u64,
     last_input_at: u64,
+    agent: bool,
 }
 
 impl Control {
@@ -1241,6 +1243,25 @@ impl Computer {
         session: &Arc<Session>,
         body: ControlBody,
     ) -> Result<Value, &'static str> {
+        self.acquire_kind(sessions, session, body, false)
+    }
+
+    pub(crate) fn acquire_agent(
+        &self,
+        sessions: &Sessions,
+        session: &Arc<Session>,
+        body: ControlBody,
+    ) -> Result<Value, &'static str> {
+        self.acquire_kind(sessions, session, body, true)
+    }
+
+    fn acquire_kind(
+        &self,
+        sessions: &Sessions,
+        session: &Arc<Session>,
+        body: ControlBody,
+        agent_control: bool,
+    ) -> Result<Value, &'static str> {
         self.supported_or("computer_unsupported")?;
         if !body.consent {
             return Err("computer_consent_required");
@@ -1281,9 +1302,15 @@ impl Computer {
         }
         if let Some(control) = &gate.control {
             if control.client_id != session.client_id {
-                // One controller for the physical device, across every view and
-                // every session. A second session never displaces the holder.
-                return Err("computer_control_held");
+                // A human click preempts an assistant-held lease, but never another
+                // human. An assistant never displaces a human holder.
+                if control.agent && !agent_control {
+                    // Replacing the lease below allocates a fresh epoch.
+                } else if !control.agent && agent_control {
+                    return Err("computer_human_control");
+                } else {
+                    return Err("computer_control_held");
+                }
             }
         }
         let Some(view) = gate.views.get(&body.view_id) else {
@@ -1320,6 +1347,7 @@ impl Computer {
             total_deadline: now + CONTROL_TOTAL_MAX_MS,
             seq_high: 0,
             last_input_at: now,
+            agent: agent_control,
         });
         Ok(json!({
             "controlId": id,
@@ -2505,6 +2533,49 @@ mod tests {
             key: None,
             text: None,
         }
+    }
+
+    #[test]
+    fn human_takeover_preempts_agent_and_handback_restores_agent_control() {
+        let fixture = fixture();
+        let human_view = fixture.view();
+        let agent_session = fixture.second_session();
+        let agent_view = fixture.view_as(&agent_session);
+        let body_for = |view: &str| ControlBody {
+            view_id: view.to_owned(),
+            device_id: fixture.mock.device.id.clone(),
+            consent: true,
+            ttl_seconds: 30,
+        };
+        let agent = fixture
+            .computer
+            .acquire_agent(&fixture.sessions, &agent_session, body_for(&agent_view))
+            .unwrap();
+        let agent_epoch = agent["generation"].as_u64().unwrap();
+        let human = fixture
+            .acquire_as(&fixture.session, &human_view, 30)
+            .unwrap();
+        assert!(human["generation"].as_u64().unwrap() > agent_epoch);
+        assert_eq!(
+            fixture.computer.acquire_agent(
+                &fixture.sessions,
+                &agent_session,
+                body_for(&agent_view),
+            ),
+            Err("computer_human_control")
+        );
+        fixture
+            .handback(
+                &fixture.session,
+                &human_view,
+                human["controlId"].as_str().unwrap(),
+                human["generation"].as_u64().unwrap(),
+            )
+            .unwrap();
+        assert!(fixture
+            .computer
+            .acquire_agent(&fixture.sessions, &agent_session, body_for(&agent_view))
+            .is_ok());
     }
 
     #[test]
