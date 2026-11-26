@@ -148,7 +148,7 @@ export function AboutUpdatesSettingsView({
     <div className="about-updates-settings" data-update-read-only={readOnly}>
       <SettingsPageHeader
         eyebrow={uiAttribute("设置 / 关于与更新")}
-        title={uiAttribute("关于与更新")}
+        title="关于"
         description={readOnly ? uiAttribute("版本信息与更新日志。") : uiAttribute("自动检查新版本，下载与安装由你决定。")}
       />
 

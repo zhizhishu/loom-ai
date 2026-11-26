@@ -232,7 +232,7 @@ export function DiagnosticsCenter({
     <div className="diagnostics-center">
       <SettingsPageHeader
         eyebrow={uiAttribute("设置 / 诊断")}
-        title={uiAttribute("诊断与修复")}
+        title="数据与诊断"
         description={uiAttribute("检查运行环境并处理可安全修复的问题。")}
         aside={(
           <>

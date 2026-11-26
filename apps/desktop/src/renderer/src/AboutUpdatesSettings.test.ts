@@ -106,7 +106,7 @@ describe('AboutUpdatesSettingsView', () => {
     const markup = render(snapshot())
     expect(markup).toContain('class="about-updates-settings" data-update-read-only="false"')
     expect(markup).toContain('data-update-status="idle" role="status"')
-    expect(markup).toContain('<h1>关于与更新</h1>')
+    expect(markup).toContain('<h1>关于</h1>')
     expect(markup).toContain('data-installed-version="true">v0.0.2</span>')
     expect(markup).toContain('>检查更新</button>')
     expect(markup).toContain('下载与安装由你决定')
