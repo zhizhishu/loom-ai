@@ -276,6 +276,9 @@ impl ClaudeControl {
                     .get("response")
                     .context("Claude control response has no response")?;
                 if response.get("request_id").and_then(Value::as_str) != Some(&self.initialize_id) {
+                    if self.state.lock().unwrap().initialized {
+                        return Ok(true);
+                    }
                     bail!("Claude Code returned an unknown control response ID");
                 }
                 let sender = self
