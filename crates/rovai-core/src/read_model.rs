@@ -4798,6 +4798,19 @@ mod tests {
         }
         transaction
             .execute_batch(
+                "UPDATE camp_message_delivery
+                 SET wake_attempts=1, next_wake_at='2999-01-01T00:00:00Z', wake_lease_until='2999-01-01T00:00:00Z'
+                 WHERE id='user-current';",
+            )
+            .unwrap();
+        let wake = super::load_message_deliveries(&transaction, "camp", None).unwrap();
+        let wake = wake.iter().find(|d| d.id == "user-current").unwrap();
+        assert_eq!(wake.wake_attempts, Some(1));
+        assert_eq!(wake.next_wake_at.as_deref(), Some("2999-01-01T00:00:00Z"));
+        assert_eq!(wake.wake_lease_until.as_deref(), Some("2999-01-01T00:00:00Z"));
+        assert_eq!(wake.wake_state.as_deref(), Some("wake_waiting"));
+        transaction
+            .execute_batch(
                 "UPDATE camp_message_delivery SET requested_mode='steer' WHERE id='user-current';
             INSERT INTO context_manifest VALUES('steer-manifest','user-current');
             INSERT INTO runtime_input_delivery(context_manifest_id, status, input_sequence) VALUES('steer-manifest','delivery_unknown',1);",
