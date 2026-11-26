@@ -422,7 +422,8 @@ async function run () {
   assert.ok(expiryError, 'expiring takeover did not refuse further control')
   record('expiryStop', { mode: FULL_EXPIRY ? 'five-minute-heartbeat' : 'quick-idle-deadman', code: expiryError.code ?? null, waitedMs: Date.now() - expiryStarted })
 
-  const after = await framePng(session, expiryView.viewId, join(outDir, 'xvfb-after.png'))
+  const afterView = await workbench({ origin: ORIGIN, session, path: '/computer/view', body: { deviceId, consent: true } })
+  const after = await framePng(session, afterView.viewId, join(outDir, 'xvfb-after.png'))
   assert.ok(after.bytes > 1_000, `post-run screenshot is empty or too small: ${after.bytes}`)
   report.screenshots.after = after
   report.status = 'passed'
