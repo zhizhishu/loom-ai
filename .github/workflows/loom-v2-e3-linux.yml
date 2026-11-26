@@ -1,0 +1,135 @@
+name: LOOM V2 Linux isolated personal
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'apps/web/**'
+      - 'crates/rovai-core/**'
+      - 'crates/rovai-host/**'
+      - 'crates/loom-node/**'
+      - 'crates/loom-pi-launcher/**'
+      - 'resources/computer/**'
+      - 'scripts/package-linux-personal.mjs'
+      - 'scripts/package-computer-runtime-linux.mjs'
+      - 'scripts/manage-loom-personal.sh'
+      - 'scripts/start-loom-personal.sh'
+      - 'scripts/install-loom-personal.sh'
+      - '.github/workflows/loom-v2-e3-linux.yml'
+      - 'scripts/lib/linux-personal.test.mjs'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: loom-v2-e3-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  personal-linux:
+    name: LOOM Linux x64 personal preview
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CI: true
+      LOOM_SOURCE_COMMIT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      CARGO_BUILD_JOBS: 3
+      PIP_DISABLE_PIP_VERSION_CHECK: 1
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.LOOM_SOURCE_COMMIT }}
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          rustup default 1.97.1
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: linux-personal-e3
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.14.1
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.20.0
+          run_install: false
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Verify Linux personal packaging contract
+        run: node --test scripts/lib/linux-personal.test.mjs
+      - name: Build Linux server preview
+        run: node scripts/build-server.mjs --target-key linux-x64 --debug
+      - name: Build Linux LOOM helper binaries
+        run: cargo +1.97.1 build --locked -p rovai-core -p loom-node -p loom-pi-launcher --bins
+      - name: Verify reviewed computer helper
+        run: python3 -m unittest discover -s resources/computer -v
+      - name: Install pinned Pi source
+        run: |
+          mkdir -p out/pi-source
+          cp scripts/pi-source/package.json scripts/pi-source/package-lock.json out/pi-source/
+          cd out/pi-source
+          npm ci --ignore-scripts --no-audit --no-fund
+      - name: Stage and verify embedded Linux Pi runtime
+        run: |
+          node scripts/package-embedded-pi.mjs \
+            --source out/pi-source/node_modules/@earendil-works/pi-coding-agent \
+            --node "$(readlink -f "$(command -v node)")" \
+            --launcher-built target/debug/loom-pi-launcher \
+            --destination resources/runtime/pi
+          node scripts/package-embedded-pi.mjs --verify --destination resources/runtime/pi
+      - name: Stage and verify DSH hook executor
+        run: |
+          node scripts/package-dsh-hook-executor.mjs
+          node scripts/package-dsh-hook-executor.mjs --verify
+      - name: Stage and verify Linux computer runtime
+        run: |
+          rm -rf resources/runtime/computer-linux
+          node scripts/package-computer-runtime-linux.mjs --destination resources/runtime/computer-linux
+          node scripts/package-computer-runtime-linux.mjs --verify --destination resources/runtime/computer-linux
+      - name: Assemble Linux personal package
+        run: |
+          mkdir -p out/linux-personal
+          node scripts/package-linux-personal.mjs \
+            --server-dir out/server/linux-x64 \
+            --pi-dir resources/runtime/pi \
+            --dsh-dir resources/runtime/dsh-hook-executor \
+            --computer-dir resources/runtime/computer-linux \
+            --binary target/debug/rovai-core \
+            --binary target/debug/loom-node \
+            --output out/linux-personal/loom-personal-linux-x64 \
+            --archive out/linux-personal/loom-personal-linux-x64.tar.gz
+      - name: Upload Linux personal artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: loom-personal-preview-linux-${{ env.LOOM_SOURCE_COMMIT }}
+          path: out/linux-personal/loom-personal-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+      - name: Download byte-for-byte artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: loom-personal-preview-linux-${{ env.LOOM_SOURCE_COMMIT }}
+          path: out/linux-personal-download
+      - name: Verify delivered Linux package closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f out/linux-personal-download/loom-personal-linux-x64.tar.gz
+          cmp out/linux-personal/loom-personal-linux-x64.tar.gz out/linux-personal-download/loom-personal-linux-x64.tar.gz
+          rm -rf out/linux-personal-verify
+          mkdir -p out/linux-personal-verify
+          tar -xzf out/linux-personal-download/loom-personal-linux-x64.tar.gz -C out/linux-personal-verify
+          node scripts/package-linux-personal.mjs --verify --output out/linux-personal-verify/loom-personal-linux-x64
+          grep -q "LOOM_COMPUTER_AGENT_PI_MCP='1'" out/linux-personal-verify/loom-personal-linux-x64/Manage-Loom.sh
+          grep -q 'LOOM_COMPUTER_PYTHON=' out/linux-personal-verify/loom-personal-linux-x64/Manage-Loom.sh
+          grep -q 'LOOM_COMPUTER_HELPER=' out/linux-personal-verify/loom-personal-linux-x64/Manage-Loom.sh
+          grep -q 'LOOM_COMPUTER_AGENT_PYTHON=' out/linux-personal-verify/loom-personal-linux-x64/Manage-Loom.sh
+          grep -q 'LOOM_COMPUTER_AGENT_BRIDGE=' out/linux-personal-verify/loom-personal-linux-x64/Manage-Loom.sh
+          test -x out/linux-personal-verify/loom-personal-linux-x64/runtime/computer/python
+          test -f out/linux-personal-verify/loom-personal-linux-x64/runtime/computer/host_desktop.py
+          test -f out/linux-personal-verify/loom-personal-linux-x64/runtime/computer/mcp_bridge.py
