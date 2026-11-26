@@ -363,7 +363,7 @@ export class InvalidationDecoder {
 type SessionResponse = { protocolVersion?: unknown; token?: unknown; clientId?: unknown; editorProof?: unknown; ownerId?: unknown; channels?: unknown; fileTransfers?: { uploadMaxBytes?: unknown; nativeDownload?: unknown }; expiresAt?: unknown; serverTime?: unknown; renewalWindowSeconds?: unknown }
 
 type RemoteComputerPath = `computer/nodes/${string}`
-type WorkbenchPath = RemoteComputerPath | 'computer/agents/list' | 'computer/agents/grant' | 'computer/agents/revoke' | 'native-discovery' | 'native-discovery/preview' | 'native-discovery/import-mcp' | 'computer/status' | 'computer/view' | 'computer/frame' | 'computer/control' | 'computer/control/heartbeat' | 'computer/control/release' | 'computer/view/stop' | 'computer/input'
+type WorkbenchPath = RemoteComputerPath | 'computer/agents/list' | 'computer/agents/grant' | 'computer/agents/revoke' | 'computer/agents/mode' | 'computer/agents/mode/status' | 'computer/agents/approvals/list' | 'computer/agents/approvals/decide' | 'native-discovery' | 'native-discovery/preview' | 'native-discovery/import-mcp' | 'computer/status' | 'computer/view' | 'computer/frame' | 'computer/control' | 'computer/control/heartbeat' | 'computer/control/release' | 'computer/view/stop' | 'computer/input'
 
 export class ConsoleClient {
   readonly origin: string
@@ -1175,7 +1175,11 @@ export class ConsoleClient {
       agents: {
         list: () => this.#workbenchJson('computer/agents/list', {}),
         grant: input => this.#workbenchJson('computer/agents/grant', { ...input, consent: true }),
-        revoke: grantId => this.#workbenchJson('computer/agents/revoke', { grantId })
+        revoke: grantId => this.#workbenchJson('computer/agents/revoke', { grantId }),
+        modeStatus: assistantId => this.#workbenchJson('computer/agents/mode/status', { assistantId }),
+        setMode: (assistantId, mode) => this.#workbenchJson('computer/agents/mode', { assistantId, mode }),
+        approvalsList: assistantId => this.#workbenchJson('computer/agents/approvals/list', assistantId ? { assistantId } : {}),
+        decideApproval: (approvalId, decision) => this.#workbenchJson('computer/agents/approvals/decide', { approvalId, decision })
       },
       status: () => this.#workbenchJson('computer/status', {}),
       startView: deviceId => this.#workbenchJson('computer/view', { deviceId, consent: true }),
@@ -1199,7 +1203,11 @@ export class ConsoleClient {
       agents: {
         list: () => this.#workbenchJson('computer/agents/list', {}),
         grant: input => this.#workbenchJson('computer/agents/grant', { ...input, nodeId, consent: true }),
-        revoke: grantId => this.#workbenchJson('computer/agents/revoke', { grantId })
+        revoke: grantId => this.#workbenchJson('computer/agents/revoke', { grantId }),
+        modeStatus: assistantId => this.#workbenchJson('computer/agents/mode/status', { assistantId }),
+        setMode: (assistantId, mode) => this.#workbenchJson('computer/agents/mode', { assistantId, mode }),
+        approvalsList: assistantId => this.#workbenchJson('computer/agents/approvals/list', assistantId ? { assistantId } : {}),
+        decideApproval: (approvalId, decision) => this.#workbenchJson('computer/agents/approvals/decide', { approvalId, decision })
       },
       status: () => this.#workbenchJson(base, {}),
       startView: deviceId => this.#workbenchJson(`${base}/view`, { deviceId, consent:true }),
