@@ -2715,6 +2715,12 @@ fn run_tool(
         }
         Tool::MouseClick | Tool::Wheel | Tool::Key | Tool::Text => {
             let event = event_for(tool, arguments)?;
+            // A user takeover refuses the request before an approval card can
+            // appear; otherwise the card would look actionable even though the
+            // physical boundary must reject the input.
+            if computer.human_control_active() {
+                return Err(Failure::code("computer_agent_human_control"));
+            }
             if let Some(agents) = agents {
                 agents.wait_for_approval(grant, browser, tool, &event)?;
             }
@@ -3331,6 +3337,60 @@ mod tests {
             .wait_for_approval(&grant, &browser, Tool::MouseClick, &approval_event())
             .is_ok());
         assert!(agents.list_approvals(Some("assistant-1")).is_empty());
+    }
+
+    #[test]
+    fn human_takeover_is_refused_before_an_approval_is_queued() {
+        let (entered_tx, _entered_rx) = mpsc::channel();
+        let (_proceed_tx, proceed) = mpsc::channel::<()>();
+        let provider = BlockingProvider::new(entered_tx, proceed);
+        let clock = Arc::new(AtomicU64::new(1_800_000_000_000));
+        let computer = Arc::new(Computer::with_test_provider(provider.clone(), {
+            let clock = clock.clone();
+            Arc::new(move || clock.load(Ordering::SeqCst))
+        }));
+        let (sessions, owner, _token) = browser();
+        let grant = grant_for(&sessions, &owner, wall_clock() + 60_000, false);
+        let agents = AgentGrants::for_test(FakeMcp::new());
+        let view = computer
+            .start_view(
+                &sessions,
+                &owner,
+                ViewBody {
+                    consent: true,
+                    device_id: "sha256:blocking".to_owned(),
+                },
+            )
+            .ok()
+            .expect("human view must open");
+        computer
+            .acquire(
+                &sessions,
+                &owner,
+                ControlBody {
+                    view_id: view["viewId"].as_str().unwrap().to_owned(),
+                    device_id: "sha256:blocking".to_owned(),
+                    consent: true,
+                    ttl_seconds: 30,
+                },
+            )
+            .ok()
+            .expect("human takeover must acquire the device");
+
+        let failure = run_tool(
+            &computer,
+            &sessions,
+            Some(&agents),
+            &grant,
+            Tool::MouseClick,
+            "req-human-before-approval",
+            json!({"x": 100, "y": 100, "button": "left"}),
+        )
+        .err()
+        .expect("human control must refuse the assistant input");
+        assert_eq!(failure.code, "computer_agent_human_control");
+        assert!(agents.list_approvals(Some("assistant-1")).is_empty());
+        assert_eq!(provider.inputs.load(Ordering::SeqCst), 0);
     }
 
     #[test]
