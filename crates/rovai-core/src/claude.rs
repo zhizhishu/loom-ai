@@ -1173,7 +1173,9 @@ impl ClaudeCodeCliRuntimeAdapter {
             output.result = protocol.redact_text(&output.result);
         }
         let stderr = stderr.expect("Claude Code stderr was collected");
-        if !status.success() {
+        let nonfatal_model_diagnostic_only = stdout.final_result.is_some()
+            && claude_stderr_is_unrecognized_model_only(&stderr.bytes);
+        if !status.success() && !nonfatal_model_diagnostic_only {
             let raw_stderr = protocol.redact_text(&String::from_utf8_lossy(&stderr.bytes));
             let exit_diagnostic = format!(
                 "Claude Code process exited with {} (stderrBytes={}, stderrDigest={})",
@@ -1477,6 +1479,14 @@ fn validate_claude_terminal_result(
         ));
     }
     Ok(final_output)
+}
+
+fn claude_stderr_is_unrecognized_model_only(stderr: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(stderr);
+    !text.trim().is_empty()
+        && text
+            .lines()
+            .all(|line| line.trim_start().starts_with("[claude-code:unrecognized_model]"))
 }
 
 fn explicit_mcp_config_rejection(stderr: &[u8]) -> bool {
