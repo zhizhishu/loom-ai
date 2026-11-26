@@ -1227,10 +1227,10 @@ impl Computer {
 
     /// Take control of the physical device: the takeover boundary.
     ///
-    /// * Exclusive. A live lease held by any other client is refused with
-    ///   `computer_control_held`; a second session never displaces the holder.
-    ///   Taking over again while holding is a fresh takeover by the same holder
-    ///   and replaces the lease, exactly as the upstream takeover branch does.
+    /// * Exclusive within each holder kind. A human click preempts an assistant
+    ///   lease, while an assistant never displaces a human holder; same-kind
+    ///   conflicts still refuse a second holder. Taking over again while holding
+    ///   replaces the lease, exactly as the upstream takeover branch does.
     /// * Epoch-bearing. The grant allocates the next epoch, whether the previous
     ///   lease had lapsed, been handed back or never existed. Every input is
     ///   fenced against that value, so an input admitted for an earlier holder
@@ -1253,6 +1253,16 @@ impl Computer {
         body: ControlBody,
     ) -> Result<Value, &'static str> {
         self.acquire_kind(sessions, session, body, true)
+    }
+
+    pub(crate) fn human_control_active(&self) -> bool {
+        let Ok(gate) = self.gate() else {
+            return false;
+        };
+        let now = self.now();
+        gate.control
+            .as_ref()
+            .is_some_and(|control| !control.agent && control_alive(&gate, control, now))
     }
 
     fn acquire_kind(
