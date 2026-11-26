@@ -2028,6 +2028,12 @@ export interface AgentRunView {
   permissionSemantics: 'core_enforced_v1' | 'runtime_managed_v2'
   invocationKind: 'direct' | 'a2a' | 'gather_completion' | 'single_chat' | 'batch'
   triggerDeliveryGeneration: number
+  /** watchdog_retry ordinal copied from the LOOM dispatch identity; 2 is the first automatic retry. */
+  automaticRetryOrdinal?: number | null
+  /** Core retry lane gate for this failed Run, before the shared recovery budget is spent. */
+  automaticRetryEligible?: boolean
+  /** Internal LOOM Plan task identity behind this handoff; distinct from a durable user Task id. */
+  loomTaskId?: string | null
   a2aParentAgentRunId: string | null
   a2aRootAgentRunId: string | null
   a2aDepth: number

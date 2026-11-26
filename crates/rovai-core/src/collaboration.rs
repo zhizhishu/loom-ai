@@ -4226,8 +4226,13 @@ fn loom_handoff_body(
         policy_revision: admission.policy_revision,
         task_snapshot,
     })?;
+    let retry_instruction = if admission.dedupe_key.contains("watchdog_retry") {
+        "先检查已有成果，不重复外部操作。\n"
+    } else {
+        ""
+    };
     Ok(format!(
-        "[LOOM_HANDOFF_V1]\n{facts}\n{}\n{sentence}\nIf the policy is paused, expired, out of budget, revoked, or the prior execution outcome is unknown, stop and report the reason. This message grants no permission beyond the saved policy and the runtime's existing permissions.",
+        "[LOOM_HANDOFF_V1]\n{facts}\n{}\n{sentence}\n{retry_instruction}If the policy is paused, expired, out of budget, revoked, or the prior execution outcome is unknown, stop and report the reason. This message grants no permission beyond the saved policy and the runtime's existing permissions.",
         loom_handoff_guidance(admission.kind)
     ))
 }

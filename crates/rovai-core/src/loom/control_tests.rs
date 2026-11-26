@@ -6784,7 +6784,9 @@ fn persist_retry_fixture_terminal(database: &OwnedTestDatabase, run_id: &str, st
     } else {
         "failed"
     };
-    let failure = (status == "failed").then_some(r#"{"retryable":true}"#);
+    let failure = (status == "failed").then_some(
+        r#"{"runtimeKind":"pi","origin":"runtime","phase":"execution","code":"runtime_turn_failed","summary":"Runtime failed","detail":null,"retryable":true}"#,
+    );
     let now = chrono::Utc::now().to_rfc3339();
     let tx = database.connection().unchecked_transaction().unwrap();
     assert_eq!(
@@ -6893,6 +6895,17 @@ fn retryable_failure_redispatches_once() {
         assert_eq!(expected[0], kind);
         expected.extend(["watchdog_retry".into(), "2".into()]);
         persist_retry_fixture_terminal(&database, &run_id, "failed");
+        let snapshot = crate::read_model::ReadModelService
+            .camp_snapshot(&mut database, &task.camp_id)
+            .unwrap();
+        let failed_view = snapshot
+            .agent_runs
+            .iter()
+            .find(|run| run.id == run_id)
+            .unwrap();
+        assert_eq!(failed_view.automatic_retry_ordinal, None);
+        assert!(failed_view.automatic_retry_eligible);
+        assert_eq!(failed_view.loom_task_id.as_deref(), Some("task_a"));
 
         let count_before = loom_deliveries(&database);
         let judged = chrono::Utc::now() + chrono::Duration::seconds(1);
@@ -6918,6 +6931,34 @@ fn retryable_failure_redispatches_once() {
             )
             .unwrap();
         assert_eq!(retry_kind, kind);
+        let retry_body: String = database
+            .connection()
+            .query_row(
+                "SELECT message.body
+                 FROM loom_control_dispatch AS dispatch
+                 JOIN camp_message_delivery AS delivery ON delivery.id = dispatch.delivery_id
+                 JOIN camp_message AS message ON message.id = delivery.message_id
+                 WHERE dispatch.dispatch_id=?1",
+                [&retry_dispatch],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(retry_body.contains("先检查已有成果，不重复外部操作。"));
+
+        let mut runs = claim_mission_lane(&mut database, &task.camp_id, 1);
+        assert_eq!(runs.len(), 1);
+        let retry_run_id = runs.pop().unwrap();
+        let snapshot = crate::read_model::ReadModelService
+            .camp_snapshot(&mut database, &task.camp_id)
+            .unwrap();
+        let retry_view = snapshot
+            .agent_runs
+            .iter()
+            .find(|run| run.id == retry_run_id)
+            .unwrap();
+        assert_eq!(retry_view.automatic_retry_ordinal, Some(2));
+        assert!(!retry_view.automatic_retry_eligible);
+        assert_eq!(retry_view.loom_task_id.as_deref(), Some("task_a"));
     }
 }
 

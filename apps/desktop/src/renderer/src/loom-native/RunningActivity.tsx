@@ -6,6 +6,7 @@ import { agentRunPresentation } from '../../../shared/execution-presentation'
 import { uiAttribute } from '../interface-language'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from './EmptyState'
 import { Icon } from './icons'
+import { manualRetryUx } from './retry-ux'
 
 /*
  * 搬运自 Mikka `components/ui/thinking-loader-clean.tsx`（affectUI thinking loader，
@@ -297,7 +298,7 @@ export function RunActivityHistory({ runs, agents, sending = false, onRetry }: {
     return <div className="ln-settings-row ln-activity-row" key={run.id} data-state={run.status} data-run-id={run.id}>
       <span className="ln-activity-who"><strong>{agents.find(agent => agent.agentId === run.agentId)?.displayName || '助手'}</strong>{reason && <small>{reason}</small>}</span>
       <span className="ln-activity-state">{terminal ? runActivitySummary(run) : presentation.label}</span>
-      {run.status === 'failed' && onRetry && <button type="button" className="ln-action" disabled={sending} onClick={onRetry}>{sending ? '正在重试…' : '重试'}</button>}
+      {run.status === 'failed' && onRetry && (() => { const ux = manualRetryUx(run, runs); return ux !== 'hidden' && <button type="button" className="ln-action" disabled={sending || ux === 'automatic'} title={ux === 'automatic' ? '自动重试最多 3 次，全部失败后才需要手动重试。' : '重试前先检查已有成果，不重复外部操作。'} onClick={onRetry}>{sending ? '正在重试…' : ux === 'automatic' ? '自动重试中' : '重试'}</button> })()}
     </div>
   })}</>
 }

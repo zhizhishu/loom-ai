@@ -259,7 +259,7 @@ describe('activity dialog rows (Mikka activityLine)', () => {
     expect(html).toContain('ln-activity-row')
     expect(html).toContain('工作了 39 分 17 秒 · 失败')
     expect(html).toContain('Claude Code 还没有可用的模型连接。')
-    expect(html).toContain('>重试<')
+    expect(html).toContain('自动重试中')
     expect(html).toContain('执行中')
   })
   it('says there is no activity instead of showing an empty list', () => {

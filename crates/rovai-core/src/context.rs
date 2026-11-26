@@ -4217,6 +4217,13 @@ struct DelegationFact {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct RetryFact {
+    required_action: &'static str,
+    instruction: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RunFacts {
     attachment_output_root: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4229,6 +4236,8 @@ struct RunFacts {
     session_continuity: Option<SessionContinuityFact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     external_effect: Option<ExternalEffectFact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry: Option<RetryFact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     gather: Option<GatherFact>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4306,6 +4315,7 @@ fn build_run_facts<R: ContextReadConnection>(
         task_context: None,
         session_continuity: None,
         external_effect: None,
+        retry: None,
         gather: None,
         delegation: None,
     };
@@ -4359,6 +4369,23 @@ fn build_run_facts<R: ContextReadConnection>(
         facts.external_effect = Some(ExternalEffectFact {
             state: "unsettled",
             required_action: "reconcile_before_repeat",
+        });
+    }
+    let retry_dedupe_key: Option<String> = database.context_connection().query_row(
+        r#"
+        SELECT dispatch.dedupe_key
+        FROM loom_control_dispatch AS dispatch
+        JOIN camp_message_delivery AS delivery ON delivery.id = dispatch.delivery_id
+        WHERE delivery.claimed_agent_run_id = ?1
+        ORDER BY dispatch.created_at DESC, dispatch.dispatch_id DESC LIMIT 1
+        "#,
+        [&snapshot.agent_run_id],
+        |row| row.get(0),
+    ).optional()?;
+    if retry_dedupe_key.as_deref().is_some_and(|key| key.contains("watchdog_retry")) {
+        facts.retry = Some(RetryFact {
+            required_action: "check_existing_results_before_repeating_external_effects",
+            instruction: "先检查已有成果，不重复外部操作。",
         });
     }
     if is_gather_member_run {
@@ -5344,6 +5371,7 @@ fn render_run_facts(run_facts: &RunFacts) -> Result<RenderedRunFacts> {
         (run_facts.mission.is_some(), "mission"),
         (run_facts.session_continuity.is_some(), "session_continuity"),
         (run_facts.external_effect.is_some(), "external_effect"),
+        (run_facts.retry.is_some(), "retry"),
         (run_facts.gather.is_some(), "gather"),
         (run_facts.delegation.is_some(), "delegation"),
     ] {
@@ -9574,6 +9602,7 @@ mod slow_tests {
             task_context: None,
             session_continuity: None,
             external_effect: None,
+            retry: None,
             gather: None,
             delegation: None,
         }
@@ -16660,6 +16689,10 @@ mod slow_tests {
                 state: "unsettled",
                 required_action: "reconcile_before_repeat",
             }),
+            retry: Some(RetryFact {
+                required_action: "check_existing_results_before_repeating_external_effects",
+                instruction: "先检查已有成果，不重复外部操作。",
+            }),
             gather: Some(GatherFact {
                 role: "member",
                 return_target: "current_input_source",
@@ -16695,6 +16728,10 @@ mod slow_tests {
                     "state": "unsettled",
                     "requiredAction": "reconcile_before_repeat",
                 },
+                "retry": {
+                    "requiredAction": "check_existing_results_before_repeating_external_effects",
+                    "instruction": "先检查已有成果，不重复外部操作。",
+                },
                 "gather": {
                     "role": "member",
                     "returnTarget": "current_input_source",
@@ -16713,7 +16750,7 @@ mod slow_tests {
                 },
             })
         );
-        assert_eq!(rendered.references.len(), 6);
+        assert_eq!(rendered.references.len(), 7);
 
         let non_gather_budget = RunFacts {
             delegation: Some(DelegationFact {

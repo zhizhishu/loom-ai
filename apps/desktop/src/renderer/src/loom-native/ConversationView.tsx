@@ -15,6 +15,7 @@ import { Icon, IconButton } from './icons'
 import { MessageAttachments, PendingAttachments, addPickedAttachments, pasteAttachments, type AttachmentPreviewLoader } from './UserAttachments'
 import { USER_ATTACHMENT_ACCEPT } from './user-attachments'
 import { RunActivityLine, RunningActivity } from './RunningActivity'
+import { manualRetryUx } from './retry-ux'
 import { runtimeFailureMessage } from '../RuntimeFailureNotice'
 import { RuntimeInstallationGuide } from '../RuntimeInstallationGuide'
 import { runtimeInstallGuide } from '../runtime-install-guide'
@@ -255,7 +256,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
           stopping={stoppingRunIds.includes(run.id) || run.cancelRequestedAt !== null}
           onStop={onStopRun ? () => onStopRun(run) : undefined}/>)}
       {endedRun && <RunActivityLine run={endedRun}/>}
-      {endedRun?.status === 'failed' && <RunFailure run={endedRun} agent={agents.find(agent => agent.agentId === endedRun.agentId) ?? null} sending={sending} onRetry={onRetryRun} onConfigure={onConfigureRuntime} onOpenRuntimeSetup={onOpenRuntimeSetup} platform={hostPlatform}/>}
+      {endedRun?.status === 'failed' && <RunFailure run={endedRun} runs={snapshot?.agentRuns ?? []} agent={agents.find(agent => agent.agentId === endedRun.agentId) ?? null} sending={sending} onRetry={onRetryRun} onConfigure={onConfigureRuntime} onOpenRuntimeSetup={onOpenRuntimeSetup} platform={hostPlatform}/>}
       {systemMessages.length > 0 && <details className="ln-system-records"><summary>会话记录 <span>{systemMessages.length}</span></summary>{systemMessages.map(message => <AgentMarkdown key={message.id} text={message.body}/>)}</details>}
     </div>
     <div className="ln-composer-area">
@@ -338,8 +339,8 @@ export function approvalStatusLabel(status: ActionApprovalView['status']): strin
  * `RuntimeFailureNotice.tsx` 的 `runtimeFailureMessage()`；没有结构化 failure 时退回共享的
  * `agentRunPresentation()` 短词（如「尚未配置 Runtime」），不自己另编一套。
  */
-export function RunFailure({ run, agent, sending, onRetry, onConfigure, onOpenRuntimeSetup, platform = null }: {
-  run: AgentRunView; agent: AgentProfile | null; sending: boolean
+export function RunFailure({ run, runs = [run], agent, sending, onRetry, onConfigure, onOpenRuntimeSetup, platform = null }: {
+  run: AgentRunView; runs?: readonly AgentRunView[]; agent: AgentProfile | null; sending: boolean
   onRetry?(): void; onConfigure?(): void; onOpenRuntimeSetup?(): void; platform?: HostPlatformKey | null
 }) {
   const reason = run.failure ? runtimeFailureMessage(run.failure) : agentRunPresentation(run).label
@@ -350,6 +351,7 @@ export function RunFailure({ run, agent, sending, onRetry, onConfigure, onOpenRu
   // 只给官方安装说明（`runtimeInstallGuide` 在 platform 为 null 时本来就不下发 shell 命令）。
   const guide = adapter ? runtimeInstallGuide(adapter, platform) : null
   const needsLogin = agent?.runtimeReadiness.blockers.some(blocker => /auth|login/.test(blocker.code)) ?? false
+  const retryUx = manualRetryUx(run, runs)
   return <section className="ln-run-failure" role="alert" data-run-id={run.id} data-state="failed" aria-label="这次运行没有完成">
     <p className="ln-run-failure-reason">{reason}</p>
     {run.terminalReasonCode && <details className="ln-run-failure-code"><summary>错误码</summary><code>{run.terminalReasonCode}</code></details>}
@@ -361,7 +363,7 @@ export function RunFailure({ run, agent, sending, onRetry, onConfigure, onOpenRu
         onCheck={() => onOpenRuntimeSetup?.()}/>
     </details>}
     <div className="ln-run-failure-actions">
-      <button type="button" className="ln-action" disabled={sending || !onRetry} onClick={onRetry}>{sending ? '正在重试…' : '重试'}</button>
+      {retryUx !== 'hidden' && <button type="button" className="ln-action" disabled={sending || !onRetry || retryUx === 'automatic'} title={retryUx === 'automatic' ? '自动重试最多 3 次，全部失败后才需要手动重试。' : '重试前先检查已有成果，不重复外部操作。'} onClick={onRetry}>{sending ? '正在重试…' : retryUx === 'automatic' ? '自动重试中' : '重试'}</button>}
       <button type="button" className="ln-action is-primary" disabled={!onConfigure} onClick={onConfigure}>去配置运行端</button>
     </div>
   </section>

@@ -403,6 +403,9 @@ pub struct AgentRunView {
     pub permission_semantics: String,
     pub invocation_kind: String,
     pub trigger_delivery_generation: i64,
+    pub automatic_retry_ordinal: Option<i64>,
+    pub automatic_retry_eligible: bool,
+    pub loom_task_id: Option<String>,
     pub a2a_parent_agent_run_id: Option<String>,
     pub a2a_root_agent_run_id: Option<String>,
     pub a2a_depth: i64,
@@ -3108,6 +3111,12 @@ fn load_message_deliveries(
     Ok(deliveries)
 }
 
+fn watchdog_retry_ordinal(dedupe_key: Option<&str>) -> Option<i64> {
+    let parts: Vec<String> = serde_json::from_str(dedupe_key?).ok()?;
+    let marker = parts.iter().rposition(|part| part == "watchdog_retry")?;
+    parts.get(marker + 1)?.parse().ok()
+}
+
 fn load_agent_runs(
     transaction: &Transaction<'_>,
     camp_id: &str,
@@ -3251,7 +3260,44 @@ fn load_agent_runs(
                continued.source_agent_run_id IS NOT NULL,
                agent_run.current_public_tail_sequence,
                agent_run.runtime_adapter_kind,
-               agent_run.last_error_code
+               agent_run.last_error_code,
+               CASE
+                 WHEN agent_run.status = 'failed'
+                  AND agent_run.ended_at IS NOT NULL
+                  AND agent_run.terminal_resolution_source = 'runtime_terminal'
+                  AND agent_run.terminal_reason_code IS NULL
+                  AND agent_run.manual_retry_allowed = 1
+                  AND agent_run.cancel_requested_at IS NULL
+                  AND agent_run.retry_declined_at IS NULL
+                  AND CASE WHEN json_valid(agent_run.public_runtime_failure_json)
+                           THEN json_type(agent_run.public_runtime_failure_json, '$.retryable') = 'true'
+                           ELSE FALSE END
+                  AND EXISTS (
+                    SELECT 1 FROM loom_control_dispatch AS retry_dispatch
+                    JOIN camp_message_delivery AS retry_delivery
+                      ON retry_delivery.id = retry_dispatch.delivery_id
+                    WHERE retry_delivery.claimed_agent_run_id = agent_run.id
+                      AND retry_dispatch.kind IN ('EXECUTE','REVIEW','REWORK'))
+                  AND NOT EXISTS (
+                    SELECT 1 FROM agent_run AS successor WHERE successor.predecessor_agent_run_id = agent_run.id)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM runtime_input_delivery AS input WHERE input.agent_run_id = agent_run.id
+                    AND (input.status = 'delivery_unknown'
+                         OR (input.status = 'accepted' AND agent_run.runtime_adapter_kind <> 'pi')
+                         OR (input.status = 'prepared' AND input.dispatch_started_at IS NOT NULL)))
+                 THEN 1 ELSE 0 END,
+               (SELECT dispatch.dedupe_key
+                FROM loom_control_dispatch AS dispatch
+                JOIN camp_message_delivery AS trigger_delivery
+                  ON trigger_delivery.id = dispatch.delivery_id
+                WHERE trigger_delivery.claimed_agent_run_id = agent_run.id
+                ORDER BY dispatch.created_at DESC, dispatch.dispatch_id DESC LIMIT 1),
+               (SELECT dispatch.task_id
+                FROM loom_control_dispatch AS dispatch
+                JOIN camp_message_delivery AS trigger_delivery
+                  ON trigger_delivery.id = dispatch.delivery_id
+                WHERE trigger_delivery.claimed_agent_run_id = agent_run.id
+                ORDER BY dispatch.created_at DESC, dispatch.dispatch_id DESC LIMIT 1)
         FROM agent_run
         LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
         JOIN camp ON camp.id = COALESCE(agent_run.camp_id, camp_turn.camp_id)
@@ -3330,6 +3376,9 @@ fn load_agent_runs(
                 row.get::<_, Option<i64>>(42)?,
                 row.get::<_, Option<String>>(43)?,
                 row.get::<_, Option<String>>(44)?,
+                row.get::<_, i64>(45)?,
+                row.get::<_, Option<String>>(46)?,
+                row.get::<_, Option<String>>(47)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3386,6 +3435,9 @@ fn load_agent_runs(
                 public_tail_sequence_at_start,
                 runtime_adapter_kind,
                 last_error_code,
+                automatic_retry_eligible,
+                retry_dedupe_key,
+                loom_task_id,
             )| {
                 // Older claim failures recorded only the stable code. Recover the
                 // same safe explanation without rewriting history or guessing a Runtime.
@@ -3448,6 +3500,9 @@ fn load_agent_runs(
                     permission_semantics,
                     invocation_kind,
                     trigger_delivery_generation,
+                    automatic_retry_ordinal: watchdog_retry_ordinal(retry_dedupe_key.as_deref()),
+                    automatic_retry_eligible: automatic_retry_eligible != 0,
+                    loom_task_id,
                     a2a_parent_agent_run_id,
                     a2a_root_agent_run_id,
                     a2a_depth,
@@ -4493,8 +4548,19 @@ mod tests {
     use super::{
         CAMP_MESSAGE_FIND_QUERY_MAX_SCALARS, ThreadMessageFindCandidate,
         case_insensitive_scalar_match_ranges, flatten_camp_message_find_matches,
-        select_camp_message_find_match, validate_camp_message_find_query,
+        select_camp_message_find_match, validate_camp_message_find_query, watchdog_retry_ordinal,
     };
+
+    #[test]
+    fn watchdog_retry_ordinal_reads_only_the_retry_marker() {
+        assert_eq!(
+            watchdog_retry_ordinal(Some(r#"["EXECUTE","plan","task","watchdog_retry","2"]"#)),
+            Some(2)
+        );
+        assert_eq!(watchdog_retry_ordinal(Some(r#"["EXECUTE","plan","task"]"#)), None);
+        assert_eq!(watchdog_retry_ordinal(Some("not-json")), None);
+        assert_eq!(watchdog_retry_ordinal(None), None);
+    }
 
     #[test]
     fn conversation_find_ranges_are_case_insensitive_non_overlapping_unicode_scalars() {

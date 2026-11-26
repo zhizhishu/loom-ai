@@ -235,7 +235,9 @@ export function LoomApp({ environment, onLogout, initialSettingsSection = null, 
     if (sending) return
     const last = data.snapshot?.messages.filter(message => (message.authorType === 'user' || message.authorType === 'external_principal') && !message.withdrawn).at(-1)
     if (!last?.body.trim()) return
-    void submit(draftKey, { text: last.body, files: [] })
+    const notice = '【重试】先检查已有成果，不重复外部操作。'
+    const text = last.body.startsWith(notice) ? last.body : `${notice}\n\n${last.body}`
+    void submit(draftKey, { text, files: [] })
   }
   // An OpenUI card's button continues the conversation with its own words instead of the composer's draft.
   const sendPrompt = async (text: string) => {
