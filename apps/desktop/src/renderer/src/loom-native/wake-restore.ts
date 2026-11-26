@@ -16,11 +16,11 @@ export function wakeRestoreLines(
   snapshot: Pick<ThreadSnapshot, 'messageDeliveries' | 'agentRuns'>,
   agents: readonly AgentProfile[]
 ): WakeRestoreLine[] {
-  const active = new Set(snapshot.agentRuns
+  const active = new Set((snapshot.agentRuns ?? [])
     .filter(run => ['running', 'queued', 'waiting'].includes(run.status))
     .map(run => run.agentId))
   const latest = new Map<string, ThreadSnapshot['messageDeliveries'][number]>()
-  for (const delivery of snapshot.messageDeliveries) {
+  for (const delivery of snapshot.messageDeliveries ?? []) {
     if (delivery.status !== 'waiting' || !delivery.wakeState || active.has(delivery.recipientAgentId)) continue
     const prior = latest.get(delivery.recipientAgentId)
     if (!prior || prior.createdAt.localeCompare(delivery.createdAt) <= 0) latest.set(delivery.recipientAgentId, delivery)
