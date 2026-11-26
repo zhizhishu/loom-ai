@@ -13,6 +13,7 @@ import { WorkMap } from './WorkMap'
 import { ComputerWorkspace } from './ComputerWorkspace'
 import { modeFor, panelFor, scopedBundles, type WorkspacePanel, type WorkspaceScope } from './workspace-panel'
 import { artifactCandidateFacts, artifactReviewKind, artifactReviewLabel, type ArtifactReviewKind } from './artifact-service'
+import { summarizeAttention, type AttentionFact } from './attention'
 
 export function relativeDate(value: string): string {
   const date = new Date(value)
@@ -112,6 +113,24 @@ export function flattenWork(bundles: WorkBundle[], questions: readonly PiQuestio
   })
 }
 
+/** 「等待你」分组的一行 → 一条注意力事实（`attention.ts` 的输入）。
+ * waitingForAnswer 的行是提问（运行正等这句回答，高分）；其余是结论已交回、
+ * 验收在你手里的工作。时间读链头候选的登记时间，没有候选退回任务更新时间——
+ * 都是 Core 真实字段，不编时间。只挑「等待你」组：其它组不进入打扰计数。 */
+export function attentionFactsFromWork(items: readonly WorkItemFacts[]): AttentionFact[] {
+  return items
+    .filter(item => workStatus(item).group === '等待你')
+    .map(item => ({
+      id: item.task.taskId,
+      kind: item.waitingForAnswer ? 'question' : 'review',
+      title: item.task.title,
+      threadId: item.mission.threadId,
+      missionId: item.mission.missionId,
+      taskId: item.task.taskId,
+      createdAt: item.candidate?.createdAt ?? item.task.updatedAt
+    }))
+}
+
 const PANELS: { id: WorkspacePanel; label: string; icon: IconName }[] = [
   { id: 'work', label: '工作', icon: 'board' }, { id: 'assets', label: '资产', icon: 'files' },
   { id: 'flow', label: '流程', icon: 'branch' }, { id: 'computer', label: '电脑', icon: 'computer' }
@@ -150,7 +169,7 @@ export function Inspector({ agents, bundles, questions = [], agent, mode, tab, o
     const facts = artifactCandidateFacts(bundle, artifact, null)
     return { artifact, bundle, candidate: facts.candidate, reviewKind: facts.reviewKind }
   }))
-  const attentionCount = all.filter(item => workStatus(item).group === '等待你').length
+  const attentionCount = summarizeAttention(attentionFactsFromWork(all)).count
   const changePanel = (value: WorkspacePanel) => { onMode(modeFor(value)); setSearchOpen(false) }
   const renderAssets = (onlyTask?: string) => {
     const rows = assets.filter(selection => (!onlyTask || selection.artifact.taskId === onlyTask)
@@ -166,14 +185,21 @@ export function Inspector({ agents, bundles, questions = [], agent, mode, tab, o
   const renderWork = () => <div className="ln-work-groups">{['等待你', '进行中', '受阻', '待开始', '已完成'].map(group => {
     const rows = shown.filter(item => workStatus(item).group === group)
     if (!rows.length) return null
-    const list = <div className="ln-task-list">{rows.map(item => {
+    // 「等待你」过注意力评分/预算（Mikka score/budget/interrupt 思想）：分数高的
+    // 在前，最多露出 ATTENTION_BUDGET 条；预算外的聚合成一行「还有 N 项」，不逐
+    // 条刷屏。分组标题仍写真实总数，不把收纳掉的项说成不存在。
+    const attention = group === '等待你' ? summarizeAttention(attentionFactsFromWork(rows)) : null
+    const visible = attention
+      ? attention.surfaced.map(item => rows.find(row => row.task.taskId === item.taskId)).filter((item): item is WorkItemFacts => item !== undefined)
+      : rows
+    const list = <div className="ln-task-list">{visible.map(item => {
       const status = workStatus(item); const member = agents.find(person => person.agentId === item.task.assigneeAgentId)
       // 状态总是写出来：描述/阻塞原因只做补充，不能把「审查中」「返工中」「受阻」藏掉。
       const detail = item.task.blockedReason || item.task.description
       return <button className="ln-task-card" type="button" key={item.task.taskId} onClick={() => setSelectedTaskId(item.task.taskId)}><Icon name={status.icon} size={21}/><span className="ln-task-content"><span className="ln-task-firstline"><strong>{item.task.title}</strong><time>{relativeDate(item.task.updatedAt)}</time></span><span className="ln-task-subtitle">{member && <Avatar agent={member} size={12}/>}<span>{member?.displayName || '未指派'} · <span data-state={status.group}>{status.label}</span>{detail ? ` · ${detail}` : ''}</span></span></span><Icon name="right" size={14}/></button>
     })}</div>
     return group === '已完成' ? <details key={group} className="ln-completed-group"><summary><span>{group}（{rows.length}）</span><i/><Icon name="right" size={13}/></summary>{list}</details>
-      : <section key={group} className="ln-work-group"><h3>{group}（{rows.length}）<i/></h3>{list}</section>
+      : <section key={group} className="ln-work-group"><h3>{group}（{rows.length}）<i/></h3>{list}{attention !== null && attention.remainder > 0 && <p className="ln-attention-rest" title="按优先级收纳，处理完上面的会逐条放出">还有 {attention.remainder} 项</p>}</section>
   })}{!shown.length && <Empty className="ln-empty--dock"><EmptyHeader><EmptyMedia variant="icon"><Icon name="board" size={18}/></EmptyMedia><EmptyTitle>{loading ? '正在读取工作' : query || owner ? '没有匹配的工作' : '从一个目标开始'}</EmptyTitle><EmptyDescription>{scope === 'conversation' && threadId ? '这段对话还没有关联的任务。创建工作后，就能在这里跟进分工和成果。' : '把目标交给协调助手，分工、待你处理的决定和成果都会出现在这里。'}</EmptyDescription></EmptyHeader>{((!loading && onCreateWork) || (scope === 'conversation' && !!threadId)) && <EmptyContent>{onCreateWork && !loading && <button type="button" className="ln-action" onClick={onCreateWork}>创建一项工作</button>}{scope === 'conversation' && threadId && <button type="button" className="ln-text-action" onClick={() => setScope('all')}>查看所有工作</button>}</EmptyContent>}</Empty>}</div>
   return <aside className={`ln-inspector ln-workspace-dock${expanded ? ' is-expanded' : ''}`} aria-label="工作空间面板">
     {/* Current-conversation identity: the real member avatar, never a stand-in

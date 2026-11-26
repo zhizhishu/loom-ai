@@ -11,10 +11,12 @@ import type {
   MissionRecord
 } from '@contracts'
 import type { WorkBundle, LoomArtifact, LoomCandidate, LoomTask, ConversationItem, WorkControlFacts } from './types'
+import type { PiQuestion } from './pi-questions'
 import { Sidebar } from './Sidebar'
 import { AgentMarkdown } from './AgentMarkdown'
-import { workStatus } from './Inspector'
+import { workStatus, attentionFactsFromWork, flattenWork } from './Inspector'
 import { Inspector } from './Inspector'
+import { ATTENTION_BUDGET } from './attention'
 import { ArtifactReviewStatus } from './ArtifactView'
 import { artifactCandidateFacts, previewStateFromResult, reviewDraftComplete, submitArtifactReview, artifactFileName, readArtifactPreview, artifactMediaKind, decodeArtifactBase64, normalizeArtifactMediaType, type LoomRpc } from './artifact-service'
 import { PDF_MAX_CANVAS_PIXELS, pdfPageGeometry, pdfPageSlotSize, pdfRenderErrorMessage, pdfjsAssetUrl, pdfjsWorkerUrl } from './artifact-pdf'
@@ -467,5 +469,60 @@ describe('artifact media preview', () => {
     expect(pdfRenderErrorMessage(new Error('boom'))).toBe('PDF 渲染失败：boom')
     expect(pdfRenderErrorMessage(undefined)).toBe('PDF 渲染失败。')
     expect(pdfRenderErrorMessage(new Error('x'.repeat(400))).length).toBeLessThan(240)
+  })
+})
+
+// 注意力评分/预算（attention.ts，Mikka score/budget/interrupt 的 renderer 移植）：
+// 「等待你」分组按分数排序、只露出预算内条数，其余聚合成一行；计数只算预算内有效项。
+describe('attention budget in the 等待你 group', () => {
+  const waiting = (entries: Array<{ taskId: string; title: string; createdAt: string }>) => {
+    const tasks: LoomTask[] = []
+    const candidates: LoomCandidate[] = []
+    for (const entry of entries) {
+      tasks.push({ ...task, taskId: entry.taskId, title: entry.title, status: 'done' })
+      candidates.push({ ...first, candidateId: `c-${entry.taskId}`, taskId: entry.taskId, createdAt: entry.createdAt })
+    }
+    return bundle(candidates, { tasks, control: observed() })
+  }
+  const dock = (bundles: WorkBundle[]) => renderToStaticMarkup(createElement(Inspector, {
+    agents: [], bundles, agent: null, mode: 'work' as const, tab: 'work' as const,
+    onTab: () => {}, onMode: () => {}, onClose: () => {}, onExpand: () => {}, expanded: false,
+    onArtifact: () => {}, onOpenConversation: () => {}, loading: false
+  }))
+  it('surfaces only the budgeted first cards and aggregates the rest into one quiet line', () => {
+    const entries = Array.from({ length: 7 }, (_, index) =>
+      ({ taskId: `wt-${index}`, title: `实际工作 ${index}`, createdAt: '2026-11-13T00:00:00Z' }))
+    const html = dock([waiting(entries)])
+    // 分组标题仍是真实总数；卡片只露出预算内条数，其余聚合成一行。
+    expect(html).toContain('等待你（7）')
+    expect(html.match(/ln-task-card/g)).toHaveLength(ATTENTION_BUDGET)
+    expect(html).toContain('还有 2 项')
+  })
+  it('orders the surfaced cards by attention score: the longest waiting first', () => {
+    const html = dock([waiting([
+      { taskId: 'fresh', title: '刚交回的结论', createdAt: '2999-01-01T00:00:00Z' },
+      { taskId: 'stale', title: '等了一天的结论', createdAt: '2020-01-01T00:00:00Z' }
+    ])])
+    expect(html.indexOf('等了一天的结论')).toBeGreaterThan(-1)
+    expect(html.indexOf('等了一天的结论')).toBeLessThan(html.indexOf('刚交回的结论'))
+  })
+  it('keeps the tab badge on the budgeted count instead of the raw total', () => {
+    const entries = Array.from({ length: 7 }, (_, index) =>
+      ({ taskId: `wt-${index}`, title: `实际工作 ${index}`, createdAt: '2026-11-13T00:00:00Z' }))
+    expect(dock([waiting(entries)])).toContain('<i>5</i>')
+    expect(dock([waiting(entries.slice(0, 2))])).toContain('<i>2</i>')
+  })
+  it('reads waiting work as attention facts and never counts other groups', () => {
+    const question: PiQuestion = {
+      threadId: 'th', agentRunId: 'run-1', executionEpoch: 1, hostInstanceId: 'host-1', taskId: 't',
+      status: 'waiting_for_user', request: { id: 'r1', method: 'select', title: '选一个', options: ['A'] }
+    }
+    const facts = attentionFactsFromWork(flattenWork([waiting([
+      { taskId: 't', title: '实际工作', createdAt: '2026-11-12T00:00:00Z' }
+    ])], [question]))
+    // 提问优先于普通待验收；时间读链头候选的登记时间。
+    expect(facts).toEqual([{ id: 't', kind: 'question', title: '实际工作', threadId: 'th', missionId: 'm', taskId: 't', createdAt: '2026-11-12T00:00:00Z' }])
+    // 待开始的工作不是「等你」，不进注意力事实。
+    expect(attentionFactsFromWork(flattenWork([bundle([first], { tasks: [task] })]))).toEqual([])
   })
 })

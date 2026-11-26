@@ -1,4 +1,5 @@
 import { readOutbox } from './pending-outbox-store'
+import { attentionFactsFromApprovals, summarizeAttention } from './attention'
 import { BotBoard } from './BotBoard'
 import { PendingInbox } from './PendingInbox'
 import type { AgentRunView, LocalAttachmentOwnerLocator, StoredCommandResult,WorkspaceSelection } from '@contracts'
@@ -10,7 +11,7 @@ import { useLoomData } from './useLoomData'
 import { usePiQuestions } from './pi-questions'
 import { Sidebar } from './Sidebar'
 import { ConversationView } from './ConversationView'
-import { Inspector, flattenWork, workStatus } from './Inspector'
+import { Inspector, attentionFactsFromWork, flattenWork } from './Inspector'
 import { ArtifactView } from './ArtifactView'
 import { refreshArtifactSelection } from './artifact-service'
 import { Avatar } from './Avatar'
@@ -166,7 +167,15 @@ export function LoomApp({ environment, onLogout, initialSettingsSection = null, 
   latestDraftKey.current = draftKey
   const draft = drafts[draftKey] ?? { text: '', files: [] }
   const work = useMemo(() => flattenWork(data.bundles, piQuestions.questions), [data.bundles, piQuestions.questions])
-  const attentionCount = work.filter(item => workStatus(item).group === '等待你').length
+  // 顶栏「等待你」计数走注意力预算（attention.ts）：只数预算内、真正需要你处理
+  // 的条目——已交回结论待验收的工作、等回答的提问，以及当前会话待确认的授权
+  // （运行正被它扣住，是最高分）。预算外的与纯完成通知不逐条打扰，聚合在工作
+  // 面板「等待你」分组的「还有 N 项」里。renderer 只读得到选中会话的授权投影；
+  // 其它会话的授权要打开会话才可见，初版不为它加跨会话请求。
+  const attentionCount = summarizeAttention([
+    ...attentionFactsFromWork(work),
+    ...attentionFactsFromApprovals(data.snapshot?.approvals ?? [], data.snapshot?.thread.id ?? null, active?.missionId ?? data.snapshot?.thread.missionId ?? null)
+  ]).count
   const report = (error: unknown) => setNotice(error instanceof Error ? error.message : String(error))
   // Leaving the settings page goes through its unsaved-changes guard (SettingsPage `guardSettingsLeave`).
   const settingsLeaveGuard = useRef<SettingsLeaveGuard | null>(null)
