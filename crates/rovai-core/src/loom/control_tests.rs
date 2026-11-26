@@ -6791,6 +6791,7 @@ fn persist_retry_fixture_terminal(database: &OwnedTestDatabase, run_id: &str, st
         tx.execute(
             "UPDATE agent_run SET status=?1, ended_at=?2, updated_at=?2,
             terminal_resolution_source='runtime_terminal', public_runtime_failure_json=?3,
+            manual_retry_allowed=CASE WHEN ?1='failed' THEN 1 ELSE manual_retry_allowed END,
             execution_lease_owner=NULL, execution_lease_expires_at=NULL WHERE id=?4",
             params![status, &now, failure, run_id],
         )
