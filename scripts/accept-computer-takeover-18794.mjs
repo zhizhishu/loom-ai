@@ -24,6 +24,7 @@ const PORT = Number(process.env.LOOM_TAKEOVER_PORT ?? 18_794)
 const ORIGIN = `http://127.0.0.1:${PORT}`
 const ARTIFACTS = resolve(process.env.LOOM_TAKEOVER_ARTIFACTS ?? '/bundles/out/_artifacts/computer-takeover-18794')
 const FULL_EXPIRY = process.env.LOOM_TAKEOVER_FULL_EXPIRY !== '0'
+const ACCEPT_LEGACY_REFUSAL = process.env.LOOM_TAKEOVER_ACCEPT_LEGACY_REFUSAL === '1'
 const CLICK_X = Number(process.env.LOOM_TAKEOVER_CLICK_X ?? 100)
 const CLICK_Y = Number(process.env.LOOM_TAKEOVER_CLICK_Y ?? 100)
 
@@ -236,7 +237,7 @@ async function run () {
 
   const mouseScript = join(desktop, 'mouse-listener.py')
   const clickReceipt = join(desktop, 'click-receipt.txt')
-  writeFileSync(mouseScript, `import os,sys,termios,tty\nout=sys.argv[1]\nsys.stdout.write('\\x1b[?1000h')\nsys.stdout.flush()\nfd=sys.stdin.fileno()\nold=termios.tcgetattr(fd)\ntty.setraw(fd)\ntry:\n    while True:\n        data=os.read(fd,6)\n        if len(data)>=6 and data[:3]==b'\\x1b[M':\n            open(out,'w').write('button=%d,col=%d,row=%d' % (data[3],data[4],data[5]))\n            break\nfinally:\n    termios.tcsetattr(fd,termios.TCSADRAIN,old)\n`)
+  writeFileSync(mouseScript, `import os,sys,termios,tty\nout=sys.argv[1]\nsys.stdout.write('\\x1b[?1000h')\nsys.stdout.flush()\nfd=sys.stdin.fileno()\nold=termios.tcgetattr(fd)\ntty.setraw(fd)\ntry:\n    while True:\n        data=os.read(fd,6)\n        if len(data)>=6 and data[:3]==b'\\x1b[M':\n            open(out,'w').write('button=%d,col=%d,row=%d' % (data[3]-32,data[4]-32,data[5]-32))\n            break\nfinally:\n    termios.tcsetattr(fd,termios.TCSADRAIN,old)\n`)
   const target = remember(spawn('xterm', ['-geometry', '120x40+0+0', '-T', 'LOOM TAKEOVER CLICK TARGET', '-e', '/usr/bin/python3', mouseScript, clickReceipt], {
     env: { ...process.env, DISPLAY: xvfb.display },
     stdio: ['ignore', 'ignore', 'pipe']
@@ -332,12 +333,18 @@ async function run () {
   const clickResult = await humanInput(session, control, 1, { kind: 'pointer', x: CLICK_X, y: CLICK_Y, button: 'left', action: 'click' })
   assert.equal(clickResult.applied, true, `human click was not applied: ${JSON.stringify(clickResult)}`)
   const receipt = await waitForFile(clickReceipt)
+  const receiptMatch = /^button=(\d+),col=(\d+),row=(\d+)$/u.exec(receipt)
+  assert.ok(receiptMatch, `click receipt has unexpected shape: ${receipt}`)
+  assert.equal(Number(receiptMatch[1]), 0, `click receipt is not a left button: ${receipt}`)
+  assert.ok(Number(receiptMatch[2]) >= 1 && Number(receiptMatch[2]) <= 80, `click column is outside the xterm: ${receipt}`)
+  assert.ok(Number(receiptMatch[3]) >= 1 && Number(receiptMatch[3]) <= 24, `click row is outside the xterm: ${receipt}`)
   record('humanClick', { seq: clickResult.seq, receipt })
 
   const rejected = await agentRpc(bridge, `reject-${randomUUID()}`, 'mouse_click', { x: CLICK_X, y: CLICK_Y, button: 'left' })
   assert.equal(rejected.ok, false, `assistant input unexpectedly succeeded during human takeover: ${JSON.stringify(rejected.payload)}`)
-  assert.equal(rejected.code, 'computer_agent_human_control', `assistant input refusal code mismatch: ${rejected.code} (${rejected.status})`)
-  record('assistantRejectedDuringTakeover', { status: rejected.status, code: rejected.code })
+  const refusalCodes = ACCEPT_LEGACY_REFUSAL ? ['computer_agent_human_control', 'computer_agent_control_held'] : ['computer_agent_human_control']
+  assert.ok(refusalCodes.includes(rejected.code), `assistant input refusal code mismatch: ${rejected.code} (${rejected.status})`)
+  record('assistantRejectedDuringTakeover', { status: rejected.status, code: rejected.code, legacyAccepted: rejected.code !== 'computer_agent_human_control' })
 
   const released = await workbench({
     origin: ORIGIN,
@@ -352,7 +359,9 @@ async function run () {
   assert.equal(restored.ok, true, `assistant input did not recover after release: ${JSON.stringify(restored.payload)}`)
   record('assistantRestoredAfterRelease', { status: restored.status, ok: restored.ok })
 
-  const second = await acquireControl(session, deviceId, view.viewId)
+  await workbench({ origin: ORIGIN, session, path: '/computer/view/stop', body: { viewId: view.viewId } })
+  const expiryView = await workbench({ origin: ORIGIN, session, path: '/computer/view', body: { deviceId, consent: true } })
+  const second = await acquireControl(session, deviceId, expiryView.viewId)
   const expiryStarted = Date.now()
   let expiryError = null
   if (FULL_EXPIRY) {
@@ -363,7 +372,7 @@ async function run () {
           origin: ORIGIN,
           session,
           path: '/computer/control/heartbeat',
-          body: { viewId: view.viewId, controlId: second.controlId, generation: second.generation, consent: true }
+          body: { viewId: expiryView.viewId, controlId: second.controlId, generation: second.generation, consent: true }
         })
       } catch (error) {
         expiryError = error
@@ -378,7 +387,7 @@ async function run () {
         origin: ORIGIN,
         session,
         path: '/computer/input',
-        body: { viewId: view.viewId, controlId: second.controlId, generation: second.generation, seq: 1, consent: true, event: { kind: 'pointer', x: CLICK_X, y: CLICK_Y, button: 'left', action: 'click' } }
+        body: { viewId: expiryView.viewId, controlId: second.controlId, generation: second.generation, seq: 1, consent: true, event: { kind: 'pointer', x: CLICK_X, y: CLICK_Y, button: 'left', action: 'click' } }
       })
     } catch (error) {
       expiryError = error
@@ -388,7 +397,7 @@ async function run () {
   assert.ok(expiryError, 'expiring takeover did not refuse further control')
   record('expiryStop', { mode: FULL_EXPIRY ? 'five-minute-heartbeat' : 'quick-idle-deadman', code: expiryError.code ?? null, waitedMs: Date.now() - expiryStarted })
 
-  const after = await framePng(session, view.viewId, join(outDir, 'xvfb-after.png'))
+  const after = await framePng(session, expiryView.viewId, join(outDir, 'xvfb-after.png'))
   assert.ok(after.bytes > 1_000, `post-run screenshot is empty or too small: ${after.bytes}`)
   report.screenshots.after = after
   report.status = 'passed'
