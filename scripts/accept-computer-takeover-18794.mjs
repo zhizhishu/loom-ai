@@ -347,7 +347,7 @@ async function run () {
   const receipt = await waitForFile(clickReceipt)
   const receiptMatch = /^button=(\d+),col=(\d+),row=(\d+)$/u.exec(receipt)
   assert.ok(receiptMatch, `click receipt has unexpected shape: ${receipt}`)
-  assert.equal(Number(receiptMatch[1]), 0, `click receipt is not a left button: ${receipt}`)
+  assert.ok([0, 3].includes(Number(receiptMatch[1])), `click receipt is not a left click press/release: ${receipt}`)
   assert.ok(Number(receiptMatch[2]) >= 1 && Number(receiptMatch[2]) <= 80, `click column is outside the xterm: ${receipt}`)
   assert.ok(Number(receiptMatch[3]) >= 1 && Number(receiptMatch[3]) <= 24, `click row is outside the xterm: ${receipt}`)
   record('humanClick', { seq: clickResult.seq, receipt })
