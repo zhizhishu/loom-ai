@@ -17,6 +17,7 @@ use super::{
 };
 use crate::{
     agent_profile::{AdapterKind, AgentProfileService},
+    command::canonical_json_digest,
     context,
     db::Database,
     managed_skills::{ManagedSkills, PLATFORM_SKILLS, SkillIndexEntry, TOOLBOX_SKILLS},
@@ -127,9 +128,8 @@ pub(crate) fn capture_in_existing_transaction(
     )?;
     let (_projected_skills, rules, hooks) =
         crate::member_capability::projection_additions(database, store, &profile.agent_id)?;
-    let hook_reviews = crate::member_capability::frozen_hook_reviews(
-        database, store, &profile.agent_id,
-    )?;
+    let hook_reviews =
+        crate::member_capability::frozen_hook_reviews(database, store, &profile.agent_id)?;
     crate::member_capability::validate_frozen_hook_reviews(&hook_reviews, &hooks)?;
     let (mcp_view, raw) = store.get_with_raw_readonly(&known)?;
     if mcp_view.file_issue.is_some() {
@@ -189,7 +189,11 @@ pub(crate) fn capture_in_existing_transaction(
         // reference at all: a missing A value would silently drop the server.
         // Only the pure capability check applies here; the value is resolved on
         // the node.
-        qualify_reference_servers(&servers, adapter, params.reported_runtime_version.as_deref())?;
+        qualify_reference_servers(
+            &servers,
+            adapter,
+            params.reported_runtime_version.as_deref(),
+        )?;
     } else {
         let projected = materialize_member_servers(
             store,
@@ -222,7 +226,9 @@ pub(crate) fn capture_in_existing_transaction(
         .filter(|item| {
             item.kind == "skill"
                 && item.selected
-                && !item.id.starts_with(crate::member_capability::SKILL_SOURCE_ID_PREFIX)
+                && !item
+                    .id
+                    .starts_with(crate::member_capability::SKILL_SOURCE_ID_PREFIX)
         })
         .map(|item| item.name.as_str())
         .collect::<BTreeSet<_>>();
@@ -236,7 +242,10 @@ pub(crate) fn capture_in_existing_transaction(
         ));
     }
     let imported: Vec<crate::member_capability::SelectedSource> =
-        crate::member_capability::selected_library_sources(database.connection(), &profile.agent_id)?;
+        crate::member_capability::selected_library_sources(
+            database.connection(),
+            &profile.agent_id,
+        )?;
     // Platform, toolbox and imported Skills share one `skills/<name>/` root, so a
     // case-insensitive clash would silently overwrite one Run's source.
     let mut frozen_names = BTreeSet::new();
@@ -290,7 +299,13 @@ pub(crate) fn capture_in_existing_transaction(
     // Imported sources were admitted and verified before the copy; the same
     // registered revision is re-verified afterwards below.
     for source in &imported {
-        collect_skill_files(&source.path, &source.path, &source.name, &mut files, &mut total)?;
+        collect_skill_files(
+            &source.path,
+            &source.path,
+            &source.name,
+            &mut files,
+            &mut total,
+        )?;
         assets.push(json!({
             "kind":"skill", "id":source.id, "mandatory":false,
             "source":"managed-skill-library",
@@ -324,12 +339,25 @@ pub(crate) fn capture_in_existing_transaction(
     } else {
         "key-free-literals-only"
     };
+    let frozen_rules = rules
+        .into_iter()
+        .map(FrozenCapability::from)
+        .collect::<Vec<_>>();
+    let frozen_hooks = hooks
+        .into_iter()
+        .map(FrozenCapability::from)
+        .collect::<Vec<_>>();
+    let capability_fingerprints =
+        capability_fingerprints(&catalog, &files, &servers, &frozen_rules, &frozen_hooks)?;
+    let capability_set_fingerprint = capability_set_fingerprint(&capability_fingerprints)?;
     let mut manifest = json!({
         "schemaVersion":1, "selectionRevision":catalog.revision,
         "mcpSourceDigest":mcp_view.config_digest, "assets":assets,
         "optionalAssetScope":"rovai-member-selection",
         "nativeHostConfiguration":"independent",
-        "credentialPolicy":credential_policy
+        "credentialPolicy":credential_policy,
+        "capabilitySetFingerprint":capability_set_fingerprint,
+        "capabilityStages":{"prepare":{"fingerprint":capability_set_fingerprint}}
     });
     // No-hook snapshots keep their existing shape and digest inputs.
     if !hook_reviews.is_empty() {
@@ -347,8 +375,10 @@ pub(crate) fn capture_in_existing_transaction(
         platform_skill_index,
         servers,
         mcp_ids: selected_mcp,
-        rules: rules.into_iter().map(FrozenCapability::from).collect(),
-        hooks: hooks.into_iter().map(FrozenCapability::from).collect(),
+        rules: frozen_rules,
+        hooks: frozen_hooks,
+        capability_fingerprints,
+        capability_set_fingerprint,
         manifest,
     })
 }
@@ -382,6 +412,170 @@ impl BundleSourceDatabaseStamp {
 pub(crate) struct CapturedMemberBundleSource {
     pub source: FrozenBundleSource,
     pub stamp: BundleSourceDatabaseStamp,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CapabilityFingerprint {
+    kind: String,
+    id: String,
+    name: String,
+    origin: String,
+    execution: String,
+    authorization: String,
+}
+
+impl CapabilityFingerprint {
+    fn new(kind: &str, id: &str, name: &str, origin: &str, execution: Value) -> Result<Self> {
+        Ok(Self {
+            kind: kind.to_string(),
+            id: id.to_string(),
+            name: name.to_string(),
+            origin: origin.to_string(),
+            execution: fingerprint_value(&execution)?,
+            authorization: fingerprint_value(&json!({
+                "kind": kind,
+                "id": id,
+                "origin": origin,
+            }))?,
+        })
+    }
+}
+
+fn fingerprint_value(value: &Value) -> Result<String> {
+    Ok(canonical_json_digest(value)?)
+}
+
+fn capability_set_fingerprint(entries: &[CapabilityFingerprint]) -> Result<String> {
+    fingerprint_value(&serde_json::to_value(entries)?)
+}
+
+fn capability_fingerprints(
+    catalog: &crate::member_capability::MemberCapabilityCatalog,
+    files: &[SkillFileSource],
+    servers: &BTreeMap<String, McpServerDefinition>,
+    rules: &[FrozenCapability],
+    hooks: &[FrozenCapability],
+) -> Result<Vec<CapabilityFingerprint>> {
+    let mut entries = Vec::new();
+    for item in catalog.items.iter().filter(|item| item.selected) {
+        let origin = item.origin.as_deref().unwrap_or("explicit");
+        let entry = match item.kind.as_str() {
+            "skill" => {
+                if item
+                    .id
+                    .starts_with(crate::member_capability::SKILL_SOURCE_ID_PREFIX)
+                {
+                    // Imported source names are the names under skills/ in the frozen bundle.
+                    // The catalog row itself carries no filename, so use the visible Skill name.
+                    CapabilityFingerprint::new(
+                        "skill",
+                        &item.id,
+                        &item.name,
+                        origin,
+                        json!({"kind":"skill","id":item.id,"name":item.name,"files":frozen_skill_digest(files, &item.name)}),
+                    )?
+                } else {
+                    CapabilityFingerprint::new(
+                        "skill",
+                        &item.id,
+                        &item.name,
+                        origin,
+                        json!({"kind":"skill","id":item.id,"name":item.name,"files":frozen_skill_digest(files, &item.name)}),
+                    )?
+                }
+            }
+            "mcp" => {
+                let definition = servers
+                    .get(&item.name)
+                    .ok_or_else(|| anyhow::anyhow!("bundle_capability_fingerprint_invalid"))?;
+                CapabilityFingerprint::new(
+                    "mcp",
+                    &item.id,
+                    &item.name,
+                    origin,
+                    json!({"kind":"mcp","id":item.id,"name":item.name,"definition":definition}),
+                )?
+            }
+            "rule" => {
+                let rule = rules
+                    .iter()
+                    .find(|rule| rule.id == item.id)
+                    .ok_or_else(|| anyhow::anyhow!("bundle_capability_fingerprint_invalid"))?;
+                CapabilityFingerprint::new(
+                    "rule",
+                    &item.id,
+                    &item.name,
+                    origin,
+                    json!({"kind":"rule","id":item.id,"body":rule.body}),
+                )?
+            }
+            "hook" => {
+                let hook = hooks
+                    .iter()
+                    .find(|hook| hook.id == item.id)
+                    .ok_or_else(|| anyhow::anyhow!("bundle_capability_fingerprint_invalid"))?;
+                CapabilityFingerprint::new(
+                    "hook",
+                    &item.id,
+                    &item.name,
+                    origin,
+                    json!({"kind":"hook","id":item.id,"body":hook.body}),
+                )?
+            }
+            _ => continue,
+        };
+        entries.push(entry);
+    }
+    entries.sort_by(|left, right| left.kind.cmp(&right.kind).then(left.id.cmp(&right.id)));
+    Ok(entries)
+}
+
+fn validate_capability_fingerprints(
+    entries: &[CapabilityFingerprint],
+    files: &[SkillFileSource],
+    servers: &BTreeMap<String, McpServerDefinition>,
+    rules: &[FrozenCapability],
+    hooks: &[FrozenCapability],
+) -> Result<()> {
+    for entry in entries {
+        let execution = match entry.kind.as_str() {
+            "skill" => fingerprint_value(
+                &json!({"kind":"skill","id":entry.id,"name":entry.name,"files":frozen_skill_digest(files, &entry.name)}),
+            )?,
+            "mcp" => {
+                let definition = servers
+                    .get(&entry.name)
+                    .ok_or_else(|| anyhow::anyhow!("bundle_capability_fingerprint_invalid"))?;
+                fingerprint_value(
+                    &json!({"kind":"mcp","id":entry.id,"name":entry.name,"definition":definition}),
+                )?
+            }
+            "rule" => {
+                let rule = rules
+                    .iter()
+                    .find(|rule| rule.id == entry.id)
+                    .ok_or_else(|| anyhow::anyhow!("bundle_capability_fingerprint_invalid"))?;
+                fingerprint_value(&json!({"kind":"rule","id":entry.id,"body":rule.body}))?
+            }
+            "hook" => {
+                let hook = hooks
+                    .iter()
+                    .find(|hook| hook.id == entry.id)
+                    .ok_or_else(|| anyhow::anyhow!("bundle_capability_fingerprint_invalid"))?;
+                fingerprint_value(&json!({"kind":"hook","id":entry.id,"body":hook.body}))?
+            }
+            _ => anyhow::bail!("bundle_capability_fingerprint_invalid"),
+        };
+        ensure!(
+            execution == entry.execution,
+            "bundle_capability_fingerprint_mismatch"
+        );
+    }
+    let mut sorted = entries.to_vec();
+    sorted.sort_by(|left, right| left.kind.cmp(&right.kind).then(left.id.cmp(&right.id)));
+    ensure!(sorted == entries, "bundle_capability_fingerprint_invalid");
+    Ok(())
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -432,6 +626,8 @@ pub(crate) struct FrozenBundleSource {
     mcp_ids: BTreeMap<String, String>,
     rules: Vec<FrozenCapability>,
     hooks: Vec<FrozenCapability>,
+    capability_fingerprints: Vec<CapabilityFingerprint>,
+    capability_set_fingerprint: String,
     manifest: Value,
 }
 impl std::fmt::Debug for FrozenBundleSource {
@@ -520,6 +716,37 @@ impl FrozenBundleSource {
             servers: self.servers.clone(),
         })
     }
+    fn validate_capabilities(&self) -> Result<()> {
+        validate_capability_fingerprints(
+            &self.capability_fingerprints,
+            &self.files,
+            &self.servers,
+            &self.rules,
+            &self.hooks,
+        )?;
+        ensure!(
+            capability_set_fingerprint(&self.capability_fingerprints)?
+                == self.capability_set_fingerprint,
+            "bundle_capability_fingerprint_mismatch"
+        );
+        ensure!(
+            self.manifest
+                .get("capabilitySetFingerprint")
+                .and_then(Value::as_str)
+                == Some(self.capability_set_fingerprint.as_str()),
+            "bundle_capability_fingerprint_mismatch"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn capability_receipt(&self) -> Result<Value> {
+        self.validate_capabilities()?;
+        Ok(json!({
+            "fingerprint": self.capability_set_fingerprint,
+            "capabilities": self.capability_fingerprints,
+        }))
+    }
+
     pub(crate) fn bind_real_run(
         &self,
         agent_run_id: &str,
@@ -545,6 +772,10 @@ impl FrozenBundleSource {
         frozen.manifest["agentRunId"] = json!(agent_run_id);
         frozen.manifest["executionEpoch"] = json!(execution_epoch);
         frozen.manifest["frozenSourceDigest"] = json!(self.digest()?);
+        frozen.manifest["capabilityStages"]["confirm"] = json!({
+            "fingerprint": self.capability_set_fingerprint,
+            "agentRunId": agent_run_id,
+        });
         Ok(frozen)
     }
     fn reviewed_hooks(&self) -> Result<Vec<crate::member_capability::FrozenHookReview>> {
@@ -559,28 +790,45 @@ impl FrozenBundleSource {
     /// The immutable source must match the real Run's frozen workspace authority.
     /// Future member selection or future consent never substitutes for this proof.
     pub(crate) fn validate_hook_scope(
-        &self, target: &crate::remote_execution::FrozenRunTarget,
+        &self,
+        target: &crate::remote_execution::FrozenRunTarget,
     ) -> Result<()> {
+        self.validate_capabilities()?;
         let reviews = self.reviewed_hooks()?;
-        let hooks = self.hooks.iter().map(FrozenCapability::projection).collect::<Vec<_>>();
+        let hooks = self
+            .hooks
+            .iter()
+            .map(FrozenCapability::projection)
+            .collect::<Vec<_>>();
         crate::member_capability::validate_frozen_hook_reviews(&reviews, &hooks)?;
         crate::member_capability::validate_frozen_hook_scope(&reviews, target)
     }
 
     /// Grant only the settings rebuilt from this Run's approved immutable source.
     pub(crate) fn codex_hook_grant(
-        &self, bundle: &RunBundleV1,
+        &self,
+        bundle: &RunBundleV1,
     ) -> Result<Option<loom_protocol::command_hooks::CodexHookGrantV1>> {
-        if self.adapter != AdapterKind::CodexCli || self.hooks.is_empty() { return Ok(None); }
-        let hooks = self.hooks.iter().map(FrozenCapability::projection).collect::<Vec<_>>();
+        if self.adapter != AdapterKind::CodexCli || self.hooks.is_empty() {
+            return Ok(None);
+        }
+        let hooks = self
+            .hooks
+            .iter()
+            .map(FrozenCapability::projection)
+            .collect::<Vec<_>>();
         let reviews = self.reviewed_hooks()?;
         crate::member_capability::validate_frozen_hook_reviews(&reviews, &hooks)?;
-        ensure!(bundle.agent_id == self.member_id && bundle.selection_revision == self.selection_revision,
-            "bundle_hook_grant_scope");
+        ensure!(
+            bundle.agent_id == self.member_id
+                && bundle.selection_revision == self.selection_revision,
+            "bundle_hook_grant_scope"
+        );
         let expected = super::hook_settings(loom_protocol::run_bundle::ADAPTER_CODEX_CLI, &hooks)?
             .ok_or_else(|| anyhow::anyhow!("bundle_hook_settings_required"))?;
         let (bytes, _) = loom_protocol::command_hooks::settings(bundle)
-            .map_err(anyhow::Error::msg)?.ok_or_else(|| anyhow::anyhow!("bundle_hook_settings_required"))?;
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow::anyhow!("bundle_hook_settings_required"))?;
         ensure!(bytes == expected, "bundle_hook_grant_settings");
         let grant = loom_protocol::command_hooks::CodexHookGrantV1 {
             version: loom_protocol::command_hooks::CODEX_HOOK_GRANT_VERSION,
@@ -593,6 +841,7 @@ impl FrozenBundleSource {
 
     fn bind(&self, run_id: &str, attempt: u32, bootstrap: &str) -> Result<FrozenMemberBundle> {
         ensure!(self.version == 1, "bundle_source_version");
+        self.validate_capabilities()?;
         let _ = self.digest()?;
         let rules = self
             .rules
@@ -830,7 +1079,8 @@ mod tests {
             crate::platform::private_storage::prepare_private_directory(&directory).unwrap();
         let mut database = Database::open(&directory).unwrap();
         let store = McpConfigStore::new(directory.join("mcp.json"));
-        let library = crate::skill::SkillLibraryService::new(directory.join("skill-library")).unwrap();
+        let library =
+            crate::skill::SkillLibraryService::new(directory.join("skill-library")).unwrap();
         let member = AgentProfileService::default()
             .list_profiles(&database)
             .unwrap()[0]
@@ -875,6 +1125,22 @@ mod tests {
             restored.digest().unwrap(),
             captured.source.digest().unwrap()
         );
+        let receipt = restored.capability_receipt().unwrap();
+        let capabilities = receipt["capabilities"].as_array().unwrap();
+        assert!(capabilities.iter().any(|item| item["kind"] == "skill"));
+        assert!(capabilities.iter().any(|item| item["kind"] == "rule"));
+        assert!(capabilities.iter().all(|item| item["execution"] != item["authorization"]));
+        assert_eq!(
+            restored.manifest["capabilityStages"]["prepare"]["fingerprint"],
+            receipt["fingerprint"]
+        );
+        let mut tampered = restored.clone();
+        tampered.rules[0].body.push_str(" tampered");
+        assert!(
+            tampered
+                .bind_real_run("tampered_run", 7, 1, &restored.default_bootstrap)
+                .is_err()
+        );
         let real_bootstrap = format!(
             "{}\nActual Run frozen bootstrap",
             restored.default_bootstrap
@@ -885,6 +1151,10 @@ mod tests {
         assert_eq!(bound.bundle.run_id, "actual_run");
         assert_eq!(bound.bundle.attempt, 1);
         assert_eq!(bound.manifest["executionEpoch"], 7);
+        assert_eq!(
+            bound.manifest["capabilityStages"]["confirm"]["fingerprint"],
+            receipt["fingerprint"]
+        );
         let settings = bound
             .bundle
             .files
@@ -981,67 +1251,173 @@ mod tests {
         // Exact consent becomes immutable Run source evidence. A later save
         // cannot authorize an older unreviewed snapshot or rewrite a reviewed one.
         use crate::member_capability::{
-            get_member_capability_catalog, set_member_capability_catalog, put_capability_item,
-            MemberCapabilityPutParams, MemberCapabilitySetParams, MemberCapabilitySelection,
-            HookReviewApproval,
+            HookReviewApproval, MemberCapabilityPutParams, MemberCapabilitySelection,
+            MemberCapabilitySetParams, get_member_capability_catalog, put_capability_item,
+            set_member_capability_catalog,
         };
-        let review_scope = crate::member_capability::test_remote_scope(&mut database, &member, &directory);
-        let body=r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"fixture-command","timeout":5}]}]}}"#;
-        put_capability_item(&database,&store,&library,&MemberCapabilityPutParams {
-            item_id:Some("source_hook".into()),kind:"hook".into(),name:Some("Source hook".into()),
-            note:Some("Fixture".into()),source_label:Some("Fixture".into()),scope:Some("project".into()),
-            tool_names:Vec::new(),body:Some(body.into()),
-        }).unwrap();
-        let codex_params=FreezeMemberBundleParams {
-            member_id:member.clone(),runtime:"codex-cli".into(),reported_runtime_version:None,
+        let review_scope =
+            crate::member_capability::test_remote_scope(&mut database, &member, &directory);
+        let body = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"fixture-command","timeout":5}]}]}}"#;
+        put_capability_item(
+            &database,
+            &store,
+            &library,
+            &MemberCapabilityPutParams {
+                item_id: Some("source_hook".into()),
+                kind: "hook".into(),
+                name: Some("Source hook".into()),
+                note: Some("Fixture".into()),
+                source_label: Some("Fixture".into()),
+                scope: Some("project".into()),
+                tool_names: Vec::new(),
+                body: Some(body.into()),
+            },
+        )
+        .unwrap();
+        let codex_params = FreezeMemberBundleParams {
+            member_id: member.clone(),
+            runtime: "codex-cli".into(),
+            reported_runtime_version: None,
         };
-        assert!(capture_member_bundle_source(&database,&directory,&store,&codex_params).is_err());
-        let catalog=get_member_capability_catalog(&database,&store,&member).unwrap();
-        let view=catalog.items.iter().find(|item|item.id=="source_hook").unwrap().hook_definition.as_ref().unwrap();
-        set_member_capability_catalog(&mut database,&store,&library,&MemberCapabilitySetParams {
-            local_camp_id: None,
-            agent_id:member.clone(),expected_revision:catalog.revision.clone(),acknowledge_high_risk:false,
-            selections:Vec::new(),
-            reviewed_hooks:vec![HookReviewApproval{id:"source_hook".into(),definition_digest:view.definition_digest.clone(),scope_digest:view.scope_digest.clone()}],
-        }).unwrap();
-        let reviewed=capture_member_bundle_source(&database,&directory,&store,&codex_params).unwrap().source;
-        let exact=reviewed.bind_real_run("reviewed_run",9,1,&reviewed.default_bootstrap).unwrap();
-        let grant=reviewed.codex_hook_grant(&exact.bundle).unwrap().unwrap();
+        assert!(
+            capture_member_bundle_source(&database, &directory, &store, &codex_params).is_err()
+        );
+        let catalog = get_member_capability_catalog(&database, &store, &member).unwrap();
+        let view = catalog
+            .items
+            .iter()
+            .find(|item| item.id == "source_hook")
+            .unwrap()
+            .hook_definition
+            .as_ref()
+            .unwrap();
+        set_member_capability_catalog(
+            &mut database,
+            &store,
+            &library,
+            &MemberCapabilitySetParams {
+                local_camp_id: None,
+                agent_id: member.clone(),
+                expected_revision: catalog.revision.clone(),
+                acknowledge_high_risk: false,
+                selections: Vec::new(),
+                reviewed_hooks: vec![HookReviewApproval {
+                    id: "source_hook".into(),
+                    definition_digest: view.definition_digest.clone(),
+                    scope_digest: view.scope_digest.clone(),
+                }],
+            },
+        )
+        .unwrap();
+        let reviewed = capture_member_bundle_source(&database, &directory, &store, &codex_params)
+            .unwrap()
+            .source;
+        let exact = reviewed
+            .bind_real_run("reviewed_run", 9, 1, &reviewed.default_bootstrap)
+            .unwrap();
+        let grant = reviewed.codex_hook_grant(&exact.bundle).unwrap().unwrap();
         grant.validate(&exact.bundle).unwrap();
-        let reviewed_bytes=serde_json::to_vec(&reviewed).unwrap();
-        assert_eq!(reviewed.manifest["hookReviews"][0]["reviewScope"], serde_json::to_value(&review_scope).unwrap());
-        let mut missing=serde_json::to_value(&reviewed).unwrap();
-        missing["manifest"].as_object_mut().unwrap().remove("hookReviews");
-        let unreviewed:FrozenBundleSource=serde_json::from_value(missing).unwrap();
-        assert!(unreviewed.bind_real_run("old_unreviewed_run",9,1,&reviewed.default_bootstrap).is_err());
+        let reviewed_bytes = serde_json::to_vec(&reviewed).unwrap();
+        assert_eq!(
+            reviewed.manifest["hookReviews"][0]["reviewScope"],
+            serde_json::to_value(&review_scope).unwrap()
+        );
+        let mut missing = serde_json::to_value(&reviewed).unwrap();
+        missing["manifest"]
+            .as_object_mut()
+            .unwrap()
+            .remove("hookReviews");
+        let unreviewed: FrozenBundleSource = serde_json::from_value(missing).unwrap();
+        assert!(
+            unreviewed
+                .bind_real_run("old_unreviewed_run", 9, 1, &reviewed.default_bootstrap)
+                .is_err()
+        );
 
-        database.connection().execute(
-            "UPDATE member_capability_item SET body=?1 WHERE item_id='source_hook'",
-            [body.replace("fixture-command","later-command")],
-        ).unwrap();
-        assert!(capture_member_bundle_source(&database,&directory,&store,&codex_params).is_err());
-        assert_eq!(reviewed_bytes,serde_json::to_vec(&reviewed).unwrap());
-        assert_eq!(exact.bundle.digest,reviewed.bind_real_run("reviewed_run",9,1,&reviewed.default_bootstrap).unwrap().bundle.digest);
-        assert_eq!(reviewed.codex_hook_grant(&exact.bundle).unwrap(),Some(grant.clone()));
-        let current=get_member_capability_catalog(&database,&store,&member).unwrap();
-        let view=current.items.iter().find(|item|item.id=="source_hook").unwrap().hook_definition.as_ref().unwrap();
-        let newer=set_member_capability_catalog(&mut database,&store,&library,&MemberCapabilitySetParams {
-            local_camp_id: None,
-            agent_id:member.clone(),expected_revision:current.revision.clone(),acknowledge_high_risk:false,
-            selections:Vec::new(),
-            reviewed_hooks:vec![HookReviewApproval{id:"source_hook".into(),definition_digest:view.definition_digest.clone(),scope_digest:view.scope_digest.clone()}],
-        }).unwrap();
-        assert!(unreviewed.bind_real_run("old_unreviewed_run",9,1,&reviewed.default_bootstrap).is_err());
-        set_member_capability_catalog(&mut database,&store,&library,&MemberCapabilitySetParams {
-            local_camp_id: None,
-            agent_id:member.clone(),expected_revision:newer.revision,acknowledge_high_risk:false,
-            selections:vec![MemberCapabilitySelection{kind:"hook".into(),id:"source_hook".into(),selected:false}],
-            reviewed_hooks:Vec::new(),
-        }).unwrap();
-        let off=capture_member_bundle_source(&database,&directory,&store,&codex_params).unwrap().source;
-        let off_bundle=off.bind_real_run("next_without_hook",10,1,&off.default_bootstrap).unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE member_capability_item SET body=?1 WHERE item_id='source_hook'",
+                [body.replace("fixture-command", "later-command")],
+            )
+            .unwrap();
+        assert!(
+            capture_member_bundle_source(&database, &directory, &store, &codex_params).is_err()
+        );
+        assert_eq!(reviewed_bytes, serde_json::to_vec(&reviewed).unwrap());
+        assert_eq!(
+            exact.bundle.digest,
+            reviewed
+                .bind_real_run("reviewed_run", 9, 1, &reviewed.default_bootstrap)
+                .unwrap()
+                .bundle
+                .digest
+        );
+        assert_eq!(
+            reviewed.codex_hook_grant(&exact.bundle).unwrap(),
+            Some(grant.clone())
+        );
+        let current = get_member_capability_catalog(&database, &store, &member).unwrap();
+        let view = current
+            .items
+            .iter()
+            .find(|item| item.id == "source_hook")
+            .unwrap()
+            .hook_definition
+            .as_ref()
+            .unwrap();
+        let newer = set_member_capability_catalog(
+            &mut database,
+            &store,
+            &library,
+            &MemberCapabilitySetParams {
+                local_camp_id: None,
+                agent_id: member.clone(),
+                expected_revision: current.revision.clone(),
+                acknowledge_high_risk: false,
+                selections: Vec::new(),
+                reviewed_hooks: vec![HookReviewApproval {
+                    id: "source_hook".into(),
+                    definition_digest: view.definition_digest.clone(),
+                    scope_digest: view.scope_digest.clone(),
+                }],
+            },
+        )
+        .unwrap();
+        assert!(
+            unreviewed
+                .bind_real_run("old_unreviewed_run", 9, 1, &reviewed.default_bootstrap)
+                .is_err()
+        );
+        set_member_capability_catalog(
+            &mut database,
+            &store,
+            &library,
+            &MemberCapabilitySetParams {
+                local_camp_id: None,
+                agent_id: member.clone(),
+                expected_revision: newer.revision,
+                acknowledge_high_risk: false,
+                selections: vec![MemberCapabilitySelection {
+                    kind: "hook".into(),
+                    id: "source_hook".into(),
+                    selected: false,
+                }],
+                reviewed_hooks: Vec::new(),
+            },
+        )
+        .unwrap();
+        let off = capture_member_bundle_source(&database, &directory, &store, &codex_params)
+            .unwrap()
+            .source;
+        let off_bundle = off
+            .bind_real_run("next_without_hook", 10, 1, &off.default_bootstrap)
+            .unwrap();
         assert!(off.codex_hook_grant(&off_bundle.bundle).unwrap().is_none());
-        assert_eq!(reviewed.codex_hook_grant(&exact.bundle).unwrap(),Some(grant));
+        assert_eq!(
+            reviewed.codex_hook_grant(&exact.bundle).unwrap(),
+            Some(grant)
+        );
 
         // Imported Library Skills: real import, real catalog registration, real
         // selection and real capture. The frozen bytes must come from the
@@ -1105,7 +1481,10 @@ mod tests {
         // Drop the hook fixture so its consent state cannot mask Skill capture.
         database
             .connection()
-            .execute("DELETE FROM member_capability_item WHERE item_id='source_hook'", [])
+            .execute(
+                "DELETE FROM member_capability_item WHERE item_id='source_hook'",
+                [],
+            )
             .unwrap();
         database
             .connection()
@@ -1196,7 +1575,10 @@ mod tests {
             v1_asset["contentDigest"],
             json!(first.current_revision.content_digest)
         );
-        assert_eq!(v1.manifest["selectionRevision"], json!(v1.selection_revision));
+        assert_eq!(
+            v1.manifest["selectionRevision"],
+            json!(v1.selection_revision)
+        );
         // A new revision is a new source; the old frozen source keeps binding v1.
         let second = import_library_skill(
             &mut database,
@@ -1243,7 +1625,11 @@ mod tests {
         // Tampered, disabled and dangling sources fail closed instead of being
         // quietly left out of the packet.
         let revision_path = library.revision_content_path(&second.id, &second.current_revision.id);
-        fs::write(revision_path.join("resources").join("notes.md"), "tampered\n").unwrap();
+        fs::write(
+            revision_path.join("resources").join("notes.md"),
+            "tampered\n",
+        )
+        .unwrap();
         assert!(capture_member_bundle_source(&database, &directory, &store, &params).is_err());
         fs::write(
             revision_path.join("resources").join("notes.md"),
@@ -1262,7 +1648,10 @@ mod tests {
             .unwrap();
         database
             .connection()
-            .execute("DELETE FROM member_skill_source WHERE skill_id=?1", [&second.id])
+            .execute(
+                "DELETE FROM member_skill_source WHERE skill_id=?1",
+                [&second.id],
+            )
             .unwrap();
         assert!(capture_member_bundle_source(&database, &directory, &store, &params).is_err());
         put_capability_item(&database, &store, &library, &register_params()).unwrap();
@@ -1290,7 +1679,11 @@ mod tests {
             .unwrap()
             .source;
         assert!(!off.files.iter().any(|file| file.name == "field-notes"));
-        assert!(!off.skill_index.iter().any(|entry| entry.name == "field-notes"));
+        assert!(
+            !off.skill_index
+                .iter()
+                .any(|entry| entry.name == "field-notes")
+        );
         assert!(
             !off.manifest["assets"]
                 .as_array()
@@ -1365,7 +1758,9 @@ mod tests {
         let run_root = material_root.join(material_run).join("skills");
         let index: Value = serde_json::from_str(
             section
-                .split_once("\nCurrent for this run; replaces any earlier Rovai Additional Skills.\n")
+                .split_once(
+                    "\nCurrent for this run; replaces any earlier Rovai Additional Skills.\n",
+                )
                 .unwrap()
                 .1
                 .strip_suffix("\n[/ROVAI_ADDITIONAL_SKILLS]")
@@ -1376,17 +1771,21 @@ mod tests {
             index["root"],
             json!(dunce::simplified(&run_root).to_str().unwrap())
         );
-        assert!(index["skills"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|entry| entry["name"] == json!("field-notes")
-                && entry["desc"] == json!("Field notes")));
-        assert!(index["skills"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|entry| entry["name"] == json!("campfire")));
+        assert!(
+            index["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["name"] == json!("field-notes")
+                    && entry["desc"] == json!("Field notes"))
+        );
+        assert!(
+            index["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["name"] == json!("campfire"))
+        );
         // The index names real files under the index root, not a mirror hash.
         let imported_entry = fs::read_to_string(run_root.join("field-notes/SKILL.md")).unwrap();
         assert!(imported_entry.contains("second body"), "{imported_entry}");
@@ -1449,14 +1848,19 @@ mod tests {
             true,
         );
         assert_ne!(third.current_revision.id, second.current_revision.id);
-        let (frozen_section, frozen_digest) = material_for(&database, &directory, material_run, &member).unwrap();
-        assert_eq!((frozen_section, frozen_digest), (section.clone(), digest.clone()));
+        let (frozen_section, frozen_digest) =
+            material_for(&database, &directory, material_run, &member).unwrap();
+        assert_eq!(
+            (frozen_section, frozen_digest),
+            (section.clone(), digest.clone())
+        );
         assert!(
             fs::read_to_string(run_root.join("field-notes/SKILL.md"))
                 .unwrap()
                 .contains("second body")
         );
-        let (next_section, next_digest) = material_for(&database, &directory, next_material_run, &member).unwrap();
+        let (next_section, next_digest) =
+            material_for(&database, &directory, next_material_run, &member).unwrap();
         assert_ne!(next_section, section);
         assert_ne!(next_digest, digest);
         assert!(
