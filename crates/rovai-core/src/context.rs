@@ -3364,6 +3364,7 @@ struct MemoryEntrypointRow {
     revision_id: String,
     kind: crate::memory::MemoryKind,
     retrieval_keys: Vec<String>,
+    body: String,
     counterparty: Option<String>,
     counterparty_order: i64,
 }
@@ -3889,6 +3890,7 @@ fn build_memory_entrypoint<R: ContextReadConnection>(
             revision_id,
             kind,
             retrieval_keys: memory.current_retrieval_keys,
+            body: memory.current_body.unwrap_or_default(),
             counterparty: None,
             counterparty_order: i64::MAX,
         };
@@ -3997,8 +3999,34 @@ fn build_memory_entrypoint<R: ContextReadConnection>(
         output
             .push_str("No Memory indexed at Session start; use `rovai memory search` when needed.");
     } else {
+        // PiBot recall.js:163-197 injects bounded memory bodies directly. Keep the existing
+        // discovery rows, but put the first topK bodies in the prompt under one byte budget.
+        const TOP_K: usize = 12;
+        const BODY_BUDGET_BYTES: usize = 4096;
+        let mut used = 0usize;
+        let mut injected = String::new();
+        for row in hearth.iter().chain(companion.iter()).chain(relationship_rows.iter()).take(TOP_K) {
+            if row.body.trim().is_empty() || used >= BODY_BUDGET_BYTES {
+                continue;
+            }
+            let remaining = BODY_BUDGET_BYTES - used;
+            let mut end = row.body.len().min(remaining);
+            while !row.body.is_char_boundary(end) {
+                end -= 1;
+            }
+            let body = &row.body[..end];
+            if body.is_empty() {
+                continue;
+            }
+            used += body.len();
+            injected.push_str(&format!("#### {} ({})\n\n{}\n\n", row.memory_id, keys_label(row), body));
+        }
+        if !injected.is_empty() {
+            output.push_str("### Memory content\n\n");
+            output.push_str(&injected);
+        }
         output.push_str(
-            "Discovery index only. Use `rovai memory read` for current content and access state before relying on an entry.",
+            "Discovery index plus bounded current Memory content. Use `rovai memory read` for access state or entries outside the budget before relying on them.",
         );
     }
     let selected = hearth
@@ -4019,6 +4047,10 @@ fn build_memory_entrypoint<R: ContextReadConnection>(
         "presentMembers": member_order.keys().collect::<Vec<_>>(),
     }))?;
     Ok((output, selected, authorization_basis_digest))
+}
+
+fn keys_label(row: &MemoryEntrypointRow) -> String {
+    row.retrieval_keys.first().cloned().unwrap_or_else(|| "memory".to_string())
 }
 
 fn append_entrypoint_row(
@@ -16112,8 +16144,8 @@ mod slow_tests {
                 .unwrap();
         let charter = build_session_charter(&snapshot, false, false).unwrap();
 
-        // Memory entrypoint text shares the Bootstrap wording contract. Its index
-        // remains a locator, never a projection of the stored Memory body.
+        // Memory entrypoint text shares the Bootstrap wording contract. It keeps the
+        // locator rows and additionally injects bounded current Memory bodies.
         let (empty_entrypoint, empty_selection, _) =
             build_memory_entrypoint(&fixture.database, &snapshot).unwrap();
         assert_eq!(
@@ -16149,9 +16181,9 @@ mod slow_tests {
         let (indexed_entrypoint, indexed_selection, _) =
             build_memory_entrypoint(&fixture.database, &snapshot).unwrap();
         assert!(indexed_entrypoint.starts_with("### Hearth\n"));
-        assert!(indexed_entrypoint.ends_with("Discovery index only. Use `rovai memory read` for current content and access state before relying on an entry."));
+        assert!(indexed_entrypoint.ends_with("Discovery index plus bounded current Memory content. Use `rovai memory read` for access state or entries outside the budget before relying on them."));
         assert_eq!(indexed_selection.len(), 1);
-        assert!(!indexed_entrypoint.contains("MEMORY_BODY_MUST_NOT_ENTER_BOOTSTRAP_INDEX"));
+        assert!(indexed_entrypoint.contains("MEMORY_BODY_MUST_NOT_ENTER_BOOTSTRAP_INDEX"));
         for obsolete in [
             "Core permissions",
             "Native Session",
