@@ -3635,7 +3635,9 @@ mod managed_workflow_request_id_tests {
             assert_eq!(managed_workflow_request_id(operation, Some(ID)).unwrap(), None);
         }
         let business = json!({
-            "missionId": "fixture-mission", "plan": null, "tasks": [],
+            "missionId": "fixture-mission", "missionTitle": "fixture title",
+            "missionGoal": "fixture goal", "missionStatus": "not_started",
+            "plan": null, "tasks": [],
             "dependencies": [], "claims": [], "evaluatedAt": "2026-11-18T00:00:00Z"
         });
         let envelope = rovai_core::builtin_tool_transport::BuiltinToolInvocationEnvelope::success(

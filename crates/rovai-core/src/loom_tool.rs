@@ -415,12 +415,22 @@ fn require_default_lead(connection: &Connection, caller: &LoomToolCaller<'_>) ->
 }
 
 fn status(database: &Database, mission_id: &str) -> Result<Value> {
+    let (mission_title, mission_goal, mission_status): (String, String, String) = database
+        .connection()
+        .query_row(
+            "SELECT title,description,status FROM mission WHERE id=?1",
+            [mission_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
     let plan = loom::plan_get(database, mission_id)?;
     let tasks = loom::tasks_list(database, mission_id)?;
     let dependencies = loom::dependencies_list(database, mission_id)?;
     let claims = loom::claims_list(database, mission_id)?;
     Ok(json!({
         "missionId": mission_id,
+        "missionTitle": mission_title,
+        "missionGoal": mission_goal,
+        "missionStatus": mission_status,
         "plan": plan,
         "tasks": tasks,
         "dependencies": dependencies,
@@ -696,13 +706,16 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({
             "name": LOOM_STATUS_TOOL_NAME,
             "title": "Read the current Mission's LOOM plan",
-            "description": "Read the current Mission's plan, tasks, dependencies and claims. Returns `plan: null` when no plan exists.",
+            "description": "Read the current Mission's goal, status, plan, tasks, dependencies and claims. Returns `plan: null` when no plan exists.",
             "inputSchema": {"type": "object", "additionalProperties": false, "properties": {}},
             "outputSchema": {
                 "type": "object",
-                "required": ["missionId", "plan", "tasks", "dependencies", "claims", "evaluatedAt"],
+                "required": ["missionId", "missionTitle", "missionGoal", "missionStatus", "plan", "tasks", "dependencies", "claims", "evaluatedAt"],
                 "properties": {
                     "missionId": {"type": "string"},
+                    "missionTitle": {"type": "string"},
+                    "missionGoal": {"type": "string"},
+                    "missionStatus": {"type": "string"},
                     "plan": {"type": ["object", "null"]},
                     "tasks": {"type": "array", "items": open_object()},
                     "dependencies": {"type": "array", "items": open_object()},
@@ -1265,6 +1278,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status["missionId"], mission_id.as_str());
+        assert_eq!(status["missionTitle"], "LOOM chain");
+        assert_eq!(status["missionGoal"], "");
+        assert_eq!(status["missionStatus"], "not_started");
         assert_eq!(status["tasks"].as_array().unwrap().len(), 2);
 
         // The reviewer's read: the latest candidate, its manifest and the authorization that
