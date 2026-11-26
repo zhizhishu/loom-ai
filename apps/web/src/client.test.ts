@@ -719,6 +719,10 @@ describe('renewable browser authentication', () => {
     expect(bodies.filter(entry => entry.path === '/api/v1/computer/agents/grant')).toEqual([
       { path: '/api/v1/computer/agents/grant', body: expect.objectContaining({ nodeId: 'node_a', deviceId: 'sha256:node', consent: true, assistantId: 'agent-a', scope: 'control' }) }
     ])
+    await remote!.agents!.decideApproval!('approval-1', 'approve', 'run', 'd'.repeat(64))
+    expect(bodies.filter(entry => entry.path === '/api/v1/computer/agents/approvals/decide')).toEqual([
+      { path: '/api/v1/computer/agents/approvals/decide', body: { approvalId: 'approval-1', decision: 'approve', scope: 'run', digest: 'd'.repeat(64) } }
+    ])
     expect(bodies.map(entry => entry.path)).not.toContain('/api/v1/computer/agents/grant-placeholder')
     client.clear()
   })
