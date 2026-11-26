@@ -4141,7 +4141,7 @@ mod tests {
             .unwrap()
             .to_owned();
         let control = computer
-            .acquire(
+            .acquire_agent(
                 &grant.sessions,
                 &grant.session,
                 ControlBody {
@@ -4302,7 +4302,7 @@ mod tests {
             .unwrap()
             .to_owned();
         let control = computer
-            .acquire(
+            .acquire_agent(
                 &grant.sessions,
                 &grant.session,
                 ControlBody {
