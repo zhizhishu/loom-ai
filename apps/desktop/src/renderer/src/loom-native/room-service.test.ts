@@ -1,3 +1,5 @@
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import type {
   ActionApprovalView,
@@ -36,6 +38,7 @@ import {
   type RoomDraft,
   type RoomPort
 } from './room-service'
+import { GROUP_NAME_LIMIT_NOTICE, GroupNameField, groupNameCounter } from './RoomDialog'
 
 type RecordedCall = { method: string; params: Record<string, unknown> | undefined }
 
@@ -703,5 +706,40 @@ describe('roomSubmitProblem with the dialog mode', () => {
     const one: RoomDraft = { ...emptyRoomDraft(), memberAgentIds: ['a'], leadAgentId: 'a' }
     expect(roomSubmitProblem(one, agents, preflightOf(['a', 'b']), 'direct')).toBeNull()
     expect(roomSubmitProblem(one, agents, preflightOf(['a', 'b']))).toBeNull()
+  })
+})
+
+// B5 回归：群聊名称字段必须有可见的 n/80 计数，并在恰好 80 字时通过 aria-live
+// 区域说出唯一一句上限提示；到达上限之前该区域已存在但内容为空。工作名称与单聊不受影响。
+describe('RoomDialog group-name counter (B5)', () => {
+  const renderField = (name: string | null) => renderToStaticMarkup(createElement(GroupNameField, { name, onChange: () => {} }))
+
+  it('counts the stored input against the native 80-character max', () => {
+    expect(groupNameCounter(null)).toEqual({ shown: '0/80', atLimit: false })
+    expect(groupNameCounter('新群').shown).toBe('2/80')
+    expect(groupNameCounter('x'.repeat(79))).toEqual({ shown: '79/80', atLimit: false })
+    expect(groupNameCounter('x'.repeat(80)).atLimit).toBe(true)
+    const field = renderField('新群')
+    expect(field).toContain('2/80')
+    // React 19 SSR 输出 camelCase。
+    expect(field).toContain('maxLength="80"')
+  })
+
+  it('keeps the live region available below the limit and clears its message', () => {
+    const field = renderField('新群')
+    expect(field).toContain('aria-live="polite"')
+    expect(field).not.toContain('已达 80 字上限')
+  })
+
+  it('announces exactly one extra line through the live region at 80 characters', () => {
+    const field = renderField('字'.repeat(80))
+    expect(field).toContain('80/80')
+    expect(field).toContain('已达 80 字上限，多出的字不会保存')
+    expect(GROUP_NAME_LIMIT_NOTICE).toBe('已达 80 字上限，多出的字不会保存')
+  })
+
+  it('GroupNameField renders only the group-name input', () => {
+    const field = renderField('任何名字')
+    expect(field.split('<input').length - 1).toBe(1)
   })
 })

@@ -13,6 +13,27 @@ import {
   roomWorkspaceChoices, applyKnownWorkspace, type RoomWorkspaceChoice, type RoomDraft
 } from './room-service'
 
+export const GROUP_NAME_MAX_LENGTH = 80
+/** B5：群名到达 80 字上限时，在 aria-live 区域里给出这句准确提示。 */
+export const GROUP_NAME_LIMIT_NOTICE = '已达 80 字上限，多出的字不会保存'
+/** 计数使用已保存的输入长度（draft.name）；原生 80 字上限保持不变。 */
+export function groupNameCounter(name: string | null): { shown: string; atLimit: boolean } {
+  const length = (name ?? '').length
+  return { shown: `${length}/${GROUP_NAME_MAX_LENGTH}`, atLimit: length >= GROUP_NAME_MAX_LENGTH }
+}
+
+export function GroupNameField({ name, disabled, onChange }: {
+  name: string | null; disabled?: boolean; onChange(value: string): void
+}) {
+  const counter = groupNameCounter(name)
+  return <>
+    <input aria-label="群聊名称" placeholder="例如：网站改版小队" maxLength={GROUP_NAME_MAX_LENGTH}
+      disabled={disabled} value={name ?? ''} onChange={event => onChange(event.target.value)}/>
+    <small className="ln-name-count" style={{ display: 'block' }}>{counter.shown}</small>
+    <small className="ln-name-limit" style={{ display: 'block' }} aria-live="polite">{counter.atLimit ? GROUP_NAME_LIMIT_NOTICE : ''}</small>
+  </>
+}
+
 export function RoomDialog({ open, environment, agents, initialAgentId, initialMode = 'group', initialWorkspace, theme = 'day', onClose, onCreated, onNewAssistant }: {
   open: boolean; environment: BusinessEnvironment; agents: AgentProfile[]; initialAgentId?: string
   initialMode?: 'direct' | 'group' | 'work'; initialWorkspace?: WorkspaceSelection | null
@@ -147,7 +168,9 @@ export function RoomDialog({ open, environment, agents, initialAgentId, initialM
   return <SurfaceDialog open={open} title="开始一段新协作" description="告诉助手要做什么，把合适的队友拉进来。" theme={theme} onClose={close} className="ln-room-dialog">
     <div className="ln-room-content">
       <nav className="ln-segment-tabs" aria-label="对话类型" style={{ marginBottom: 20 }}><button type="button" disabled={creationUnknown || busy} className={mode === 'direct' ? 'is-selected' : ''} onClick={() => { setMode('direct'); const id = draft.leadAgentId || draft.memberAgentIds[0]; patch({ name: agents.find(agent => agent.agentId === id)?.displayName ?? null, memberAgentIds: id ? [id] : [], leadAgentId: id || '' }) }}>单聊</button><button type="button" disabled={creationUnknown || busy} className={mode === 'group' ? 'is-selected' : ''} onClick={() => setMode('group')}>群聊协作</button><button type="button" disabled={creationUnknown || busy} className={mode === 'work' ? 'is-selected' : ''} onClick={() => setMode('work')}>共同完成工作</button></nav>
-      {mode !== 'direct' && <label className="ln-field"><span>{mode === 'work' ? '工作名称' : '群聊名称'}</span><input aria-label={mode === 'work' ? '工作名称' : '群聊名称'} placeholder={mode === 'work' ? '例如：做一个可以使用的网站' : '例如：网站改版小队'} maxLength={mode === 'work' ? 200 : 80} disabled={busy || creationUnknown} value={draft.name ?? ''} onChange={event => patch({ name: event.target.value || null })}/></label>}
+      {mode !== 'direct' && <label className="ln-field"><span>{mode === 'work' ? '工作名称' : '群聊名称'}</span>{mode === 'group'
+        ? <GroupNameField name={draft.name} disabled={busy || creationUnknown} onChange={value => patch({ name: value || null })}/>
+        : <input aria-label="工作名称" placeholder="例如：做一个可以使用的网站" maxLength={200} disabled={busy || creationUnknown} value={draft.name ?? ''} onChange={event => patch({ name: event.target.value || null })}/>}</label>}
       {mode === 'work' && <label className="ln-field"><span>想要什么结果？</span><textarea aria-label="工作目标" rows={4} maxLength={12000} placeholder="描述目标、约束和你希望交付的成果。协调助手会组织队友，进度与成果显示在右侧。" disabled={busy || creationUnknown} value={goal} onChange={event => { setGoal(event.target.value); setChanged(true); setError(''); if (!creationUnknown) workAttempt.current = undefined }}/><small>工作会保留目标、任务进展和成果；不是只建一个空群。</small></label>}
       <div className="ln-panel-title"><h3>{mode === 'direct' ? '选择助手' : '邀请助手'}</h3><small>{draft.memberAgentIds.length} 位已选</small></div>
       {people.length > 0 ? <div className="ln-room-people">{people.map(agent => <label className="ln-room-person" key={agent.agentId}><input type={mode === 'direct' ? 'radio' : 'checkbox'} name="room-members" checked={draft.memberAgentIds.includes(agent.agentId)} onChange={() => toggle(agent.agentId)} disabled={busy || creationUnknown}/><Avatar agent={agent} size={32}/><span><strong>{agent.displayName}</strong><small>{agent.teamRole || '助手'}{!agent.runtimeConfiguration ? ' · 待配置运行端' : ''}</small></span>{mode !== 'direct' && draft.leadAgentId === agent.agentId && <span className="ln-room-lead-badge">负责回复</span>}</label>)}</div>
