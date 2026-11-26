@@ -308,7 +308,7 @@ async function stopOwnedTree(child) {
 // ---------------------------------------------------------------------------
 const OVERRIDES = ['ROVAI_EMBEDDED_PI_ROOT', 'PI_CODING_AGENT_DIR', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'DSH_HOME',
   'ROVAI_DEEPSEEK_HARNESS_BIN', 'NODE_OPTIONS', 'NODE_PATH', 'LOOM_COMPUTER_PYTHON', 'LOOM_COMPUTER_HELPER',
-  'LOOM_COMPUTER_AGENT_PYTHON', 'LOOM_COMPUTER_AGENT_BRIDGE']
+  'LOOM_COMPUTER_AGENT_PYTHON', 'LOOM_COMPUTER_AGENT_BRIDGE', 'LOOM_COMPUTER_AGENT_PI_MCP']
 
 function isolatedEnv(root) {
   const env = { ...process.env }

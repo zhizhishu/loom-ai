@@ -285,6 +285,7 @@ function Run-Loom([string]$Root, [string]$DataRoot, [int]$ListenPort, $Manifest)
         $env:LOOM_COMPUTER_HELPER = Join-Path $computer 'host_desktop.py'
         $env:LOOM_COMPUTER_AGENT_PYTHON = $env:LOOM_COMPUTER_PYTHON
         $env:LOOM_COMPUTER_AGENT_BRIDGE = Join-Path $computer 'mcp_bridge.py'
+        $env:LOOM_COMPUTER_AGENT_PI_MCP = '1'
     }
     Write-Host "LOOM: http://127.0.0.1:$ListenPort/"
     Write-Host 'Keep this window open. Press Ctrl+C to stop.'

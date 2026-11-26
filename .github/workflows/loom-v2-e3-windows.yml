@@ -540,7 +540,13 @@ jobs:
             throw 'Delivered Hook provenance does not match the candidate manifest'
           }
           & ./scripts/package-computer-runtime.ps1 -Verify -Destination (Join-Path $kit 'runtime/computer')
-          if ($LASTEXITCODE -ne 0) { throw 'Delivered computer runtime verification failed' }
+          if ($LASTEXITCODE -ne 0) { throw 'Delivered computer runtime verification failed' }          foreach ($relative in @('runtime/computer/host_desktop.py', 'runtime/computer/mcp_bridge.py', 'runtime/computer/python/python.exe')) {
+            if (!(Test-Path -LiteralPath (Join-Path $kit $relative) -PathType Leaf)) { throw "Delivered computer file missing: $relative" }
+          }
+          $deliveredManager = Get-Content -LiteralPath (Join-Path $kit 'Manage-Loom.ps1') -Raw
+          foreach ($requiredEnv in @('LOOM_COMPUTER_PYTHON', 'LOOM_COMPUTER_HELPER', 'LOOM_COMPUTER_AGENT_PYTHON', 'LOOM_COMPUTER_AGENT_BRIDGE', 'LOOM_COMPUTER_AGENT_PI_MCP')) {
+            if ($deliveredManager -cnotmatch [regex]::Escape('$env:' + $requiredEnv)) { throw "Delivered launcher does not configure $requiredEnv" }
+          }
           node scripts/loom-v2-pi-purge-stage.mjs --verify (Join-Path $kit 'runtime/extensions/pi-purge/upstream')
           if ($LASTEXITCODE -ne 0) { throw 'Delivered optional Pi Purge closed manifest verification failed' }
           $extensionInfo = Get-Content (Join-Path $kit 'runtime/extensions/pi-purge/extension-info.json') -Raw | ConvertFrom-Json
