@@ -226,6 +226,8 @@ export const WEB_OPERATIONS = [
   'messageQuotes.capture',
   'thread.messages.send',
   'thread.messages.withdraw',
+  'pi.extensionUi.pending',
+  'pi.extensionUi.respond',
   'action.approvals.resolve',
   'agentRuns.cancel', 'agentRuns.continue',
   'commands.reconcile',

@@ -371,6 +371,10 @@ pub enum Operation {
     Send,
     #[serde(rename = "thread.messages.withdraw", alias = "camp.messages.withdraw")]
     WithdrawMessage,
+    #[serde(rename = "pi.extensionUi.pending")]
+    PiExtensionUiPending,
+    #[serde(rename = "pi.extensionUi.respond")]
+    PiExtensionUiRespond,
     #[serde(rename = "action.approvals.resolve")]
     Approval,
     #[serde(rename = "agentRuns.cancel")]
@@ -704,6 +708,8 @@ impl Operation {
             Self::CaptureQuote => "messageQuotes.capture",
             Self::Send => "camp.messages.send",
             Self::WithdrawMessage => "camp.messages.withdraw",
+            Self::PiExtensionUiPending => "pi.extensionUi.pending",
+            Self::PiExtensionUiRespond => "pi.extensionUi.respond",
             Self::Approval => "action.approvals.resolve",
             Self::CancelRun => "agentRuns.cancel",
             Self::ContinueRun => "agentRuns.continue",
@@ -1200,6 +1206,8 @@ mod tests {
         );
         for (public, internal) in [
             ("runtime.status.get", "runtime.status.get"),
+            ("pi.extensionUi.pending", "pi.extensionUi.pending"),
+            ("pi.extensionUi.respond", "pi.extensionUi.respond"),
             (
                 "members.runProjection.preview",
                 "members.runProjection.preview",

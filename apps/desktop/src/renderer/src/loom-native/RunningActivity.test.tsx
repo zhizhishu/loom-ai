@@ -62,7 +62,7 @@ const approval = (over: Partial<ActionApprovalView> = {}): ActionApprovalView =>
 
 function conversation(over: {
   snapshot?: Partial<ThreadSnapshot>; agents?: AgentProfile[]; error?: string | null
-  draft?: string; sending?: boolean
+  draft?: string; sending?: boolean; questions?: import('./pi-questions').PiQuestion[]
 } = {}) {
   return renderToStaticMarkup(createElement(ConversationView, {
     item, snapshot: snapshot(over.snapshot ?? {}), agents: over.agents ?? [profile()], bundles: [],
@@ -70,7 +70,7 @@ function conversation(over: {
     error: over.error ?? null, onDraft: () => {}, onFiles: () => {}, onSend: () => {}, onProfile: () => {},
     onArtifact: () => {}, onShowSidebar: () => {}, sidebarHidden: false, onShowWork: () => {},
     inspectorHidden: false, onAttachment: () => {}, onResolveApproval: () => {}, approvalBusy: false,
-    onRetryRun: () => {}, onConfigureRuntime: () => {}
+    onRetryRun: () => {}, onConfigureRuntime: () => {}, questions: over.questions, onAnswerQuestion: async () => {}
   }))
 }
 
@@ -106,6 +106,16 @@ describe('running row (Mikka agent-activity working row)', () => {
     const failed = conversation({ snapshot: { agentRuns: [run()] } })
     expect(failed).not.toContain('Hanzi正在处理')
     expect(failed).toContain('工作了 39 分 17 秒 · 失败')
+    const questions: import('./pi-questions').PiQuestion[] = [{
+      threadId: 'th', agentRunId: 'r1', executionEpoch: 1, hostInstanceId: 'host', agentId: 'a',
+      status: 'waiting_for_user', request: { id: 'question', method: 'select', title: '选哪一个？', options: ['A', 'B'] }
+    }]
+    const waiting = conversation({ snapshot: { agentRuns: [run({ status: 'running', endedAt: null })] }, questions })
+    expect(waiting).toContain('等你回答')
+    expect(waiting).toContain('选哪一个？')
+    expect(waiting).not.toContain('Hanzi正在处理')
+    const otherThread = conversation({ questions: [{ ...questions[0], threadId: 'other' }] })
+    expect(otherThread).not.toContain('选哪一个？')
   })
 })
 

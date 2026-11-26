@@ -60,6 +60,10 @@ use super::{
 };
 
 const MANAGED_HOST_EXTENSION: &str = include_str!("managed-host.ts");
+pub(crate) const QUESTION_EXTENSION: &str = include_str!("adapted/ask-user-question.mjs");
+pub(crate) const QUESTION_GUARD: &str = include_str!("question-guard.mjs");
+const QUESTION_EXTENSION_NAME: &str = "ask-user-question.mjs";
+const QUESTION_GUARD_NAME: &str = "question-guard.mjs";
 const MANAGED_PURGE_ADAPTER: &str =
     include_str!("../../../../scripts/loom-v2-pi-purge-extension.ts");
 const PI_PURGE_SOURCE_SHA256: &str =
@@ -595,9 +599,11 @@ fn append_host_arguments(
     // `--no-extensions`) stay exactly as the frozen launch already declared them. `--tools` carries the
     // comma-joined tool list Core derived from the frozen access mode, never a caller-composed list.
     if let Some((guard_path, tools)) = file_access {
-        command.args(["--tools", tools, "--extension"]).arg(guard_path);
+        // The managed question tool has no filesystem or execution capability.
+        command.args(["--tools", &format!("{tools},ask_user_question"), "--extension"]).arg(guard_path);
     }
     command.args(["--extension"]).arg(extension_path);
+    command.args(["--extension"]).arg(extension_path.with_file_name(QUESTION_EXTENSION_NAME));
     if let Some(path) = purge_extension {
         command.args(["--extension"]).arg(path);
     }
@@ -651,6 +657,7 @@ impl PiHost {
         create_private_directory(&config_root)?;
         let extension_path = config_root.join("rovai-pi-host.ts");
         write_private_file(&extension_path, MANAGED_HOST_EXTENSION.as_bytes())?;
+        write_private_file(&config_root.join(QUESTION_EXTENSION_NAME), QUESTION_EXTENSION.as_bytes())?;
         // The managed Host extension imports the workflow bridge from this same private directory. It is
         // written for every policy (one extra small file) so the import can never be the reason a Host
         // fails to load; the bridge itself registers nothing unless the grant carries its tool.
@@ -687,9 +694,11 @@ impl PiHost {
             Some(grant) => {
                 let guard_path = config_root.join(super::PI_FILE_GUARD_EXTENSION_NAME);
                 write_private_file(&guard_path, super::PI_FILE_GUARD_EXTENSION_SOURCE.as_bytes())?;
+                let guard_entry = config_root.join(QUESTION_GUARD_NAME);
+                write_private_file(&guard_entry, QUESTION_GUARD.as_bytes())?;
                 let grant_path = config_root.join(GUARD_GRANT_FILE_NAME);
                 write_private_json(&grant_path, &grant.to_document()?)?;
-                Some((guard_path, grant.allowed_tools.join(","), grant_path))
+                Some((guard_entry, grant.allowed_tools.join(","), grant_path))
             }
             None => None,
         };
@@ -1782,6 +1791,8 @@ pub struct PiRuntime {
     text_state: Mutex<super::PiTextState>,
     input_submission: Mutex<()>,
     stopping: AtomicBool,
+    // TODO: Pending questions are lost on Core restart; add recovery if durable answers become required.
+    pending_ui: Mutex<HashMap<String, (super::ExtensionUiRequest, Option<tokio::time::Instant>)>>,
 }
 
 impl PiRuntime {
@@ -1812,6 +1823,7 @@ impl PiRuntime {
             text_state: Mutex::new(super::PiTextState::default()),
             input_submission: Mutex::new(()),
             stopping: AtomicBool::new(false),
+            pending_ui: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1988,6 +2000,7 @@ impl PiRuntime {
 
     pub async fn cancel(&self) -> Result<()> {
         self.stopping.store(true, Ordering::Release);
+        self.pending_ui.lock().await.clear();
         self.host.streaming.store(false, Ordering::Release);
         let _submission = self.input_submission.lock().await;
         // Pi abort may drain queued input. This path must remove it first;
@@ -2003,7 +2016,66 @@ impl PiRuntime {
         self.host.detach_and_flush_ingress(&self.owner).await
     }
 
+    pub(crate) async fn request_ui(&self, message: &Value) -> Result<()> {
+        let request = super::ExtensionUiRequest::parse(message)?;
+        let deadline = request.timeout.and_then(|ms| {
+            tokio::time::Instant::now().checked_add(Duration::from_millis(ms))
+        });
+        let mut pending = self.pending_ui.lock().await;
+        pending.retain(|_, (_, until)| until.is_none_or(|until| until > tokio::time::Instant::now()));
+        anyhow::ensure!(
+            pending.len() < 32 && !pending.contains_key(&request.id),
+            "Pi dialog limit or duplicate id"
+        );
+        pending.insert(request.id.clone(), (request, deadline));
+        Ok(())
+    }
+
+    pub(crate) async fn pending_ui(&self) -> Vec<Value> {
+        if self.stopping.load(Ordering::Acquire) || !self.host.is_alive() {
+            return Vec::new();
+        }
+        let mut pending = self.pending_ui.lock().await;
+        pending.retain(|_, (_, until)| until.is_none_or(|until| until > tokio::time::Instant::now()));
+        pending.values().map(|(request, _)| json!({
+            "threadId": self.camp_id, "agentRunId": self.owner.agent_run_id,
+            "executionEpoch": self.owner.execution_epoch, "hostInstanceId": self.host_instance_id(),
+            "status": "waiting_for_user", "request": request,
+        })).collect()
+    }
+
+    pub(crate) async fn answer_ui(&self, answer: &super::ExtensionUiAnswer) -> Result<()> {
+        anyhow::ensure!(
+            self.belongs_to_camp(&answer.thread_id)
+                && self.owner.agent_run_id == answer.agent_run_id
+                && self.owner.execution_epoch == answer.execution_epoch
+                && self.host_instance_id() == answer.host_instance_id,
+            "Pi dialog route mismatch"
+        );
+        // Serialize competing answers; retain on validation failure, consume once stdin is written.
+        let mut pending = self.pending_ui.lock().await;
+        let (request, deadline) = pending
+            .get(&answer.request_id)
+            .context("Pi dialog is no longer pending")?;
+        anyhow::ensure!(
+            deadline.is_none_or(|until| until > tokio::time::Instant::now()),
+            "Pi dialog expired"
+        );
+        let response = request.response(answer)?;
+        self.respond(json!(request.id), response).await?;
+        pending.remove(&answer.request_id);
+        Ok(())
+    }
+
     pub async fn respond(&self, id: Value, response: Value) -> Result<()> {
+        // Hold owner through the write so a warm Host cannot rebind between check and send.
+        let owner = self.host.owner.read().await;
+        anyhow::ensure!(
+            owner.as_ref() == Some(&self.owner)
+                && !self.stopping.load(Ordering::Acquire)
+                && self.host.is_alive(),
+            "Pi dialog owner is no longer active"
+        );
         if response.get("type").and_then(Value::as_str) != Some("extension_ui_response")
             || response.get("id") != Some(&id)
         {
@@ -2014,6 +2086,7 @@ impl PiRuntime {
 
     pub async fn observe(&self, mut message: Value) -> Result<(Value, Option<CompletedAcpAction>)> {
         match message.get("type").and_then(Value::as_str) {
+            Some("agent_end") => self.pending_ui.lock().await.clear(),
             Some("message_end") => {
                 let Some(assistant) = message
                     .get("message")
@@ -2077,6 +2150,10 @@ impl PiRuntime {
         self.host.poisoned.store(true, Ordering::Release);
     }
 
+    pub(crate) fn thread_id(&self) -> &str {
+        &self.camp_id
+    }
+
     pub fn host_instance_id(&self) -> &str {
         self.host.host_instance_id()
     }
@@ -2133,6 +2210,8 @@ impl PiRuntime {
     }
 
     async fn cleanup_for_release(&self) -> Result<()> {
+        self.stopping.store(true, Ordering::Release);
+        self.pending_ui.lock().await.clear();
         let session_result = validate_native_session_file(
             &self.session_file,
             &self.session_id,
@@ -2545,6 +2624,17 @@ impl PiRpcRuntimeAdapter {
             return Ok(false);
         };
         runtime.reissue_file_grant(claim, requires_claim, now_epoch_ms())
+    }
+
+    pub(crate) async fn pending_ui(&self, thread_id: Option<&str>) -> Vec<Value> {
+        let runtimes = self.active.lock().await.values()
+            .filter(|runtime| thread_id.is_none_or(|id| runtime.belongs_to_camp(id))).cloned().collect::<Vec<_>>();
+        let mut result = Vec::new();
+        for runtime in runtimes {
+            result.extend(runtime.pending_ui().await);
+        }
+        result.sort_by(|a, b| a["request"]["id"].as_str().cmp(&b["request"]["id"].as_str()));
+        result
     }
 
     pub async fn get_agent_run_on_host(
@@ -3979,6 +4069,8 @@ while IFS= read -r request; do
     get_state)
       printf '{"type":"response","id":"%s","success":true,"command":"get_state","data":{}}\n' "$request_id"
       ;;
+    extension_ui_response)
+      ;;
     steer)
       case "$request" in *STOP_PROBE*) queued_probe=STOP_PROBE; delayed_id=$request_id; continue ;; esac
       printf '{"type":"response","id":"%s","success":true,"command":"steer","data":{"disposition":"queued"}}\n' "$request_id"
@@ -4053,6 +4145,51 @@ done
         );
 
         host.bind(runtime.owner.clone()).await.unwrap();
+        // Extend this pipe owner: exact dialog bytes and the Host/Run fence cannot be
+        // proven by the response constructor alone. get_state drains the fake stdin log.
+        let request = json!({"type":"extension_ui_request", "id":"question-1",
+            "method":"select", "title":"Pick one", "options":["A","B"]});
+        runtime.request_ui(&request).await.unwrap();
+        assert_eq!(runtime.pending_ui().await.len(), 1);
+        let mut answer: super::super::ExtensionUiAnswer = serde_json::from_value(json!({
+            "threadId":"camp-abort", "agentRunId":"run-abort", "executionEpoch":1,
+            "hostInstanceId":host.host_instance_id(), "requestId":"question-1", "value":"B"
+        })).unwrap();
+        answer.execution_epoch = 2;
+        assert!(runtime.answer_ui(&answer).await.is_err());
+        answer.execution_epoch = 1;
+        answer.thread_id = "other-thread".into();
+        assert!(runtime.answer_ui(&answer).await.is_err());
+        answer.thread_id = "camp-abort".into();
+        answer.host_instance_id = "other-host".into();
+        assert!(runtime.answer_ui(&answer).await.is_err());
+        answer.host_instance_id = host.host_instance_id().into();
+        let original_owner = runtime.owner.clone();
+        *host.owner.write().await = Some(PiRuntimeOwner { agent_run_id: "other-run".into(), ..original_owner.clone() });
+        assert!(runtime.answer_ui(&answer).await.is_err());
+        *host.owner.write().await = Some(original_owner);
+        runtime.answer_ui(&answer).await.unwrap();
+        assert!(runtime.answer_ui(&answer).await.is_err());
+        assert!(runtime.pending_ui().await.is_empty());
+        host.command("get_state", json!({})).await.unwrap();
+        let logged: Vec<Value> = std::fs::read_to_string(root.join("requests.jsonl")).unwrap()
+            .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(logged.iter().filter(|row| row["type"] == "extension_ui_response").collect::<Vec<_>>(),
+            vec![&json!({"type":"extension_ui_response", "id":"question-1", "value":"B"})]);
+        let mut timed = request.clone();
+        timed["timeout"] = json!(0);
+        runtime.request_ui(&timed).await.unwrap();
+        assert!(runtime.answer_ui(&answer).await.is_err());
+        assert!(runtime.pending_ui().await.is_empty());
+        runtime.request_ui(&request).await.unwrap();
+        answer.value = None;
+        answer.cancelled = Some(true);
+        runtime.answer_ui(&answer).await.unwrap();
+        host.command("get_state", json!({})).await.unwrap();
+        let logged = std::fs::read_to_string(root.join("requests.jsonl")).unwrap();
+        assert!(logged.lines().any(|line| serde_json::from_str::<Value>(line).unwrap()
+            == json!({"type":"extension_ui_response", "id":"question-1", "cancelled":true})));
+        assert!(runtime.pending_ui().await.is_empty());
         assert!(
             runtime
                 .steer("idle", &[])
@@ -4173,6 +4310,10 @@ done
         assert_eq!(
             commands,
             [
+                "get_state",
+                "extension_ui_response",
+                "get_state",
+                "extension_ui_response",
                 "get_state",
                 "steer",
                 "steer",
@@ -4376,6 +4517,8 @@ done
                 "--approve",
                 "--extension",
                 "/private/rovai-pi-host-v11.ts",
+                "--extension",
+                "/private/ask-user-question.mjs",
             ]
         );
         for forbidden in [
@@ -4413,11 +4556,13 @@ done
                     "--no-themes",
                     "--approve",
                     "--tools",
-                    tools,
+                    &format!("{tools},ask_user_question"),
                     "--extension",
                     "/private/rovai-pi-file-guard.ts",
                     "--extension",
                     "/private/rovai-pi-host-v11.ts",
+                    "--extension",
+                    "/private/ask-user-question.mjs",
                 ]
             );
             // Exactly one `--tools` flag, and no isolation switch is dropped by the guard slice.

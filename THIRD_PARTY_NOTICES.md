@@ -131,7 +131,20 @@ The desktop build uses Electron `43.1.1`. Electron and Chromium retain their
 upstream licenses; the repository does not run a separate legal preparation or
 package-verification step for the Electron distribution.
 
-## 9. Product Names and Trademarks
+## 9. Pi Question Extension
+
+`crates/rovai-core/src/pi/adapted/ask-user-question.mjs` adapts the question schema,
+defaults, answer fields and result semantics from `earendil-works/pi` commit
+`f9a26365568127461c47a07a37dcb42c140a3ac5` (v1.5.0),
+`packages/coding-agent/examples/extensions/questionnaire.ts`, under MIT.
+The upstream file SHA-256 is
+`3f1f719d81152ff013f5d36a97cc3976388d43f2d89bff0f19827d3443d903e6`.
+RPC cannot run the example's `ctx.ui.custom()` terminal interface, so this adapter
+registers `ask_user_question` and asks sequentially with `select` and `input`.
+The upstream MIT license is retained in `crates/rovai-core/src/pi/adapted/LICENSE`.
+Existing plugins and Pi Purge are unchanged.
+
+## 10. Product Names and Trademarks
 
 Rovai AI does not claim rights in third-party product names, logos,
 trademarks, characters, or people merely because a compatibility surface,

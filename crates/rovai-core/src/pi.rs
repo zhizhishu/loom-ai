@@ -1,5 +1,7 @@
+mod extension_ui;
 mod file_grant;
 mod host;
+pub(crate) use extension_ui::{ExtensionUiAnswer, ExtensionUiRequest};
 
 use std::{fmt, path::Path, time::Duration};
 
@@ -445,6 +447,8 @@ pub(crate) fn runtime_compatibility_digest_with_mcp(
         // The managed workflow bridge is part of the same compatibility identity: two Runs that would
         // load a different bridge implementation must never share a warm Host.
         "managedWorkflowToolDigest": format!("{:x}", Sha256::digest(MANAGED_WORKFLOW_TOOL_EXTENSION.as_bytes())),
+        "managedQuestionDigest": format!("{:x}", Sha256::digest(host::QUESTION_EXTENSION.as_bytes())),
+        "managedQuestionGuardDigest": format!("{:x}", Sha256::digest(host::QUESTION_GUARD.as_bytes())),
         "managedWorkflowContractDigest": canonical_json_digest(&managed_workflow_contract())?,
     });
     if let Some(document) = mcp_document {

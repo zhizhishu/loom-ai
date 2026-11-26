@@ -4586,6 +4586,8 @@ export type CoreMethod =
   | 'thread.messages.withdraw'
   | 'userAutomation.thread.send'
   | 'action.approvals.resolve'
+  | 'pi.extensionUi.pending'
+  | 'pi.extensionUi.respond'
   | 'notifications.inbox'
   | 'notifications.threadInterruptions'
   | 'notifications.changesSince'

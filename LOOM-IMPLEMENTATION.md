@@ -4,6 +4,15 @@
 
 产品要做什么看 [PRODUCT.md](PRODUCT.md)，已选 Mikka/PiBot 三栏 UI 与用户指定猫耳品牌看 [DESIGN.md](DESIGN.md)，架构与每层复用来源看 [LOOM-ARCHITECTURE](docs/loom/LOOM-ARCHITECTURE.md)，交接与施工规则看 [LOOM-HANDOFF](docs/loom/LOOM-HANDOFF.md)，验收标准看 [LOOM-ACCEPTANCE](docs/loom/LOOM-ACCEPTANCE.md)，参考项目看 [参考锁](docs/loom/LOOM-V2-REFERENCE-LOCK.md)。旧计划（含 P0–P14 原设计）已归档于 [plans-2026-11-18](docs/loom/archive/plans-2026-11-18/README.md)，不在本页重复叙述。
 
+## 2026-11-26 M7-A Pi 问题桥接（本地候选，未发布）
+
+- 受管加载 `ask_user_question`；只用 Pi RPC `select` / `input`。Core 对四种原生对话保存内存待答状态，LOOM 群聊呈现问题卡片，Run 和关联任务显示「等你回答」。回答/取消经原进程 `respond(id, response)`，校验群聊、Host、Run、执行代次和请求 ID；终止及超时清除。重启不恢复待答问题。
+- 无数据库迁移、表或投影版本变化；既有插件、文件守卫及 Purge 源文件未修改。新 guard 适配只把无文件/执行能力的问题工具排除在文件工具守卫外，其余调用原样交给原守卫。
+- 上游对照：Pi `f9a26365568127461c47a07a37dcb42c140a3ac5`，`packages/coding-agent/examples/extensions/questionnaire.ts`，复制改写 schema/defaults/answer envelope；`custom()` 在 RPC 不可用，改为顺序 `select` / `input`。源码哈希与 MIT 许可见 `THIRD_PARTY_NOTICES.md`。新增超过 300 行主要为协议/路由/卡片和独立测试，不增加调度、存储或通用交互框架。
+- Rust owner：新 `pi::extension_ui` 纯函数测试覆盖原来自动取消的四种响应；既有 `active_input_receipts_and_late_abort_keep_exact_rpc_correlation` 扩展原内存/子进程夹具，证明 stdin 精确帧、跨 Host/群/代次拒绝和单次消费。最小命令：`cargo test -p rovai-core --lib --features extended-tests --locked -j 2 pi::`。没有新数据库夹具。
+- 门禁：Core `--list` 非零后全量 **714 PASS / 1 ignored**；Pi 专项 **62 PASS / 1 ignored**；extended control **60 PASS**；migration **46 PASS**；相关 Vitest **121 PASS**，待答群聊回归再测 **18 PASS**；扩展 Node **4 PASS**；Web Host 操作 **1 PASS**。隔离真实 Pi 1.5.0 RPC `select → input → result` **PASS**，未调用模型；尚无完整 Core + 浏览器真人点击验收。
+- 阻塞：全仓 typecheck 的既有 PDF 类型错误，两次出现 `ArtifactPdfPreview.tsx:97 TS18047` 后停止该检查；本任务不改 PDF。首轮 pnpm 依赖确认失败后使用已装工具直接执行。一次源码归档路径竞争导致 control 编译失败，路径修正后的专项已通过。原始日志在本机 `/tmp/m7a-plugin-evidence/`，不作为可移植仓库依赖。
+
 ## 给云上施工 Agent 的用户建议（2026-11-17，非规范）
 
 > 下面是 User 给任何来仓干活的 Agent（含云上长跑任务）的三条建议。**是建议、不是规范；User 明说可能讲错**——与仓内文档或实测证据冲突时，以文档和实测为准，并把冲突点在交付报告里指出来，别静默二选一。

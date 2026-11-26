@@ -12954,6 +12954,43 @@ impl Core {
                 }
                 Ok(serde_json::to_value(view)?)
             }
+            "pi.extensionUi.pending" => {
+                let mut questions = self
+                    .pi
+                    .pending_ui(request.params.get("threadId").and_then(Value::as_str))
+                    .await;
+                let database = self.database.lock().await;
+                for question in &mut questions {
+                    if let Some(execution) = ExecutionRuntimeService::default().load_agent_run_execution(
+                        &database,
+                        question["agentRunId"].as_str().unwrap_or_default(),
+                        question["executionEpoch"].as_i64().unwrap_or_default(),
+                    )? {
+                        question["agentId"] = json!(execution.agent_id);
+                        question["taskId"] = json!(execution.task_id);
+                    }
+                }
+                Ok(json!(questions))
+            }
+            "pi.extensionUi.respond" => {
+                let answer: pi::ExtensionUiAnswer = serde_json::from_value(request.params.clone())?;
+                let runtime = self
+                    .pi
+                    .get_agent_run_on_host(
+                        &answer.host_instance_id,
+                        &answer.agent_run_id,
+                        answer.execution_epoch,
+                    )
+                    .await
+                    .context("Pi dialog run is no longer active")?;
+                runtime.answer_ui(&answer).await?;
+                emit(
+                    &self.output,
+                    "pi.extensionUi.changed",
+                    json!({"threadId": answer.thread_id, "agentRunId": answer.agent_run_id}),
+                );
+                Ok(json!({"status": "sent"}))
+            }
             "action.approvals.resolve" => {
                 let params: ResolveActionApprovalParams =
                     serde_json::from_value(request.params.clone())?;
@@ -22973,6 +23010,18 @@ async fn process_agent_run_pi_message(
         match message.get("method").and_then(Value::as_str) {
             Some("setStatus") => return Ok(()),
             Some("notify" | "setWidget" | "setTitle" | "set_editor_text") => return Ok(()),
+            Some("select" | "confirm" | "input" | "editor") => {
+                if let Err(error) = runtime.request_ui(&message).await {
+                    runtime.mark_failed_closed();
+                    return Err(error).context("Pi Extension UI framing is invalid");
+                }
+                emit(output, "pi.extensionUi.changed", json!({
+                    "threadId": runtime.thread_id(),
+                    "agentRunId": agent_run_id, "executionEpoch": execution_epoch,
+                    "hostInstanceId": host_instance_id,
+                }));
+                return Ok(());
+            }
             _ => {
                 let response = match pi::unsupported_extension_ui_cancellation(&message) {
                     Ok(response) => response,

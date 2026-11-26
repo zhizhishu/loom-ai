@@ -264,6 +264,11 @@
 .ln-activity-row>.ln-action{font-size:11px;padding:4px 9px}
 
 /* 失败块里的「怎么装」：复用 RuntimeInstallationGuide，折叠在原因下面。 */
+.ln-question-request form{display:flex;flex-direction:column;gap:8px;align-items:flex-start}
+.ln-question-request input,.ln-question-request textarea{box-sizing:border-box;width:100%;max-width:100%;padding:8px;border:1px solid var(--ln-soft-line);border-radius:9px;background:var(--ln-bg);color:var(--ln-text);font:inherit}
+.ln-question-request textarea{min-height:100px;resize:vertical}
+.ln-question-request button{white-space:pre-wrap;overflow-wrap:anywhere;max-width:100%}
+.ln-question-request button:disabled{opacity:.6;cursor:wait}
 .ln-run-failure-guide{font-size:11px;color:#8d2f28}
 .ln-run-failure-guide>summary{cursor:pointer;font-weight:550}
 .ln-run-failure-guide .runtime-install-guide{margin-top:8px;background:var(--ln-bg);color:var(--ln-text)}
