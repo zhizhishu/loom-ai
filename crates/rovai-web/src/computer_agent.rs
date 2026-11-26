@@ -75,6 +75,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use subtle::ConstantTimeEq;
 use tokio::task::spawn_blocking;
 
 /// Most grants a Host holds at once, across every browser session.
@@ -540,6 +541,10 @@ pub(crate) struct ApprovalListBody {
 pub(crate) struct ApprovalDecisionBody {
     pub approval_id: String,
     pub decision: String,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub digest: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -560,6 +565,7 @@ struct ClickArgs {
     x: i32,
     y: i32,
     button: String,
+    step: String,
 }
 
 #[derive(Deserialize)]
@@ -568,18 +574,21 @@ struct WheelArgs {
     x: i32,
     y: i32,
     delta: i32,
+    step: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KeyArgs {
     key: String,
+    step: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TextArgs {
     text: String,
+    step: String,
 }
 
 #[derive(Deserialize)]
@@ -680,10 +689,15 @@ impl ApprovalStatus {
 
 struct Approval {
     id: String,
+    digest: String,
     assistant_id: String,
     grant_id: String,
     tool: &'static str,
     summary: String,
+    step: Option<String>,
+    x: Option<i32>,
+    y: Option<i32>,
+    rect: Option<Value>,
     created_at: u64,
     expires_at: u64,
     status: ApprovalStatus,
@@ -695,8 +709,13 @@ fn approval_json(item: &Approval) -> Value {
         "assistantId": item.assistant_id,
         "grantId": item.grant_id,
         "runId": Value::Null,
+        "digest": item.digest,
         "tool": item.tool,
         "summary": item.summary,
+        "step": item.step,
+        "x": item.x,
+        "y": item.y,
+        "rect": item.rect,
         "createdAt": item.created_at,
         "expiresAt": item.expires_at,
         "status": item.status.label(),
@@ -731,6 +750,45 @@ fn event_summary(tool: Tool, event: &EventBody) -> String {
         }
     };
     format!("{} {}", tool.label(), detail)
+}
+
+fn normalized_step(raw: &str) -> Option<String> {
+    let value = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.is_empty() || value.chars().count() > 200 {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn action_rect(x: Option<i32>, y: Option<i32>) -> Option<Value> {
+    let (x, y) = (x?, y?);
+    Some(json!({"x": x.saturating_sub(16), "y": y.saturating_sub(16), "w": 32, "h": 32}))
+}
+
+fn approval_digest(
+    id: &str,
+    tool: Tool,
+    event: &EventBody,
+    step: Option<&str>,
+    rect: Option<&Value>,
+) -> String {
+    let material = format!(
+        "approval-v1|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
+        id,
+        tool.label(),
+        event.kind,
+        event.x,
+        event.y,
+        event.button,
+        event.action,
+        event.delta,
+        event.key,
+        event.text,
+        step,
+        rect.map(|value| value.to_string()).unwrap_or_default(),
+    );
+    format!("{:x}", Sha256::digest(material.as_bytes()))
 }
 
 pub(crate) struct Grant {
@@ -1451,6 +1509,7 @@ pub(crate) struct AgentGrants {
     modes: Mutex<HashMap<String, AgentControlMode>>,
     approvals: Mutex<Vec<Approval>>,
     approval_wake: Condvar,
+    run_approved: Mutex<HashSet<String>>,
 }
 
 impl AgentGrants {
@@ -1496,6 +1555,7 @@ impl AgentGrants {
             modes: Mutex::new(HashMap::new()),
             approvals: Mutex::new(Vec::new()),
             approval_wake: Condvar::new(),
+            run_approved: Mutex::new(HashSet::new()),
         })
     }
 
@@ -1533,8 +1593,14 @@ impl AgentGrants {
         grant: &Grant,
         tool: Tool,
         event: &EventBody,
+        step: Option<&str>,
     ) -> Result<String, Failure> {
-        if self.mode(&grant.authority.bot_id) == AgentControlMode::Full {
+        if self.mode(&grant.authority.bot_id) == AgentControlMode::Full
+            || self
+                .run_approved
+                .lock()
+                .is_ok_and(|approved| approved.contains(&grant.id))
+        {
             return Ok(String::new());
         }
         let now = wall_clock();
@@ -1556,12 +1622,19 @@ impl AgentGrants {
         if pending >= MAX_APPROVALS {
             return Err(Failure::code("computer_agent_request_capacity"));
         }
+        let rect = action_rect(event.x, event.y);
+        let digest = approval_digest(&id, tool, event, step, rect.as_ref());
         approvals.push(Approval {
             id: id.clone(),
+            digest,
             assistant_id: grant.authority.bot_id.clone(),
             grant_id: grant.id.clone(),
             tool: tool.label(),
             summary: event_summary(tool, event),
+            step: step.map(str::to_owned),
+            x: event.x,
+            y: event.y,
+            rect,
             created_at: now,
             expires_at,
             status: ApprovalStatus::Pending,
@@ -1577,8 +1650,9 @@ impl AgentGrants {
         browser: &Sessions,
         tool: Tool,
         event: &EventBody,
+        step: Option<&str>,
     ) -> Result<(), Failure> {
-        let approval_id = self.queue_approval(grant, tool, event)?;
+        let approval_id = self.queue_approval(grant, tool, event, step)?;
         if approval_id.is_empty() {
             return Ok(());
         }
@@ -1620,14 +1694,21 @@ impl AgentGrants {
         }
     }
 
-    fn decide_approval(&self, approval_id: &str, approve: bool) -> Result<Value, &'static str> {
+    fn decide_approval(
+        &self,
+        approval_id: &str,
+        digest: &str,
+        approve: bool,
+        run_scope: bool,
+    ) -> Result<Value, &'static str> {
         let mut approvals = self
             .approvals
             .lock()
             .map_err(|_| "computer_agent_endpoint_busy")?;
-        let Some(item) = approvals.iter_mut().find(|item| item.id == approval_id) else {
+        let Some(pos) = approvals.iter().position(|item| item.id == approval_id) else {
             return Err("computer_agent_approval_unknown");
         };
+        let item = &mut approvals[pos];
         if item.status != ApprovalStatus::Pending {
             return Err("computer_agent_approval_decided");
         }
@@ -1636,13 +1717,22 @@ impl AgentGrants {
             self.approval_wake.notify_all();
             return Err("computer_agent_approval_expired");
         }
+        if digest.len() != 64 || !bool::from(item.digest.as_bytes().ct_eq(digest.as_bytes())) {
+            return Err("computer_agent_digest_mismatch");
+        }
         item.status = if approve {
             ApprovalStatus::Approved
         } else {
             ApprovalStatus::Denied
         };
+        let grant_id = item.grant_id.clone();
         let out = approval_json(item);
         drop(approvals);
+        if approve && run_scope {
+            if let Ok(mut approved) = self.run_approved.lock() {
+                approved.insert(grant_id);
+            }
+        }
         self.approval_wake.notify_all();
         Ok(out)
     }
@@ -2447,7 +2537,18 @@ pub(crate) async fn approvals_decide(
         "deny" => false,
         _ => return reject("computer_agent_invalid_request"),
     };
-    match state.agents.decide_approval(&body.approval_id, approve) {
+    let run_scope = match body.scope.as_deref() {
+        None | Some("once") => false,
+        Some("run") if approve => true,
+        _ => return reject("computer_agent_invalid_request"),
+    };
+    let Some(digest) = body.digest.as_deref() else {
+        return reject("computer_agent_invalid_request");
+    };
+    match state
+        .agents
+        .decide_approval(&body.approval_id, digest, approve, run_scope)
+    {
         Ok(item) => Json(item).into_response(),
         Err(code) => reject(code),
     }
@@ -2714,7 +2815,7 @@ fn run_tool(
             }))
         }
         Tool::MouseClick | Tool::Wheel | Tool::Key | Tool::Text => {
-            let event = event_for(tool, arguments)?;
+            let (event, step) = event_and_step(tool, arguments)?;
             // A user takeover refuses the request before an approval card can
             // appear; otherwise the card would look actionable even though the
             // physical boundary must reject the input.
@@ -2722,7 +2823,7 @@ fn run_tool(
                 return Err(Failure::code("computer_agent_human_control"));
             }
             if let Some(agents) = agents {
-                agents.wait_for_approval(grant, browser, tool, &event)?;
+                agents.wait_for_approval(grant, browser, tool, &event, step.as_deref())?;
             }
             // Approved or full-permission input still re-proves the live grant at the
             // physical boundary; a human takeover wins there even if it lands now.
@@ -2885,7 +2986,7 @@ fn clone_event(event: &EventBody) -> EventBody {
     }
 }
 
-fn event_for(tool: Tool, arguments: Value) -> Result<EventBody, Failure> {
+fn event_and_step(tool: Tool, arguments: Value) -> Result<(EventBody, Option<String>), Failure> {
     let invalid = || Failure::code("computer_agent_invalid_request");
     let empty = |kind: EventKind| EventBody {
         kind,
@@ -2900,45 +3001,65 @@ fn event_for(tool: Tool, arguments: Value) -> Result<EventBody, Failure> {
     match tool {
         Tool::MouseClick => {
             let args: ClickArgs = serde_json::from_value(arguments).map_err(|_| invalid())?;
+            let step = normalized_step(&args.step).ok_or_else(invalid)?;
             let button: WireButton =
                 serde_json::from_value(json!(args.button)).map_err(|_| invalid())?;
-            Ok(EventBody {
-                x: Some(args.x),
-                y: Some(args.y),
-                button: Some(button),
-                action: Some(computer::WireAction::Click),
-                ..empty(EventKind::Pointer)
-            })
+            Ok((
+                EventBody {
+                    x: Some(args.x),
+                    y: Some(args.y),
+                    button: Some(button),
+                    action: Some(computer::WireAction::Click),
+                    ..empty(EventKind::Pointer)
+                },
+                Some(step),
+            ))
         }
         Tool::Wheel => {
             let args: WheelArgs = serde_json::from_value(arguments).map_err(|_| invalid())?;
-            Ok(EventBody {
-                x: Some(args.x),
-                y: Some(args.y),
-                delta: Some(args.delta),
-                ..empty(EventKind::Wheel)
-            })
+            let step = normalized_step(&args.step).ok_or_else(invalid)?;
+            Ok((
+                EventBody {
+                    x: Some(args.x),
+                    y: Some(args.y),
+                    delta: Some(args.delta),
+                    ..empty(EventKind::Wheel)
+                },
+                Some(step),
+            ))
         }
         Tool::Key => {
             let args: KeyArgs = serde_json::from_value(arguments).map_err(|_| invalid())?;
+            let step = normalized_step(&args.step).ok_or_else(invalid)?;
             let key: WireKey = serde_json::from_value(json!(args.key)).map_err(|_| invalid())?;
-            Ok(EventBody {
-                key: Some(key),
-                ..empty(EventKind::Key)
-            })
+            Ok((
+                EventBody {
+                    key: Some(key),
+                    ..empty(EventKind::Key)
+                },
+                Some(step),
+            ))
         }
         Tool::Text => {
             let args: TextArgs = serde_json::from_value(arguments).map_err(|_| invalid())?;
-            Ok(EventBody {
-                text: Some(args.text),
-                ..empty(EventKind::Text)
-            })
+            let step = normalized_step(&args.step).ok_or_else(invalid)?;
+            Ok((
+                EventBody {
+                    text: Some(args.text),
+                    ..empty(EventKind::Text)
+                },
+                Some(step),
+            ))
         }
         Tool::Screenshot => {
             let _: EmptyArgs = serde_json::from_value(arguments).map_err(|_| invalid())?;
             Err(invalid())
         }
     }
+}
+
+fn event_for(tool: Tool, arguments: Value) -> Result<EventBody, Failure> {
+    event_and_step(tool, arguments).map(|(event, _step)| event)
 }
 
 #[cfg(test)]
@@ -3300,12 +3421,26 @@ mod tests {
                 &waiting_browser,
                 Tool::MouseClick,
                 &approval_event(),
+                Some("点击登录"),
             )
         });
         let item = pending_approval(&agents);
         assert_eq!(item["tool"], "mouse_click");
+        assert_eq!(item["step"], "点击登录");
+        assert_eq!(item["x"], 20);
+        assert_eq!(item["y"], 30);
+        assert_eq!(item["rect"]["w"], 32);
         let approval_id = item["approvalId"].as_str().unwrap().to_owned();
-        let decided = agents.decide_approval(&approval_id, true).unwrap();
+        let digest = item["digest"].as_str().unwrap().to_owned();
+        assert_eq!(
+            agents
+                .decide_approval(&approval_id, &"0".repeat(64), true, false)
+                .err(),
+            Some("computer_agent_digest_mismatch")
+        );
+        let decided = agents
+            .decide_approval(&approval_id, &digest, true, false)
+            .unwrap();
         assert_eq!(decided["status"], "approved");
         match waiter.join().unwrap() {
             Ok(()) => {}
@@ -3322,20 +3457,67 @@ mod tests {
                 &waiting_browser,
                 Tool::MouseClick,
                 &approval_event(),
+                Some("点击登录"),
             )
         });
         let item = pending_approval(&agents);
         let approval_id = item["approvalId"].as_str().unwrap().to_owned();
-        agents.decide_approval(&approval_id, false).unwrap();
+        let digest = item["digest"].as_str().unwrap().to_owned();
+        agents
+            .decide_approval(&approval_id, &digest, false, false)
+            .unwrap();
         match waiter.join().unwrap() {
             Ok(()) => panic!("denied input was allowed"),
             Err(failure) => assert_eq!(failure.code, "computer_agent_approval_denied"),
         }
 
+        let waiting_agents = agents.clone();
+        let waiting_grant = grant.clone();
+        let waiting_browser = browser.clone();
+        let waiter = std::thread::spawn(move || {
+            waiting_agents.wait_for_approval(
+                &waiting_grant,
+                &waiting_browser,
+                Tool::MouseClick,
+                &approval_event(),
+                Some("点击登录"),
+            )
+        });
+        let item = pending_approval(&agents);
+        let approval_id = item["approvalId"].as_str().unwrap().to_owned();
+        let digest = item["digest"].as_str().unwrap().to_owned();
+        agents
+            .decide_approval(&approval_id, &digest, true, true)
+            .unwrap();
+        assert!(waiter.join().unwrap().is_ok());
+        assert!(
+            agents
+                .wait_for_approval(
+                    &grant,
+                    &browser,
+                    Tool::MouseClick,
+                    &approval_event(),
+                    Some("点击登录")
+                )
+                .is_ok()
+        );
+        assert!(
+            agents.list_approvals(Some("assistant-1")).is_empty(),
+            "run-scope approval must answer later steps for this grant without a new card"
+        );
+
         agents.set_mode("assistant-1", AgentControlMode::Full);
-        assert!(agents
-            .wait_for_approval(&grant, &browser, Tool::MouseClick, &approval_event())
-            .is_ok());
+        assert!(
+            agents
+                .wait_for_approval(
+                    &grant,
+                    &browser,
+                    Tool::MouseClick,
+                    &approval_event(),
+                    Some("点击登录")
+                )
+                .is_ok()
+        );
         assert!(agents.list_approvals(Some("assistant-1")).is_empty());
     }
 
@@ -3384,7 +3566,7 @@ mod tests {
             &grant,
             Tool::MouseClick,
             "req-human-before-approval",
-            json!({"x": 100, "y": 100, "button": "left"}),
+            json!({"x": 100, "y": 100, "button": "left", "step": "点击屏幕"}),
         )
         .err()
         .expect("human control must refuse the assistant input");
@@ -3853,25 +4035,44 @@ mod tests {
         for (tool, arguments) in [
             (
                 Tool::MouseClick,
-                json!({"x": 1, "y": 2, "button": "left", "command": "calc"}),
+                json!({"x": 1, "y": 2, "button": "left", "step": "点击按钮", "command": "calc"}),
             ),
-            (Tool::Key, json!({"key": "enter", "path": "/etc/passwd"})),
+            (
+                Tool::Key,
+                json!({"key": "enter", "step": "按回车", "path": "/etc/passwd"}),
+            ),
             (
                 Tool::Text,
-                json!({"text": "hi", "url": "http://example.com"}),
+                json!({"text": "hi", "step": "输入文字", "url": "http://example.com"}),
             ),
             (
                 Tool::Wheel,
-                json!({"x": 1, "y": 2, "delta": 3, "tool": "shell"}),
+                json!({"x": 1, "y": 2, "delta": 3, "step": "滚动页面", "tool": "shell"}),
             ),
             (Tool::Screenshot, json!({"path": "/tmp/x.png"})),
         ] {
             let failure = event_for(tool, arguments).err().expect("must refuse");
             assert_eq!(failure.code, "computer_agent_invalid_request");
         }
-        let click = event_for(Tool::MouseClick, json!({"x": -5, "y": 5, "button": "left"}))
-            .ok()
-            .expect("a valid click must parse");
+        for arguments in [
+            json!({"x": 1, "y": 2, "button": "left"}),
+            json!({"x": 1, "y": 2, "button": "left", "step": "   "}),
+            json!({"x": 1, "y": 2, "button": "left", "step": "x".repeat(201)}),
+        ] {
+            assert_eq!(
+                event_for(Tool::MouseClick, arguments)
+                    .err()
+                    .map(|failure| failure.code),
+                Some("computer_agent_invalid_request"),
+                "input actions require one bounded human-readable step"
+            );
+        }
+        let click = event_for(
+            Tool::MouseClick,
+            json!({"x": -5, "y": 5, "button": "left", "step": "点击按钮"}),
+        )
+        .ok()
+        .expect("a valid click must parse");
         assert_eq!(click.action, Some(computer::WireAction::Click));
     }
 
@@ -4209,7 +4410,7 @@ mod tests {
                     &grant,
                     Tool::Key,
                     "req-queued",
-                    json!({"key": "enter"}),
+                    json!({"key": "enter", "step": "按回车"}),
                 )
                 .map(|_| ())
             })
@@ -4331,7 +4532,7 @@ mod tests {
                     &grant,
                     Tool::Key,
                     "req-once",
-                    json!({"key": "enter"}),
+                    json!({"key": "enter", "step": "按回车"}),
                 )
             })
         };
@@ -4373,7 +4574,7 @@ mod tests {
             &grant,
             Tool::Key,
             "req-once",
-            json!({"key": "enter"}),
+            json!({"key": "enter", "step": "按回车"}),
         )
         .err()
         .expect("replay must fail");
@@ -4429,7 +4630,7 @@ mod tests {
             &view_grant,
             Tool::Key,
             "pi-key-view",
-            json!({"key": "enter"}),
+            json!({"key": "enter", "step": "按回车"}),
         )
         .err()
         .expect("a view grant must not type");
@@ -4451,7 +4652,7 @@ mod tests {
             &grant,
             Tool::Key,
             "pi-key-1",
-            json!({"key": "enter"}),
+            json!({"key": "enter", "step": "按回车"}),
         )
         .ok()
         .expect("the first input must be admitted");
@@ -4464,7 +4665,7 @@ mod tests {
             &grant,
             Tool::Key,
             "pi-key-1",
-            json!({"key": "enter"}),
+            json!({"key": "enter", "step": "按回车"}),
         )
         .err()
         .expect("a replay must be refused");
@@ -4480,7 +4681,7 @@ mod tests {
             &grant,
             Tool::Key,
             "pi-key-2",
-            json!({"key": "enter"}),
+            json!({"key": "enter", "step": "按回车"}),
         )
         .err()
         .expect("a revoked grant must not type");
@@ -4497,7 +4698,7 @@ mod tests {
             &expired,
             Tool::Key,
             "pi-key-3",
-            json!({"key": "enter"}),
+            json!({"key": "enter", "step": "按回车"}),
         )
         .err()
         .expect("an expired grant must not type");
@@ -4546,18 +4747,12 @@ mod tests {
             runtime.block_on(admit_live_authority(fake.as_ref(), &grant))?;
             let arguments = match tool {
                 Tool::Screenshot => json!({}),
-                _ => json!({"key": "enter"}),
+                _ => json!({"key": "enter", "step": "按回车"}),
             };
             run_tool(
-                &computer,
-                &sessions,
-                None,
-                &grant,
-                tool,
-                request_id,
-                arguments,
+                &computer, &sessions, None, &grant, tool, request_id, arguments,
             )
-                .map_err(|failure| failure.code)
+            .map_err(|failure| failure.code)
         };
 
         // 1. The member is unchanged, so the grant still captures and types.
@@ -4707,9 +4902,9 @@ mod tests {
         );
         for (tool, request_id) in [(Tool::Key, "node-key-1"), (Tool::Text, "node-text-1")] {
             let arguments = if tool == Tool::Key {
-                json!({"key": "enter"})
+                json!({"key": "enter", "step": "按回车"})
             } else {
-                json!({"text": "hello"})
+                json!({"text": "hello", "step": "输入问候"})
             };
             run_tool(
                 &grant.target,
@@ -4756,7 +4951,7 @@ mod tests {
             &grant,
             Tool::Key,
             "node-key-2",
-            json!({"key": "enter"}),
+            json!({"key": "enter", "step": "按回车"}),
         )
         .err()
         .expect("a revoked node grant must be refused");

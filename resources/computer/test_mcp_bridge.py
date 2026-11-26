@@ -131,6 +131,11 @@ class ToolSurface(unittest.TestCase):
         )
         for tool in bridge.TOOLS:
             self.assertFalse(tool["inputSchema"]["additionalProperties"])
+        self.assertNotIn("step", bridge.TOOLS[0]["inputSchema"]["properties"])
+        for tool in bridge.TOOLS[1:]:
+            self.assertIn("step", tool["inputSchema"]["properties"])
+            self.assertIn("step", tool["inputSchema"]["required"])
+            self.assertEqual(tool["inputSchema"]["properties"]["step"]["maxLength"], 200)
 
     def test_no_tool_accepts_command_path_url_or_token_arguments(self):
         for key in ("command", "path", "url", "token", "tokenFile", "shell", "argv"):
@@ -145,7 +150,7 @@ class ToolSurface(unittest.TestCase):
             bridge.call_body("1", "shell", {}, DIGEST)
 
     def test_wire_body_carries_the_request_id_and_no_secret(self):
-        body = bridge.call_body("req-1", "mouse_click", {"x": 1, "y": 2, "button": "left"}, DIGEST)
+        body = bridge.call_body("req-1", "mouse_click", {"x": 1, "y": 2, "button": "left", "step": "Click button"}, DIGEST)
         self.assertEqual(body["requestId"], "req-1")
         self.assertEqual(body["tool"], "mouse_click")
         self.assertEqual(body["expectedConfigDigest"], DIGEST)
@@ -188,8 +193,9 @@ class Protocol(unittest.TestCase):
     def test_tool_call_forwards_id_bearer_and_origin(self):
         fixture = Fixture()
         try:
-            response = self.call(fixture, "req-abc", "key", {"key": "enter"})
+            response = self.call(fixture, "req-abc", "key", {"key": "enter", "step": "Press Enter"})
             self.assertFalse(response["result"]["isError"])
+            self.assertEqual(response["result"]["content"][1]["text"], bridge.UNTRUSTED_TEXT)
             self.assertEqual(len(fixture.requests), 1)
             sent = fixture.requests[0]
             self.assertEqual(sent["path"], bridge.RPC_PATH)
@@ -199,7 +205,7 @@ class Protocol(unittest.TestCase):
             self.assertEqual(body["requestId"], "req-abc")
             self.assertEqual(body["tool"], "key")
             self.assertEqual(body["expectedConfigDigest"], DIGEST)
-            self.assertEqual(body["arguments"], {"key": "enter"})
+            self.assertEqual(body["arguments"], {"key": "enter", "step": "Press Enter"})
             self.assertNotIn(TOKEN, sent["body"].decode("utf-8"))
         finally:
             fixture.close()
@@ -226,15 +232,16 @@ class Protocol(unittest.TestCase):
             self.assertEqual(content[0]["type"], "image")
             self.assertEqual(content[0]["mimeType"], "image/png")
             self.assertEqual(json.loads(content[1]["text"])["originX"], -1920)
+            self.assertEqual(content[2]["text"], bridge.UNTRUSTED_TEXT)
         finally:
             fixture.close()
 
     def test_host_refusals_surface_public_codes_only(self):
         fixture = Fixture(status=409, body={"ok": False, "error": {"code": "computer_agent_request_replayed"}})
         try:
-            response = self.call(fixture, "req-dup", "text", {"text": "hi"})
+            response = self.call(fixture, "req-dup", "text", {"text": "hi", "step": "Type greeting"})
             self.assertTrue(response["result"]["isError"])
-            self.assertEqual(response["result"]["content"][0]["text"], "computer_agent_request_replayed")
+            self.assertEqual(response["result"]["content"][0]["text"], bridge.FAILURE_TEXT)
         finally:
             fixture.close()
 
@@ -259,7 +266,7 @@ class Protocol(unittest.TestCase):
         try:
             response = self.call(fixture, "req-redirect", "key", {"key": "tab"})
             self.assertTrue(response["result"]["isError"])
-            self.assertEqual(response["result"]["content"][0]["text"], "redirect_refused")
+            self.assertEqual(response["result"]["content"][0]["text"], bridge.FAILURE_TEXT)
             self.assertEqual(len(fixture.requests), 1, "the redirect must not be followed")
         finally:
             fixture.close()
@@ -356,10 +363,10 @@ class ScopeSurface(unittest.TestCase):
                 fixture.endpoint, fixture.origin, TOKEN, 10, DIGEST, scope="view"
             )
             for tool, arguments in [
-                ("mouse_click", {"x": 1, "y": 2, "button": "left"}),
+                ("mouse_click", {"x": 1, "y": 2, "button": "left", "step": "Click button"}),
                 ("wheel", {"x": 1, "y": 2, "delta": 1}),
-                ("key", {"key": "enter"}),
-                ("text", {"text": "hi"}),
+                ("key", {"key": "enter", "step": "Press Enter"}),
+                ("text", {"text": "hi", "step": "Type greeting"}),
             ]:
                 response = bridge.handle(
                     instance,
@@ -371,7 +378,7 @@ class ScopeSurface(unittest.TestCase):
                     },
                 )
                 self.assertTrue(response["result"]["isError"], tool)
-                self.assertEqual(response["result"]["content"][0]["text"], "scope_denied")
+                self.assertEqual(response["result"]["content"][0]["text"], bridge.FAILURE_TEXT)
                 self.assertFalse(instance.fatal, "a scope refusal is not a revoked grant")
             self.assertEqual(
                 fixture.requests, [], "no input scope request may reach the Host"
@@ -440,7 +447,7 @@ class Subprocess(unittest.TestCase):
             + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
             + "\n"
             + json.dumps(
-                {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "key", "arguments": {"key": "enter"}}}
+                {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "key", "arguments": {"key": "enter", "step": "Press Enter"}}}
             )
             + "\n"
         )
@@ -469,7 +476,7 @@ class Subprocess(unittest.TestCase):
             json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
             + "\n"
             + json.dumps(
-                {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "key", "arguments": {"key": "enter"}}}
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "key", "arguments": {"key": "enter", "step": "Press Enter"}}}
             )
             + "\n"
         )
@@ -481,7 +488,7 @@ class Subprocess(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         lines = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
         self.assertEqual([tool["name"] for tool in lines[0]["result"]["tools"]], ["screenshot"])
-        self.assertEqual(lines[1]["result"]["content"][0]["text"], "scope_denied")
+        self.assertEqual(lines[1]["result"]["content"][0]["text"], bridge.FAILURE_TEXT)
         self.assertEqual(fixture.requests, [])
 
     def test_a_claude_definition_cannot_start_the_bridge(self):
@@ -585,7 +592,7 @@ class PiLifecycle(unittest.TestCase):
                     "jsonrpc": "2.0",
                     "id": "req-%d" % index,
                     "method": "tools/call",
-                    "params": {"name": "key", "arguments": {"key": "enter"}},
+                    "params": {"name": "key", "arguments": {"key": "enter", "step": "Press Enter"}},
                 }
             ) + "\n"
         try:
@@ -611,7 +618,7 @@ class PiLifecycle(unittest.TestCase):
         lines = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
         self.assertEqual(len(lines), 1)
         self.assertTrue(lines[0]["result"]["isError"])
-        self.assertEqual(lines[0]["result"]["content"][0]["text"], "grant_unavailable")
+        self.assertEqual(lines[0]["result"]["content"][0]["text"], bridge.FAILURE_TEXT)
         self.assertNotIn(TOKEN.encode(), completed.stdout + completed.stderr)
 
     def test_an_expired_grant_ends_the_pi_toolchain(self):
@@ -626,7 +633,7 @@ class PiLifecycle(unittest.TestCase):
             fixture.close()
         self.assertEqual(completed.returncode, 1, completed.stderr)
         self.assertEqual(len(fixture.requests), 1)
-        self.assertIn(b"grant_unavailable", completed.stdout)
+        self.assertIn(bridge.FAILURE_TEXT.encode("utf-8"), completed.stdout)
 
     def test_a_replayed_request_is_a_tool_error_and_is_never_retried(self):
         fixture = Fixture()
@@ -645,7 +652,7 @@ class PiLifecycle(unittest.TestCase):
         self.assertEqual(len(fixture.requests), 1)
         lines = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
         self.assertEqual(
-            lines[0]["result"]["content"][0]["text"], "computer_agent_request_replayed"
+            lines[0]["result"]["content"][0]["text"], bridge.FAILURE_TEXT
         )
         self.assertTrue(lines[0]["result"]["isError"])
 

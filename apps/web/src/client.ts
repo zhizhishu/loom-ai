@@ -1179,7 +1179,7 @@ export class ConsoleClient {
         modeStatus: assistantId => this.#workbenchJson('computer/agents/mode/status', { assistantId }),
         setMode: (assistantId, mode) => this.#workbenchJson('computer/agents/mode', { assistantId, mode }),
         approvalsList: assistantId => this.#workbenchJson('computer/agents/approvals/list', assistantId ? { assistantId } : {}),
-        decideApproval: (approvalId, decision) => this.#workbenchJson('computer/agents/approvals/decide', { approvalId, decision })
+        decideApproval: (approvalId, decision, scope = 'once', digest) => this.#workbenchJson('computer/agents/approvals/decide', { approvalId, decision, scope, digest })
       },
       status: () => this.#workbenchJson('computer/status', {}),
       startView: deviceId => this.#workbenchJson('computer/view', { deviceId, consent: true }),
@@ -1207,7 +1207,7 @@ export class ConsoleClient {
         modeStatus: assistantId => this.#workbenchJson('computer/agents/mode/status', { assistantId }),
         setMode: (assistantId, mode) => this.#workbenchJson('computer/agents/mode', { assistantId, mode }),
         approvalsList: assistantId => this.#workbenchJson('computer/agents/approvals/list', assistantId ? { assistantId } : {}),
-        decideApproval: (approvalId, decision) => this.#workbenchJson('computer/agents/approvals/decide', { approvalId, decision })
+        decideApproval: (approvalId, decision, scope = 'once', digest) => this.#workbenchJson('computer/agents/approvals/decide', { approvalId, decision, scope, digest })
       },
       status: () => this.#workbenchJson(base, {}),
       startView: deviceId => this.#workbenchJson(`${base}/view`, { deviceId, consent:true }),

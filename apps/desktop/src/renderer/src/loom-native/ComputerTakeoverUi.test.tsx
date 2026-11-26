@@ -16,12 +16,13 @@ describe('computer takeover UI', () => {
     const html = renderToStaticMarkup(createElement(ComputerAgentApprovalCards, {
       busy: false,
       onDecide: () => {},
-      approvals: [{ approvalId: 'a1', assistantId: 'agent', grantId: 'grant', tool: 'computer.input', summary: '点击屏幕中央', createdAt: 1, expiresAt: 2, status: 'pending' }]
+      approvals: [{ approvalId: 'a1', assistantId: 'agent', grantId: 'grant', digest: 'd'.repeat(64), tool: 'computer.input', summary: '点击屏幕中央', createdAt: 1, expiresAt: 2, status: 'pending' }]
     }))
     expect(html).toContain('助手请求操作电脑')
     expect(html).toContain('点击屏幕中央')
     expect(html).toContain('不批准不会落到屏幕')
     expect(html).toContain('允许这一步')
+    expect(html).toContain('本任务内都允许')
     expect(html).toContain('拒绝')
   })
 

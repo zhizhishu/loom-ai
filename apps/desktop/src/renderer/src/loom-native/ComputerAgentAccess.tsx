@@ -12,8 +12,13 @@ export function ComputerAgentModeControls({ mode, modeReady, busy, onChoose }: {
   return <div className="ln-computer-mode" role="group" aria-label="助手电脑操作模式"><span>助手操作模式</span><button type="button" className={mode === 'ask' ? 'ln-action is-primary' : 'ln-action'} disabled={busy || !modeReady} onClick={() => onChoose('ask')}>每步先问我</button><button type="button" className={mode === 'full' ? 'ln-action is-primary' : 'ln-action'} disabled={busy || !modeReady} onClick={() => onChoose('full')}>全权限</button></div>
 }
 
-export function ComputerAgentApprovalCards({ approvals, busy, onDecide }: { approvals: ComputerAgentApproval[]; busy: boolean; onDecide(item: ComputerAgentApproval, decision: 'approve' | 'deny'): void }) {
-  return <>{approvals.map(item => <section key={item.approvalId} className="ln-approval-request" aria-label="等待批准电脑操作"><strong><Icon name="hand" size={16}/>助手请求操作电脑</strong><p>{item.summary}</p><small>{item.tool} · 不批准不会落到屏幕</small><div><button type="button" disabled={busy} onClick={() => onDecide(item, 'approve')}>允许这一步</button><button type="button" disabled={busy} onClick={() => onDecide(item, 'deny')}>拒绝</button></div></section>)}</>
+export function ComputerAgentApprovalCards({ approvals, busy, onDecide }: { approvals: ComputerAgentApproval[]; busy: boolean; onDecide(item: ComputerAgentApproval, decision: 'approve' | 'deny', scope: 'once' | 'run'): void }) {
+  return <>{approvals.map(item => <section key={item.approvalId} className="ln-approval-request" aria-label="等待批准电脑操作">
+    <strong><Icon name="hand" size={16}/>助手请求操作电脑</strong>
+    <p>{item.step || item.summary}</p>
+    <small>{item.tool}{item.x != null && item.y != null ? ` · (${item.x}, ${item.y})` : ''} · 不批准不会落到屏幕</small>
+    <div><button type="button" disabled={busy} onClick={() => onDecide(item, 'approve', 'run')}>本任务内都允许</button><button type="button" disabled={busy} onClick={() => onDecide(item, 'deny', 'once')}>拒绝</button><button type="button" disabled={busy} onClick={() => onDecide(item, 'approve', 'once')}>允许这一步</button></div>
+  </section>)}</>
 }
 
 /** Assistant control is a separate, explicit, revocable permission. Neither
@@ -132,11 +137,11 @@ export function ComputerAgentAccess({ port, client, agent, device, theme }: {
     } catch (cause) { setError(hostFeatureError(cause)) }
     finally { setBusy(false) }
   }
-  const decide = async (item: ComputerAgentApproval, decision: 'approve' | 'deny') => {
+  const decide = async (item: ComputerAgentApproval, decision: 'approve' | 'deny', scope: 'once' | 'run') => {
     if (!port?.decideApproval || busy) return
     setBusy(true); setError('')
     try {
-      const result = await port.decideApproval(item.approvalId, decision)
+      const result = await port.decideApproval(item.approvalId, decision, scope, item.digest)
       const expected = decision === 'approve' ? 'approved' : 'denied'
       if (result.approvalId !== item.approvalId || result.status !== expected) throw new Error('审批结果尚未确认，请刷新检查。')
       setApprovals(current => current.filter(value => value.approvalId !== item.approvalId))
@@ -152,7 +157,7 @@ export function ComputerAgentAccess({ port, client, agent, device, theme }: {
     {!port || catalog?.limits.configured === false ? <p className="ln-muted">这台电脑尚未启用助手操作。</p> : <>
       {owned.map(item => <div key={item.grantId} className="ln-computer-grant-row"><span><strong>{item.scope === 'control' ? '查看与点击、输入' : '仅查看屏幕'}</strong><small>{item.state === 'active' && item.expiresAt > now ? `剩余约 ${Math.ceil((item.expiresAt - now) / 1000)} 秒` : '已失效，可清理'}</small></span><button type="button" className="ln-action is-danger" disabled={busy} onClick={() => { void revoke(item) }}>撤销</button></div>)}
       {port.modeStatus && <ComputerAgentModeControls mode={mode} modeReady={modeReady} busy={busy} onChoose={next => { void chooseMode(next) }}/>}
-      <ComputerAgentApprovalCards approvals={approvals} busy={busy} onDecide={(item, decision) => { void decide(item, decision) }}/>
+      <ComputerAgentApprovalCards approvals={approvals} busy={busy} onDecide={(item, decision, scope) => { void decide(item, decision, scope) }}/>
       {!runtime && <p className="ln-muted">先为助手选择运行方式。</p>}
       {!!runtime && !runtimeSupported && <p className="ln-muted">这个助手当前的运行方式暂不支持电脑操作。</p>}
       {needsCleanup && <p className="ln-muted">先撤销上方已过期的授权，再重新授权。</p>}

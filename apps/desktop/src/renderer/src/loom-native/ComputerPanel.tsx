@@ -3,7 +3,7 @@ import type { AgentProfile } from './types'
 import { ComputerAgentAccess } from './ComputerAgentAccess'
 import { ComputerUnavailableHint } from './ComputerUnavailableHint'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { ComputerControl, ComputerEvent, ComputerFrame, ComputerPort, ComputerStatus, ComputerView } from './host-services'
+import type { ComputerAgentApproval, ComputerControl, ComputerEvent, ComputerFrame, ComputerPort, ComputerStatus, ComputerView } from './host-services'
 import { hostFeatureError, screenPoint } from './host-services'
 import { Icon, IconButton } from './icons'
 import { FormMessage } from './Controls'
@@ -21,6 +21,7 @@ export function ComputerPanel({ port, client, agent = null, theme = 'day', retry
   const [busy, setBusy] = useState(false)
   const [statusCheckFailed, setStatusCheckFailed] = useState(false)
   const [text, setText] = useState('')
+  const [agentApprovals, setAgentApprovals] = useState<ComputerAgentApproval[]>([])
   const [tick, setTick] = useState(Date.now())
   const viewRef = useRef<ComputerView | null>(null)
   const controlRef = useRef<ComputerControl | null>(null)
@@ -170,7 +171,32 @@ export function ComputerPanel({ port, client, agent = null, theme = 'day', retry
     target.addEventListener('wheel', wheel, { passive: false })
     return () => target.removeEventListener('wheel', wheel)
   }, [control?.controlId, frame?.bounds.x, frame?.bounds.y, frame?.bounds.width, frame?.bounds.height, send])
+  useEffect(() => {
+    if (!port?.agents?.approvalsList || !agent) { setAgentApprovals([]); return }
+    let cancelled = false
+    const load = async () => {
+      try {
+        const result = await port.agents!.approvalsList!(agent.agentId)
+        if (!cancelled) setAgentApprovals(result.items.filter(item => item.assistantId === agent.agentId && item.status === 'pending'))
+      } catch { if (!cancelled) setAgentApprovals([]) }
+    }
+    void load()
+    const timer = setInterval(() => { void load() }, 1000)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [port?.agents, agent?.agentId])
   const seconds = control ? Math.max(0, Math.ceil((control.totalDeadline - tick - clockSkew.current) / 1000)) : 0
+  const pendingApproval = agentApprovals[0]
+  const rawRect = pendingApproval?.rect ?? (pendingApproval?.x != null && pendingApproval.y != null ? { x: pendingApproval.x - 16, y: pendingApproval.y - 16, w: 32, h: 32 } : null)
+  const targetRect = frame && rawRect && frame.bounds.width > 0 && frame.bounds.height > 0 ? {
+    x: ((rawRect.x - frame.bounds.x) / frame.bounds.width) * 100,
+    y: ((rawRect.y - frame.bounds.y) / frame.bounds.height) * 100,
+    w: (rawRect.w / frame.bounds.width) * 100,
+    h: (rawRect.h / frame.bounds.height) * 100,
+  } : null
+  const targetPoint = frame && frame.bounds.width > 0 && frame.bounds.height > 0 && pendingApproval?.x != null && pendingApproval.y != null ? {
+    x: ((pendingApproval.x - frame.bounds.x) / frame.bounds.width) * 100,
+    y: ((pendingApproval.y - frame.bounds.y) / frame.bounds.height) * 100,
+  } : null
   return <section className="ln-computer-panel" aria-label="电脑控制">
     <div className="ln-computer-title"><div><strong>电脑</strong><span>{control ? '由你控制' : view ? '仅查看' : '未连接'}</span></div><IconButton icon="refresh" label="检查电脑连接" disabled={busy || !!view} onClick={() => { void refreshStatus() }}/></div>
     <p className="ln-computer-scope">先允许查看屏幕；点一下画面立即接管鼠标和键盘，最长五分钟，可点“交还助手”停止。</p>
@@ -183,7 +209,7 @@ export function ComputerPanel({ port, client, agent = null, theme = 'day', retry
       if (KEYS[event.key]) { event.preventDefault(); send({ kind: 'key', key: KEYS[event.key]! }) }
       else if ([...event.key].length === 1) { event.preventDefault(); send({ kind: 'text', text: event.key }) }
     }}>
-      {frame ? <img ref={image} src={frame.url} alt="所选电脑实时屏幕" draggable={false} onClick={event => {
+      {frame ? <div className="ln-computer-picture"><img ref={image} src={frame.url} alt="所选电脑实时屏幕" draggable={false} onClick={event => {
         if (!controlRef.current) { void acquire(); return }
         const point = screenPoint(event.currentTarget.getBoundingClientRect(), frame.bounds, event.clientX, event.clientY)
         if (point) { screen.current?.focus(); send({ kind: 'pointer', action: 'click', button: 'left', ...point }) }
@@ -192,7 +218,7 @@ export function ComputerPanel({ port, client, agent = null, theme = 'day', retry
         event.preventDefault()
         const point = screenPoint(event.currentTarget.getBoundingClientRect(), frame.bounds, event.clientX, event.clientY)
         if (point) send({ kind: 'pointer', action: 'click', button: 'right', ...point })
-      }}/> : <div className="ln-computer-placeholder"><Icon name="computer" size={43}/><strong>{view ? '正在连接屏幕…' : !port ? '此设备暂不支持查看屏幕' : status?.ready ? '查看这台电脑的屏幕' : '电脑连接未就绪'}</strong><span>{view ? '请稍候' : status?.ready ? '点击下方按钮开始查看' : '请检查电脑连接'}</span></div>}
+      }}/>{pendingApproval && targetRect && <span aria-hidden="true" className="ln-computer-approval-target" style={{ left: `${targetRect.x}%`, top: `${targetRect.y}%`, width: `${targetRect.w}%`, height: `${targetRect.h}%` }}/>}{pendingApproval && targetPoint && <span aria-hidden="true" className="ln-computer-cursor" style={{ left: `${targetPoint.x}%`, top: `${targetPoint.y}%` }}/>}</div> : <div className="ln-computer-placeholder"><Icon name="computer" size={43}/><strong>{view ? '正在连接屏幕…' : !port ? '此设备暂不支持查看屏幕' : status?.ready ? '查看这台电脑的屏幕' : '电脑连接未就绪'}</strong><span>{view ? '请稍候' : status?.ready ? '点击下方按钮开始查看' : '请检查电脑连接'}</span></div>}
     </div>
     <div className="ln-computer-actions">{!view ? <button type="button" className="ln-action is-primary" disabled={busy || !port || !status?.ready || !status.device} onClick={() => { void beginView() }}>允许本次查看屏幕</button> : <><button type="button" className="ln-action" onClick={() => { void stop() }}>断开画面</button>{control ? <button type="button" className="ln-action is-danger" onClick={() => { void dropControl() }}>交还助手 · {seconds}秒</button> : <button type="button" className="ln-action is-primary" disabled={busy || !frame} onClick={() => { void acquire() }}>接管电脑</button>}</>}</div>
     {control && <div className="ln-computer-inputs"><p>点击画面后可打字。按 Esc 交还助手；离开页面或五分钟后自动停止。</p><div className="ln-computer-keys">{[['Enter','enter'],['Tab','tab'],['Esc','escape'],['⌫','backspace'],['↑','up'],['↓','down']].map(([label,key]) => <button key={key} type="button" className="ln-action" onClick={() => send({ kind: 'key', key: key! })}>{label}</button>)}</div><form onSubmit={event => { event.preventDefault(); if (text.trim()) { send({ kind: 'text', text }); setText('') } }}><input value={text} onChange={event => setText(event.target.value)} maxLength={2048} placeholder="向电脑输入文字…" aria-label="发送到电脑的文字" autoComplete="off"/><button type="submit" className="ln-action" disabled={!text}>输入</button></form></div>}

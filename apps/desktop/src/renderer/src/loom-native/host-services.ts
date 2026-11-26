@@ -60,7 +60,9 @@ export type ComputerAgentGrants = {
 export type ComputerAgentMode = 'ask' | 'full'
 export type ComputerAgentApproval = {
   approvalId: string; assistantId: string; grantId: string; runId?: string | null
-  tool: string; summary: string; createdAt: number; expiresAt: number
+  digest: string; tool: string; summary: string; step?: string | null
+  x?: number | null; y?: number | null; rect?: { x: number; y: number; w: number; h: number } | null
+  createdAt: number; expiresAt: number
   status: 'pending' | 'approved' | 'denied' | 'expired'
 }
 export interface ComputerAgentPort {
@@ -70,7 +72,7 @@ export interface ComputerAgentPort {
   modeStatus?(assistantId: string): Promise<{ assistantId: string; mode: ComputerAgentMode }>
   setMode?(assistantId: string, mode: ComputerAgentMode): Promise<{ assistantId: string; mode: ComputerAgentMode }>
   approvalsList?(assistantId?: string): Promise<{ items: ComputerAgentApproval[] }>
-  decideApproval?(approvalId: string, decision: 'approve' | 'deny'): Promise<{ approvalId: string; status: 'approved' | 'denied' }>
+  decideApproval?(approvalId: string, decision: 'approve' | 'deny', scope?: 'once' | 'run', digest?: string): Promise<{ approvalId: string; status: 'approved' | 'denied' }>
 }
 export interface ComputerPort {
   agents?: ComputerAgentPort
