@@ -273,3 +273,5 @@
 .ln-run-failure-guide{font-size:11px;color:#8d2f28}
 .ln-run-failure-guide>summary{cursor:pointer;font-weight:550}
 .ln-run-failure-guide .runtime-install-guide{margin-top:8px;background:var(--ln-bg);color:var(--ln-text)}
+
+.ln-message-quote{display:grid;gap:3px;margin:0 0 8px;padding:7px 9px;border-left:3px solid var(--ln-accent,#7b61ff);border-radius:8px;background:color-mix(in srgb,var(--ln-accent,#7b61ff) 10%,transparent);font-size:12px}.ln-message-quote strong{font-weight:600}.ln-message-quote span{white-space:pre-wrap;overflow-wrap:anywhere;opacity:.86}

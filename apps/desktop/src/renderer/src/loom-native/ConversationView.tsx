@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ActionApprovalView, AgentRunView, DomainEventView, HostPlatformKey, ThreadMessageView } from '@contracts'
 import type { AgentProfile, ArtifactSelection, ConversationItem, ThreadSnapshot, WorkBundle } from './types'
 import { AgentMarkdown } from './AgentMarkdown'
+import { splitQuote } from './artifact-quote'
 import { AgentOpenUiProvider, type AgentOpenUiHost } from './AgentOpenUiButton'
 import { PiQuestionCard } from './PiQuestionCard'
 import { questionKey, type PiAnswer, type PiQuestion } from './pi-questions'
@@ -240,10 +241,11 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
         const user = message.authorType === 'user' || message.authorType === 'external_principal'
         const author = agents.find(agent => agent.agentId === message.authorId)
         const handoff = !user && /\[LOOM_HANDOFF|"dispatchId"|"tool_call_id"/.test(message.body)
+        const quoted = splitQuote(message.body)
         return <article className={`ln-message ${user ? 'is-user' : 'is-assistant'} ${handoff ? 'is-record' : ''}`} key={message.id} data-message-id={message.id}>
           {!user && snapshot && snapshot.members.length > 1 && <div className="ln-message-author"><Avatar agent={author} name={message.authorDisplayName || ''} size={16}/><span>{author?.displayName || message.authorDisplayName || '助手'}</span></div>}
           {handoff ? <details className="ln-execution-record"><summary><Icon name="branch" size={14}/><span>执行记录</span><Icon name="right" size={12}/></summary><AgentMarkdown text={message.body}/></details>
-            : <div className="ln-message-content"><AgentMarkdown text={message.body}/></div>}
+            : <div className="ln-message-content">{quoted.quote && <div className="ln-message-quote" data-quote-kind={quoted.quote.kind}><strong>{quoted.quote.label ?? (quoted.quote.kind === 'element' ? '引用元素' : '引用选文')}</strong><span>{quoted.quote.text}</span></div>}<AgentMarkdown text={quoted.text}/></div>}
           {message.attachments.length > 0 && snapshot && <MessageAttachments attachments={message.attachments} threadId={snapshot.thread.id} messageId={message.id} loadPreview={onPreviewAttachment} onOpen={attachmentId => onAttachment(message.id, attachmentId)}/>}
           <div className="ln-message-actions"><button type="button" aria-label="复制消息" title="复制消息" onClick={() => { void navigator.clipboard.writeText(message.body).then(() => { setCopied(message.id); window.setTimeout(() => setCopied(null), 1500) }) }}><Icon name={copied === message.id ? 'check' : 'copy'} size={13}/></button><time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time></div>
         </article>

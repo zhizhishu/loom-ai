@@ -6,6 +6,7 @@ import type { LoomReviewRecordReceipt } from '@contracts'
 import { useThreadClient } from '../camp-client'
 import { readErrorMessage } from '../error-message'
 import { ArtifactPdfPreview } from './ArtifactPdfPreview'
+import { quoteFromSelection, type ArtifactQuote } from './artifact-quote'
 import { Icon } from './icons'
 import './artifact-ux.css'
 import type { ArtifactSelection } from './types'
@@ -91,13 +92,14 @@ function savedDrafts(client: object): Map<string, ReviewDraftMemory> {
   return drafts
 }
 
-export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = null, contextAvailable = true, theme: suppliedTheme }: {
+export function ArtifactView({ selection, onClose, onRefresh, onQuote, fallbackFocus = null, contextAvailable = true, theme: suppliedTheme }: {
   selection: ArtifactSelection
   fallbackFocus?: HTMLElement | null
   contextAvailable?: boolean
   theme?: 'day' | 'night'
   onClose(): void
   onRefresh(): Promise<void>
+  onQuote?(quote: ArtifactQuote): void
 }): React.JSX.Element {
   const client = useThreadClient()
   const { artifact, bundle } = selection
@@ -107,6 +109,7 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
 
   // 触发浮层的那个元素：关闭后焦点必须回到它，找不到就交给浏览器默认处理。
   const opener = useRef<HTMLElement | null>(typeof document !== 'undefined' && document.activeElement instanceof HTMLElement ? document.activeElement : null)
+  const documentRoot = useRef<HTMLDivElement>(null)
   // The app supplies the live theme across this portal; legacy callers use the initial app theme.
   const [initialTheme] = useState(() => document.querySelector('.ln-app')?.getAttribute('data-theme') ?? undefined)
   const theme = suppliedTheme ?? initialTheme
@@ -301,6 +304,10 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
   const versionLabel = artifactVersionLabel(facts)
   const canSubmit = contextAvailable && !pending && receipt === null && (attempt !== null || (draft !== null && facts.reviewable && facts.latest && reviewDraftComplete(draft, facts)))
   const documentTitle = preview.status === 'ready' && markdown ? /^\s*#\s+(.+)$/mu.exec(preview.text)?.[1] ?? fileName : fileName
+  const quoteSelection = (kind: 'text' | 'element') => {
+    const quote = quoteFromSelection(artifact.artifactId, documentRoot.current, kind, fileName)
+    if (quote && onQuote) onQuote(quote)
+  }
 
   return <>
   <Dialog.Root open onOpenChange={next => { if (!next) onClose() }}>
@@ -325,6 +332,8 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
                 {versionLabel}
               </span>}
             <span className="ln-artifact-head-actions">
+              {onQuote && <button type="button" className="ln-artifact-download" title="引用所选文字" onMouseDown={event => event.preventDefault()} onClick={() => quoteSelection('text')}><span>引用选文</span></button>}
+              {onQuote && <button type="button" className="ln-artifact-download" title="引用所选元素" onMouseDown={event => event.preventDefault()} onClick={() => quoteSelection('element')}><span>引用元素</span></button>}
               {download !== null && <button
                 type="button" className="ln-artifact-download" title="下载文件" aria-label="下载文件"
                 onClick={startDownload}
@@ -339,7 +348,7 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
 
           {!contextAvailable && <div className="ln-artifact-state" role="alert">工作记录已更新，请刷新后再验收。<button type="button" className="ln-artifact-retry" onClick={()=>{void onRefresh().catch(error=>setFailure(readErrorMessage(error, '刷新失败')))}}>刷新记录</button></div>}
           <div className="ln-artifact-body">
-            <div className="ln-artifact-document">
+            <div className="ln-artifact-document" ref={documentRoot}>
               <h2 className="ln-artifact-doc-title">{documentTitle}</h2>
               <p className="ln-artifact-doc-meta">{bundle.mission.title} · {new Date(artifact.createdAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} 更新</p>
               {documentBody}

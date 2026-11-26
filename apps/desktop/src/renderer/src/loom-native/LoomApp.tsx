@@ -13,6 +13,7 @@ import { ConversationView } from './ConversationView'
 import { Inspector, flattenWork, workStatus } from './Inspector'
 import { ArtifactView } from './ArtifactView'
 import { refreshArtifactSelection } from './artifact-service'
+import { splitQuote, withQuote } from './artifact-quote'
 import { Avatar } from './Avatar'
 import { Icon, IconButton } from './icons'
 import './native.css'
@@ -364,7 +365,7 @@ export function LoomApp({ environment, onLogout, initialSettingsSection = null, 
       onRefreshWork={data.refresh}
       onClose={() => setRunSurfaceOpen(false)} onCreateWork={() => { setRunSurfaceOpen(false); beginWork() }}
       onArtifact={selection => { setRunSurfaceOpen(false); setArtifact(selection) }}/>
-    {artifact && <ArtifactView key={`${artifact.bundle.mission.missionId}:${artifact.artifact.artifactId}:${artifact.candidate?.candidateId ?? "none"}`} theme={theme} fallbackFocus={runSurfaceOpener.current} selection={currentArtifact?.selection ?? artifact} contextAvailable={currentArtifact?.contextAvailable ?? false} onClose={() => setArtifact(null)} onRefresh={data.refresh}/>}
+    {artifact && <ArtifactView key={`${artifact.bundle.mission.missionId}:${artifact.artifact.artifactId}:${artifact.candidate?.candidateId ?? "none"}`} theme={theme} fallbackFocus={runSurfaceOpener.current} selection={currentArtifact?.selection ?? artifact} contextAvailable={currentArtifact?.contextAvailable ?? false} onClose={() => setArtifact(null)} onRefresh={data.refresh} onQuote={quote => { patchDraft({ text: withQuote(splitQuote(draft.text).text, quote) }); setArtifact(null) }}/>}
     <Dialog.Root open={modal !== null} onOpenChange={open => { if (!open) setModal(null) }}><Dialog.Portal><div className="ln-portal" data-theme={theme}><Dialog.Overlay className="ln-modal-backdrop"/><Dialog.Content className={`ln-dialog${modal === 'search' ? ' ln-search-dialog' : ''}`} aria-describedby={undefined}><header><Dialog.Title>{modal === 'search' ? '搜索' : '会话活动'}</Dialog.Title><Dialog.Close asChild><button type="button" className="ln-icon-button" aria-label="关闭"><Icon name="close"/></button></Dialog.Close></header>
       {modal === 'search' && <><div className="ln-search-field"><Icon name="search"/><input placeholder="搜索对话、助手、工作或文件名…" aria-label="全局搜索" value={query} onChange={event => setQuery(event.target.value)} autoFocus/></div><WorkspaceSearch results={searchResults} query={query} onConversation={item => safeInspectorAction(() => { void select(item); setModal(null) })} onAssistant={agentId => { setModal(null); manageAssistant(agentId) }} onWork={searchWork} onArtifact={searchArtifact}/></>}
       {modal === 'history' && <div className="ln-dialog-results"><RunActivityHistory runs={data.snapshot?.agentRuns ?? []} agents={data.agents} sending={sending} onRetry={retryLastRun}/></div>}
