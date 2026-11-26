@@ -27,7 +27,7 @@ describe('computer takeover UI', () => {
 
   it('explains that one screen click starts takeover', () => {
     const html = renderToStaticMarkup(createElement(ComputerPanel, {}))
-    expect(html).toContain('点一下画面即可接管鼠标和键盘')
+    expect(html).toContain('点一下画面立即接管鼠标和键盘')
     expect(html).toContain('所选电脑屏幕；点击接管')
   })
 })
