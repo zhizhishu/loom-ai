@@ -200,6 +200,18 @@ async function acquireControl (session, deviceId, viewId) {
   })
 }
 
+async function acquireControlWhenFree (session, deviceId, viewId, budgetMs = 40_000) {
+  const deadline = Date.now() + budgetMs
+  for (;;) {
+    try {
+      return await acquireControl(session, deviceId, viewId)
+    } catch (error) {
+      if (error?.code !== 'computer_control_held' || Date.now() >= deadline) throw error
+      await pause(500)
+    }
+  }
+}
+
 async function run () {
   assert.equal(await portFree(), true, `port ${PORT} is already listening; refusing to borrow another process`)
   mkdirSync(ARTIFACTS, { recursive: true })
@@ -361,7 +373,7 @@ async function run () {
 
   await workbench({ origin: ORIGIN, session, path: '/computer/view/stop', body: { viewId: view.viewId } })
   const expiryView = await workbench({ origin: ORIGIN, session, path: '/computer/view', body: { deviceId, consent: true } })
-  const second = await acquireControl(session, deviceId, expiryView.viewId)
+  const second = await acquireControlWhenFree(session, deviceId, expiryView.viewId)
   const expiryStarted = Date.now()
   let expiryError = null
   if (FULL_EXPIRY) {
