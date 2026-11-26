@@ -71,7 +71,7 @@ jobs:
       - name: Install pinned Pi source
         run: |
           mkdir -p out/pi-source
-          cp scripts/pi-source/package.json scripts/pi-source/package-lock.json out/pi-source/
+          cp scripts/runtime/pi-source/package.json scripts/runtime/pi-source/package-lock.json out/pi-source/
           cd out/pi-source
           npm ci --ignore-scripts --no-audit --no-fund
       - name: Stage and verify embedded Linux Pi runtime
@@ -82,10 +82,6 @@ jobs:
             --launcher-built target/debug/loom-pi-launcher \
             --destination resources/runtime/pi
           node scripts/package-embedded-pi.mjs --verify --destination resources/runtime/pi
-      - name: Stage and verify DSH hook executor
-        run: |
-          node scripts/package-dsh-hook-executor.mjs
-          node scripts/package-dsh-hook-executor.mjs --verify
       - name: Stage and verify Linux computer runtime
         run: |
           rm -rf resources/runtime/computer-linux
@@ -97,7 +93,6 @@ jobs:
           node scripts/package-linux-personal.mjs \
             --server-dir out/server/linux-x64 \
             --pi-dir resources/runtime/pi \
-            --dsh-dir resources/runtime/dsh-hook-executor \
             --computer-dir resources/runtime/computer-linux \
             --binary target/debug/rovai-core \
             --binary target/debug/loom-node \

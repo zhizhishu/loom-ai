@@ -11,7 +11,6 @@ const REQUIRED = [
   'web-ui/index.html', 'skills/cli-operations/SKILL.md', 'LICENSE',
   'Manage-Loom.sh', 'Start-Loom.sh', 'Install-Loom.sh', 'README.md',
   'runtime/pi/pi-bundle.json', 'runtime/pi/node/node', 'runtime/pi/pi',
-  'runtime/dsh-hook-executor/executor-bundle.json',
   'runtime/computer/computer-bundle.json', 'runtime/computer/python',
   'runtime/computer/host_desktop.py', 'runtime/computer/mcp_bridge.py'
 ]
@@ -41,7 +40,7 @@ function parseArgs() {
     const key = args[index]
     if (key === '--verify') out.verify = true
     else if (key === '--binary') out.binaries.push(resolve(args[++index] ?? ''))
-    else if (['--server-dir', '--pi-dir', '--dsh-dir', '--computer-dir', '--output', '--archive'].includes(key)) out[key.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = resolve(args[++index] ?? '')
+    else if (['--server-dir', '--pi-dir', '--computer-dir', '--output', '--archive'].includes(key)) out[key.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = resolve(args[++index] ?? '')
     else throw new Error(`unknown argument: ${key}`)
   }
   return out
@@ -62,7 +61,7 @@ export function verifyLinuxPersonalPackage(root) {
   return manifest
 }
 function stage(options) {
-  for (const key of ['serverDir', 'piDir', 'dshDir', 'computerDir', 'output']) if (!options[key]) throw new Error(`missing --${key.replace(/[A-Z]/g, c => `-${c.toLowerCase()}`)}`)
+  for (const key of ['serverDir', 'piDir', 'computerDir', 'output']) if (!options[key]) throw new Error(`missing --${key.replace(/[A-Z]/g, c => `-${c.toLowerCase()}`)}`)
   if (!existsSync(join(options.serverDir, 'rovai-server'))) throw new Error('--server-dir must be a built linux server preview')
   if (existsSync(options.output)) {
     if (readdirSync(options.output).length) throw new Error(`refusing to overwrite non-empty output ${options.output}`)
@@ -75,7 +74,6 @@ function stage(options) {
   rmSync(join(options.output, 'install-server.sh'), { force: true })
   mkdirSync(join(options.output, 'runtime'), { recursive: true })
   cpSync(options.piDir, join(options.output, 'runtime/pi'), { recursive: true })
-  cpSync(options.dshDir, join(options.output, 'runtime/dsh-hook-executor'), { recursive: true })
   cpSync(options.computerDir, join(options.output, 'runtime/computer'), { recursive: true })
   copyFileSync(join(repository, 'scripts/manage-loom-personal.sh'), join(options.output, 'Manage-Loom.sh'))
   copyFileSync(join(repository, 'scripts/start-loom-personal.sh'), join(options.output, 'Start-Loom.sh'))
