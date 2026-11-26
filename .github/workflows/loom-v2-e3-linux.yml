@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 90
     env:
       CI: true
-      LOOM_SOURCE_COMMIT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      LOOM_SOURCE_COMMIT: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       CARGO_BUILD_JOBS: 3
       PIP_DISABLE_PIP_VERSION_CHECK: 1
     steps:
