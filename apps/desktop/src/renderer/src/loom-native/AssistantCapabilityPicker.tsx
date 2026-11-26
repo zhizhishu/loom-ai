@@ -58,7 +58,11 @@ export function AssistantCapabilityPicker({ environment, catalogAgentId, runtime
     setLoading(false)
   },[catalogAgentId,environment.workbench,port,threadId])
   useEffect(()=>{void load();return()=>{generation.current++}},[load])
-  useEffect(()=>{void port.listLibrary().then(rows=>setSkillVersions(Object.fromEntries(rows.map(row=>[row.id,row.version])))).catch(()=>{})},[port])
+  useEffect(()=>{void port.listLibrary().then(rows=>{
+    const versions:Record<string,number>={}
+    for(const row of rows){versions[row.id]=row.version;versions[`library:${row.id}`]=row.version}
+    setSkillVersions(versions)
+  }).catch(()=>{})},[port])
   useEffect(()=>{onBusyChange?.(busy);return()=>onBusyChange?.(false)},[busy,onBusyChange])
   const selected = new Set(selectedKeys)
   const needle=query.trim().toLocaleLowerCase()
@@ -68,10 +72,11 @@ export function AssistantCapabilityPicker({ environment, catalogAgentId, runtime
   const toggle=(key:string)=>onSelection(selected.has(key)?selectedKeys.filter(value=>value!==key):[...selectedKeys,key])
   const changeScope=async(item:import('../member-catalog-model').CapabilityItem,value:string)=>{
     const version=skillVersions[item.id]
+    const skillId=item.id.startsWith('library:')?item.id.slice('library:'.length):item.id
     if(version===undefined||busy||disabled)return
     setBusy(true);setError('');setNotice('')
     try{
-      await setSkillMetadata(environment.client,item.id,version,{visibilityScope:value as import('@contracts').SkillVisibilityScope})
+      await setSkillMetadata(environment.client,skillId,version,{visibilityScope:value as import('@contracts').SkillVisibilityScope})
       await load()
       setNotice('可见范围已保存。')
     }catch(cause){setError(hostFeatureError(cause))}finally{setBusy(false)}

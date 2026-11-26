@@ -61,7 +61,7 @@ it('keeps control transitions ahead of attention and maps upstream task lines',(
 
 it('shows assigned task ownership even before control facts are observed',()=>{
  const agent={agentId:'a',displayName:'A'} as AgentProfile
- const mission={missionId:'m',threadId:'t',memberAgentIds:['a'],runningAgentIds:[],title:'Mission'} as MissionRecord
+ const mission={missionId:'m',threadId:'t',memberAgentIds:['a'],runningAgentIds:[],title:'Mission'} as unknown as MissionRecord
  const bundle={mission,plan:null,tasks:[{taskId:'task-a',title:'Owned task',assigneeAgentId:'a',status:'draft'}],candidates:[],artifacts:[],reviews:[],verifications:[]} as never
  const [target]=botBoardTargets([agent],[],[mission],[bundle])
  expect(target?.title).toBe('Owned task')
