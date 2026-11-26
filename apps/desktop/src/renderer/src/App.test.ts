@@ -3474,10 +3474,10 @@ describe('task event projections', () => {
       channels: '渠道',
       appearance: '外观',
       shortcuts: '快捷键',
-      notifications: '提醒',
+      notifications: '通知',
       monitoring: '运行监控',
-      diagnostics: '诊断与修复',
-      about: '关于与更新'
+      diagnostics: '数据与诊断',
+      about: '关于'
     }
     const remoteHostTestApi: import('@contracts').RemoteHostApi = {
       list: async () => ({ ok: true, value: [] }),
@@ -3488,7 +3488,8 @@ describe('task event projections', () => {
     for (const [section, heading] of Object.entries(contentBySection) as Array<[NavigationSettingsSection, string]>) {
       const markup = renderToStaticMarkup(createElement(SettingsView, { remoteConnection: createElement(RemoteConnectionStatus, { origin: 'http://fixture.invalid', state: 'live', onLogout: () => undefined }), remoteHosts: createElement(RemoteHostsSettings, { api: remoteHostTestApi }), nodes: createElement(NodesSettings, { api: { list: async () => ({ nodes: [] }), pair: async () => ({ pairingCode: 'code', expiresInSeconds: 600, connectUrl: 'ws://127.0.0.1:9/api/v1/nodes/connect' }), revoke: async () => ({ nodeId: 'node', revokedAt: '', status: 'offline' }), output: async () => ({ runId: 'run', attempt: 1, nodeId: 'node', runtime: 'codex-cli', status: 'running', ackedSeq: 0, exitCode: null, frames: [], truncated: false, nextFrom: null }) } }), preferencesApi: {} as import('@contracts').GeneralPreferencesApi, ...baseProps, section }))
       if (section === 'shortcuts') {
-        expect(markup).not.toContain('<h1>快捷键</h1>') // Desktop capability is required.
+        expect(markup).toContain('<h1>快捷键</h1>')
+        expect(markup).toContain('此环境暂无快捷键')
       } else if (section === 'mcp') {
         expect(markup).toContain(`<h1>${heading}<span>`)
         expect(markup.match(/class="capability-library-heading"/g)).toHaveLength(1)
@@ -7915,7 +7916,7 @@ describe('task event projections', () => {
       onAppearanceChange: async (preferences: import('@contracts').AppearancePreferences) => ({ ...preferences, resolvedTheme: 'day' as const })
     }))
 
-    expect(markup).toContain('<h1>诊断与修复</h1>')
+    expect(markup).toContain('<h1>数据与诊断</h1>')
     expect(markup).toContain('重新检查')
     expect(markup).toContain('导出诊断')
     expect(markup).toContain('正在读取诊断事实')
