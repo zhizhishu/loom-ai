@@ -1,17 +1,19 @@
 import type { AgentProfile } from '@contracts'
 import type { SettingsSectionId } from './settings-sections'
 
-export const SETUP_CHECKLIST_ITEMS = ['assistant', 'runtime', 'workspace'] as const
+export const SETUP_CHECKLIST_ITEMS = ['assistant', 'runtime', 'mcp', 'workspace'] as const
 export type SetupChecklistItem = (typeof SETUP_CHECKLIST_ITEMS)[number]
 export type SetupChecklistItemState = 'done' | 'todo'
 
 export interface SetupChecklistInput {
   agents: ReadonlyArray<Pick<AgentProfile, 'removedAt' | 'presence' | 'runtimeConfiguration' | 'runtimeReadiness'>>
   hasWorkspaceDefault: boolean
+  hasMcpConnection: boolean
 }
 
 export const SETUP_ITEM_ACTIONS: Partial<Record<SetupChecklistItem, SettingsSectionId>> = {
   runtime: 'runtime',
+  mcp: 'connections',
   workspace: 'workspace'
 }
 
@@ -30,6 +32,7 @@ export function setupChecklistItemState(item: SetupChecklistItem, input: SetupCh
   switch (item) {
     case 'assistant': return present.length > 0 ? 'done' : 'todo'
     case 'runtime': return input.agents.some(agentCanLaunch) ? 'done' : 'todo'
+    case 'mcp': return input.hasMcpConnection ? 'done' : 'todo'
     case 'workspace': return input.hasWorkspaceDefault ? 'done' : 'todo'
   }
 }

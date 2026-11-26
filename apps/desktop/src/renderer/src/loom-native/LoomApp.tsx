@@ -31,6 +31,7 @@ import { RunActivityHistory } from './RunningActivity'
 import { storedPanelWidth, fittedPanelWidths, type PanelSide, type PanelWidths } from './panel-resize'
 import { SetupChecklist } from './SetupChecklist'
 import { readWorkspaceDefault } from './workspace-defaults'
+import { readMcpConnections } from './mcp-service'
 
 // Load optional editors only when opened; keep them mounted after first use so
 // transport-unknown drafts cannot be discarded by closing a modal.
@@ -53,6 +54,7 @@ export function RailBottom({ children }: { children: React.ReactNode }) {
 export function LoomApp({ environment, onLogout, initialSettingsSection = null, onSettingsSectionChange }: Props) {
   const data = useLoomData(environment)
   const piQuestions = usePiQuestions(environment.client)
+  const [hasMcpConnection, setHasMcpConnection] = useState(false)
   const [boardOpen,setBoardOpen] = useState(false)
   const [pendingOpen,setPendingOpen] = useState(false)
   const [pendingCount,setPendingCount] = useState(0)
@@ -100,6 +102,13 @@ export function LoomApp({ environment, onLogout, initialSettingsSection = null, 
   const [modal, setModal] = useState<'search' | 'history' | null>(null)
   const [newRoom, setNewRoom] = useState(false)
   const [settingsSection, setSettingsSection] = useState<SettingsSectionId | null>(initialSettingsSection)
+  useEffect(() => {
+    let alive = true
+    void readMcpConnections(environment.client).then(read => {
+      if (alive && read.status === 'ready') setHasMcpConnection(read.connections.length > 0)
+    })
+    return () => { alive = false }
+  }, [environment.client, settingsSection])
   // Same guard as the inspector (`safeInspectorAction`): unsaved capability edits ask before the settings page covers them.
   const openSettings = (id?: SettingsSectionId) => safeInspectorAction(() => { setCapabilityDirty(false); setSettingsSection(id ?? readStoredSettingsSection(typeof localStorage === 'undefined' ? null : localStorage)) })
   // The page owns the section; the Web entry mirrors it into `?section=` and clears it again.
@@ -361,7 +370,7 @@ export function LoomApp({ environment, onLogout, initialSettingsSection = null, 
       <section ref={frameRef} className="ln-frame" aria-label="LOOM 工作空间" style={{ '--ln-sidebar-width': `${panelWidths.sidebar}px`, '--ln-inspector-width': `${panelWidths.inspector}px` } as React.CSSProperties}>
         {settingsSection ? <SettingsPage section={settingsSection} onLeaveGuard={registerSettingsLeave} onSection={setSettingsSection} environment={environment} agents={data.agents} theme={theme} onTheme={setTheme} threadId={active?.threadId ?? undefined} onLogout={onLogout} onRefreshWorkspace={() => { void data.refresh().catch(report) }} onManageAssistants={() => manageAssistant(activeAgent?.agentId)} onStartWorkspace={root => { setSettingsSection(null); beginWorkIn(root) }} onChanged={() => { setCapabilityEpoch(value => value + 1); void data.refresh().catch(report) }}/>
         : <>{sidebarOpen && <Sidebar agents={data.agents} items={data.conversations} selectedId={data.selectedId} loading={data.loading} groupRosters={groupRosters} hidden={data.hidden} onRestoreHidden={threadId => { void data.setHidden(threadId, false) }} onSelect={item => safeInspectorAction(() => { setCapabilityDirty(false); void select(item) })} onCreate={beginConversation} onCollapse={() => setSidebarOpen(false)} onEditAssistant={agentId => manageAssistant(agentId)}/>}{sidebarOpen && <PanelResizeHandle side="sidebar" frame={frameRef} widths={panelWidths} sidebarOpen={sidebarOpen} inspectorOpen={inspectorOpen} onResize={resizePanel}/> }
-        {!settingsSection && <SetupChecklist agents={data.agents} hasWorkspaceDefault={typeof localStorage !== 'undefined' && readWorkspaceDefault(localStorage) !== null} onOpenSettings={openSettings} onCreateAssistant={() => manageAssistant(undefined, true)}/>}
+        {!settingsSection && <SetupChecklist agents={data.agents} hasWorkspaceDefault={typeof localStorage !== 'undefined' && readWorkspaceDefault(localStorage) !== null} hasMcpConnection={hasMcpConnection} onOpenSettings={openSettings} onCreateAssistant={() => manageAssistant(undefined, true)}/>}
         <ConversationView item={active} agents={data.agents} snapshot={data.snapshot} bundles={data.bundles} loading={data.loading} sending={sending} draft={draft.text} files={draft.files} error={sendError ?? piQuestions.error} questions={piQuestions.questions} onAnswerQuestion={piQuestions.answer} onDraft={text => patchDraft({ text })} onFiles={files => patchDraft({ files })} onSend={agentId => { void send(agentId) }} onPrompt={sendPrompt} onRetryRun={retryLastRun} onStopRun={run => { void stopRun(run) }} stoppingRunIds={stoppingRunIds} onConfigureRuntime={() => manageAssistant(activeAgent?.agentId)} onOpenRuntimeSetup={() => openSettings('runtime')} onProfile={() => manageAssistant(activeAgent?.agentId)} onWorkspaceManager={() => openSettings('workspace')} onMembers={() => setMembersOpen(true)} onArtifact={setArtifact} onShowSidebar={() => setSidebarOpen(true)} sidebarHidden={!sidebarOpen} onShowWork={() => openWork()} inspectorHidden={!inspectorOpen} onAttachment={(messageId,attachmentId) => { void openAttachment(messageId,attachmentId) }} onPreviewAttachment={previewAttachment} approvalBusy={approvalBusy} onResolveApproval={(approvalId,optionId) => { void resolveApproval(approvalId,optionId) }}/>
         {inspectorOpen && <PanelResizeHandle side="inspector" frame={frameRef} widths={panelWidths} sidebarOpen={sidebarOpen} inspectorOpen={inspectorOpen} onResize={resizePanel}/>}
         {inspectorOpen && <Inspector key={capabilityEpoch} questions={piQuestions.questions} selectedTaskId={dockSelection?.threadId === (active?.threadId ?? null) ? dockSelection?.taskId ?? null : null} onTaskSelect={taskId => setDockSelection({ threadId: active?.threadId ?? null, taskId })} threadId={active?.threadId} conversationTitle={active?.title} onCreateWork={beginWork} onConnectDevice={() => openSettings('devices')} workbench={environment.workbench} client={environment.client} theme={theme} onManageAssistant={manageAssistant} onCapabilityDirty={setCapabilityDirty} onLibrary={() => safeInspectorAction(() => { setCapabilityDirty(false); setLibraryOpen(true) })} agents={data.agents} bundles={data.bundles} agent={activeAgent} mode={inspectorMode} tab={tab} onTab={value => safeInspectorAction(() => { setTab(value); setCapabilityDirty(false) })} onMode={value => safeInspectorAction(() => { setInspectorMode(value); setCapabilityDirty(false) })} onClose={() => safeInspectorAction(() => { setInspectorOpen(false); setExpanded(false); setCapabilityDirty(false) })} onExpand={() => setExpanded(value => !value)} expanded={expanded} onArtifact={setArtifact} loading={data.loading} onOpenConversation={threadId => { const item = data.conversations.find(item => item.threadId === threadId); if (item) void select(item) }}/>}</>}</section>

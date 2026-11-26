@@ -277,12 +277,14 @@ export function RunEventLine({ run, agentName, onJump }: {
   agentName: string
   onJump?(): void
 }) {
-  const text = `${agentName} · ${runEventStatusLabel(run.status)}`
+  const label = runEventStatusLabel(run.status)
+  const text = `${agentName} · ${label}`
   return (
     <p className="ln-run-event-line" data-event-line="runFinished" data-state={run.status} data-run-id={run.id}>
       {onJump
-        ? <button type="button" aria-label={`${text}，跳到触发消息`} title="跳到触发消息" onClick={onJump}>{text}</button>
-        : <span>{text}</span>}
+        ? <button type="button" className="ln-run-event-chip" aria-label={`${text}，跳到触发消息`} title="跳到触发消息" onClick={onJump}>{agentName}</button>
+        : <span className="ln-run-event-chip">{agentName}</span>}
+      <span>{label}</span>
     </p>
   )
 }

@@ -14,21 +14,23 @@ import {
 const ITEM_LABELS: Record<SetupChecklistItem, string> = {
   assistant: '建立一位助手',
   runtime: '给助手配置运行端',
+  mcp: '连接一个 MCP 工具',
   workspace: '选择默认工作目录'
 }
 
 /** Mikka setup-checklist 的首启引导：只读现有投影/本地工作区偏好，不发明后端事实；
  * 点项目深链到真实设置分区。关闭是本地展示偏好，不是完成状态。 */
-export function SetupChecklist({ agents, hasWorkspaceDefault, onOpenSettings, onCreateAssistant }: {
+export function SetupChecklist({ agents, hasWorkspaceDefault, hasMcpConnection, onOpenSettings, onCreateAssistant }: {
   agents: readonly AgentProfile[]
   hasWorkspaceDefault: boolean
+  hasMcpConnection: boolean
   onOpenSettings(section: SettingsSectionId): void
   onCreateAssistant(): void
 }) {
   const [dismissed, setDismissed] = useState(() => {
     try { return localStorage.getItem(SETUP_CHECKLIST_DISMISSED_KEY) === '1' } catch { return false }
   })
-  const input = useMemo(() => ({ agents, hasWorkspaceDefault }), [agents, hasWorkspaceDefault])
+  const input = useMemo(() => ({ agents, hasWorkspaceDefault, hasMcpConnection }), [agents, hasWorkspaceDefault, hasMcpConnection])
   const states = setupChecklistStates(input)
   const remaining = setupChecklistRemaining(input)
   if (dismissed || remaining === 0) return null

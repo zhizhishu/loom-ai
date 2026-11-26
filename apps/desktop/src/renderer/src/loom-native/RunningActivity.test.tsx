@@ -117,7 +117,7 @@ describe('running row (Mikka agent-activity working row)', () => {
     expect(stopping).toContain('正在停止…')
     const stopped = conversation({ snapshot: { agentRuns: [run({ status: 'cancelled' })] } })
     expect(stopped).not.toContain('aria-label="停止本次运行"')
-    expect(stopped).toContain('Hanzi · 已停止')
+    expect(stopped).toContain('>Hanzi</span><span>已停止</span>')
   })
   it('inserts terminal run events into the timed flow as clickable grey lines', () => {
     const first = snapshot().messages[0]
@@ -132,9 +132,10 @@ describe('running row (Mikka agent-activity working row)', () => {
     } })
     expect(html.match(/data-event-line="runFinished"/gu)).toHaveLength(3)
     expect(html).toContain('ln-run-event-line')
-    expect(html).toContain('Hanzi · 已停止')
-    expect(html).toContain('Hanzi · 运行失败')
-    expect(html).toContain('Hanzi · 运行完成')
+    expect(html).toContain('ln-run-event-chip')
+    expect(html).toContain('>Hanzi</button><span>已停止</span>')
+    expect(html).toContain('>Hanzi</button><span>运行失败</span>')
+    expect(html).toContain('>Hanzi</button><span>运行完成</span>')
     expect(html).toContain('aria-label="Hanzi · 已停止，跳到触发消息"')
     const eventAt = html.indexOf('data-event-line="runFinished"')
     expect(html.indexOf('你好')).toBeLessThan(eventAt)
@@ -145,7 +146,7 @@ describe('running row (Mikka agent-activity working row)', () => {
       .toContain('Hanzi正在处理')
     const failed = conversation({ snapshot: { agentRuns: [run()] } })
     expect(failed).not.toContain('Hanzi正在处理')
-    expect(failed).toContain('Hanzi · 运行失败')
+    expect(failed).toContain('>Hanzi</span><span>运行失败</span>')
     const questions: import('./pi-questions').PiQuestion[] = [{
       threadId: 'th', agentRunId: 'r1', executionEpoch: 1, hostInstanceId: 'host', agentId: 'a',
       status: 'waiting_for_user', request: { id: 'question', method: 'select', title: '选哪一个？', options: ['A', 'B'] }

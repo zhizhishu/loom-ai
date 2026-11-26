@@ -9,6 +9,7 @@ import {
 } from '../member-catalog-model'
 import { createCapabilityPort } from './capability-service'
 import { FormMessage, SurfaceDialog } from './Controls'
+import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from './EmptyState'
 import { Icon, type IconName } from './icons'
 import { HookScopeSummary } from './HookScopeSummary'
 
@@ -154,7 +155,7 @@ export function CapabilityPanel({ client, agent, threadId, theme = 'day', compac
         return <CapabilityRow key={itemKey(item)} item={item} icon={category.icon} saving={saving}
           refusal={refusal} onToggle={() => toggle(item)}/>
       })}</div>
-      {!rows.length && <p className="ln-inspector-empty">{query ? '没有匹配的能力' : kind === 'skill' ? '尚未添加 Skills' : kind === 'mcp' ? '尚未配置工具连接' : kind === 'rule' ? '尚未添加规则' : '尚未添加 Hooks'}</p>}
+      {!rows.length && <Empty className="ln-empty--inline"><EmptyHeader><EmptyMedia variant="icon"><Icon name={category.icon} size={18}/></EmptyMedia><EmptyTitle>{query ? '没有匹配的能力' : kind === 'skill' ? '尚未添加 Skills' : kind === 'mcp' ? '尚未配置工具连接' : kind === 'rule' ? '尚未添加规则' : '尚未添加 Hooks'}</EmptyTitle><EmptyDescription>{query ? '换一个关键词，或清除搜索查看全部能力。' : category.help}</EmptyDescription></EmptyHeader><EmptyContent>{query ? <button type="button" className="ln-action" onClick={() => setQuery('')}>清除搜索</button> : onLibrary ? <button type="button" className="ln-action" onClick={onLibrary}>打开能力库</button> : null}</EmptyContent></Empty>}
       <div className={`ln-cap-state ${saved && !dirty ? 'is-saved' : ''}`}><Icon name={dirty ? 'clock' : 'check'} size={13}/><span>{dirty ? '修改尚未保存' : saved ? '已保存，下次运行采用新选择' : `已选 ${total} 项`}</span></div>
       {preview === 'ready' && <FormMessage>已生成下次运行的配置。</FormMessage>}
       {preview === 'unsupported' && <FormMessage>当前运行端不支持配置预览，已保存的选择会保留。</FormMessage>}
