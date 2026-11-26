@@ -293,7 +293,10 @@ async function run () {
     }
   })
   assert.equal(grant.state, 'active', `assistant grant is not active: ${JSON.stringify(grant)}`)
-  const reveal = await hostRequest({ origin: ORIGIN, session, operation: 'mcp.servers.reveal', params: { serverId: grant.serverId, expectedConfigDigest: mcpConfig.configDigest } })
+  // Creating the grant itself mutates the MCP config, so reveal must use the post-grant digest.
+  const grantedConfig = await hostRequest({ origin: ORIGIN, session, operation: 'mcp.config.get' })
+  const reveal = await hostRequest({ origin: ORIGIN, session, operation: 'mcp.servers.reveal', params: { serverId: grant.serverId, expectedConfigDigest: grantedConfig.configDigest } })
+  assert.equal(reveal?.status, 'ok', `grant MCP definition was not revealed: ${JSON.stringify(reveal)}`)
   const bridge = readGrantBridge(reveal.definitionJson)
   record('assistantGrant', { grantId: grant.grantId, assistantId: member.agentId, serverId: grant.serverId })
 
