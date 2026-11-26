@@ -19,6 +19,7 @@ import { manualRetryUx } from './retry-ux'
 import { wakeRestoreLines } from './wake-restore'
 import { approvalAging, approvalAgingText } from './approval-aging'
 import { AgentCitationContext, type CitationContextValue, type CitationReference } from './AgentCitations'
+import { CollapsibleMessage } from './CollapsibleMessage'
 import { runtimeFailureMessage } from '../RuntimeFailureNotice'
 import { RuntimeInstallationGuide } from '../RuntimeInstallationGuide'
 import { runtimeInstallGuide } from '../runtime-install-guide'
@@ -315,7 +316,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
         return <article className={`ln-message ${user ? 'is-user' : 'is-assistant'} ${handoff ? 'is-record' : ''}`} key={message.id} data-message-id={message.id}>
           {!user && snapshot && snapshot.members.length > 1 && <div className="ln-message-author"><Avatar agent={author} name={message.authorDisplayName || ''} size={16}/><span>{author?.displayName || message.authorDisplayName || '助手'}</span></div>}
           {handoff ? <details className="ln-execution-record"><summary><Icon name="branch" size={14}/><span>执行记录</span><Icon name="right" size={12}/></summary><AgentMarkdown text={message.body}/></details>
-            : <div className="ln-message-content"><AgentMarkdown text={message.body}/></div>}
+            : <div className="ln-message-content"><CollapsibleMessage><AgentMarkdown text={message.body}/></CollapsibleMessage></div>}
           {message.attachments.length > 0 && snapshot && <MessageAttachments attachments={message.attachments} threadId={snapshot.thread.id} messageId={message.id} loadPreview={onPreviewAttachment} onOpen={attachmentId => onAttachment(message.id, attachmentId)}/>}
           <div className="ln-message-actions"><button type="button" aria-label="复制消息" title="复制消息" onClick={() => { void navigator.clipboard.writeText(message.body).then(() => { setCopied(message.id); window.setTimeout(() => setCopied(null), 1500) }) }}><Icon name={copied === message.id ? 'check' : 'copy'} size={13}/></button><time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time></div>
         </article>

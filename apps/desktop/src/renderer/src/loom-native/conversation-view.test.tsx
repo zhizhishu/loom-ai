@@ -164,6 +164,28 @@ describe('聊天 | 成果 segmented toggle', () => {
 })
 
 
+describe('collapsible long messages', () => {
+  it('wraps normal messages for measured folding without showing a button before measurement', () => {
+    const message = (id: string, authorType: 'user' | 'agent', body: string) => ({
+      id, sequence: 1, authorType, authorId: authorType === 'user' ? 'local_user' : 'a1', authorDisplayName: null,
+      body, withdrawn: false, attachments: [], agentRunId: null, createdAt: '2026-02-03T10:00:00.000Z'
+    })
+    const thread = {
+      ...snapshot('发版群', [member('a1', 'Hanzi')]),
+      messages: [
+        message('m-long', 'user', '很长的普通消息'),
+        message('m-record', 'agent', '[LOOM_HANDOFF] {"dispatchId":"d1"}')
+      ]
+    }
+    const html = view(thread as unknown as ThreadSnapshot)
+    expect(html).toContain('class="ln-collapsible-message"')
+    expect(html).toContain('ln-collapsible-frame')
+    expect(html).not.toContain('显示更多')
+    expect(html).toContain('ln-execution-record')
+    expect(html.indexOf('m-long')).toBeGreaterThan(-1)
+  })
+})
+
 describe('approval cards above composer', () => {
   it('shows per-card waiting age without inventing an expired state', () => {
     const approval = {
