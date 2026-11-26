@@ -546,6 +546,7 @@ impl MemoryRetrievalService {
             &transaction,
             invocation.input.scope,
             &identity.run.agent_id,
+            &identity.run.camp_id,
             counterparty,
         )?;
         let (max_items, max_body_bytes) = match invocation.input.scope {
@@ -625,6 +626,7 @@ fn load_view_items(
     connection: &Connection,
     scope: MemoryScopeKind,
     agent_id: &str,
+    camp_id: &str,
     counterparty_agent_id: Option<&str>,
 ) -> Result<Vec<MemoryViewItem>> {
     let (sql, parameters): (&str, Vec<&str>) = match scope {
@@ -659,6 +661,17 @@ fn load_view_items(
             WHERE memory.lifecycle_status = 'active'
               AND memory.scope_kind = 'companion'
               AND memory.companion_agent_id = ?1
+              AND (
+                revision.source_camp_id IS NULL
+                OR EXISTS (
+                    SELECT 1
+                    FROM camp AS source_camp
+                    JOIN camp AS current_camp
+                      ON current_camp.project_path = source_camp.project_path
+                    WHERE source_camp.id = revision.source_camp_id
+                      AND current_camp.id = ?2
+                )
+              )
             ORDER BY CASE memory.kind
                          WHEN 'agreement' THEN 0
                          WHEN 'preference' THEN 1
@@ -667,7 +680,7 @@ fn load_view_items(
                      END,
                      memory.id
             "#,
-            vec![agent_id],
+            vec![agent_id, camp_id],
         ),
         MemoryScopeKind::Relationship => {
             let counterparty =
@@ -690,6 +703,17 @@ fn load_view_items(
                   AND memory.relationship_agent_low_id = ?1
                   AND memory.relationship_agent_high_id = ?2
                   AND (
+                    revision.source_camp_id IS NULL
+                    OR EXISTS (
+                        SELECT 1
+                        FROM camp AS source_camp
+                        JOIN camp AS current_camp
+                          ON current_camp.project_path = source_camp.project_path
+                        WHERE source_camp.id = revision.source_camp_id
+                          AND current_camp.id = ?4
+                    )
+                  )
+                  AND (
                         memory.relationship_direction = 'mutual'
                      OR (
                             memory.relationship_direction = 'directed'
@@ -708,7 +732,7 @@ fn load_view_items(
                          END,
                          memory.id
                 "#,
-                vec![low, high, agent_id],
+                vec![low, high, agent_id, camp_id],
             )
         }
     };
@@ -943,9 +967,10 @@ fn memory_accessible(
 ) -> Result<bool> {
     match memory.scope {
         Some(MemoryScopeKind::Hearth) => Ok(true),
-        Some(MemoryScopeKind::Companion) => {
-            Ok(memory.companion_agent_id.as_deref() == Some(run.agent_id.as_str()))
-        }
+        Some(MemoryScopeKind::Companion) => Ok(
+            memory.companion_agent_id.as_deref() == Some(run.agent_id.as_str())
+                && crate::memory::memory_source_matches_workspace(database.connection(), &run.camp_id, memory.current_source_camp_id.as_deref())?,
+        ),
         Some(MemoryScopeKind::Relationship) => {
             if !memory
                 .relationship_agent_ids
@@ -974,6 +999,7 @@ fn memory_accessible(
                 |row| row.get(0),
             )?;
             Ok(present
+                && crate::memory::memory_source_matches_workspace(database.connection(), &run.camp_id, memory.current_source_camp_id.as_deref())?
                 && (memory.direction == Some(RelationshipDirection::Mutual)
                     || (memory.direction == Some(RelationshipDirection::Directed)
                         && memory.directed_actor_agent_id.as_deref()
@@ -1168,6 +1194,55 @@ mod tests {
             total_body_bytes: items.iter().map(|item| item.body.len()).sum(),
             items,
         }
+    }
+
+
+    fn companion_stored_memory(source_camp_id: Option<&str>) -> StoredMemoryView {
+        StoredMemoryView {
+            id: "memory-1".to_string(),
+            scope: Some(MemoryScopeKind::Companion),
+            kind: Some(MemoryKind::Preference),
+            creation_origin: Some(crate::memory::MemoryCreationOrigin::Agent),
+            companion_agent_id: Some("agent_1".to_string()),
+            relationship_agent_ids: Vec::new(),
+            direction: None,
+            directed_actor_agent_id: None,
+            lifecycle: "active".to_string(),
+            current_revision_id: Some("revision-1".to_string()),
+            current_source_camp_id: source_camp_id.map(str::to_string),
+            current_body: Some("workspace fact".to_string()),
+            current_body_utf8_bytes: Some(14),
+            current_retrieval_keys: vec!["workspace fact".to_string()],
+            review_after: None,
+            review_due: false,
+            outgoing_successor_ids: Vec::new(),
+            incoming_predecessor_ids: Vec::new(),
+            version: 1,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            retired_at: None,
+            forgotten_at: None,
+            revisions: Vec::new(),
+        }
+    }
+
+    fn authenticated_run(camp_id: &str) -> AuthenticatedTeamToolRun {
+        AuthenticatedTeamToolRun {
+            camp_id: camp_id.to_string(),
+            agent_id: "agent_1".to_string(),
+            agent_run_id: "run-1".to_string(),
+            execution_epoch: 1,
+        }
+    }
+
+    #[test]
+    fn companion_memory_is_scoped_to_the_source_workspace() {
+        let (database, _directory) = crate::test_support::seeded_runtime_database_fast();
+        let memory = companion_stored_memory(Some("camp-w1"));
+        assert!(memory_accessible(&database, &authenticated_run("camp-w1"), &memory).unwrap());
+        assert!(!memory_accessible(&database, &authenticated_run("camp-w2"), &memory).unwrap());
+        let legacy_user_unscoped = companion_stored_memory(None);
+        assert!(memory_accessible(&database, &authenticated_run("camp-w1"), &legacy_user_unscoped).unwrap());
     }
 
     #[test]

@@ -3867,6 +3867,17 @@ fn build_memory_entrypoint<R: ContextReadConnection>(
         if memory.lifecycle != "active" {
             continue;
         }
+        // PiBot memory-scope.js composes the workspace scope tag into recall. LOOM's existing
+        // workspace fact is the current revision's source Camp; Hearth stays the explicit global layer.
+        if memory.scope != Some(MemoryScopeKind::Hearth)
+            && !crate::memory::memory_source_matches_workspace(
+                database.context_connection(),
+                &snapshot.camp_id,
+                memory.current_source_camp_id.as_deref(),
+            )?
+        {
+            continue;
+        }
         let Some(revision_id) = memory.current_revision_id.clone() else {
             continue;
         };
@@ -15988,6 +15999,107 @@ mod slow_tests {
             })
             .unwrap();
         assert_eq!(manifest_count, 0);
+        fixture.cleanup();
+    }
+
+
+    #[test]
+    fn memory_entrypoint_filters_companion_memory_to_the_current_workspace() {
+        let mut fixture = fixture();
+        for (command_id, camp_id, key) in [
+            ("memory-current-workspace", Some(fixture.camp_id.clone()), "current workspace fact"),
+            ("memory-other-workspace", Some("camp-other".to_string()), "other workspace fact"),
+        ] {
+            crate::memory::MemoryService::default()
+                .create(
+                    &mut fixture.database,
+                    &CommandEnvelope {
+                        command_id: command_id.to_string(),
+                        actor: ActorRef::User {
+                            user_id: "test-user".to_string(),
+                        },
+                        camp_id,
+                        expected_versions: Vec::new(),
+                        execution_epoch: None,
+                        payload: crate::memory::CreateMemoryCommand {
+                            scope: MemoryScopeKind::Companion,
+                            kind: crate::memory::MemoryKind::Preference,
+                            body: format!("body for {key}"),
+                            retrieval_keys: vec![key.to_string()],
+                            companion_agent_id: Some("agent_1".to_string()),
+                            relationship_agent_ids: Vec::new(),
+                            direction: None,
+                            directed_actor_agent_id: None,
+                            review_after: None,
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        let project_path: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT project_path FROM camp WHERE id = ?1",
+                [&fixture.camp_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        fixture
+            .database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO camp(
+                    id, title, name_origin, collaboration_mode,
+                    project_binding_kind, project_path, last_message_sequence,
+                    version, created_at, updated_at
+                ) VALUES (
+                    'camp-same-workspace', 'Same workspace', 'user', 'peer',
+                    'directory', ?1, 0, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'
+                ), (
+                    'camp-other-workspace', 'Other workspace', 'user', 'peer',
+                    'directory', '/other-workspace', 0, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'
+                )
+                "#,
+                [project_path],
+            )
+            .unwrap();
+        fixture
+            .database
+            .connection()
+            .execute(
+                r#"
+                UPDATE memory_revision
+                SET actor_kind = 'agent', actor_id = 'agent_1',
+                    source_camp_id = 'camp-same-workspace', source_agent_run_id = 'run-memory', source_execution_epoch = 1
+                WHERE id IN (SELECT current_revision_id FROM memory WHERE companion_agent_id = 'agent_1')
+                  AND body LIKE 'body for current%'
+                "#,
+                [],
+            )
+            .unwrap();
+        fixture
+            .database
+            .connection()
+            .execute(
+                r#"
+                UPDATE memory_revision
+                SET actor_kind = 'agent', actor_id = 'agent_1',
+                    source_camp_id = 'camp-other-workspace', source_agent_run_id = 'run-memory', source_execution_epoch = 1
+                WHERE id IN (SELECT current_revision_id FROM memory WHERE companion_agent_id = 'agent_1')
+                  AND body LIKE 'body for other%'
+                "#,
+                [],
+            )
+            .unwrap();
+        let snapshot = load_run_snapshot(&fixture.database, &fixture.run_id, fixture.execution_epoch)
+            .unwrap()
+            .unwrap();
+        let (entrypoint, selection, _) = build_memory_entrypoint(&fixture.database, &snapshot).unwrap();
+        assert!(entrypoint.contains("current workspace fact"));
+        assert!(!entrypoint.contains("other workspace fact"));
+        assert_eq!(selection.len(), 1);
         fixture.cleanup();
     }
 

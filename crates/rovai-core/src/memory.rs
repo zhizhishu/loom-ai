@@ -501,6 +501,8 @@ pub struct MemoryView {
     pub directed_actor_agent_id: Option<String>,
     pub lifecycle: String,
     pub current_revision_id: Option<String>,
+    #[serde(skip)]
+    pub current_source_camp_id: Option<String>,
     pub current_body: Option<String>,
     pub current_body_utf8_bytes: Option<i64>,
     pub current_retrieval_keys: Vec<String>,
@@ -582,6 +584,7 @@ struct MemoryRecord {
     creation_origin: Option<MemoryCreationOrigin>,
     lifecycle: String,
     current_revision_id: Option<String>,
+    current_source_camp_id: Option<String>,
     current_body: Option<String>,
     current_body_utf8_bytes: Option<i64>,
     review_after: Option<String>,
@@ -2423,6 +2426,7 @@ fn load_memory_record(connection: &Connection, memory_id: &str) -> Result<Option
                    memory.directed_actor_agent_id,
                    memory.lifecycle_status, memory.current_revision_id,
                    revision.body, revision.body_utf8_bytes,
+                   revision.source_camp_id,
                    memory.review_after, memory.version,
                    memory.created_at, memory.updated_at,
                    memory.retired_at, memory.forgotten_at
@@ -2481,12 +2485,13 @@ fn memory_record_from_row(row: &Row<'_>) -> rusqlite::Result<MemoryRecord> {
         current_revision_id: row.get(10)?,
         current_body: row.get(11)?,
         current_body_utf8_bytes: row.get(12)?,
-        review_after: row.get(13)?,
-        version: row.get(14)?,
-        created_at: row.get(15)?,
-        updated_at: row.get(16)?,
-        retired_at: row.get(17)?,
-        forgotten_at: row.get(18)?,
+        current_source_camp_id: row.get(13)?,
+        review_after: row.get(14)?,
+        version: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
+        retired_at: row.get(18)?,
+        forgotten_at: row.get(19)?,
     })
 }
 
@@ -2501,6 +2506,7 @@ fn load_active_memory_records(connection: &Connection) -> Result<Vec<MemoryRecor
                memory.directed_actor_agent_id,
                memory.lifecycle_status, memory.current_revision_id,
                revision.body, revision.body_utf8_bytes,
+               revision.source_camp_id,
                memory.review_after, memory.version,
                memory.created_at, memory.updated_at,
                memory.retired_at, memory.forgotten_at
@@ -2514,6 +2520,35 @@ fn load_active_memory_records(connection: &Connection) -> Result<Vec<MemoryRecor
         .query_map([], memory_record_from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+/// User-authored revisions have no Camp provenance and remain explicit user-global memory.
+/// Agent revisions carry their source Camp; compare the Camp project paths so memory follows
+/// the workspace rather than only one Thread.
+pub(crate) fn memory_source_matches_workspace(
+    connection: &Connection,
+    current_camp_id: &str,
+    source_camp_id: Option<&str>,
+) -> Result<bool> {
+    let Some(source_camp_id) = source_camp_id else {
+        return Ok(true);
+    };
+    if source_camp_id == current_camp_id {
+        return Ok(true);
+    }
+    let matches: bool = connection.query_row(
+        r#"
+        SELECT COUNT(*) = 1
+        FROM camp AS source_camp
+        JOIN camp AS current_camp
+          ON current_camp.project_path = source_camp.project_path
+        WHERE source_camp.id = ?1
+          AND current_camp.id = ?2
+        "#,
+        params![source_camp_id, current_camp_id],
+        |row| row.get(0),
+    )?;
+    Ok(matches)
 }
 
 /// Startup discovery needs current metadata, not every historical Memory body.
@@ -3458,6 +3493,7 @@ fn memory_view_from_record(
             .and_then(|scope| scope.directed_actor_agent_id.clone()),
         lifecycle: record.lifecycle,
         current_revision_id: record.current_revision_id,
+        current_source_camp_id: record.current_source_camp_id,
         current_body: record.current_body,
         current_body_utf8_bytes: record.current_body_utf8_bytes,
         current_retrieval_keys,
