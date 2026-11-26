@@ -16,7 +16,8 @@ use super::{
     LoomAcceptanceCriterionResult, LoomCandidateRecordInput, LoomClaimAcquireInput,
     LoomCommandError, LoomPlanImportCriterion, LoomPlanImportDependency, LoomPlanImportInput,
     LoomPlanImportTask, LoomReviewRecordInput, LoomReviewVerdict, LoomTaskReleaseInput,
-    candidate_record, claim_acquire, plan_import, review_record, task_release,
+    candidate_record, claim_acquire, claim_acquire_reusing_own_lease, plan_import, review_record,
+    task_release,
 };
 use crate::agent_profile::AdapterKind;
 use crate::collaboration::ProjectBindingKind;
@@ -7783,5 +7784,284 @@ fn the_dispatch_tick_runs_the_watchdog_against_the_real_clock() {
     assert!(
         !task.installation_id.is_empty() && !task.camp_id.is_empty(),
         "assertion the_fixture_is_a_real_mission_on_a_real_installation"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Completion hook boundary (M6-C): the Run-completion path folds only the dispatch the finished
+// Run actually claimed, then admits the same Task's next event. The global tick stays the retry
+// fallback; every fixture here commits real terminal states through
+// `ExecutionRuntimeService::succeed_agent_run` exactly as the ACP completion path does.
+// ---------------------------------------------------------------------------------------------
+
+/// The Candidate one LOOM execution Run delivers, recorded through the real write path under the
+/// claim the Run's own execution admission already holds.
+fn recorded_candidate(
+    database: &mut OwnedTestDatabase,
+    mission_id: &str,
+    run_id: &str,
+    command_id: &str,
+) -> (String, String) {
+    let claim = claim_acquire_reusing_own_lease(
+        database,
+        LoomClaimAcquireInput {
+            mission_id: mission_id.into(),
+            task_id: "task_a".into(),
+            agent_run_id: run_id.into(),
+            claimant_agent_id: Some(PRODUCER_AGENT.into()),
+            command_id: format!("{command_id}-claim"),
+            lease_seconds: None,
+        },
+    )
+    .unwrap();
+    let candidate = candidate_record(
+        database,
+        LoomCandidateRecordInput {
+            mission_id: mission_id.into(),
+            task_id: "task_a".into(),
+            agent_run_id: run_id.into(),
+            claim_id: claim.claim_id,
+            fence_generation: claim.fence_generation,
+            command_id: command_id.into(),
+            content_hash: "sha256:delivery-one".into(),
+            evidence_ids: vec![],
+            acceptance_criteria_version: "ac-v1".into(),
+            previous_candidate_id: None,
+        },
+    )
+    .unwrap();
+    let manifest =
+        control::candidate_manifest_hash(database.connection(), &candidate.candidate_id).unwrap();
+    (candidate.candidate_id, manifest)
+}
+
+/// The real terminal commit the completion callback hands to the hook: the same
+/// `succeed_agent_run` command the ACP normal-commit branch writes, which settles the claimed
+/// Delivery from the same transaction.
+fn succeed_run_for_real(
+    database: &mut OwnedTestDatabase,
+    camp_id: &str,
+    run_id: &str,
+    turn: &str,
+) {
+    let (version, epoch, adapter_kind): (i64, i64, String) = database
+        .connection()
+        .query_row(
+            "SELECT version, execution_epoch, runtime_adapter_kind FROM agent_run WHERE id=?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let completed = crate::runtime::ExecutionRuntimeService::default()
+        .succeed_agent_run(
+            database,
+            &CommandEnvelope {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                actor: ActorRef::System {
+                    component_id: format!("runtime-adapter:{adapter_kind}"),
+                },
+                camp_id: Some(camp_id.to_string()),
+                expected_versions: vec![],
+                execution_epoch: None,
+                payload: crate::runtime::SucceedAgentRunCommand {
+                    agent_run_id: run_id.to_string(),
+                    expected_version: version,
+                    execution_epoch: epoch,
+                    native_turn_id: turn.to_string(),
+                    final_output: "the delivery is complete".into(),
+                    missing_send_recovery_candidate: None,
+                    ending_git_observation: None,
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        (completed.result.status, completed.replayed),
+        (crate::command::CommandResultStatus::Applied, false),
+        "assertion the_fixture_commits_the_terminal_state_once: {:?}",
+        completed.result
+    );
+}
+
+/// The claimed run and execution epoch of one dispatch, as the completion callback knows them.
+fn claimed_run_of(
+    database: &OwnedTestDatabase,
+    task_id: &str,
+) -> (String, i64) {
+    database
+        .connection()
+        .query_row(
+            "SELECT delivery.claimed_agent_run_id, run.execution_epoch
+             FROM loom_control_dispatch dispatch
+             JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+             JOIN agent_run run ON run.id = delivery.claimed_agent_run_id
+             WHERE dispatch.task_id=?1",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn loom_m6c_current_completion_admits_review_and_replay_is_idempotent() {
+    let mut database = fixture();
+    let now = at(1_900_000_000);
+    let (mission_id, _plan_id) = dispatchable_plan(
+        &mut database,
+        "m6c completion admits review",
+        "command_m6c_completion_review",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    assert_eq!(
+        control::admit_due_dispatches_at(&mut database, now).unwrap().admitted,
+        1,
+        "assertion the_approved_task_reserves_its_execution_delivery"
+    );
+    let mut runs = claim_mission_lane(&mut database, &camp_id, 1);
+    assert_eq!(runs.len(), 1, "assertion the_delivery_produces_one_run");
+    let run_id = runs.pop().unwrap();
+    claim_the_run(&mut database, &camp_id, &run_id);
+    let (claimed_run, epoch) = claimed_run_of(&database, "task_a");
+    assert_eq!(claimed_run, run_id, "assertion the_claim_is_the_ledger_pinned_run");
+
+    let _ = recorded_candidate(&mut database, &mission_id, &run_id, "command_candidate_m6c_review");
+    succeed_run_for_real(&mut database, &camp_id, &run_id, "turn_m6c_review");
+
+    let admitted = control::reconcile_completed_run_at(&mut database, &run_id, epoch, now).unwrap();
+    assert_eq!(
+        admitted, 1,
+        "assertion the_scoped_hook_admits_the_next_stage_of_the_same_task"
+    );
+    let (execute_status, review_recipient): (String, String) = database
+        .connection()
+        .query_row(
+            "SELECT execute_dispatch.status, review_dispatch.recipient_agent_id
+             FROM loom_control_dispatch execute_dispatch
+             JOIN loom_control_dispatch review_dispatch
+                    ON review_dispatch.plan_id = execute_dispatch.plan_id
+                   AND review_dispatch.task_id = execute_dispatch.task_id
+                   AND review_dispatch.kind = 'REVIEW'
+             WHERE execute_dispatch.task_id='task_a' AND execute_dispatch.kind='EXECUTE'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (execute_status.as_str(), review_recipient.as_str()),
+        ("SETTLED", REVIEWER_AGENT),
+        "assertion the_folded_execute_dispatch_reads_the_committed_settlement"
+    );
+    assert!(
+        crate::delivery_queue::has_pending_delivery_batch_work(&database).unwrap(),
+        "assertion the_admitted_review_is_pending_lane_work_the_wake_covers"
+    );
+
+    // Replays — the hook again, the global fallback tick, and a full reopen — are the same
+    // committed fact and never mint a second dispatch for a dedupe key that already exists.
+    assert_eq!(
+        control::reconcile_completed_run_at(&mut database, &run_id, epoch, now).unwrap(),
+        0,
+        "assertion the_replayed_hook_admits_nothing"
+    );
+    assert_eq!(
+        control::admit_due_dispatches_at(&mut database, now).unwrap().admitted,
+        0,
+        "assertion the_global_fallback_admits_nothing_behind_the_hook"
+    );
+    let directory = database.directory().to_path_buf();
+    database.close();
+    let mut database = Database::open(&directory).expect("the fixture database must reopen");
+    assert_eq!(
+        control::reconcile_completed_run_at(&mut database, &run_id, epoch, now).unwrap(),
+        0,
+        "assertion the_replayed_hook_after_a_reopen_admits_nothing"
+    );
+    assert_eq!(
+        control::admit_due_dispatches_at(&mut database, now).unwrap().admitted,
+        0,
+        "assertion the_global_fallback_after_a_reopen_admits_nothing"
+    );
+    let (dispatch_rows, distinct_keys, candidates): (i64, i64, i64) = database
+        .connection()
+        .query_row(
+            "SELECT COUNT(*), COUNT(DISTINCT dedupe_key),
+                    (SELECT COUNT(*) FROM loom_candidate WHERE task_id='task_a')
+             FROM loom_control_dispatch",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (dispatch_rows, distinct_keys, candidates),
+        (2, 2, 1),
+        "assertion replays_and_reopens_add_no_dedupe_key"
+    );
+}
+
+#[test]
+fn loom_m6c_success_without_domain_fact_does_not_admit_next_stage() {
+    let mut database = fixture();
+    let now = at(1_900_000_000);
+    let (mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "m6c completion without fact",
+        "command_m6c_completion_plain",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    assert_eq!(
+        control::admit_due_dispatches_at(&mut database, now).unwrap().admitted,
+        1,
+        "assertion the_approved_task_reserves_its_execution_delivery"
+    );
+    let mut runs = claim_mission_lane(&mut database, &camp_id, 1);
+    assert_eq!(runs.len(), 1, "assertion the_delivery_produces_one_run");
+    let run_id = runs.pop().unwrap();
+    claim_the_run(&mut database, &camp_id, &run_id);
+    let (claimed_run, epoch) = claimed_run_of(&database, "task_a");
+    assert_eq!(claimed_run, run_id, "assertion the_claim_is_the_ledger_pinned_run");
+
+    // A success that writes no matching successor fact — no Candidate, nothing the ledger can
+    // fold a stage from — is still a terminal commit the hook sees.
+    succeed_run_for_real(&mut database, &camp_id, &run_id, "turn_m6c_plain");
+
+    assert_eq!(
+        control::reconcile_completed_run_at(&mut database, &run_id, epoch, now).unwrap(),
+        0,
+        "assertion the_scoped_hook_admits_no_stage_without_a_domain_fact"
+    );
+    assert_eq!(
+        control::admit_due_dispatches_at(&mut database, now).unwrap().admitted,
+        0,
+        "assertion the_global_fallback_also_admits_no_stage_without_a_domain_fact"
+    );
+    let (dispatch_status, dispatch_rows, candidates, task_status): (String, i64, i64, String) =
+        database
+            .connection()
+            .query_row(
+                "SELECT (SELECT status FROM loom_control_dispatch WHERE task_id='task_a'),
+                        (SELECT COUNT(*) FROM loom_control_dispatch WHERE task_id='task_a'),
+                        (SELECT COUNT(*) FROM loom_candidate WHERE task_id='task_a'),
+                        (SELECT status FROM loom_task WHERE plan_id=?1 AND task_id='task_a')",
+                [&plan_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+    assert_eq!(
+        (
+            dispatch_status.as_str(),
+            dispatch_rows,
+            candidates,
+            task_status.as_str()
+        ),
+        ("SETTLED", 1, 0, "READY"),
+        "assertion the_settled_delivery_folds_its_own_dispatch_and_nothing_else"
+    );
+    assert!(
+        !crate::delivery_queue::has_pending_delivery_batch_work(&database).unwrap(),
+        "assertion nothing_pending_remains_for_the_wake_predicate"
     );
 }

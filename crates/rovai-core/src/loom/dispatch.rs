@@ -293,6 +293,7 @@ pub(crate) fn admit_due_dispatches_at(
             &mission_id,
             &now_text,
             MAX_DISPATCHES_PER_TICK - admitted,
+            None,
         )?;
     }
     transaction.commit()?;
@@ -302,6 +303,144 @@ pub(crate) fn admit_due_dispatches_at(
     })
 }
 
+/// One dispatch the completion hook of a finished Run may fold, selected by the persisted claim.
+struct ClaimedDispatch {
+    dispatch_id: String,
+    plan_id: String,
+    task_id: String,
+    mission_id: String,
+    policy_revision: i64,
+    delivery_status: String,
+    failure_code: Option<String>,
+    run_status: Option<String>,
+}
+
+/// The per-Run completion path (upstream BE-9 `reconcile.run`): fold only the dispatch whose
+/// Delivery this very Run claimed, at the Run's own execution epoch, then admit the same Task's
+/// next due event. The standing authorization, the Task scope and the attempt are re-proved under
+/// the write lock, so a callback from a replaced execution, a stale Run, a superseded or expired
+/// approval or a Run that is not terminal yet has no effect here and stays the global sweep's
+/// work ([`admit_due_dispatches_at`]). No watchdog pass runs here: the hook owns one completed Run,
+/// never a Plan's whole lane.
+pub(crate) fn reconcile_completed_run_at(
+    database: &mut Database,
+    agent_run_id: &str,
+    execution_epoch: i64,
+    now: DateTime<Utc>,
+) -> Result<usize> {
+    let transaction = database
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let now_text = now.to_rfc3339();
+
+    // Selection is the ledger's own claim chain: camp_message_delivery.claimed_agent_run_id →
+    // dispatch → plan/task, pinned to the callback's execution epoch. A replaced execution's stale
+    // callback, an ordinary (non-dispatch) Delivery and a Run that claimed no LOOM work select
+    // nothing here.
+    let mut claimed: Vec<ClaimedDispatch> = Vec::new();
+    {
+        let mut statement = transaction.prepare(
+            "SELECT dispatch.dispatch_id, dispatch.plan_id, dispatch.task_id, plan.mission_id,
+                    dispatch.policy_revision, delivery.status, delivery.failure_code, run.status
+             FROM loom_control_dispatch dispatch
+             JOIN loom_plan plan ON plan.plan_id = dispatch.plan_id
+             JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+             JOIN agent_run run ON run.id = delivery.claimed_agent_run_id
+             WHERE run.id = ?1 AND run.execution_epoch = ?2
+               AND dispatch.status IN ('WAITING','DISPATCHED')
+             ORDER BY dispatch.created_at, dispatch.dispatch_id",
+        )?;
+        let mapped = statement.query_map(params![agent_run_id, execution_epoch], |row| {
+            Ok(ClaimedDispatch {
+                dispatch_id: row.get(0)?,
+                plan_id: row.get(1)?,
+                task_id: row.get(2)?,
+                mission_id: row.get(3)?,
+                policy_revision: row.get(4)?,
+                delivery_status: row.get(5)?,
+                failure_code: row.get(6)?,
+                run_status: row.get(7)?,
+            })
+        })?;
+        for row in mapped {
+            claimed.push(row?);
+        }
+    }
+
+    let mut admitted = 0usize;
+    let mut scoped_tasks: Vec<(String, String, String)> = Vec::new();
+    for claimed_dispatch in claimed {
+        let ClaimedDispatch {
+            dispatch_id,
+            plan_id,
+            task_id,
+            mission_id,
+            policy_revision,
+            delivery_status,
+            failure_code,
+            run_status,
+        } = claimed_dispatch;
+        // The facts that admitted this dispatch are re-proved under the write lock, exactly as
+        // `admit_plan` proves them before it reserves an event: an approval that has been paused,
+        // expired, re-scoped or re-granted since the Run started keeps this callback silent.
+        let Some(policy) = read_policy(&transaction, &plan_id)? else {
+            continue;
+        };
+        if !policy.enabled || policy.paused || policy.mission_id != mission_id {
+            continue;
+        }
+        let Some(expires_at) = policy.expires_at.as_deref() else {
+            continue;
+        };
+        if !expiry_is_future(expires_at, &now_text) {
+            continue;
+        }
+        if !policy.task_ids.iter().any(|scoped| *scoped == task_id) {
+            continue;
+        }
+        if policy.authorization_revision != policy_revision {
+            continue;
+        }
+        // The attempt is judged from the terminal state the callback committed. A Run that is
+        // still going proves nothing: the fold waits for the success/failure commit, never reads
+        // a settlement out of a running Run.
+        let terminal = run_status
+            .as_deref()
+            .is_some_and(|status| matches!(status, "succeeded" | "failed" | "cancelled"));
+        if !terminal {
+            continue;
+        }
+        fold_dispatch_outcome(
+            &transaction,
+            &dispatch_id,
+            &delivery_status,
+            failure_code.as_deref(),
+            run_status.as_deref(),
+            &now_text,
+        )?;
+        if !scoped_tasks
+            .iter()
+            .any(|(scoped_plan, _, task)| *scoped_plan == plan_id && *task == task_id)
+        {
+            scoped_tasks.push((plan_id, mission_id, task_id));
+        }
+    }
+
+    // With the matched dispatch folded, only the same Task's next event is admitted — the shared
+    // decision table restricted to this Task, never a second scheduler for the Plan.
+    for (plan_id, mission_id, task_id) in scoped_tasks {
+        admitted += admit_plan(
+            &transaction,
+            &plan_id,
+            &mission_id,
+            &now_text,
+            MAX_DISPATCHES_PER_TICK - admitted,
+            Some(&task_id),
+        )?;
+    }
+    transaction.commit()?;
+    Ok(admitted)
+}
 /// Why this recorded dispatch may not proceed, or `None` when it may.
 ///
 /// This is a pure read and the authority's second opinion: the wrapper that is about to execute a
@@ -403,6 +542,7 @@ fn admit_plan(
     mission_id: &str,
     now: &str,
     remaining_ticks: usize,
+    scoped_task_id: Option<&str>,
 ) -> Result<usize> {
     let Some(policy) = read_policy(transaction, plan_id)? else {
         return Ok(0);
@@ -427,7 +567,7 @@ fn admit_plan(
         )
         .optional()?;
 
-    let mut events = due_events(transaction, plan_id, mission_id, &policy, now)?;
+    let mut events = due_events(transaction, plan_id, mission_id, &policy, now, scoped_task_id)?;
     let mut admitted = 0usize;
     for event in events.drain(..) {
         if admitted >= remaining_ticks {
@@ -648,13 +788,15 @@ fn admit_plan(
 }
 
 /// Every event the standing policy authorizes right now, in Task order. One Task contributes at
-/// most one event per pass: its facts decide which one it is.
+/// most one event per pass: its facts decide which one it is. `scoped_task_id` narrows the pass to
+/// one Task's own next event (the per-Run completion path); `None` sweeps the whole policy scope.
 fn due_events(
     transaction: &Transaction<'_>,
     plan_id: &str,
     mission_id: &str,
     policy: &LoomControlPolicy,
     now: &str,
+    scoped_task_id: Option<&str>,
 ) -> Result<Vec<DispatchEvent>> {
     let lead: Option<String> = transaction
         .query_row(
@@ -669,6 +811,9 @@ fn due_events(
 
     let mut events = Vec::new();
     for task_id in &policy.task_ids {
+        if scoped_task_id.is_some_and(|scoped| scoped != task_id.as_str()) {
+            continue;
+        }
         let task: Option<(String, Option<String>)> = transaction
             .query_row(
                 "SELECT status, assignee_agent_id FROM loom_task WHERE plan_id=?1 AND task_id=?2",
@@ -1284,39 +1429,58 @@ fn reconcile_dispatches(transaction: &Transaction<'_>, now: &str) -> Result<()> 
         }
     }
     for (dispatch_id, delivery_status, failure_code, run_status) in rows {
-        let settled = match (delivery_status.as_str(), run_status.as_deref()) {
-            ("settled", _) => Some(("SETTLED", None)),
-            ("failed", _) => Some((
-                "BLOCKED",
-                Some(failure_code.unwrap_or_else(|| "loom.dispatch_failed".to_string())),
-            )),
-            ("cancelled", _) => Some(("CANCELLED", None)),
-            (_, Some("failed")) => {
-                Some(("BLOCKED", Some("loom.dispatch_run_failed".to_string())))
-            }
-            (_, Some("cancelled")) => Some(("CANCELLED", None)),
-            // A Delivery that is still only claimed proves nothing either way, and a Run that is
-            // still going proves nothing at all: the ledger may only be folded from a *finished*
-            // Run, and then only from the successor fact of that very dispatch — the Candidate
-            // produced by this Run, the stage verdict written by this reviewer Run under this
-            // Candidate and policy revision, the rework chained onto this Candidate, or a settled
-            // handoff. A Run that succeeded without writing its fact stays `Pending`, so a
-            // settlement is never read out of the Run alone and a running Run is never ended here.
-            (_, Some("succeeded")) => match prior_dispatch_outcome(transaction, &dispatch_id)? {
-                PriorOutcome::Completed => Some(("SETTLED", None)),
-                _ => None,
-            },
-            _ => None,
-        };
-        let Some((status, reason)) = settled else {
-            continue;
-        };
-        transaction.execute(
-            "UPDATE loom_control_dispatch SET status=?1, reason=?2, updated_at=?3
-             WHERE dispatch_id=?4",
-            params![status, reason, now, &dispatch_id],
+        fold_dispatch_outcome(
+            &transaction,
+            &dispatch_id,
+            &delivery_status,
+            failure_code.as_deref(),
+            run_status.as_deref(),
+            now,
         )?;
     }
+    Ok(())
+}
+
+/// Fold one recorded dispatch's real Delivery/Run outcome into the ledger. The successor-fact
+/// reading is shared by the global sweep and the per-Run hook, so both fold a claim from the same
+/// judgement and neither invents its own.
+fn fold_dispatch_outcome(
+    transaction: &Transaction<'_>,
+    dispatch_id: &str,
+    delivery_status: &str,
+    failure_code: Option<&str>,
+    run_status: Option<&str>,
+    now: &str,
+) -> Result<()> {
+    let settled = match (delivery_status, run_status) {
+        ("settled", _) => Some(("SETTLED", None)),
+        ("failed", _) => Some((
+            "BLOCKED",
+            Some(failure_code.unwrap_or("loom.dispatch_failed")),
+        )),
+        ("cancelled", _) => Some(("CANCELLED", None)),
+        (_, Some("failed")) => Some(("BLOCKED", Some("loom.dispatch_run_failed"))),
+        (_, Some("cancelled")) => Some(("CANCELLED", None)),
+        // A Delivery that is still only claimed proves nothing either way, and a Run that is
+        // still going proves nothing at all: the ledger may only be folded from a finished Run,
+        // and then only from the matching successor fact of that very dispatch — the Candidate
+        // produced by this Run, the stage verdict written by this reviewer Run under this
+        // Candidate and policy revision, the rework chained onto this Candidate, or a settled
+        // handoff.
+        (_, Some("succeeded")) => match prior_dispatch_outcome(transaction, &dispatch_id)? {
+            PriorOutcome::Completed => Some(("SETTLED", None)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some((status, reason)) = settled else {
+        return Ok(());
+    };
+    transaction.execute(
+        "UPDATE loom_control_dispatch SET status=?1, reason=?2, updated_at=?3
+         WHERE dispatch_id=?4",
+        params![status, reason, now, dispatch_id],
+    )?;
     Ok(())
 }
 

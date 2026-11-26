@@ -33,7 +33,8 @@ use crate::db::Database;
 mod dispatch;
 pub use dispatch::admit_due_dispatches;
 pub(crate) use dispatch::{
-    LoomTickOutcome, admit_due_dispatches_at, dispatch_block_reason, request_epoch,
+    LoomTickOutcome, admit_due_dispatches_at, dispatch_block_reason, reconcile_completed_run_at,
+    request_epoch,
 };
 
 /// Only the real Owner may grant or pause the authority. There is no other identity that can

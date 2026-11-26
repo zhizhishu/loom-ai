@@ -14393,6 +14393,35 @@ impl Core {
         Ok(outcome)
     }
 
+    /// The per-Run LOOM fold behind the runtime completion callback (upstream BE-9
+    /// `reconcile.run`): only the dispatch the finished Run actually claimed is settled from the
+    /// committed terminal fact, and only the same Task's next due event is admitted. The global
+    /// tick (`admit_due_loom_dispatches`) stays the fallback for everything this hook did not
+    /// select. The caller invokes this after the terminal command committed and its database lock
+    /// is released, so a failure here can never re-open the terminal state; nothing it does may
+    /// swallow the completion's own wakes either.
+    async fn reconcile_loom_completed_run(self: &Arc<Self>, agent_run_id: &str, execution_epoch: i64) {
+        let outcome = {
+            let mut database = self.database.lock().await;
+            rovai_core::loom::control::reconcile_completed_run_at(
+                &mut database,
+                agent_run_id,
+                execution_epoch,
+                chrono::Utc::now(),
+            )
+        };
+        match outcome {
+            Ok(admitted) if admitted > 0 => {
+                self.delivery_batch_scheduler_notify.notify_one();
+                self.execution_wake.runs.notify_one();
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "loom reconcile run={agent_run_id} epoch={execution_epoch} decision=deferred_to_tick error={error:#}",
+            ),
+        }
+    }
+
     /// One due-timer pass of the Message Delivery recovery loop: it runs only the sweeps whose work
     /// has come, and answers when the next one is due plus whether it started anything the scan
     /// still owes a dispatch. `None` means nothing can come due without a new write, so the
@@ -26245,6 +26274,15 @@ async fn persist_acp_prompt_completion(
                 core.execution_wake.runs.notify_one();
                 core.project_agent_run_file_changes_after_terminal(agent_run_id, execution_epoch)
                     .await;
+                // The terminal state is committed, its transaction closed and the database lock is
+                // released above; fold only this Run's own LOOM claim — never the planned-shutdown
+                // settlement path, never the whole ledger. A failure here is logged, not re-raised:
+                // the terminal state must not be re-submitted and the completion's own wakes above
+                // must not be swallowed; the global tick stays the fallback for everything else.
+                if terminal_admission.planned_permit().is_none() {
+                    core.reconcile_loom_completed_run(agent_run_id, execution_epoch)
+                        .await;
+                }
                 return Ok(());
             }
             Ok(terminal)
@@ -38502,5 +38540,378 @@ for line in sys.stdin:
         .expect("a committed hold must wake the delivery scheduler after the transaction");
         drop(core);
         std::fs::remove_dir_all(directory).ok();
+    }
+
+    /// M6-C: the ACP normal-commit branch folds the finished Run's own LOOM claim chain after the
+    /// terminal state, the transaction, and the database lock are all released, then wakes the
+    /// lanes from the committed state. The scoping is the contract: the sibling Task whose Run
+    /// finished through the same real success path stays untouched until the global fallback tick
+    /// runs. Both lanes materialise through the real Delivery claim, and both terminal states
+    /// commit through the real `succeed_agent_run` — the hook call is the only fixture surface.
+    #[tokio::test]
+    async fn loom_m6c_completion_hook_is_scoped_and_wakes_after_commit() {
+        use rovai_core::delivery_queue::{
+            BatchWorkspaces, capture_prepared_batch_workspace,
+            claim_waiting_delivery_batches_with_workspaces,
+        };
+        use rovai_core::loom::control::{
+            LoomControlPolicyInput, LoomReviewerAssignment, configure,
+        };
+        use rovai_core::loom::{
+            LoomCandidateRecordInput, LoomPlanImportCriterion, LoomPlanImportInput,
+            LoomPlanImportTask,
+        };
+        use rovai_core::mission::{CreateMissionCommand, MissionService};
+
+        let (mut database, root) = rovai_core::test_support::seeded_runtime_database();
+        let workspace = root.join("loom-m6c-completion-hook");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let created = MissionService::default()
+            .create(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: uuid::Uuid::new_v4().to_string(),
+                    actor: ActorRef::User {
+                        user_id: "local_user".into(),
+                    },
+                    camp_id: None,
+                    expected_versions: vec![],
+                    execution_epoch: None,
+                    payload: CreateMissionCommand {
+                        team: None,
+                        title: "m6c completion hook".into(),
+                        description: String::new(),
+                        description_content: None,
+                        project_path: workspace.to_string_lossy().into_owned(),
+                        project_binding_kind: rovai_core::collaboration::ProjectBindingKind::Directory,
+                        member_agent_ids: vec!["agent_1".into(), "agent_2".into()],
+                        default_lead_agent_id: "agent_1".into(),
+                        tags: vec![],
+                        source_attachments: vec![],
+                    },
+                },
+            )
+            .unwrap();
+        let mission_id = created.result.payload["missionId"].as_str().unwrap().to_string();
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET profile_status='present' WHERE id IN ('agent_1','agent_2')",
+                [],
+            )
+            .unwrap();
+        rovai_core::loom::plan_import(
+            &mut database,
+            LoomPlanImportInput {
+                mission_id: mission_id.clone(),
+                goal: "m6c completion hook".into(),
+                acceptance_criteria_version: "ac-v1".into(),
+                criteria: vec![LoomPlanImportCriterion {
+                    criterion_id: "criterion_one".into(),
+                    text: "the delivery is complete".into(),
+                }],
+                tasks: vec![
+                    LoomPlanImportTask {
+                        task_id: "task_a".into(),
+                        title: "Task A".into(),
+                        description: String::new(),
+                        assignee_agent_id: Some("agent_1".into()),
+                    },
+                    LoomPlanImportTask {
+                        task_id: "task_b".into(),
+                        title: "Task B".into(),
+                        description: String::new(),
+                        assignee_agent_id: Some("agent_2".into()),
+                    },
+                ],
+                dependencies: vec![],
+            },
+        )
+        .unwrap();
+        let plan_id: String = database
+            .connection()
+            .query_row("SELECT plan_id FROM loom_plan WHERE mission_id=?1", [&mission_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let camp_id: String = database
+            .connection()
+            .query_row("SELECT camp_id FROM mission WHERE id=?1", [&mission_id], |row| row.get(0))
+            .unwrap();
+        configure(
+            &mut database,
+            "local_user",
+            LoomControlPolicyInput {
+                mission_id: mission_id.clone(),
+                command_id: "command_m6c_completion_hook".into(),
+                expected_revision: 0,
+                enabled: true,
+                task_ids: vec!["task_a".into(), "task_b".into()],
+                reviewers: vec![
+                    LoomReviewerAssignment {
+                        task_id: "task_a".into(),
+                        reviewer_agent_id: "agent_2".into(),
+                    },
+                    LoomReviewerAssignment {
+                        task_id: "task_b".into(),
+                        reviewer_agent_id: "agent_1".into(),
+                    },
+                ],
+                max_dispatches: 8,
+                max_reworks_per_task: 1,
+                expires_at: Some("2099-01-01T00:00:00Z".into()),
+            },
+        )
+        .unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_task SET status='READY' WHERE plan_id=?1 AND task_id IN ('task_a','task_b')",
+                [&plan_id],
+            )
+            .unwrap();
+
+        let core = Arc::new(test_core_for_database(&root, database).unwrap());
+
+        let admitted = core.admit_due_loom_dispatches().await.unwrap();
+        assert_eq!(admitted.admitted, 2, "both approved tasks reserve one lane each");
+        tokio::time::timeout(Duration::from_secs(5), core.execution_wake.runs.notified())
+            .await
+            .expect("the admission wake must be consumable");
+
+        // The real claim entry materialises one Run per member lane; each Run's execution
+        // admission pre-claims its Task, exactly as a restarted Core resumes.
+        let (run_a, run_b) = {
+            let mut database = core.database.lock().await;
+            let project_path: String = database
+                .connection()
+                .query_row("SELECT project_path FROM camp WHERE id=?1", [&camp_id], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let prepared = capture_prepared_batch_workspace(
+                &database,
+                &camp_id,
+                rovai_core::runtime::AgentRunWorkspace {
+                    access: "write".into(),
+                    execution_root: project_path.clone(),
+                    isolation: "git_worktree".into(),
+                },
+                json!({
+                    "workingDirectory": project_path.clone(),
+                    "branch": "rovai/mission/fixture",
+                }),
+            )
+            .unwrap();
+            let workspaces = BatchWorkspaces::from([(camp_id.clone(), Ok(prepared))]);
+            let claimed = claim_waiting_delivery_batches_with_workspaces(&mut database, 2, &workspaces)
+                .expect("the real claim materialises both lanes");
+            assert_eq!(claimed.len(), 2, "both lanes materialise one Run");
+            let run_of = |task: &str| -> String {
+                database
+                    .connection()
+                    .query_row(
+                        "SELECT delivery.claimed_agent_run_id
+                         FROM loom_control_dispatch dispatch
+                         JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+                         WHERE dispatch.task_id=?1",
+                        [task],
+                        |row| row.get(0),
+                    )
+                    .unwrap()
+            };
+            let run_a: String = run_of("task_a");
+            let run_b: String = run_of("task_b");
+            assert_ne!(run_a, run_b, "two lanes, two Runs");
+            for run_id in [&run_a, &run_b] {
+                let version: i64 = database
+                    .connection()
+                    .query_row("SELECT version FROM agent_run WHERE id=?1", [run_id], |row| row.get(0))
+                    .unwrap();
+                ExecutionRuntimeService::default()
+                    .claim_agent_run(
+                        &mut database,
+                        &CommandEnvelope {
+                            command_id: uuid::Uuid::new_v4().to_string(),
+                            actor: ActorRef::System {
+                                component_id: "agent-run-scheduler".into(),
+                            },
+                            camp_id: Some(camp_id.clone()),
+                            expected_versions: vec![],
+                            execution_epoch: None,
+                            payload: ClaimAgentRunCommand {
+                                agent_run_id: run_id.to_string(),
+                                expected_version: version,
+                                lease_owner: "m6c-completion-hook-test".into(),
+                                lease_seconds: 60,
+                                workspace: None,
+                                starting_git_observation: None,
+                            },
+                        },
+                    )
+                    .unwrap();
+            }
+            (run_a, run_b)
+        };
+
+        // Both Runs deliver their Candidate through the real write path, under the claim their
+        // execution admission already wrote.
+        {
+            let mut database = core.database.lock().await;
+            for (task_id, run_id, hint) in [("task_a", &run_a, "a"), ("task_b", &run_b, "b")] {
+                let (claim_id, fence_generation): (String, i64) = database
+                    .connection()
+                    .query_row(
+                        "SELECT claim_id, fence_generation FROM loom_claim
+                         WHERE plan_id=?1 AND task_id=?2 AND agent_run_id=?3 AND released_at IS NULL",
+                        rusqlite::params![&plan_id, task_id, run_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                rovai_core::loom::candidate_record(
+                    &mut database,
+                    LoomCandidateRecordInput {
+                        mission_id: mission_id.clone(),
+                        task_id: task_id.into(),
+                        agent_run_id: run_id.clone(),
+                        claim_id,
+                        fence_generation,
+                        command_id: format!("command-candidate-{hint}"),
+                        content_hash: format!("sha256:m6c-{hint}"),
+                        evidence_ids: vec![],
+                        acceptance_criteria_version: "ac-v1".into(),
+                        previous_candidate_id: None,
+                    },
+                )
+                .unwrap();
+            }
+        }
+
+        // Both terminal states commit through the real runtime command; the hook below fires for
+        // Run A only.
+        {
+            let mut database = core.database.lock().await;
+            for run_id in [&run_a, &run_b] {
+                let (version, epoch, adapter_kind): (i64, i64, String) = database
+                    .connection()
+                    .query_row(
+                        "SELECT version, execution_epoch, runtime_adapter_kind FROM agent_run WHERE id=?1",
+                        [run_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+                let completed = ExecutionRuntimeService::default()
+                    .succeed_agent_run(
+                        &mut database,
+                        &CommandEnvelope {
+                            command_id: uuid::Uuid::new_v4().to_string(),
+                            actor: ActorRef::System {
+                                component_id: format!("runtime-adapter:{adapter_kind}"),
+                            },
+                            camp_id: Some(camp_id.clone()),
+                            expected_versions: vec![],
+                            execution_epoch: None,
+                            payload: SucceedAgentRunCommand {
+                                agent_run_id: run_id.to_string(),
+                                expected_version: version,
+                                execution_epoch: epoch,
+                                native_turn_id: format!("turn-{run_id}"),
+                                final_output: "the delivery is complete".into(),
+                                missing_send_recovery_candidate: None,
+                                ending_git_observation: None,
+                            },
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(completed.result.status, CommandResultStatus::Applied);
+            }
+        }
+        let (dispatch_a_before, dispatch_b_before, epoch_a) = {
+            let database = core.database.lock().await;
+            let execute_status = |task: &str| -> String {
+                database
+                    .connection()
+                    .query_row(
+                        "SELECT status FROM loom_control_dispatch WHERE task_id=?1 AND kind='EXECUTE'",
+                        [task],
+                        |row| row.get(0),
+                    )
+                    .unwrap()
+            };
+            let epoch: i64 = database
+                .connection()
+                .query_row("SELECT execution_epoch FROM agent_run WHERE id=?1", [&run_a], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            (execute_status("task_a"), execute_status("task_b"), epoch)
+        };
+        assert_eq!(
+            (dispatch_a_before.as_str(), dispatch_b_before.as_str()),
+            ("DISPATCHED", "DISPATCHED"),
+            "a committed terminal state alone folds nothing"
+        );
+
+        core.reconcile_loom_completed_run(&run_a, epoch_a).await;
+
+        {
+            let database = core.database.lock().await;
+            let state = |task: &str| -> (String, i64) {
+                database
+                    .connection()
+                    .query_row(
+                        "SELECT (SELECT status FROM loom_control_dispatch
+                                 WHERE task_id=?1 AND kind='EXECUTE'),
+                                (SELECT COUNT(*) FROM loom_control_dispatch
+                                 WHERE task_id=?1 AND kind='REVIEW')",
+                        [task],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap()
+            };
+            assert_eq!(
+                state("task_a"),
+                ("SETTLED".into(), 1),
+                "the hook folds its own claim chain and admits the same task's next stage"
+            );
+            assert_eq!(
+                state("task_b"),
+                ("DISPATCHED".into(), 0),
+                "another run's completion hook leaves the sibling chain untouched"
+            );
+        }
+        tokio::time::timeout(Duration::from_millis(500), core.execution_wake.runs.notified())
+            .await
+            .expect("the admitted review must wake the dispatch lane after the commit");
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            core.delivery_batch_scheduler_notify.notified(),
+        )
+        .await
+        .expect("the admitted review must wake the delivery scheduler after the commit");
+
+        // The global tick stays the fallback: alone it folds the sibling chain and admits its
+        // next stage.
+        let fallback = core.admit_due_loom_dispatches().await.unwrap();
+        assert_eq!(
+            fallback.admitted, 1,
+            "the fallback advances only what the hook left behind"
+        );
+        {
+            let database = core.database.lock().await;
+            let state: (String, i64) = database
+                .connection()
+                .query_row(
+                    "SELECT (SELECT status FROM loom_control_dispatch WHERE task_id='task_b' AND kind='EXECUTE'),
+                            (SELECT COUNT(*) FROM loom_control_dispatch WHERE task_id='task_b' AND kind='REVIEW')",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("SETTLED".into(), 1), "the fallback finishes the sibling chain");
+        }
+
+        drop(core);
+        std::fs::remove_dir_all(&root).ok();
     }
 }
