@@ -367,9 +367,22 @@ async function run () {
   assert.equal(released.released, true, `release did not release: ${JSON.stringify(released)}`)
   record('release', { confirmed: released.confirmed === true, generation: released.generation })
 
-  const restored = await agentRpc(bridge, `restore-${randomUUID()}`, 'mouse_click', { x: CLICK_X, y: CLICK_Y, button: 'left' })
+  const restoreCall = agentRpc(bridge, `restore-${randomUUID()}`, 'mouse_click', { x: CLICK_X, y: CLICK_Y, button: 'left' })
+  let restoreApproval = null
+  if (modeProbe.ok) {
+    const restoreDeadline = Date.now() + 45_000
+    while (Date.now() < restoreDeadline && restoreApproval === null) {
+      const listed = await workbench({ origin: ORIGIN, session, path: '/computer/agents/approvals/list', body: { assistantId: member.agentId } })
+      restoreApproval = (listed.items ?? []).find(item => item.assistantId === member.agentId && item.status === 'pending') ?? null
+      if (!restoreApproval) await pause(500)
+    }
+    assert.ok(restoreApproval, 'release restore input did not queue for approval in ask mode')
+    const restoreDecision = await workbench({ origin: ORIGIN, session, path: '/computer/agents/approvals/decide', body: { approvalId: restoreApproval.approvalId, decision: 'approve' } })
+    assert.equal(restoreDecision.status, 'approved', `release restore approval was not approved: ${JSON.stringify(restoreDecision)}`)
+  }
+  const restored = await restoreCall
   assert.equal(restored.ok, true, `assistant input did not recover after release: ${JSON.stringify(restored.payload)}`)
-  record('assistantRestoredAfterRelease', { status: restored.status, ok: restored.ok })
+  record('assistantRestoredAfterRelease', { status: restored.status, ok: restored.ok, approvalId: restoreApproval?.approvalId ?? null })
 
   await workbench({ origin: ORIGIN, session, path: '/computer/view/stop', body: { viewId: view.viewId } })
   const expiryView = await workbench({ origin: ORIGIN, session, path: '/computer/view', body: { deviceId, consent: true } })
