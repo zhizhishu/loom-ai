@@ -1430,6 +1430,8 @@ export interface ThreadMessageAttachmentView {
   pastedTextPreview?: string
   /** Present only while an unsent local Composer owns this attachment. */
   sourcePath?: string
+  /** Browser-extracted Office text sent once with the unsent attachment; never shown as message chrome. */
+  extractedText?: string
 }
 
 export type LocalAttachmentAvailability =

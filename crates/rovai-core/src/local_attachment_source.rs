@@ -2,6 +2,7 @@ use std::{error::Error, fmt, fs, io::Read, path::Path};
 
 use anyhow::{Context, Result};
 use rusqlite::{OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -40,6 +41,9 @@ pub struct LocalAttachmentSourceRef {
     /// Display only; never grants file access or deletion authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pasted_text_preview: Option<String>,
+    /// Browser-extracted Office document text, carried only as input data for the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extracted_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -373,6 +377,12 @@ fn validate_ref_shape(refs: &[LocalAttachmentSourceRef]) -> Result<()> {
                 "Source Attachment pasted text preview is invalid"
             );
         }
+        if let Some(text) = &source_ref.extracted_text {
+            anyhow::ensure!(
+                source_ref.kind == LocalAttachmentKind::File && text.chars().count() <= 200_000,
+                "Source Attachment extracted text is invalid"
+            );
+        }
         if source_ref.kind == LocalAttachmentKind::Directory {
             anyhow::ensure!(
                 source_ref.observed_byte_size.is_none(),
@@ -441,6 +451,7 @@ pub fn observe_source_attachment(
             .flatten(),
         observed_byte_size: (kind == LocalAttachmentKind::File).then_some(metadata.len()),
         pasted_text_preview: None,
+        extracted_text: None,
     })
 }
 
@@ -790,6 +801,14 @@ pub fn resolve_source_attachments_for_run(
     for source_ref in source_refs {
         validate_source_attachment(source_ref).map_err(anyhow::Error::new)?;
         resolved.push(source_ref.source_path.clone());
+        if let Some(text) = source_ref.extracted_text.as_deref().filter(|text| !text.trim().is_empty()) {
+            let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+            let path = std::env::temp_dir().join(format!("loom-office-text-{digest}.txt"));
+            if !path.exists() {
+                fs::write(&path, text).context("office_attachment_extract_write_failed")?;
+            }
+            resolved.push(path.to_str().context("office attachment extract path must be valid UTF-8")?.to_string());
+        }
     }
     Ok(resolved)
 }
@@ -808,6 +827,7 @@ mod tests {
             media_type: Some("text/plain".to_string()),
             observed_byte_size: Some(7),
             pasted_text_preview: None,
+            extracted_text: None,
         };
         let json = serialize_source_attachments(std::slice::from_ref(&source_ref)).unwrap();
         assert_eq!(

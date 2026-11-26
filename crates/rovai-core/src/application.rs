@@ -32920,6 +32920,7 @@ done
             media_type: Some("text/plain".to_string()),
             observed_byte_size: Some(pasted_text.len() as u64),
             pasted_text_preview: Some("😀中".repeat(80)),
+            extracted_text: None,
         };
         let attachment_id = source_attachment.id.clone();
         let sent = core

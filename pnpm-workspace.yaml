@@ -7,6 +7,7 @@ allowBuilds:
   esbuild: true
   electron-winstaller: false
   protobufjs: true
+  tesseract.js: false
 
 patchedDependencies:
   '@larksuiteoapi/node-sdk@1.73.0': patches/@larksuiteoapi__node-sdk@1.73.0.patch
