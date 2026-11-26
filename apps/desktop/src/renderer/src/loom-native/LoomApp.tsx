@@ -14,6 +14,7 @@ import { ConversationView } from './ConversationView'
 import { Inspector, attentionFactsFromWork, flattenWork } from './Inspector'
 import { ArtifactView } from './ArtifactView'
 import { refreshArtifactSelection } from './artifact-service'
+import { withQuote, type ArtifactQuote } from './artifact-quote'
 import { Avatar } from './Avatar'
 import { Icon, IconButton } from './icons'
 import './native.css'
@@ -43,7 +44,7 @@ const RoomMembersDialog = lazy(() => import('./RoomDialog').then(v => ({default:
 type Props = { environment: BusinessEnvironment; remoteConnection?: ReactNode; onLogout?(): void; initialStartupSnapshot?: unknown; startupStartedAtMs?: number;
   /** Web only: the linked section and the hook that keeps `?section=` in step; Desktop passes neither. */
   initialSettingsSection?: SettingsSectionId | null; onSettingsSectionChange?(section: SettingsSectionId | null): void }
-type Draft = { text: string; files: File[] }
+type Draft = { text: string; files: File[]; quote?: ArtifactQuote | null }
 
 /** PiBot-style React/Vite application frame with a new Mikka-reference component
  * tree. Only the authenticated adapter, domain types and animated avatar are shared. */
@@ -231,12 +232,19 @@ export function LoomApp({ environment, onLogout, initialSettingsSection = null, 
     if (sending) return
     setSending(true); setSendError(null)
     try {
-      await data.send(submitted.text, submitted.files, agentId)
+      await data.send(withQuote(submitted.text, submitted.quote), submitted.files, agentId)
       setDrafts(current => {
-        const same = current[key]?.text === submitted.text && current[key]?.files === submitted.files
-        if (!same) return current
-        saveEditorText(key, '')
-        return { ...current, [key]: { text: '', files: [] } }
+        const entry = current[key]
+        const sameQuote = (entry?.quote ?? null) === (submitted.quote ?? null)
+        const same = entry?.text === submitted.text && entry?.files === submitted.files && sameQuote
+        if (same) {
+          saveEditorText(key, '')
+          return { ...current, [key]: { text: '', files: [], quote: null } }
+        }
+        // 发送成功后引用已经随上一条走掉：即使用户趁请求期间又写了下一条，
+        // 也只清引用，不动新草稿。
+        if (entry && sameQuote && entry.quote) return { ...current, [key]: { ...entry, quote: null } }
+        return current
       })
     } catch (error) {
       if (key.startsWith('agent:') && latestDraftKey.current !== key) {
@@ -375,7 +383,7 @@ export function LoomApp({ environment, onLogout, initialSettingsSection = null, 
         {settingsSection ? <SettingsPage section={settingsSection} onLeaveGuard={registerSettingsLeave} onSection={setSettingsSection} environment={environment} agents={data.agents} theme={theme} onTheme={setTheme} threadId={active?.threadId ?? undefined} onLogout={onLogout} onRefreshWorkspace={() => { void data.refresh().catch(report) }} onManageAssistants={() => manageAssistant(activeAgent?.agentId)} onStartWorkspace={root => { setSettingsSection(null); beginWorkIn(root) }} onChanged={() => { setCapabilityEpoch(value => value + 1); void data.refresh().catch(report) }}/>
         : <>{sidebarOpen && <Sidebar agents={data.agents} items={data.conversations} selectedId={data.selectedId} loading={data.loading} groupRosters={groupRosters} hidden={data.hidden} onRestoreHidden={threadId => { void data.setHidden(threadId, false) }} onSelect={item => safeInspectorAction(() => { setCapabilityDirty(false); void select(item) })} onCreate={beginConversation} onCollapse={() => setSidebarOpen(false)} onEditAssistant={agentId => manageAssistant(agentId)}/>}{sidebarOpen && <PanelResizeHandle side="sidebar" frame={frameRef} widths={panelWidths} sidebarOpen={sidebarOpen} inspectorOpen={inspectorOpen} onResize={resizePanel}/> }
         {!settingsSection && <SetupChecklist agents={data.agents} hasWorkspaceDefault={typeof localStorage !== 'undefined' && readWorkspaceDefault(localStorage) !== null} hasMcpConnection={hasMcpConnection} onOpenSettings={openSettings} onCreateAssistant={() => manageAssistant(undefined, true)}/>}
-        <ConversationView item={active} agents={data.agents} snapshot={data.snapshot} bundles={data.bundles} loading={data.loading} sending={sending} draft={draft.text} files={draft.files} error={sendError ?? piQuestions.error} questions={piQuestions.questions} onAnswerQuestion={piQuestions.answer} onDraft={text => patchDraft({ text })} onFiles={files => patchDraft({ files })} onSend={agentId => { void send(agentId) }} onPrompt={sendPrompt} onRetryRun={retryLastRun} onStopRun={run => { void stopRun(run) }} stoppingRunIds={stoppingRunIds} onConfigureRuntime={() => manageAssistant(activeAgent?.agentId)} onOpenRuntimeSetup={() => openSettings('runtime')} onProfile={() => manageAssistant(activeAgent?.agentId)} onWorkspaceManager={() => openSettings('workspace')} onMembers={() => setMembersOpen(true)} onArtifact={setArtifact} onShowSidebar={() => setSidebarOpen(true)} sidebarHidden={!sidebarOpen} onShowWork={() => openWork()} inspectorHidden={!inspectorOpen} onAttachment={(messageId,attachmentId) => { void openAttachment(messageId,attachmentId) }} onPreviewAttachment={previewAttachment} approvalBusy={approvalBusy} onResolveApproval={(approvalId,optionId) => { void resolveApproval(approvalId,optionId) }} onOpenTaskCitation={openTaskCitation}/>
+        <ConversationView item={active} agents={data.agents} snapshot={data.snapshot} bundles={data.bundles} loading={data.loading} sending={sending} draft={draft.text} files={draft.files} quote={draft.quote ?? null} onRemoveQuote={() => patchDraft({ quote: null })} error={sendError ?? piQuestions.error} questions={piQuestions.questions} onAnswerQuestion={piQuestions.answer} onDraft={text => patchDraft({ text })} onFiles={files => patchDraft({ files })} onSend={agentId => { void send(agentId) }} onPrompt={sendPrompt} onRetryRun={retryLastRun} onStopRun={run => { void stopRun(run) }} stoppingRunIds={stoppingRunIds} onConfigureRuntime={() => manageAssistant(activeAgent?.agentId)} onOpenRuntimeSetup={() => openSettings('runtime')} onProfile={() => manageAssistant(activeAgent?.agentId)} onWorkspaceManager={() => openSettings('workspace')} onMembers={() => setMembersOpen(true)} onArtifact={setArtifact} onShowSidebar={() => setSidebarOpen(true)} sidebarHidden={!sidebarOpen} onShowWork={() => openWork()} inspectorHidden={!inspectorOpen} onAttachment={(messageId,attachmentId) => { void openAttachment(messageId,attachmentId) }} onPreviewAttachment={previewAttachment} approvalBusy={approvalBusy} onResolveApproval={(approvalId,optionId) => { void resolveApproval(approvalId,optionId) }} onOpenTaskCitation={openTaskCitation}/>
         {inspectorOpen && <PanelResizeHandle side="inspector" frame={frameRef} widths={panelWidths} sidebarOpen={sidebarOpen} inspectorOpen={inspectorOpen} onResize={resizePanel}/>}
         {inspectorOpen && <Inspector key={capabilityEpoch} questions={piQuestions.questions} selectedTaskId={dockSelection?.threadId === (active?.threadId ?? null) ? dockSelection?.taskId ?? null : null} onTaskSelect={taskId => setDockSelection({ threadId: active?.threadId ?? null, taskId })} threadId={active?.threadId} conversationTitle={active?.title} onCreateWork={beginWork} onConnectDevice={() => openSettings('devices')} workbench={environment.workbench} client={environment.client} theme={theme} onManageAssistant={manageAssistant} onCapabilityDirty={setCapabilityDirty} onLibrary={() => safeInspectorAction(() => { setCapabilityDirty(false); setLibraryOpen(true) })} agents={data.agents} bundles={data.bundles} agent={activeAgent} mode={inspectorMode} tab={tab} onTab={value => safeInspectorAction(() => { setTab(value); setCapabilityDirty(false) })} onMode={value => safeInspectorAction(() => { setInspectorMode(value); setCapabilityDirty(false) })} onClose={() => safeInspectorAction(() => { setInspectorOpen(false); setExpanded(false); setCapabilityDirty(false) })} onExpand={() => setExpanded(value => !value)} expanded={expanded} onArtifact={setArtifact} loading={data.loading} onOpenConversation={threadId => { const item = data.conversations.find(item => item.threadId === threadId); if (item) void select(item) }}/>}</>}</section>
     </div>
@@ -389,7 +397,14 @@ export function LoomApp({ environment, onLogout, initialSettingsSection = null, 
       onRefreshWork={data.refresh}
       onClose={() => setRunSurfaceOpen(false)} onCreateWork={() => { setRunSurfaceOpen(false); beginWork() }}
       onArtifact={selection => { setRunSurfaceOpen(false); setArtifact(selection) }}/>
-    {artifact && <ArtifactView key={`${artifact.bundle.mission.missionId}:${artifact.artifact.artifactId}:${artifact.candidate?.candidateId ?? "none"}`} theme={theme} fallbackFocus={runSurfaceOpener.current} selection={currentArtifact?.selection ?? artifact} contextAvailable={currentArtifact?.contextAvailable ?? false} onClose={() => setArtifact(null)} onRefresh={data.refresh}/>}
+    {artifact && <ArtifactView key={`${artifact.bundle.mission.missionId}:${artifact.artifact.artifactId}:${artifact.candidate?.candidateId ?? "none"}`} theme={theme} fallbackFocus={runSurfaceOpener.current} selection={currentArtifact?.selection ?? artifact} contextAvailable={currentArtifact?.contextAvailable ?? false} onQuote={quote => {
+      const threadId = artifact.bundle.mission.threadId
+      setArtifact(null)
+      setDrafts(current => ({ ...current, [threadId]: { ...(current[threadId] ?? { text: '', files: [] }), quote } }))
+      const target = data.conversations.find(item => item.threadId === threadId)
+      if (target) void select(target)
+      else void data.openConversation(threadId).catch(report)
+    }} onClose={() => setArtifact(null)} onRefresh={data.refresh}/>}
     <Dialog.Root open={modal !== null} onOpenChange={open => { if (!open) setModal(null) }}><Dialog.Portal><div className="ln-portal" data-theme={theme}><Dialog.Overlay className="ln-modal-backdrop"/><Dialog.Content className={`ln-dialog${modal === 'search' ? ' ln-search-dialog' : ''}`} aria-describedby={undefined}><header><Dialog.Title>{modal === 'search' ? '搜索' : '会话活动'}</Dialog.Title><Dialog.Close asChild><button type="button" className="ln-icon-button" aria-label="关闭"><Icon name="close"/></button></Dialog.Close></header>
       {modal === 'search' && <><div className="ln-search-field"><Icon name="search"/><input placeholder="搜索对话、助手、工作或文件名…" aria-label="全局搜索" value={query} onChange={event => setQuery(event.target.value)} autoFocus/></div><WorkspaceSearch results={searchResults} query={query} onConversation={item => safeInspectorAction(() => { void select(item); setModal(null) })} onAssistant={agentId => { setModal(null); manageAssistant(agentId) }} onWork={searchWork} onArtifact={searchArtifact}/></>}
       {modal === 'history' && <div className="ln-dialog-results"><RunActivityHistory runs={data.snapshot?.agentRuns ?? []} agents={data.agents} sending={sending} onRetry={retryLastRun}/></div>}

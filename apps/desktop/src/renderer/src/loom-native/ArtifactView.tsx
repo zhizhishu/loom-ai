@@ -6,6 +6,8 @@ import type { LoomReviewRecordReceipt } from '@contracts'
 import { useThreadClient } from '../camp-client'
 import { readErrorMessage } from '../error-message'
 import { ArtifactPdfPreview } from './ArtifactPdfPreview'
+import { ArtifactSelectionActions } from './ArtifactSelectionActions'
+import type { ArtifactQuote } from './artifact-quote'
 import { markdownDiff, remarkDiff } from './artifact-diff'
 import { Icon } from './icons'
 import { ArtifactXlsxPreview } from './ArtifactXlsxPreview'
@@ -93,8 +95,9 @@ function savedDrafts(client: object): Map<string, ReviewDraftMemory> {
   return drafts
 }
 
-export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = null, contextAvailable = true, theme: suppliedTheme }: {
+export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = null, contextAvailable = true, theme: suppliedTheme, onQuote }: {
   selection: ArtifactSelection
+  onQuote?(quote: ArtifactQuote): void
   fallbackFocus?: HTMLElement | null
   contextAvailable?: boolean
   theme?: 'day' | 'night'
@@ -116,6 +119,22 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
   const facts = useMemo(
     () => artifactCandidateFacts(bundle, artifact, selection.candidate),
     [bundle, artifact, selection.candidate])
+  const documentText = useRef<HTMLDivElement>(null)
+  const [textSelection, setTextSelection] = useState<{ text: string; range: Range } | null>(null)
+  const readSelection = (): void => {
+    const current = window.getSelection()
+    const root = documentText.current
+    if (!current || current.isCollapsed || !root || !current.rangeCount) { setTextSelection(null); return }
+    const range = current.getRangeAt(0)
+    if (!root.contains(range.commonAncestorContainer)) { setTextSelection(null); return }
+    const text = current.toString().replace(/\s+/g, ' ').trim()
+    setTextSelection(text ? { text, range: range.cloneRange() } : null)
+  }
+  useEffect(() => {
+    const clear = () => { if (window.getSelection()?.isCollapsed) setTextSelection(null) }
+    document.addEventListener('selectionchange', clear)
+    return () => document.removeEventListener('selectionchange', clear)
+  }, [])
   const previousArtifact = useMemo(() => {
     const previousCandidateId = selection.candidate?.previousCandidateId
     if (!previousCandidateId) return null
@@ -128,6 +147,7 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
   useEffect(() => {
     setComparing(false)
     setPreviousPreview(null)
+    setTextSelection(null)
   }, [artifact.artifactId])
   useEffect(() => {
     if (!comparing || previousArtifact === null) return
@@ -379,7 +399,11 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
             <div className="ln-artifact-document">
               <h2 className="ln-artifact-doc-title">{documentTitle}</h2>
               <p className="ln-artifact-doc-meta">{bundle.mission.title} · {new Date(artifact.createdAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} 更新</p>
-              {documentBody}
+              <div ref={documentText} className="ln-artifact-selectable" onMouseUp={readSelection} onKeyUp={readSelection}>{documentBody}</div>
+              {onQuote && <ArtifactSelectionActions selection={textSelection} onClose={() => setTextSelection(null)} onQuote={text => {
+                onQuote({ artifactId: artifact.artifactId, version: facts.version ?? 1, kind: 'text', text })
+                setTextSelection(null)
+              }}/>}
             </div>
 
             <aside className="ln-artifact-context" aria-label="验收上下文">

@@ -1,6 +1,6 @@
 import type { CSSProperties, ReactNode } from 'react'
 
-export type IconName = 'home' | 'bulb' | 'board' | 'clock' | 'files' | 'settings' | 'search' | 'plus' | 'close' | 'left' | 'right' | 'down' | 'up' | 'panel' | 'expand' | 'chat' | 'globe' | 'download' | 'check' | 'hand' | 'progress' | 'blocked' | 'file' | 'image' | 'audio' | 'computer' | 'refresh' | 'attach' | 'copy' | 'stop' | 'more' | 'branch' | 'sun' | 'moon' | 'people' | 'minus' | 'user' | 'bell' | 'command' | 'info'
+export type IconName = 'home' | 'bulb' | 'board' | 'clock' | 'files' | 'settings' | 'search' | 'plus' | 'close' | 'left' | 'right' | 'down' | 'up' | 'panel' | 'expand' | 'chat' | 'globe' | 'download' | 'check' | 'hand' | 'progress' | 'blocked' | 'file' | 'image' | 'audio' | 'computer' | 'refresh' | 'attach' | 'copy' | 'quote' | 'stop' | 'more' | 'branch' | 'sun' | 'moon' | 'people' | 'minus' | 'user' | 'bell' | 'command' | 'info'
   | 'dashboard' | 'inbox' | 'sparkle' | 'pin' | 'lock' | 'archive'
 const paths: Record<IconName, ReactNode> = {
   dashboard: <><rect x="3" y="3" width="7" height="18" rx="1"/><rect x="14" y="3" width="7" height="8" rx="1"/><rect x="14" y="15" width="7" height="6" rx="1"/></>,
@@ -41,6 +41,7 @@ const paths: Record<IconName, ReactNode> = {
   refresh: <><path d="M20 10a8 8 0 1 0-1 7M20 4v6h-6"/></>,
   attach: <path d="m8 13 7-7a3 3 0 0 1 4 4L9 20a5 5 0 0 1-7-7L13 2"/>,
   copy: <><rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V3H3v13h5"/></>,
+  quote: <><path d="M7 6H4v5h3v2H5v2h4v-9Z"/><path d="M20 6h-3v5h3v2h-2v2h4v-9Z"/></>,
   stop: <rect x="6" y="6" width="12" height="12" rx="2"/>,
   more: <><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></>,
   branch: <><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="5" r="2"/><path d="M6 7v10m12-10c0 7-12 3-12 10"/></>,

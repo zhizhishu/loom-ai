@@ -39,10 +39,10 @@ const item = (over: Partial<ConversationItem> = {}): ConversationItem => ({
   missionId: null, unread: false, updatedAt: null, ...over
 })
 
-const view = (thread: ThreadSnapshot, row: ConversationItem = item()): string =>
+const view = (thread: ThreadSnapshot, row: ConversationItem = item(), quote: import('./artifact-quote').ArtifactQuote | null = null): string =>
   renderToStaticMarkup(createElement(ConversationView, {
     item: row, snapshot: thread, agents: [hanzi, muwa], bundles: [], loading: false, sending: false,
-    draft: '', files: [], error: null, onDraft: () => {}, onFiles: () => {}, onSend: () => {}, onProfile: () => {},
+    draft: '', files: [], error: null, quote, onRemoveQuote: quote ? () => {} : undefined, onDraft: () => {}, onFiles: () => {}, onSend: () => {}, onProfile: () => {},
     onArtifact: () => {}, onShowSidebar: () => {}, sidebarHidden: false, onShowWork: () => {}, inspectorHidden: false,
     onAttachment: () => {}, onResolveApproval: () => {}, approvalBusy: false, onMembers: () => {}, onWorkspaceManager: () => {}
   }))
@@ -183,6 +183,34 @@ describe('collapsible long messages', () => {
     expect(html).not.toContain('显示更多')
     expect(html).toContain('ln-execution-record')
     expect(html.indexOf('m-long')).toBeGreaterThan(-1)
+  })
+})
+
+
+describe('artifact quotes in chat', () => {
+  const message = (id: string, authorType: 'user' | 'agent', body: string) => ({
+    id, sequence: 1, authorType, authorId: authorType === 'user' ? 'local_user' : 'a1', authorDisplayName: null,
+    body, withdrawn: false, attachments: [], agentRunId: null, createdAt: '2026-02-03T10:00:00.000Z'
+  })
+
+  it('draws a stored artifact quote above the message instead of raw quote markup', () => {
+    const thread = {
+      ...snapshot('发版群', [member('a1', 'Hanzi')]),
+      messages: [message('m-quote', 'user', '<quote artifact="art-1" version="2" kind="text">核对首页截图</quote>\n请继续改这一处')]
+    }
+    const html = view(thread as unknown as ThreadSnapshot)
+    expect(html).toContain('data-slot="artifact-quote"')
+    expect(html).toContain('核对首页截图')
+    expect(html).toContain('请继续改这一处')
+    expect(html).not.toContain('&lt;quote')
+    expect(html).not.toContain('artifact=&quot;art-1')
+  })
+
+  it('shows the pending artifact quote as a removable composer chip', () => {
+    const html = view(snapshot('发版群', [member('a1', 'Hanzi')]) as unknown as ThreadSnapshot, item(), { artifactId: 'art-1', version: 2, kind: 'text', text: '核对首页截图' })
+    expect(html).toContain('data-slot="artifact-quote-chip"')
+    expect(html).toContain('成果 v2')
+    expect(html).toContain('移除成果引用')
   })
 })
 

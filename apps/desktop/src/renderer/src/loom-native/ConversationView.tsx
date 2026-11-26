@@ -20,6 +20,8 @@ import { wakeRestoreLines } from './wake-restore'
 import { approvalAging, approvalAgingText } from './approval-aging'
 import { AgentCitationContext, type CitationContextValue, type CitationReference } from './AgentCitations'
 import { CollapsibleMessage } from './CollapsibleMessage'
+import { ArtifactQuoteChip, ArtifactQuoteLine } from './ArtifactQuote'
+import { splitQuote, type ArtifactQuote } from './artifact-quote'
 import { bottomUnreadCount, UnreadPill } from './UnreadPill'
 import { runtimeFailureMessage } from '../RuntimeFailureNotice'
 import { RuntimeInstallationGuide } from '../RuntimeInstallationGuide'
@@ -104,9 +106,12 @@ function ApprovalAge({ requestedAt }: { requestedAt: string | null }) {
   return <small className="ln-approval-age" data-aged={aging.aged || undefined}>{text}</small>
 }
 
-export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, onDraft, onFiles, onSend, onPrompt, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onPreviewAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager, onRetryRun, onConfigureRuntime, onOpenRuntimeSetup, hostPlatform = null, questions = [], onAnswerQuestion, onStopRun, stoppingRunIds = [], onOpenTaskCitation }: {
+export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, quote = null, onRemoveQuote, onDraft, onFiles, onSend, onPrompt, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onPreviewAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager, onRetryRun, onConfigureRuntime, onOpenRuntimeSetup, hostPlatform = null, questions = [], onAnswerQuestion, onStopRun, stoppingRunIds = [], onOpenTaskCitation }: {
   item: ConversationItem | null; snapshot: ThreadSnapshot | null; agents: AgentProfile[]; bundles: WorkBundle[]; loading: boolean; sending: boolean
-  draft: string; files: File[]; error: string | null; onDraft(value: string): void; onFiles(files: File[]): void
+  draft: string; files: File[]; error: string | null
+  /** 成果里选中的文字：在输入框上方等待随下一条消息发出。 */
+  quote?: ArtifactQuote | null; onRemoveQuote?(): void
+  onDraft(value: string): void; onFiles(files: File[]): void
   onSend(agentId?: string): void; onPrompt?(text: string): Promise<boolean>; onProfile(): void; onArtifact(selection: ArtifactSelection): void
   onShowSidebar(): void; sidebarHidden: boolean; onShowWork(): void; inspectorHidden: boolean
   onAttachment(messageId: string, attachmentId: string): void
@@ -324,12 +329,13 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
         const user = message.authorType === 'user' || message.authorType === 'external_principal'
         const author = agents.find(agent => agent.agentId === message.authorId)
         const handoff = !user && /\[LOOM_HANDOFF|"dispatchId"|"tool_call_id"/.test(message.body)
+        const quoted = splitQuote(message.body)
         return <article className={`ln-message ${user ? 'is-user' : 'is-assistant'} ${handoff ? 'is-record' : ''}`} key={message.id} data-message-id={message.id}>
           {!user && snapshot && snapshot.members.length > 1 && <div className="ln-message-author"><Avatar agent={author} name={message.authorDisplayName || ''} size={16}/><span>{author?.displayName || message.authorDisplayName || '助手'}</span></div>}
           {handoff ? <details className="ln-execution-record"><summary><Icon name="branch" size={14}/><span>执行记录</span><Icon name="right" size={12}/></summary><AgentMarkdown text={message.body}/></details>
-            : <div className="ln-message-content"><CollapsibleMessage><AgentMarkdown text={message.body}/></CollapsibleMessage></div>}
+            : <div className="ln-message-content"><CollapsibleMessage>{quoted.quote && <ArtifactQuoteLine quote={quoted.quote}/>}<AgentMarkdown text={quoted.text}/></CollapsibleMessage></div>}
           {message.attachments.length > 0 && snapshot && <MessageAttachments attachments={message.attachments} threadId={snapshot.thread.id} messageId={message.id} loadPreview={onPreviewAttachment} onOpen={attachmentId => onAttachment(message.id, attachmentId)}/>}
-          <div className="ln-message-actions"><button type="button" aria-label="复制消息" title="复制消息" onClick={() => { void navigator.clipboard.writeText(message.body).then(() => { setCopied(message.id); window.setTimeout(() => setCopied(null), 1500) }) }}><Icon name={copied === message.id ? 'check' : 'copy'} size={13}/></button><time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time></div>
+          <div className="ln-message-actions"><button type="button" aria-label="复制消息" title="复制消息" onClick={() => { void navigator.clipboard.writeText(quoted.text).then(() => { setCopied(message.id); window.setTimeout(() => setCopied(null), 1500) }) }}><Icon name={copied === message.id ? 'check' : 'copy'} size={13}/></button><time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time></div>
         </article>
       })}
       {artifacts.length > 0 && <div className="ln-delivered-files">{artifacts.map(selection => <button type="button" className="ln-artifact-card" key={selection.artifact.artifactId} onClick={() => onArtifact(selection)}><span className="ln-document-icon"><Icon name="file" size={22}/></span><span><strong>{selection.artifact.relativePath.split(/[\\/]/).pop()}</strong><small>{resultStatusLabel(selection.candidate)}</small></span><Icon name="right" size={15}/></button>)}</div>}
@@ -351,6 +357,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
       {snapshot?.approvals.filter(approval => approval.status === 'pending').map(approval => <section className="ln-approval-request" key={approval.id} aria-label="等待你的授权" data-state={approval.status} aria-busy={approvalBusy}><strong><Icon name="hand" size={16}/>需要你确认<span className="ln-approval-state" data-state={approval.status}>{approvalStatusLabel(approval.status)}</span></strong><p>{approval.actionSummary}</p>{approval.reason && <small>{approval.reason}</small>}<ApprovalAge requestedAt={approval.requestedAt}/><p className="ln-approval-scope">{agents.find(agent => agent.agentId === approval.agentId)?.displayName || '当前助手'} · {approval.options.some(option => option.kind === 'allow_session') ? '持续授权仅限此原生会话，具体范围见选项。' : '本次请求按运行端提供的范围授权。'}</p><div>{approval.options.map(option => <button type="button" disabled={approvalBusy} key={option.optionId} title={option.consequence} className={option.kind === 'allow_once' ? 'is-once' : option.kind === 'allow_session' ? 'is-persistent' : ''} onClick={() => onResolveApproval(approval.id, option.optionId)}>{option.label}</button>)}</div></section>)}
       {resolvedApproval && <p className="ln-approval-result" data-slot="approval-result" data-state={resolvedApproval.status} aria-label={`${approvalStatusLabel(resolvedApproval.status)}的授权`}><Icon name={resolvedApproval.status === 'approved' ? 'check' : 'blocked'} size={14}/><span>{resolvedApproval.actionSummary}</span><em>{approvalStatusLabel(resolvedApproval.status)}</em></p>}
       {segment === 'chat' && <form className="ln-composer" onPaste={event => { if (pasteAttachments(event.clipboardData, files, onFiles)) { event.preventDefault(); event.stopPropagation() } }} onSubmit={event => { event.preventDefault(); if (!sending && !composing.current && (draft.trim() || files.length)) onSend(isGroup ? mentionRecipient(draft, activeMembers) : undefined) }}>
+        {quote && onRemoveQuote && <ArtifactQuoteChip quote={quote} onRemove={onRemoveQuote}/>}
         <PendingAttachments files={files} onRemove={onFiles}/>
         {mentionOpen && <MentionPopup id="ln-mention-options" options={mentionChoices} activeIndex={mentionActiveIndex} onPick={pickMention} onHover={setMentionIndex}/>}
         <textarea ref={input} value={draft}
