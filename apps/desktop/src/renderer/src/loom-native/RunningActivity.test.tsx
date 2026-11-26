@@ -117,14 +117,35 @@ describe('running row (Mikka agent-activity working row)', () => {
     expect(stopping).toContain('正在停止…')
     const stopped = conversation({ snapshot: { agentRuns: [run({ status: 'cancelled' })] } })
     expect(stopped).not.toContain('aria-label="停止本次运行"')
-    expect(stopped).toContain('工作了 39 分 17 秒 · 已停止')
+    expect(stopped).toContain('Hanzi · 已停止')
+  })
+  it('inserts terminal run events into the timed flow as clickable grey lines', () => {
+    const first = snapshot().messages[0]
+    const later = { ...first, id: 'm2', sequence: 2, body: '后来', createdAt: '2026-11-22T01:00:00.000Z' }
+    const html = conversation({ snapshot: {
+      messages: [first, later],
+      agentRuns: [
+        run({ status: 'cancelled', anchorMessageId: 'm1' }),
+        run({ id: 'r2', status: 'failed', anchorMessageId: 'm1', endedAt: '2026-11-22T00:40:17.000Z' }),
+        run({ id: 'r3', status: 'succeeded', anchorMessageId: 'm1', endedAt: '2026-11-22T00:41:17.000Z' })
+      ]
+    } })
+    expect(html.match(/data-event-line="runFinished"/gu)).toHaveLength(3)
+    expect(html).toContain('ln-run-event-line')
+    expect(html).toContain('Hanzi · 已停止')
+    expect(html).toContain('Hanzi · 运行失败')
+    expect(html).toContain('Hanzi · 运行完成')
+    expect(html).toContain('aria-label="Hanzi · 已停止，跳到触发消息"')
+    const eventAt = html.indexOf('data-event-line="runFinished"')
+    expect(html.indexOf('你好')).toBeLessThan(eventAt)
+    expect(eventAt).toBeLessThan(html.indexOf('后来'))
   })
   it('keeps the working row in the transcript and drops it once the run failed', () => {
     expect(conversation({ snapshot: { agentRuns: [run({ status: 'running', endedAt: null })] } }))
       .toContain('Hanzi正在处理')
     const failed = conversation({ snapshot: { agentRuns: [run()] } })
     expect(failed).not.toContain('Hanzi正在处理')
-    expect(failed).toContain('工作了 39 分 17 秒 · 失败')
+    expect(failed).toContain('Hanzi · 运行失败')
     const questions: import('./pi-questions').PiQuestion[] = [{
       threadId: 'th', agentRunId: 'r1', executionEpoch: 1, hostInstanceId: 'host', agentId: 'a',
       status: 'waiting_for_user', request: { id: 'question', method: 'select', title: '选哪一个？', options: ['A', 'B'] }

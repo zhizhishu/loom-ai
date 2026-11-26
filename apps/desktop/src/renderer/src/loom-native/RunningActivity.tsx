@@ -264,6 +264,29 @@ export function runActivitySummary(
   return worked
 }
 
+/** Mikka `chat-event-line.tsx:15-29` 的 runFinished：一行灰字事件，不说模型内部细节。 */
+export function runEventStatusLabel(status: AgentRunView['status']): string {
+  if (status === 'succeeded') return '运行完成'
+  if (status === 'failed') return '运行失败'
+  if (status === 'cancelled') return '已停止'
+  return '运行状态变化'
+}
+
+export function RunEventLine({ run, agentName, onJump }: {
+  run: Pick<AgentRunView, 'id' | 'status'>
+  agentName: string
+  onJump?(): void
+}) {
+  const text = `${agentName} · ${runEventStatusLabel(run.status)}`
+  return (
+    <p className="ln-run-event-line" data-event-line="runFinished" data-state={run.status} data-run-id={run.id}>
+      {onJump
+        ? <button type="button" aria-label={`${text}，跳到触发消息`} title="跳到触发消息" onClick={onJump}>{text}</button>
+        : <span>{text}</span>}
+    </p>
+  )
+}
+
 /** 终止之后的 run 在 transcript 末尾留的一行状态（不是弹窗、不是活动列表里的两个字）。 */
 export function RunActivityLine({ run, now }: {
   run: Pick<AgentRunView, 'id' | 'status' | 'startedAt' | 'createdAt' | 'endedAt'>

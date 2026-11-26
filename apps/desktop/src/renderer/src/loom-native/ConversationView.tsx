@@ -14,7 +14,7 @@ import { useComposerSendPreference } from './ComposerSendPreference'
 import { Icon, IconButton } from './icons'
 import { MessageAttachments, PendingAttachments, addPickedAttachments, pasteAttachments, type AttachmentPreviewLoader } from './UserAttachments'
 import { USER_ATTACHMENT_ACCEPT } from './user-attachments'
-import { RunActivityLine, RunningActivity } from './RunningActivity'
+import { RunEventLine, RunningActivity } from './RunningActivity'
 import { manualRetryUx } from './retry-ux'
 import { runtimeFailureMessage } from '../RuntimeFailureNotice'
 import { RuntimeInstallationGuide } from '../RuntimeInstallationGuide'
@@ -38,6 +38,7 @@ export type MemberSystemLine = {
 type ChatFlowEntry =
   | { kind: 'message'; key: string; at: string; message: ThreadMessageView }
   | { kind: 'member-line'; key: string; at: string; line: MemberSystemLine }
+  | { kind: 'run-event'; key: string; at: string; run: AgentRunView }
 
 /** DomainEventView.payload 是 unknown：只有能在 payload 里归属到 agentId 的事件才出系统行，不做猜测。 */
 function memberEventPayloadAgentId(payload: unknown): string | null {
@@ -123,7 +124,8 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   const pendingQuestions = questions.filter(question => question.threadId === snapshot?.thread.id)
   const waitingRuns = new Set(pendingQuestions.map(question => question.agentRunId))
   const running = useMemo(() => snapshot?.agentRuns.filter(run => ['running', 'queued', 'waiting'].includes(run.status)) ?? [], [snapshot?.agentRuns])
-  // 最近一次运行：只有在它已经终止时才在 transcript 末尾留一条状态行（Mikka 的 activityLine）。
+  const terminalRuns = useMemo(() => snapshot?.agentRuns.filter(run => ['succeeded', 'failed', 'cancelled'].includes(run.status)) ?? [], [snapshot?.agentRuns])
+  // 最近一次运行：失败时仍在末尾保留可操作的失败卡；终态事实本身进入上面的时间流。
   const latestRun = useMemo(() => {
     const runs = [...(snapshot?.agentRuns ?? [])]
       .sort((left, right) => (left.startedAt ?? left.createdAt).localeCompare(right.startedAt ?? right.createdAt))
@@ -157,9 +159,10 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   const flowEntries = useMemo<ChatFlowEntry[]>(() => {
     const entries: ChatFlowEntry[] = visibleMessages.map(message => ({ kind: 'message' as const, key: `message:${message.id}`, at: message.createdAt, message }))
     for (const line of memberLines) entries.push({ kind: 'member-line', key: line.key, at: line.createdAt, line })
+    for (const run of terminalRuns) entries.push({ kind: 'run-event', key: `run-event:${run.id}`, at: run.endedAt ?? run.createdAt, run })
     // ISO 时间字符串按字典序即按时间序；等值时 sort 稳定，消息保持原序，系统行排在同刻消息之后。
     return entries.sort((left, right) => left.at.localeCompare(right.at))
-  }, [visibleMessages, memberLines])
+  }, [visibleMessages, memberLines, terminalRuns])
   const lastId = flowEntries[flowEntries.length - 1]?.key
   // 换会话就是换候选范围：上一轮的候选和光标区间一律丢掉。
   useEffect(() => { mentionToken.current = null; setMention(null); setMentionIndex(0) }, [item?.id, snapshot?.thread.id])
@@ -181,6 +184,13 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
     input.current.style.height = `${Math.min(180, Math.max(36, input.current.scrollHeight))}px`
   }, [draft])
   const jump = () => { pinned.current = true; scroll.current?.scrollTo({ top: scroll.current.scrollHeight, behavior: 'smooth' }); setShowLatest(false) }
+  const jumpToMessage = (messageId: string) => {
+    const target = scroll.current?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(messageId)}"]`)
+    if (!target) return
+    pinned.current = false
+    target.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    setShowLatest(true)
+  }
   const title = item?.title || activeAgent?.displayName || 'LOOM'
   // 群里说话是「给群名发消息」（Mikka `group-chat-view.tsx:271` 传的是 group.title）；
   // 只有单聊才写助手名（Mikka `messages/zh-CN.json:212` Nav.messageBot）。
@@ -236,6 +246,11 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
         if (entry.kind === 'member-line') {
           return <p key={entry.key} className="ln-member-system-line" data-member-event-kind={entry.line.kind} data-event-id={entry.line.eventId ?? undefined} data-agent-id={entry.line.agentId ?? undefined}>{entry.line.text}</p>
         }
+        if (entry.kind === 'run-event') {
+          const run = entry.run
+          return <RunEventLine key={entry.key} run={run} agentName={agents.find(agent => agent.agentId === run.agentId)?.displayName || '助手'}
+            onJump={run.anchorMessageId ? () => jumpToMessage(run.anchorMessageId!) : undefined}/>
+        }
         const message = entry.message
         const user = message.authorType === 'user' || message.authorType === 'external_principal'
         const author = agents.find(agent => agent.agentId === message.authorId)
@@ -255,7 +270,6 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
         : <RunningActivity key={run.id} label={`${agents.find(agent => agent.agentId === run.agentId)?.displayName || '助手'}正在处理`}
           stopping={stoppingRunIds.includes(run.id) || run.cancelRequestedAt !== null}
           onStop={onStopRun ? () => onStopRun(run) : undefined}/>)}
-      {endedRun && <RunActivityLine run={endedRun}/>}
       {endedRun?.status === 'failed' && <RunFailure run={endedRun} runs={snapshot?.agentRuns ?? []} agent={agents.find(agent => agent.agentId === endedRun.agentId) ?? null} sending={sending} onRetry={onRetryRun} onConfigure={onConfigureRuntime} onOpenRuntimeSetup={onOpenRuntimeSetup} platform={hostPlatform}/>}
       {systemMessages.length > 0 && <details className="ln-system-records"><summary>会话记录 <span>{systemMessages.length}</span></summary>{systemMessages.map(message => <AgentMarkdown key={message.id} text={message.body}/>)}</details>}
     </div>
