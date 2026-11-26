@@ -19,6 +19,7 @@ mod control_tests;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
@@ -1087,7 +1088,11 @@ pub enum LoomArtifactPreviewUnavailableReason {
     NotArchived,
 }
 
-/// Bounded archive text for Owner inspection; reading it records no verification or review.
+/// Bounded archive text or media for Owner inspection; reading it records no verification or review.
+///
+/// `text` is the only body a non-media file ever gets, and `bytesBase64` the only body a media
+/// file gets: a media hit never falls back to text even when its bytes happen to be valid UTF-8,
+/// and a text file is never handed out as bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoomArtifactPreviewResult {
@@ -1097,10 +1102,46 @@ pub struct LoomArtifactPreviewResult {
     pub size_bytes: i64,
     pub sha256: String,
     pub text: Option<String>,
+    /// Standard base64 of the archived bytes, only when `media_type` is set.
+    pub bytes_base64: Option<String>,
+    /// Canonical media type judged from the immutable `relative_path` extension, not from the
+    /// recorded `content_type` (that stays display metadata, never a security boundary).
+    pub media_type: Option<String>,
     pub unavailable_reason: Option<LoomArtifactPreviewUnavailableReason>,
 }
 
+/// Text previews stay bounded at 256 KiB.
 const MAX_ARTIFACT_PREVIEW_BYTES: i64 = 256 * 1024;
+/// Media previews reuse the chat attachment preview ceiling: the same 8 MiB the composer already
+/// previews, so a screenshot or PDF report is viewable without a second, larger budget.
+const MAX_ARTIFACT_MEDIA_PREVIEW_BYTES: i64 = 8 * 1024 * 1024;
+
+/// Canonical media type for an archived media file, or `None` when it is not on the whitelist.
+///
+/// The immutable `relative_path` extension is the only input: extension whitelisting keeps SVG and
+/// HTML out (both can execute), and a missing or wrong recorded `content_type` never decides.
+fn artifact_preview_media_type(relative_path: &str) -> Option<&'static str> {
+    // Judge the last segment only, so a directory named `shot.png/` cannot whitelist a text file,
+    // and accept both separators because a relative path is recorded verbatim.
+    let file_name = relative_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(relative_path);
+    let extension = file_name.rsplit_once('.').map(|(_, extension)| extension)?;
+    if extension.is_empty() || extension.len() > 5 {
+        return None;
+    }
+    // ASCII-only folding: a non-ASCII "extension" is never one of the whitelisted literals.
+    let extension = extension.to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        "pdf" => Some("application/pdf"),
+        _ => None,
+    }
+}
 
 fn required_field(operation: &str, field: &str, value: &str) -> Result<String> {
     let trimmed = value.trim();
@@ -3422,6 +3463,8 @@ pub fn artifact_preview(
                         size_bytes: row.get(5)?,
                         sha256: row.get(6)?,
                         text: None,
+                        bytes_base64: None,
+                        media_type: None,
                         unavailable_reason: None,
                     },
                 ))
@@ -3440,8 +3483,19 @@ pub fn artifact_preview(
             "Local evidence cannot carry a remote archive locator",
         ));
     }
+    // A whitelisted media file gets its own ceiling and its own body; everything else keeps the
+    // text rules untouched. Judged from the recorded path, never from the recorded content type.
+    let media_type = artifact_preview_media_type(&preview.relative_path);
+    // The judged type is a pure function of the immutable path, so it is reported even when the
+    // bytes turn out to be missing or oversized: the client still learns what the file is.
+    preview.media_type = media_type.map(str::to_string);
+    let size_limit = if media_type.is_some() {
+        MAX_ARTIFACT_MEDIA_PREVIEW_BYTES
+    } else {
+        MAX_ARTIFACT_PREVIEW_BYTES
+    };
     // Refuse by recorded size before either store opens or allocates the archived content.
-    if preview.size_bytes > MAX_ARTIFACT_PREVIEW_BYTES {
+    if preview.size_bytes > size_limit {
         preview.unavailable_reason = Some(LoomArtifactPreviewUnavailableReason::TooLarge);
         return Ok(preview);
     }
@@ -3469,9 +3523,28 @@ pub fn artifact_preview(
         None => {
             preview.unavailable_reason = Some(LoomArtifactPreviewUnavailableReason::NotArchived);
         }
-        Some(bytes) => match String::from_utf8(bytes) {
-            Ok(text) if !text.contains('\0') => preview.text = Some(text),
-            _ => preview.unavailable_reason = Some(LoomArtifactPreviewUnavailableReason::Binary),
+        Some(bytes) => match media_type {
+            // The verified channel already checked the digest; the length is checked again against
+            // the registered size because that is the number the client displays and the ceiling
+            // was chosen from.
+            Some(_) => {
+                if bytes.len() as i64 != preview.size_bytes {
+                    return Err(LoomCommandError::rejection(
+                        LOOM_EVIDENCE_UNREADABLE,
+                        format!(
+                            "evidence {artifact_id} archived bytes do not match the registered size"
+                        ),
+                    ));
+                }
+                preview.bytes_base64 = Some(STANDARD.encode(&bytes));
+            }
+            None => match String::from_utf8(bytes) {
+                Ok(text) if !text.contains('\0') => preview.text = Some(text),
+                _ => {
+                    preview.unavailable_reason =
+                        Some(LoomArtifactPreviewUnavailableReason::Binary)
+                }
+            },
         },
     }
     Ok(preview)
@@ -9178,6 +9251,8 @@ mod tests {
             size_bytes: first.size_bytes,
             sha256: first.sha256.clone(),
             text: Some("archived bytes".into()),
+            bytes_base64: None,
+            media_type: None,
             unavailable_reason: None,
         };
         assert_eq!(preview(&database, &mission_id, &first.artifact_id).unwrap(), expected);
@@ -9362,6 +9437,117 @@ mod tests {
         );
         preview(&database, &mission_id, &boundary.artifact_id).unwrap();
         assert_eq!(database.connection().total_changes(), changes_before);
+    }
+
+    /// The immutable `relativePath` extension decides whether an artifact is previewable media. A
+    /// media hit is answered with standard base64 of the archived bytes and never with text — even
+    /// when those bytes happen to be valid UTF-8 — while everything else keeps the text rules.
+    #[test]
+    fn artifact_preview_returns_whitelisted_media_bytes_by_extension() {
+        use base64::Engine as _;
+
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact media preview");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        let preview = |database: &OwnedTestDatabase, artifact_id: &str| {
+            artifact_preview(
+                database,
+                database.directory(),
+                LoomArtifactPreviewInput {
+                    mission_id: mission_id.clone(),
+                    artifact_id: artifact_id.into(),
+                },
+            )
+            .unwrap()
+        };
+        let workspace = mission_workspace(database.connection(), &mission_id).unwrap();
+        for path in ["diagram.svg", "page.html"] {
+            std::fs::write(workspace.join(path), format!("<p>{path}</p>")).unwrap();
+        }
+        // Registered as `text/plain` on purpose: the recorded content type is display metadata and
+        // must not decide the preview mode, while the extension always does.
+        for (path, bytes, media_type) in [
+            ("shot.png", b"\x89PNG\r\n\x1a".to_vec(), "image/png"),
+            ("photo.JPG", b"\xff\xd8\xff".to_vec(), "image/jpeg"),
+            ("photo.jpeg", b"\xff\xd8\xff".to_vec(), "image/jpeg"),
+            ("cover.webp", b"RIFF\xff".to_vec(), "image/webp"),
+            ("anim.gif", b"GIF89a".to_vec(), "image/gif"),
+            ("report.PDF", b"%PDF-1.7\n".to_vec(), "application/pdf"),
+            // Valid UTF-8 bytes in a media file still take the media branch, never the text one.
+            ("note.png", b"plain text that happens to be utf8".to_vec(), "image/png"),
+        ] {
+            std::fs::write(workspace.join(path), &bytes).unwrap();
+            let artifact = register(&mut database, &mission_id, path);
+            let result = preview(&database, &artifact.artifact_id);
+            assert_eq!(result.media_type.as_deref(), Some(media_type), "{path}");
+            assert_eq!(result.text, None, "{path} must not be served as text");
+            assert_eq!(result.unavailable_reason, None, "{path}");
+            assert_eq!(
+                result.bytes_base64.as_deref(),
+                Some(base64::engine::general_purpose::STANDARD.encode(&bytes).as_str()),
+                "{path} must carry the archived bytes"
+            );
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(result.bytes_base64.unwrap())
+                    .unwrap(),
+                bytes
+            );
+        }
+        // SVG and HTML are deliberately not media: they can execute, so they stay on the text path.
+        for path in ["diagram.svg", "page.html"] {
+            let artifact = register(&mut database, &mission_id, path);
+            let result = preview(&database, &artifact.artifact_id);
+            assert_eq!(result.media_type, None, "{path}");
+            assert_eq!(result.bytes_base64, None, "{path}");
+            assert_eq!(result.text, Some(format!("<p>{path}</p>")), "{path}");
+        }
+        // The media ceiling is 8 MiB and, like the text one, refuses before any storage read.
+        let oversized = vec![0u8; MAX_ARTIFACT_MEDIA_PREVIEW_BYTES as usize + 1];
+        std::fs::write(workspace.join("huge.png"), &oversized).unwrap();
+        let huge = register(&mut database, &mission_id, "huge.png");
+        std::fs::remove_file(
+            database.directory().join("managed-blobs").join("sha256")
+                .join(&huge.sha256[..2]).join(&huge.sha256),
+        )
+        .unwrap();
+        let too_large = preview(&database, &huge.artifact_id);
+        assert_eq!(too_large.bytes_base64, None);
+        assert_eq!(
+            too_large.media_type.as_deref(),
+            Some("image/png"),
+            "assertion the judged type is a pure function of the path"
+        );
+        assert_eq!(
+            too_large.unavailable_reason,
+            Some(LoomArtifactPreviewUnavailableReason::TooLarge)
+        );
+        // A media file that was never archived is still not_archived, not "binary".
+        let (sha256, size_bytes) = artifact_digest(&workspace.join("shot.png")).unwrap();
+        database
+            .connection()
+            .execute(
+                "INSERT INTO loom_artifact(artifact_id,plan_id,task_id,agent_run_id,
+                     relative_path,sha256,size_bytes,content_type,creator_id,created_at)
+                 SELECT ?1, plan_id, NULL, NULL, 'legacy-shot.png', ?2, ?3, NULL, 'local_user', ?4
+                 FROM loom_plan WHERE mission_id=?5",
+                params![
+                    "legacy_media_artifact",
+                    &sha256,
+                    size_bytes,
+                    chrono::Utc::now().to_rfc3339(),
+                    &mission_id
+                ],
+            )
+            .unwrap();
+        let legacy = preview(&database, "legacy_media_artifact");
+        assert_eq!(legacy.text, None);
+        assert_eq!(legacy.bytes_base64, None);
+        assert_eq!(legacy.media_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            legacy.unavailable_reason,
+            Some(LoomArtifactPreviewUnavailableReason::NotArchived)
+        );
     }
 
     /// A verification judges the archived bytes: evidence whose workspace files were rewritten

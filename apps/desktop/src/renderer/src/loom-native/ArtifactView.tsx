@@ -5,6 +5,7 @@ import remarkGfm from 'remark-gfm'
 import type { LoomReviewRecordReceipt } from '@contracts'
 import { useThreadClient } from '../camp-client'
 import { readErrorMessage } from '../error-message'
+import { ArtifactPdfPreview } from './ArtifactPdfPreview'
 import { Icon } from './icons'
 import './artifact-ux.css'
 import type { ArtifactSelection } from './types'
@@ -27,11 +28,33 @@ import {
   discardUnconfirmedReviewAttempt,
   taskStatusLabel,
   verificationLabel,
+  type ArtifactMedia,
   type ArtifactPreviewState,
   type ArtifactReviewDraft,
   type ArtifactReviewAttempt,
   type ArtifactReviewKind
 } from './artifact-service'
+
+/**
+ * 图片预览的 object URL：切换文件、重试、关闭浮层都必须 revoke，否则 Blob 会一直留在内存里。
+ * 只负责地址生命周期，字节仍然只来自 Core 的一次预览回执。
+ */
+function useArtifactImageUrl(media: ArtifactMedia | null): string | null {
+  const [url, setUrl] = useState<string | null>(null)
+  useEffect(() => {
+    if (media === null || media.kind !== 'image') {
+      setUrl(null)
+      return
+    }
+    const objectUrl = URL.createObjectURL(new Blob([media.bytes as BlobPart], { type: media.mediaType }))
+    setUrl(objectUrl)
+    return () => {
+      setUrl(null)
+      URL.revokeObjectURL(objectUrl)
+    }
+  }, [media])
+  return url
+}
 
 /**
  * 成果状态位（M7-C）：只描述这份成果现在在哪一步，不接管验收写入口。
@@ -154,11 +177,15 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
     }
   }
 
-  // 下载只对已取到的正文快照成立：没有正文就没有按钮，避免点了没反应的假动作。
-  const download = preview.status === 'ready' ? { text: preview.text, name: fileName } : null
+  // 下载只对已取到的快照成立：没有正文/字节就没有按钮，避免点了没反应的假动作。
+  const download = preview.status === 'ready'
+    ? { name: fileName, blob: new Blob([preview.text], { type: 'text/plain;charset=utf-8' }) }
+    : preview.status === 'media'
+      ? { name: fileName, blob: new Blob([preview.media.bytes as BlobPart], { type: preview.media.mediaType }) }
+      : null
   const startDownload = (): void => {
     if (download === null) return
-    const url = URL.createObjectURL(new Blob([download.text], { type: 'text/plain;charset=utf-8' }))
+    const url = URL.createObjectURL(download.blob)
     const anchor = document.createElement('a')
     anchor.href = url
     anchor.download = download.name
@@ -167,6 +194,12 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
     anchor.remove()
     window.setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
+
+  // 图片的 object URL 只随当前归档字节变化：切到另一份成果、重试或关闭浮层都会 revoke。
+  const imageUrl = useArtifactImageUrl(preview.status === 'media' && preview.media.kind === 'image' ? preview.media : null)
+  const imageMedia = preview.status === 'media' && preview.media.kind === 'image' ? preview.media : null
+  const [lightboxOpen, setLightboxOpen] = useState(false)
+  useEffect(() => { if (imageUrl === null) setLightboxOpen(false) }, [imageUrl])
 
   const toggleCriterion = (criterionId: string): void => {
     if (draft !== null) saveDraft({ ...draft, satisfied: draft.satisfied.includes(criterionId)
@@ -220,9 +253,9 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
   }
 
   const unavailableText = (reason: 'too_large' | 'binary' | 'not_archived'): string =>
-    reason === 'too_large' ? '该文件较大，暂不支持正文预览。'
+    reason === 'too_large' ? '该文件较大，暂不支持预览。'
       : reason === 'binary' ? '这是二进制文件，不展示正文。'
-        : '这份成果没有归档正文，只能看登记信息。'
+        : '这份成果没有归档内容，只能看登记信息。'
 
   const documentBody = preview.status === 'reading'
     ? <div className="ln-artifact-state" data-state="reading" role="status">正在读取正文…</div>
@@ -232,20 +265,36 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
         </div>
       : preview.status === 'error'
         ? <div className="ln-artifact-state" data-state="error" role="alert">
-            <span>正文读取失败：{preview.message}</span>
+            <span>内容读取失败：{preview.message}</span>
             <button type="button" className="ln-artifact-retry" onClick={() => setRetry(value => value + 1)}>重试</button>
           </div>
-        : markdown
-          ? <div className="ln-markdown">
-              <ReactMarkdown
-                remarkPlugins={[[remarkGfm, { singleTilde: false }]]}
-                skipHtml
-                disallowedElements={['img', 'iframe', 'object', 'embed', 'script', 'style']}
-                unwrapDisallowed
-                urlTransform={defaultUrlTransform}
-              >{stripLeadingHeading(preview.text)}</ReactMarkdown>
-            </div>
-          : <pre className="ln-artifact-text">{preview.text}</pre>
+        : preview.status === 'media'
+          ? preview.media.kind === 'pdf'
+            ? <ArtifactPdfPreview bytes={preview.media.bytes} fileName={fileName}/>
+            : imageUrl === null
+              // 字节已经解码，但 object URL 还没就绪：这是短暂的过渡态，不是「没有图」。
+              ? <div className="ln-artifact-state" data-state="reading" role="status">正在准备图片…</div>
+              : <div className="ln-artifact-media" data-media={preview.media.mediaType}>
+                  <button
+                    type="button" className="ln-artifact-image-button"
+                    title="放大查看" aria-label={`放大查看 ${fileName} · 按 Esc 关闭`}
+                    onClick={() => setLightboxOpen(true)}
+                  >
+                    <img className="ln-artifact-image" src={imageUrl} alt={fileName}/>
+                  </button>
+                  <p className="ln-artifact-image-hint">{preview.media.mediaType} · 点击图片放大</p>
+                </div>
+          : markdown
+            ? <div className="ln-markdown">
+                <ReactMarkdown
+                  remarkPlugins={[[remarkGfm, { singleTilde: false }]]}
+                  skipHtml
+                  disallowedElements={['img', 'iframe', 'object', 'embed', 'script', 'style']}
+                  unwrapDisallowed
+                  urlTransform={defaultUrlTransform}
+                >{stripLeadingHeading(preview.text)}</ReactMarkdown>
+              </div>
+            : <pre className="ln-artifact-text">{preview.text}</pre>
 
   // 可写入口只有一种条件：候选是链头且尚无评审；已有回执则一律锁住。
   const candidate = facts.candidate
@@ -253,7 +302,8 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
   const canSubmit = contextAvailable && !pending && receipt === null && (attempt !== null || (draft !== null && facts.reviewable && facts.latest && reviewDraftComplete(draft, facts)))
   const documentTitle = preview.status === 'ready' && markdown ? /^\s*#\s+(.+)$/mu.exec(preview.text)?.[1] ?? fileName : fileName
 
-  return <Dialog.Root open onOpenChange={next => { if (!next) onClose() }}>
+  return <>
+  <Dialog.Root open onOpenChange={next => { if (!next) onClose() }}>
     <Dialog.Portal>
       <div className="ln-portal" data-theme={theme}>
         <Dialog.Overlay className="ln-artifact-overlay"/>
@@ -276,7 +326,7 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
               </span>}
             <span className="ln-artifact-head-actions">
               {download !== null && <button
-                type="button" className="ln-artifact-download" title="下载正文" aria-label="下载正文"
+                type="button" className="ln-artifact-download" title="下载文件" aria-label="下载文件"
                 onClick={startDownload}
               ><Icon name="download" size={16}/><span>下载</span></button>}
               <Dialog.Close asChild>
@@ -440,4 +490,20 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
       </div>
     </Dialog.Portal>
   </Dialog.Root>
+    {/* 图片灯箱：和附件卡同一套 Radix Dialog 手法，但用 ln- 前缀的新样式，不复用旧表面类。 */}
+    {imageMedia !== null && imageUrl !== null && <Dialog.Root open={lightboxOpen} onOpenChange={setLightboxOpen}>
+      <Dialog.Portal>
+        <div className="ln-portal" data-theme={theme}>
+          <Dialog.Overlay className="ln-artifact-lightbox-overlay"/>
+          <Dialog.Content className="ln-artifact-lightbox" aria-describedby={undefined}>
+            <Dialog.Title className="ln-artifact-lightbox-title">{fileName}</Dialog.Title>
+            <img className="ln-artifact-lightbox-image" src={imageUrl} alt={fileName}/>
+            <Dialog.Close className="ln-artifact-lightbox-close" aria-label="关闭图片预览">
+              <Icon name="close" size={16}/>
+            </Dialog.Close>
+          </Dialog.Content>
+        </div>
+      </Dialog.Portal>
+    </Dialog.Root>}
+  </>
 }

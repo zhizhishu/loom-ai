@@ -63,3 +63,6 @@ __pycache__/
 /resources/runtime/dsh-hook-executor/
 # Generated, verified complete official DSH ACP runtime.
 /resources/runtime/dsh/
+# Generated pdf.js runtime assets copied from node_modules by the root postinstall script
+# (worker, cmaps, standard fonts, wasm, iccs) for the Renderer public directory.
+/apps/desktop/src/renderer/public/pdfjs/

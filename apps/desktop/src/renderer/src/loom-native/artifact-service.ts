@@ -40,8 +40,62 @@ export type LoomRpc = Pick<ThreadClient, 'request'>
 export type ArtifactPreviewState =
   | { status: 'reading' }
   | { status: 'ready'; text: string }
+  | { status: 'media'; media: ArtifactMedia }
   | { status: 'unavailable'; reason: 'too_large' | 'binary' | 'not_archived' }
   | { status: 'error'; message: string }
+
+/** Core 归一后的媒体类型：白名单与 Core 一一对应，多一个都不认。 */
+export type ArtifactMediaType =
+  | 'image/png'
+  | 'image/jpeg'
+  | 'image/webp'
+  | 'image/gif'
+  | 'application/pdf'
+
+/** 媒体预览：图片走 Blob 灯箱，PDF 走 pdf.js 画布；字节是 Core 归档字节的解码结果。 */
+export type ArtifactMedia = {
+  mediaType: ArtifactMediaType
+  kind: 'image' | 'pdf'
+  bytes: Uint8Array
+}
+
+const ARTIFACT_MEDIA_TYPES: readonly ArtifactMediaType[] = [
+  'image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf'
+]
+
+/**
+ * 只认白名单里的规范化媒体类型。返回值不认识（含缺字段、`null`、拼错的类型、svg/html）
+ * 时给 null，调用方据此走文本逻辑或直接报读失败，绝不按「大约像图片」放行。
+ */
+export function normalizeArtifactMediaType(value: unknown): ArtifactMediaType | null {
+  if (typeof value !== 'string') return null
+  return ARTIFACT_MEDIA_TYPES.find(entry => entry === value) ?? null
+}
+
+/** 图片与 PDF 在界面上是两种完全不同的渲染路径，判定只在这里做一次。 */
+export function artifactMediaKind(mediaType: ArtifactMediaType): 'image' | 'pdf' {
+  return mediaType === 'application/pdf' ? 'pdf' : 'image'
+}
+
+/**
+ * 标准 base64 → 字节。任何不合法的输入都返回 null，调用方必须当读失败处理：
+ * 这里不做「尽量解码」，也不吞掉长度错误，否则半张图会被当成整张展示。
+ */
+export function decodeArtifactBase64(value: unknown): Uint8Array | null {
+  if (typeof value !== 'string' || value.length === 0 || value.length % 4 !== 0) return null
+  // 标准字母表 + 只在末尾出现的 padding：`atob` 对多数坏输入已经会抛，这是第二道门。
+  if (!/^[A-Za-z0-9+/]+={0,2}$/u.test(value)) return null
+  if (typeof atob !== 'function') return null
+  let binary: string
+  try {
+    binary = atob(value)
+  } catch {
+    return null
+  }
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
+  return bytes
+}
 
 /** 文件名主标题：只取路径最后一段，不显示整条相对路径。 */
 export function artifactFileName(relativePath: string): string {
@@ -64,11 +118,23 @@ export function artifactSizeLabel(bytes: number): string {
 /**
  * 预览回执 → 界面状态。只认契约里的取值：形状不认识就是读失败，
  * 绝不把「读不到」伪装成 not_archived。
+ *
+ * 优先级是刻意的：Core 命中媒体白名单就只给 `bytesBase64`，所以媒体分支必须排在
+ * 文本之前——即便字节恰好是 UTF-8 也走媒体，不能退回文本。媒体命中了却没有可用字节
+ * 就是读失败，不猜测、不降级成文本。
  */
 export function previewStateFromResult(result: LoomArtifactPreviewResult): ArtifactPreviewState {
   const reason = result.unavailableReason
   if (reason === 'too_large' || reason === 'binary' || reason === 'not_archived') {
     return { status: 'unavailable', reason }
+  }
+  const mediaType = normalizeArtifactMediaType(result.mediaType)
+  if (mediaType !== null) {
+    const bytes = decodeArtifactBase64(result.bytesBase64)
+    if (bytes === null || bytes.length === 0) {
+      return { status: 'error', message: '媒体预览没有可用的归档字节' }
+    }
+    return { status: 'media', media: { mediaType, kind: artifactMediaKind(mediaType), bytes } }
   }
   if (typeof result.text === 'string') return { status: 'ready', text: result.text }
   return { status: 'error', message: '预览没有返回正文' }

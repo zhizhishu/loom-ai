@@ -3,6 +3,38 @@
 .ln-artifact-dialog .ln-artifact-error{overflow-wrap:anywhere}
 .ln-artifact-dialog .ln-artifact-review-form button[type=submit]{min-height:38px}
 .ln-artifact-dialog .ln-artifact-fact-note{line-height:1.75}
+
+/* Media previews: an image and a PDF are read in the same document column as text, so they
+   never introduce a second surface or a fake viewer chrome. Tokens only, ln- prefix only. */
+.ln-artifact-media{display:flex;flex-direction:column;gap:10px;align-items:flex-start;max-width:100%;min-width:0}
+.ln-artifact-image-button{display:block;max-width:100%;padding:0;border-radius:14px;overflow:hidden;cursor:zoom-in;background:var(--ln-card);box-shadow:var(--ln-shadow)}
+.ln-artifact-image-button:hover{box-shadow:0 2px 12px #0000001f}
+.ln-artifact-image-button:focus-visible{outline:2px solid var(--ln-blue);outline-offset:3px}
+.ln-artifact-image{display:block;width:auto;height:auto;max-width:100%;max-height:min(68vh,720px);object-fit:contain}
+.ln-artifact-image-hint{margin:0;font-size:12px;color:var(--ln-muted)}
+
+.ln-artifact-pdf{display:flex;flex-direction:column;gap:10px;min-width:0;max-width:100%}
+.ln-artifact-pdf-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--ln-muted)}
+.ln-artifact-pdf-pages{font-variant-numeric:tabular-nums}
+.ln-artifact-pdf-actions{display:flex;align-items:center;gap:4px;margin-left:auto}
+.ln-artifact-pdf-actions button{display:inline-flex;align-items:center;justify-content:center;min-width:26px;height:26px;padding:0 7px;border-radius:8px;font-size:12px;color:var(--ln-muted)}
+.ln-artifact-pdf-actions button:hover:not(:disabled){background:var(--ln-hover);color:var(--ln-text)}
+.ln-artifact-pdf-actions button[data-active=true]{background:var(--ln-card);color:var(--ln-text)}
+.ln-artifact-pdf-zoom{min-width:42px;text-align:center;font-variant-numeric:tabular-nums}
+.ln-artifact-pdf-pages-scroll{display:flex;flex-direction:column;align-items:center;gap:14px;max-height:min(70vh,760px);overflow:auto;padding:4px;scrollbar-width:thin;overscroll-behavior:contain}
+.ln-artifact-pdf-page{position:relative;flex:0 0 auto;overflow:hidden;border-radius:10px;background:#fff;box-shadow:0 1px 6px #0000001f}
+.ln-artifact-pdf-page canvas{display:block}
+/* Page number stays visible on placeholder pages: an unrendered page is still a page. */
+.ln-artifact-pdf-page-number{position:absolute;right:6px;bottom:6px;padding:1px 6px;border-radius:6px;background:#000000b3;color:#fff;font-size:11px;font-variant-numeric:tabular-nums;pointer-events:none}
+
+/* Image lightbox: same Radix Dialog technique as the attachment card, new ln- surface. */
+.ln-artifact-lightbox-overlay{position:fixed;inset:0;z-index:110;background:#10101080;backdrop-filter:blur(6px)}
+.ln-artifact-lightbox{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:111;display:flex;align-items:center;justify-content:center;width:min(1100px,calc(100vw - 48px));height:min(820px,calc(100dvh - 48px));padding:44px 16px 16px;border-radius:21px;background:var(--ln-bg);box-shadow:0 24px 70px #0006}
+.ln-artifact-lightbox-title{position:absolute;top:12px;left:16px;max-width:calc(100% - 80px);margin:0;font-size:13px;font-weight:500;color:var(--ln-muted);overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.ln-artifact-lightbox-image{max-width:100%;max-height:100%;object-fit:contain;border-radius:12px}
+.ln-artifact-lightbox-close{position:absolute;top:9px;right:10px;display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:9px;color:var(--ln-muted)}
+.ln-artifact-lightbox-close:hover{background:var(--ln-hover);color:var(--ln-text)}
+
 @media(max-width:800px){
  .ln-artifact-dialog .ln-artifact-body{display:block;overflow-y:auto;overscroll-behavior:contain}
  .ln-artifact-dialog .ln-artifact-document{overflow:visible;min-height:150px;padding:22px 24px 26px}
@@ -14,4 +46,6 @@
  .ln-artifact-dialog .ln-artifact-title{max-width:none;flex:1;font-size:13px}
  .ln-artifact-dialog .ln-artifact-head{gap:6px;padding:0 12px}
  .ln-artifact-dialog .ln-artifact-download>span{display:none}
+ .ln-artifact-pdf-actions{margin-left:0}
+ .ln-artifact-lightbox{width:calc(100vw - 24px);height:calc(100dvh - 24px);padding:42px 10px 10px}
 }

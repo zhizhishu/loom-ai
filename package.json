@@ -13,6 +13,7 @@
     "node": ">=24"
   },
   "scripts": {
+    "postinstall": "node scripts/copy-pdfjs-assets.mjs",
     "docs:check:version": "node scripts/check-doc-version.mjs",
     "docs:check:decisions": "node scripts/check-doc-decisions.mjs",
     "docs:check:ci": "node scripts/check-doc-version.mjs && node scripts/check-doc-decisions.mjs --require-base",
@@ -215,6 +216,7 @@
     "micromark-util-decode-string": "2.0.1",
     "open-bot-avatar": "0.2.0",
     "parse5": "7.3.0",
+    "pdfjs-dist": "6.4.299",
     "pinyin-pro": "3.29.5",
     "qrcode": "1.5.4",
     "qrcode.react": "4.2.0",

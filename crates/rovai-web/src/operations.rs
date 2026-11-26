@@ -543,6 +543,10 @@ impl Operation {
                     "sizeBytes",
                     "sha256",
                     "text",
+                    // Media previews are the same read, not a second RPC: the bytes stay behind the
+                    // same admission list as the text they replace.
+                    "bytesBase64",
+                    "mediaType",
                     "unavailableReason",
                 ],
             ),
@@ -1087,6 +1091,21 @@ mod tests {
         let mut with_private_field = preview_result.clone();
         with_private_field["archivePath"] = json!("private-archive");
         assert_eq!(preview.project(with_private_field), preview_result);
+        // Media previews ride the same admission: the bytes and the canonical media type pass,
+        // a private archive locator does not.
+        let media_result = json!({
+            "artifactId":"artifact_fixture", "relativePath":"chart.png",
+            "contentType":null, "sizeBytes":4, "sha256":"fixture_digest",
+            "text":null, "bytesBase64":"iVBORw==", "mediaType":"image/png",
+            "unavailableReason":null
+        });
+        let mut media_with_private_field = media_result.clone();
+        media_with_private_field["archivePath"] = json!("private-archive");
+        assert_eq!(
+            preview.project(media_with_private_field),
+            media_result,
+            "media bytes are admitted through the same field list"
+        );
         for unregistered in ["loom.artifacts.preview", "loom.artifact.read"] {
             assert!(serde_json::from_value::<Operation>(json!(unregistered)).is_err());
         }

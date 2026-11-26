@@ -178,6 +178,7 @@ import {
 } from './dingtalk-channel-settings'
 import { CoreFilePreviewSourceAuthority } from './file-preview/file-preview-authority'
 import { FilePreviewService } from './file-preview/file-preview-service'
+import { createPdfjsAssetHandler, PDFJS_ASSET_SCHEME } from './pdfjs-asset-protocol'
 import {
   parseChooseRootRequest,
   parseCopyPathRequest,
@@ -380,6 +381,17 @@ const APP_NAME = 'Rovai AI'
 app.setName(APP_NAME)
 protocol.registerSchemesAsPrivileged([{
   scheme: 'rovai-preview',
+  privileges: {
+    standard: true,
+    secure: true,
+    supportFetchAPI: true,
+    corsEnabled: true,
+    stream: true
+  }
+}, {
+  // pdf.js 的 worker 与静态资产。生产是 file: 页面，页面自己取不到 file:// 资产，
+  // 所以由主进程协议按白名单读 out/renderer/pdfjs。
+  scheme: PDFJS_ASSET_SCHEME,
   privileges: {
     standard: true,
     secure: true,
@@ -638,6 +650,7 @@ const filePreview = new FilePreviewService(
   }
 )
 const filePreviewProtocolSessions = new WeakSet<Electron.Session>()
+const pdfjsAssetProtocolSessions = new WeakSet<Electron.Session>()
 
 function installFilePreviewProtocol(window: BrowserWindow): void {
   const targetSession = window.webContents.session
@@ -656,6 +669,21 @@ function installFilePreviewProtocol(window: BrowserWindow): void {
   )
   targetSession.protocol.handle('rovai-preview', (request) => filePreview.serveHtmlAsset(request))
   filePreviewProtocolSessions.add(targetSession)
+}
+
+/**
+ * pdf.js 资产协议：只读 `out/renderer/pdfjs`（生产 asar 内的构建产物）。
+ *
+ * 开发期页面是 http，走 Vite public 目录，不会命中这个协议；生产 `loadFile` 下
+ * `file://` 页面无法 fetch/XHR 同源文件，pdf.js 的 cmaps/字体/wasm 只能从这里来。
+ * 授权逻辑与 `rovai-preview` 完全分开：这里没有内容句柄，只有固定的只读资产根。
+ */
+function installPdfjsAssetProtocol(window: BrowserWindow): void {
+  const targetSession = window.webContents.session
+  if (pdfjsAssetProtocolSessions.has(targetSession)) return
+  const assetRoot = join(import.meta.dirname, '../renderer/pdfjs')
+  targetSession.protocol.handle(PDFJS_ASSET_SCHEME, createPdfjsAssetHandler(assetRoot))
+  pdfjsAssetProtocolSessions.add(targetSession)
 }
 
 function publishLocalDegradations(next: StructuredError[]): void {
@@ -836,6 +864,7 @@ function createWindow(): void {
   })
   const webContentsId = window.webContents.id
   installFilePreviewProtocol(window)
+  installPdfjsAssetProtocol(window)
   if (process.platform === 'win32') window.setMenuBarVisibility(false)
   mainWindow = window
   if (localStoresReady) {

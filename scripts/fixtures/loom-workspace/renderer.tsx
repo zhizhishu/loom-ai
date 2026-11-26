@@ -318,6 +318,9 @@ function readArtifactPreview(input: LoomArtifactPreviewInput): LoomArtifactPrevi
     sizeBytes: artifact.sizeBytes,
     sha256: artifact.sha256,
     text: text === undefined ? null : text,
+    // 夹具没有登记图片/PDF 产物，所以媒体两列如实为 null：媒体预览要真字节，不能编。
+    bytesBase64: null,
+    mediaType: null,
     unavailableReason: text === undefined ? 'not_archived' : null
   }
 }

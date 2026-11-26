@@ -244,7 +244,7 @@ export interface LoomArtifactPreviewInput {
   artifactId: string
 }
 
-/** 只读已归档的文本（最多 256 KiB）；不会记录核验或验收状态。 */
+/** 只读已归档的文本（最多 256 KiB）或媒体字节（最多 8 MiB）；不会记录核验或验收状态。 */
 export interface LoomArtifactPreviewResult {
   artifactId: string
   relativePath: string
@@ -252,6 +252,23 @@ export interface LoomArtifactPreviewResult {
   sizeBytes: number
   sha256: string
   text: string | null
+  /**
+   * 媒体命中时的归档字节（标准 base64）；非媒体文件为 null。
+   *
+   * 可空但不省略：Core 总会写出这个键。声明成可选只是为了让本次改动不强迫
+   * 与媒体预览无关的旧构造点补字段；读端缺任何一个都必须当读失败处理，不得
+   * 把「没有字节」当成「不是媒体」。
+   */
+  bytesBase64?: string | null
+  /**
+   * 按不可变 `relativePath` 扩展名归一出的媒体类型；非媒体文件为 null。
+   *
+   * 只可能是 `image/png`、`image/jpeg`、`image/webp`、`image/gif`、`application/pdf`。
+   * 登记时的 `contentType` 只是展示元数据，不能当安全边界，也不能决定这里。
+   * 命中的类型是路径的纯函数：字节因过大/未归档而读不到时仍会给出，那时确实没
+   * `bytesBase64`，读端必须先看 `unavailableReason`。
+   */
+  mediaType?: string | null
   unavailableReason: 'too_large' | 'binary' | 'not_archived' | null
 }
 

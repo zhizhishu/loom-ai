@@ -16,7 +16,9 @@ import { AgentMarkdown } from './AgentMarkdown'
 import { workStatus } from './Inspector'
 import { Inspector } from './Inspector'
 import { ArtifactReviewStatus } from './ArtifactView'
-import { artifactCandidateFacts, previewStateFromResult, reviewDraftComplete, submitArtifactReview, artifactFileName, readArtifactPreview, type LoomRpc } from './artifact-service'
+import { artifactCandidateFacts, previewStateFromResult, reviewDraftComplete, submitArtifactReview, artifactFileName, readArtifactPreview, artifactMediaKind, decodeArtifactBase64, normalizeArtifactMediaType, type LoomRpc } from './artifact-service'
+import { PDF_MAX_CANVAS_PIXELS, pdfPageGeometry, pdfPageSlotSize, pdfRenderErrorMessage, pdfjsAssetUrl, pdfjsWorkerUrl } from './artifact-pdf'
+import { ArtifactPdfPage, ArtifactPdfPreview } from './ArtifactPdfPreview'
 
 const criteria = { version: 'pinned-v1', criteria: [{ criterionId: 'a', text: 'Content verified' }, { criterionId: 'b', text: 'Review complete' }] }
 const task = { taskId:'t',planId:'p',title:'Actual work',description:'Actual description',assigneeAgentId:'a',status:'ready',acceptanceCriteria:criteria,blockedReason:null,createdAt:'2026-11-13T00:00:00Z',updatedAt:'2026-11-13T00:00:00Z',revision:1 } satisfies LoomTask
@@ -25,7 +27,7 @@ const first = { candidateId:'c1',taskId:'t',agentRunId:'r',contentHash:'a'.repea
 const second: LoomCandidate = { ...first,candidateId:'c2',evidenceIds:['file2'],previousCandidateId:'c1',createdAt:'2026-11-13T00:01:00Z' }
 const mission = { missionId:'m',threadId:'th',title:'Real mission',runningAgentIds:[] } as unknown as MissionRecord
 function bundle(candidates: LoomCandidate[] = [first], over: Partial<WorkBundle> = {}): WorkBundle { return {mission,plan:null,tasks:[task],candidates,artifacts:[artifact],reviews:[],verifications:[],...over} }
-const preview: LoomArtifactPreviewResult = { artifactId:'file1',relativePath:'out/report.md',contentType:'text/markdown',sizeBytes:32,sha256:artifact.sha256,text:'# Exact archived text',unavailableReason:null }
+const preview: LoomArtifactPreviewResult = { artifactId:'file1',relativePath:'out/report.md',contentType:'text/markdown',sizeBytes:32,sha256:artifact.sha256,text:'# Exact archived text',bytesBase64:null,mediaType:null,unavailableReason:null }
 
 // Control projection fixtures: the same shapes `loom.control.get` returns, so
 // 「审查中／等你」的判定读的是真合同字段，不是为测试编出来的中间态。
@@ -321,5 +323,149 @@ describe('workspace dock empty states (Mikka empty.tsx)', () => {
       expect(dock(mode)).not.toContain('ln-inspector-empty')
       expect(dock(mode)).not.toContain('ln-dock-empty')
     }
+  })
+})
+
+// 媒体预览：图片与 PDF 走同一条 loom.artifact.preview 回执的字节，Markdown/纯文本的行为不动。
+// 这里的断言只吃契约字段（mediaType/bytesBase64），不编造 Core 不会返回的形状。
+describe('artifact media preview', () => {
+  // 0x89 0x50 0x4e 0x47 = PNG 魔数前四字节；base64 由 Core 的标准编码产生。
+  const pngBase64 = 'iVBORw=='
+  const pngBytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47])
+  const media = (over: Partial<LoomArtifactPreviewResult> = {}): LoomArtifactPreviewResult =>
+    ({ ...preview, relativePath: 'out/shot.png', text: null, bytesBase64: pngBase64, mediaType: 'image/png', ...over })
+
+  it('maps a whitelisted image to the image media state with the archived bytes', () => {
+    const state = previewStateFromResult(media())
+    expect(state.status).toBe('media')
+    expect(state).toMatchObject({ status: 'media', media: { mediaType: 'image/png', kind: 'image' } })
+    expect(state.status === 'media' ? Array.from(state.media.bytes) : null).toEqual(Array.from(pngBytes))
+  })
+  it('maps a PDF to the pdf media state instead of the text body', () => {
+    const state = previewStateFromResult(media({ relativePath: 'out/report.pdf', mediaType: 'application/pdf', bytesBase64: 'JVBERi0=' }))
+    expect(state).toMatchObject({ status: 'media', media: { mediaType: 'application/pdf', kind: 'pdf' } })
+  })
+  it('never serves media bytes as text even when both fields are present', () => {
+    // 字节恰好是 UTF-8 也不行：命中媒体就走媒体，文本分支只属于非媒体文件。
+    const state = previewStateFromResult(media({ text: 'looks like text' }))
+    expect(state.status).toBe('media')
+    expect(state).not.toHaveProperty('text')
+  })
+  it('keeps Markdown and plain text exactly as they were', () => {
+    expect(previewStateFromResult({ ...preview, bytesBase64: null, mediaType: null }))
+      .toEqual({ status: 'ready', text: '# Exact archived text' })
+    expect(previewStateFromResult(media({ relativePath: 'out/notes.txt', mediaType: null, bytesBase64: null, text: 'plain' })))
+      .toEqual({ status: 'ready', text: 'plain' })
+  })
+  it('reports a media hit without usable bytes as an error instead of success', () => {
+    for (const broken of [null, '', 'not base64!', 'abc']) {
+      expect(previewStateFromResult(media({ bytesBase64: broken }))).toMatchObject({ status: 'error' })
+    }
+    // 缺字段同样不能当成「不是媒体」而落回文本。
+    const missing = { ...preview, relativePath: 'out/shot.png', text: null, mediaType: 'image/png' }
+    expect(previewStateFromResult(missing)).toMatchObject({ status: 'error' })
+  })
+  it('does not treat unsupported or malformed media types as media', () => {
+    for (const value of ['image/svg+xml', 'text/html', 'image/png; charset=binary', '', null, 42]) {
+      expect(normalizeArtifactMediaType(value)).toBeNull()
+    }
+    // 不认识的类型：有正文就仍是正文，没正文就是读失败。
+    expect(previewStateFromResult(media({ mediaType: 'image/svg+xml', text: '<svg/>' })))
+      .toEqual({ status: 'ready', text: '<svg/>' })
+    expect(previewStateFromResult(media({ mediaType: 'image/svg+xml', text: null })))
+      .toMatchObject({ status: 'error' })
+  })
+  it('keeps the Core unavailable reasons in front of any media branch', () => {
+    for (const reason of ['too_large', 'not_archived', 'binary'] as const) {
+      expect(previewStateFromResult(media({ bytesBase64: null, unavailableReason: reason })))
+        .toEqual({ status: 'unavailable', reason })
+    }
+  })
+  it('only accepts strict standard base64', () => {
+    expect(decodeArtifactBase64(pngBase64)).toEqual(pngBytes)
+    expect(decodeArtifactBase64('')).toBeNull()
+    expect(decodeArtifactBase64('iVBORw')).toBeNull()
+    expect(decodeArtifactBase64('iVBO Rw==')).toBeNull()
+    expect(decodeArtifactBase64('iVBORw==\n')).toBeNull()
+    expect(decodeArtifactBase64(42)).toBeNull()
+    expect(artifactMediaKind('application/pdf')).toBe('pdf')
+    for (const image of ['image/png', 'image/jpeg', 'image/webp', 'image/gif'] as const) {
+      expect(artifactMediaKind(image)).toBe('image')
+    }
+  })
+  it('serves pdf.js assets from the privileged protocol on file: pages and relatively on http', () => {
+    const fileBase = 'file:///app/out/renderer/index.html'
+    // 生产 loadFile：file 页面自己取不到 file:// 兄弟资源（CORS/XHR 都不允许），
+    // 改走主进程协议，协议根就是 out/renderer/pdfjs，所以路径里不再带 pdfjs/ 前缀。
+    expect(pdfjsAssetUrl('cmaps/', fileBase)).toBe('rovai-pdfjs://asset/cmaps/')
+    expect(pdfjsAssetUrl('/standard_fonts/', fileBase)).toBe('rovai-pdfjs://asset/standard_fonts/')
+    expect(pdfjsAssetUrl('wasm/', fileBase)).toBe('rovai-pdfjs://asset/wasm/')
+    expect(pdfjsAssetUrl('iccs/', fileBase)).toBe('rovai-pdfjs://asset/iccs/')
+    expect(pdfjsWorkerUrl('6.4.299', fileBase)).toBe('rovai-pdfjs://asset/pdf.worker.min.mjs?v=6.4.299')
+    // 开发期是 http 基址：同一相对路径解析到 dev server，不是站点根，也不是私有协议。
+    expect(pdfjsAssetUrl('cmaps/', 'http://localhost:5173/')).toBe('http://localhost:5173/pdfjs/cmaps/')
+    expect(pdfjsWorkerUrl('6.4.299', 'http://localhost:5173/'))
+      .toBe('http://localhost:5173/pdfjs/pdf.worker.min.mjs?v=6.4.299')
+    // 两种形态都不许出现 `file:` 直读，也不许把 pdfjs/ 再嵌一层。
+    for (const url of ['cmaps/', 'standard_fonts/', 'wasm/', 'iccs/', 'pdf.worker.min.mjs'].map(path => pdfjsAssetUrl(path, fileBase))) {
+      expect(url.startsWith('rovai-pdfjs://asset/')).toBe(true)
+      expect(url.includes('file:')).toBe(false)
+      expect(url.includes('pdfjs/pdfjs')).toBe(false)
+    }
+    // http 形态仍然是「文档基址 + pdfjs/…」：根路径 `/pdfjs` 在生产 loadFile 下会 404。
+    for (const url of ['cmaps/', 'wasm/', 'iccs', 'pdf.worker.min.mjs'].map(path => pdfjsAssetUrl(path, 'https://rovai.example/out/renderer/index.html'))) {
+      expect(url.startsWith('https://rovai.example/out/renderer/pdfjs/')).toBe(true)
+    }
+  })
+  it('caps a single page bitmap and keeps the page aspect ratio', () => {
+    // A4 @2x：普通页不降采样，占位与位图都按同一比例放大。
+    const a4 = pdfPageGeometry(595, 842, 2)
+    expect(a4.css).toEqual({ width: 595, height: 842 })
+    expect(a4.pixels).toEqual({ width: 1190, height: 1684 })
+    expect(a4.transform).toEqual([2, 0, 0, 2, 0, 0])
+    // 怪页（两万点见方）也只许吃到像素上限，且宽高比不能被拉歪。
+    const huge = pdfPageGeometry(20000, 20000, 2)
+    expect(huge.pixels.width * huge.pixels.height).toBeLessThanOrEqual(PDF_MAX_CANVAS_PIXELS)
+    expect(huge.pixels.width * huge.pixels.height * 4).toBeLessThanOrEqual(64 * 1024 * 1024)
+    expect(Math.abs(huge.pixels.width / huge.pixels.height - 1)).toBeLessThan(0.01)
+    // 1:1 时不传 transform（pdf.js 默认就是 1:1），dpr 非法也退回 1。
+    expect(pdfPageGeometry(600, 800, 1).transform).toBeUndefined()
+    expect(pdfPageGeometry(600, 800, Number.NaN).pixels).toEqual({ width: 600, height: 800 })
+  })
+  it('sizes a not-yet-rendered page from the first page so scrolling never jumps', () => {
+    expect(pdfPageSlotSize(595, 842, 1)).toEqual({ width: 595, height: 842 })
+    expect(pdfPageSlotSize(595, 842, 1.5)).toEqual({ width: 893, height: 1263 })
+    expect(pdfPageSlotSize(0, Number.NaN, 2)).toEqual({ width: 1, height: 1 })
+  })
+  it('gives an off-screen page a height placeholder and a page number instead of a bitmap', () => {
+    // 离屏页只留占位与页码：没有位图就没有 backing store，页数再多也不涨内存。
+    const html = renderToStaticMarkup(createElement(ArtifactPdfPage, {
+      pdfDocument: null, pageNumber: 7, scale: 1.5, live: false,
+      slot: pdfPageSlotSize(595, 842, 1.5), onError: () => undefined
+    }))
+    expect(html).toContain('data-page="7"')
+    expect(html).toContain('data-live="false"')
+    expect(html).toContain('data-rendered="false"')
+    expect(html).toContain('height:1263px')
+    expect(html).toContain('width:893px')
+    expect(html).toContain('ln-artifact-pdf-page-number">7</span>')
+  })
+  it('gives the PDF surface the required controls and a loading state before any render', () => {
+    // 静态渲染只跑到「打开中」：真正的画布渲染要 Electron 的 canvas，这里锁定的是
+    // 页数位、缩小/放大/适配宽度和加载态都必须真实存在，而不是空白容器。
+    const html = renderToStaticMarkup(createElement(ArtifactPdfPreview, { bytes: Uint8Array.from([0x25, 0x50]), fileName: 'report.pdf' }))
+    expect(html).toContain('ln-artifact-pdf')
+    expect(html).toContain('正在打开 PDF…')
+    expect(html).toContain('aria-label="缩小"')
+    expect(html).toContain('aria-label="放大"')
+    expect(html).toContain('aria-label="适配宽度"')
+    expect(html).toContain('aria-label="report.pdf PDF 预览"')
+  })
+  it('classifies pdf.js failures into readable messages without leaking a stack', () => {
+    expect(pdfRenderErrorMessage(new Error('No password given'))).toBe('这份 PDF 受密码保护，无法预览。')
+    expect(pdfRenderErrorMessage(new Error('InvalidPDFException: bad xref'))).toBe('这份 PDF 无法解析。')
+    expect(pdfRenderErrorMessage(new Error('boom'))).toBe('PDF 渲染失败：boom')
+    expect(pdfRenderErrorMessage(undefined)).toBe('PDF 渲染失败。')
+    expect(pdfRenderErrorMessage(new Error('x'.repeat(400))).length).toBeLessThan(240)
   })
 })
