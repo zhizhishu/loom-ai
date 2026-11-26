@@ -53,7 +53,7 @@ function makePackage(root, letter, contract = { version: 'v1.72', projectionSche
   mkdirSync(directory)
   const files = {}
   const longPath = 'runtime/pi/' + Array.from({ length: 4 }, (_, i) => 'dependency-' + i + '-'.repeat(48)).join('/') + '/index.js'
-  for (const path of [...required, 'runtime/pi/.runtime-marker', longPath]) {
+  for (const path of [...required, 'runtime/pi/.runtime-marker', 'runtime/pi/node/node.exe', longPath]) {
     const value = Buffer.from(letter + ':' + path)
     mkdirSync(dirname(join(directory, path)), { recursive: true })
     writeFileSync(join(directory, path), value)
@@ -138,43 +138,6 @@ test('declared Hook runtime is complete, bound to its manifest, and checked befo
   assert.notEqual(damaged.status, 0)
   assert.match(damaged.stderr, /Damaged program file: runtime\/dsh-hook-executor\/executor\.mjs/)
   assert.equal(existsSync(f.data), false, 'a rejected package must not start its Server or create data')
-})
-
-test('bundled DSH 0.2 rejects missing files and mismatched manifests before installation or startup', { skip: !windows }, t => {
-  const f = fixture(t)
-  const pkg = makePackage(f.root, 'd')
-  const manifestPath = join(pkg, 'candidate-manifest.json')
-  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-  manifest.dshRuntime = { rootVersion: '0.2.0-rc.2', manifestSha256: '0'.repeat(64) }
-  const save = () => writeFileSync(manifestPath, JSON.stringify(manifest))
-  save()
-  const missing = run('Install', f.install, ['-PackageDirectory', pkg])
-  assert.notEqual(missing.status, 0)
-  assert.match(missing.stderr, /DSH runtime is incomplete/)
-  assert.equal(existsSync(f.install), false)
-  for (const relative of ['runtime/pi/node/node.exe', 'runtime/dsh/dsh-runtime-bundle.json',
-    'runtime/dsh/verify.mjs', 'runtime/dsh/package.json', 'runtime/dsh/package-lock.json',
-    'runtime/dsh/node_modules/.bin/dsh.cmd', 'runtime/dsh/THIRD-PARTY-NOTICES.txt']) {
-    const path = join(pkg, relative)
-    const value = relative.endsWith('.json') ? '{}\n' : 'isolated DSH version fixture: ' + relative
-    mkdirSync(dirname(path), { recursive: true })
-    writeFileSync(path, value)
-    manifest.files[relative] = hash(value)
-  }
-  save()
-  const unbound = run('Install', f.install, ['-PackageDirectory', pkg])
-  assert.notEqual(unbound.status, 0)
-  assert.match(unbound.stderr, /DSH runtime manifest does not match/)
-  assert.equal(existsSync(f.install), false)
-  manifest.dshRuntime.manifestSha256 = manifest.files['runtime/dsh/dsh-runtime-bundle.json']
-  save()
-  installPackage(pkg, f)
-  const installed = join(f.install, 'versions', 'd'.repeat(40))
-  writeFileSync(join(installed, 'runtime/dsh/verify.mjs'), 'unverified tampering')
-  const damaged = run('Start', f.install)
-  assert.notEqual(damaged.status, 0)
-  assert.match(damaged.stderr, /Damaged program file: runtime\/dsh\/verify\.mjs/)
-  assert.equal(existsSync(f.data), false, 'bad DSH must not create personal data')
 })
 
 test('install, upgrade and compatible rollback keep data and both program versions', { skip: !windows }, t => {

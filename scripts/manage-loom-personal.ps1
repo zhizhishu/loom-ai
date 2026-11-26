@@ -205,19 +205,6 @@ function Verify-Package([string]$Root, [switch]$InstalledStart) {
             throw 'DSH Hook manifest does not match the package file list.'
         }
     }
-    if ($manifest.ContainsKey('dshRuntime')) {
-        $dsh = $manifest.dshRuntime
-        if ($dsh.rootVersion -cne '0.2.0-rc.2') { throw 'Unsupported bundled DSH version.' }
-        foreach ($required in @('runtime/pi/node/node.exe', 'runtime/dsh/dsh-runtime-bundle.json',
-            'runtime/dsh/verify.mjs', 'runtime/dsh/package.json', 'runtime/dsh/package-lock.json',
-            'runtime/dsh/node_modules/.bin/dsh.cmd', 'runtime/dsh/THIRD-PARTY-NOTICES.txt')) {
-            if (-not $allowed.Contains($required)) { throw "DSH runtime is incomplete: $required" }
-        }
-        if ($dsh.manifestSha256 -cnotmatch '^[0-9a-f]{64}$' -or
-            $dsh.manifestSha256 -cne $manifest.files.'runtime/dsh/dsh-runtime-bundle.json') {
-            throw 'DSH runtime manifest does not match the package file list.'
-        }
-    }
     if ($InstalledStart) {
         # The whole closure was verified before activation. Recheck entry
         # points on launch without rereading thousands of Pi dependency files.
@@ -226,11 +213,7 @@ function Verify-Package([string]$Root, [switch]$InstalledStart) {
             @($allowed | Where-Object {
                 $_ -match '^runtime/dsh-hook-executor/(hook-executor-bundle\.json|executor\.mjs|verify\.mjs|package(?:-lock)?\.json|THIRD-PARTY-NOTICES\.txt)$'
             })
-        if ($manifest.ContainsKey('dshRuntime')) {
-            $entries += @('runtime/pi/node/node.exe', 'runtime/dsh/dsh-runtime-bundle.json',
-                'runtime/dsh/verify.mjs', 'runtime/dsh/package.json', 'runtime/dsh/package-lock.json',
-                'runtime/dsh/node_modules/.bin/dsh.cmd')
-        }
+        $entries += @('runtime/pi/node/node.exe')
         foreach ($relative in $entries) {
             $file = Resolve-Directory (Join-Path $Root $relative)
             if ((File-Hash $file) -cne $manifest.files[$relative]) { throw "Damaged program file: $relative" }
@@ -294,30 +277,6 @@ function Run-Loom([string]$Root, [string]$DataRoot, [int]$ListenPort, $Manifest)
     $env:CODEX_HOME = Join-Path $DataRoot 'runtime-home\codex'
     $env:CLAUDE_CONFIG_DIR = Join-Path $DataRoot 'runtime-home\claude'
     $env:DSH_HOME = Join-Path $DataRoot 'runtime-home\dsh'
-    $oldPath = $env:Path
-    $oldNodeOptions = $env:NODE_OPTIONS
-    $oldNodePath = $env:NODE_PATH
-    $oldDshBinary = $env:ROVAI_DEEPSEEK_HARNESS_BIN
-    if ($Manifest.ContainsKey('dshRuntime')) {
-        $node = Join-Path $Root 'runtime\pi\node\node.exe'
-        $dsh = Join-Path $Root 'runtime\dsh'
-        $dshBinary = Join-Path $dsh 'node_modules\.bin\dsh.cmd'
-        $env:NODE_OPTIONS = $null
-        $env:NODE_PATH = $null
-        $env:Path = (Split-Path -Parent $node) + [IO.Path]::PathSeparator + $oldPath
-        $ownedPriorDsh = $oldDshBinary -and $oldDshBinary -match '(?i)[\\/]LOOM-Personal[\\/]versions[\\/][0-9a-f]{40}[\\/]runtime[\\/]dsh[\\/]node_modules[\\/]\.bin[\\/]dsh\.cmd$'
-        if (-not $oldDshBinary -or $ownedPriorDsh) { $env:ROVAI_DEEPSEEK_HARNESS_BIN = $dshBinary }
-        try {
-            & $node (Join-Path $dsh 'verify.mjs') $Manifest.dshRuntime.manifestSha256 | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'Bundled DSH runtime verification failed before startup.' }
-        } catch {
-            $env:Path = $oldPath
-            $env:NODE_OPTIONS = $oldNodeOptions
-            $env:NODE_PATH = $oldNodePath
-            $env:ROVAI_DEEPSEEK_HARNESS_BIN = $oldDshBinary
-            throw
-        }
-    }
     # Host-owned configuration only. The browser still requires independent
     # view/control consent; the assistant bridge still requires its own grant.
     if ($Manifest.ContainsKey('computerRuntime')) {
@@ -332,17 +291,8 @@ function Run-Loom([string]$Root, [string]$DataRoot, [int]$ListenPort, $Manifest)
     Write-Host "Personal data: $DataRoot"
     # The native Server prepares its private data root, Skill library and MCP
     # path. Never create this directory with inherited ACLs in the launcher.
-    try {
-        & (Join-Path $Root 'rovai-server.exe') --data-dir $DataRoot --listen "127.0.0.1:$ListenPort"
-        if ($LASTEXITCODE -ne 0) { throw "LOOM could not start (exit $LASTEXITCODE). Your data was kept." }
-    } finally {
-        if ($Manifest.ContainsKey('dshRuntime')) {
-            $env:Path = $oldPath
-            $env:NODE_OPTIONS = $oldNodeOptions
-            $env:NODE_PATH = $oldNodePath
-            $env:ROVAI_DEEPSEEK_HARNESS_BIN = $oldDshBinary
-        }
-    }
+    & (Join-Path $Root 'rovai-server.exe') --data-dir $DataRoot --listen "127.0.0.1:$ListenPort"
+    if ($LASTEXITCODE -ne 0) { throw "LOOM could not start (exit $LASTEXITCODE). Your data was kept." }
 }
 
 $InstallDirectory = Resolve-Directory $InstallDirectory
