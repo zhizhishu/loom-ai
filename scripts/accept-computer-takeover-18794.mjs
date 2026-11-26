@@ -249,7 +249,7 @@ async function run () {
 
   const mouseScript = join(desktop, 'mouse-listener.py')
   const clickReceipt = join(desktop, 'click-receipt.txt')
-  writeFileSync(mouseScript, `import os,sys,termios,tty\nout=sys.argv[1]\nsys.stdout.write('\\x1b[?1000h')\nsys.stdout.flush()\nfd=sys.stdin.fileno()\nold=termios.tcgetattr(fd)\ntty.setraw(fd)\ntry:\n    while True:\n        data=os.read(fd,6)\n        if len(data)>=6 and data[:3]==b'\\x1b[M':\n            open(out,'w').write('button=%d,col=%d,row=%d' % (data[3]-32,data[4]-32,data[5]-32))\n            break\nfinally:\n    termios.tcsetattr(fd,termios.TCSADRAIN,old)\n`)
+  writeFileSync(mouseScript, `import os,sys,termios,tty\nout=sys.argv[1]\nsys.stdout.write('\\x1b[?1000h')\nsys.stdout.flush()\nfd=sys.stdin.fileno()\nold=termios.tcgetattr(fd)\ntty.setraw(fd)\ntry:\n    while True:\n        data=os.read(fd,6)\n        if len(data)>=6 and data[:3]==b'\\x1b[M':\n            open(out,'w').write('button=%d,col=%d,row=%d' % (data[3]-32,data[4]-32,data[5]-32))\n            # Keep listening: approval-mode validation consumes one click before human takeover.\nfinally:\n    termios.tcsetattr(fd,termios.TCSADRAIN,old)\n`)
   const target = remember(spawn('xterm', ['-geometry', '120x40+0+0', '-T', 'LOOM TAKEOVER CLICK TARGET', '-e', '/usr/bin/python3', mouseScript, clickReceipt], {
     env: { ...process.env, DISPLAY: xvfb.display },
     stdio: ['ignore', 'ignore', 'pipe']
