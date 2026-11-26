@@ -1,5 +1,6 @@
 import { AgentMarkdown } from './AgentMarkdown'
 import { AgentOpenUiButton } from './AgentOpenUiButton'
+import { CitationChip } from './AgentCitations'
 import { inlineMarkdown, isComponent, openUIText, parseOpenUI, splitOpenUI, str, type Value } from './openui-lang'
 
 /**
@@ -38,8 +39,7 @@ function Node({ value }: { value: Value | undefined }) {
     case 'InlineText':
       return <p className="ln-openui-inline"><Inline value={value.props.parts}/></p>
     case 'TaskChip': case 'RunChip':
-      // Upstream's own degradation: the raw id when the conversation cannot show the issue or run (agent-citations.tsx:195).
-      return <span className="ln-openui-chip">{str(value.props.id).toLowerCase()}</span>
+      return <CitationChip id={str(value.props.id).toLowerCase()} kind={value.name === 'TaskChip' ? 'issue' : 'run'}/>
     case 'SourceChip': {
       const url = str(value.props.url)
       if (!url) return null
@@ -76,8 +76,8 @@ function Inline({ value }: { value: Value | undefined }) {
   if (Array.isArray(value)) return <>{value.map((item, index) => <Inline key={index} value={item}/>)}</>
   if (!isComponent(value)) return null
   if (value.name === 'InlineText') return <Inline value={value.props.parts}/>
-  if (value.name === 'TaskChip') return <span className="ln-openui-chip">{str(value.props.id).toLowerCase()}</span>
-  if (value.name === 'RunChip') return <span className="ln-openui-chip">{str(value.props.id).toLowerCase()}</span>
+  if (value.name === 'TaskChip') return <CitationChip id={str(value.props.id).toLowerCase()} kind="issue"/>
+  if (value.name === 'RunChip') return <CitationChip id={str(value.props.id).toLowerCase()} kind="run"/>
   if (value.name === 'SourceChip') {
     const url = str(value.props.url)
     return url ? <a className="ln-openui-chip" href={url} target="_blank" rel="noreferrer noopener">{str(value.props.label) || url}</a> : null

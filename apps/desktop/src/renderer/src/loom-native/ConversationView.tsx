@@ -18,6 +18,7 @@ import { RunEventLine, RunningActivity } from './RunningActivity'
 import { manualRetryUx } from './retry-ux'
 import { wakeRestoreLines } from './wake-restore'
 import { approvalAging, approvalAgingText } from './approval-aging'
+import { AgentCitationContext, type CitationContextValue, type CitationReference } from './AgentCitations'
 import { runtimeFailureMessage } from '../RuntimeFailureNotice'
 import { RuntimeInstallationGuide } from '../RuntimeInstallationGuide'
 import { runtimeInstallGuide } from '../runtime-install-guide'
@@ -101,7 +102,7 @@ function ApprovalAge({ requestedAt }: { requestedAt: string | null }) {
   return <small className="ln-approval-age" data-aged={aging.aged || undefined}>{text}</small>
 }
 
-export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, onDraft, onFiles, onSend, onPrompt, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onPreviewAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager, onRetryRun, onConfigureRuntime, onOpenRuntimeSetup, hostPlatform = null, questions = [], onAnswerQuestion, onStopRun, stoppingRunIds = [] }: {
+export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, onDraft, onFiles, onSend, onPrompt, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onPreviewAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager, onRetryRun, onConfigureRuntime, onOpenRuntimeSetup, hostPlatform = null, questions = [], onAnswerQuestion, onStopRun, stoppingRunIds = [], onOpenTaskCitation }: {
   item: ConversationItem | null; snapshot: ThreadSnapshot | null; agents: AgentProfile[]; bundles: WorkBundle[]; loading: boolean; sending: boolean
   draft: string; files: File[]; error: string | null; onDraft(value: string): void; onFiles(files: File[]): void
   onSend(agentId?: string): void; onPrompt?(text: string): Promise<boolean>; onProfile(): void; onArtifact(selection: ArtifactSelection): void
@@ -113,6 +114,8 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   questions?: PiQuestion[]; onAnswerQuestion?(question: PiQuestion, answer: PiAnswer): Promise<void>
   onRetryRun?(): void; onConfigureRuntime?(): void; onOpenRuntimeSetup?(): void; hostPlatform?: HostPlatformKey | null
   onStopRun?(run: AgentRunView): void; stoppingRunIds?: readonly string[]
+  /** Open a cited LOOM task in the work inspector; absent outside the app shell. */
+  onOpenTaskCitation?(taskId: string): void
 }) {
   const scroll = useRef<HTMLDivElement>(null)
   const input = useRef<HTMLTextAreaElement>(null)
@@ -208,6 +211,35 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
     target.scrollIntoView({ block: 'center', behavior: 'smooth' })
     setShowLatest(true)
   }
+  const citationContext = useMemo<CitationContextValue>(() => ({
+    resolve: (id, kind) => {
+      if (kind !== 'run') {
+        for (const bundle of bundles) {
+          const task = bundle.tasks.find(row => row.taskId === id)
+          if (task) return { kind: 'issue', id, label: task.title }
+        }
+      }
+      if (kind !== 'issue') {
+        const run = snapshot?.agentRuns.find(row => row.id === id)
+        if (run) {
+          const name = agents.find(agent => agent.agentId === run.agentId)?.displayName || '助手'
+          return { kind: 'run', id, label: `${name} · ${agentRunPresentation(run).label}` }
+        }
+      }
+      return null
+    },
+    onOpen: (reference: CitationReference) => {
+      if (reference.kind === 'issue') { onOpenTaskCitation?.(reference.id); return }
+      const run = snapshot?.agentRuns.find(row => row.id === reference.id)
+      if (run?.anchorMessageId) { jumpToMessage(run.anchorMessageId); return }
+      const target = scroll.current?.querySelector<HTMLElement>(`[data-run-id="${CSS.escape(reference.id)}"]`)
+      if (target) {
+        pinned.current = false
+        target.scrollIntoView({ block: 'center', behavior: 'smooth' })
+        setShowLatest(true)
+      }
+    }
+  }), [agents, bundles, snapshot?.agentRuns, onOpenTaskCitation])
   const title = item?.title || activeAgent?.displayName || 'LOOM'
   // 群里说话是「给群名发消息」（Mikka `group-chat-view.tsx:271` 传的是 group.title）；
   // 只有单聊才写助手名（Mikka `messages/zh-CN.json:212` Nav.messageBot）。
@@ -240,6 +272,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
     setMention(null); setMentionIndex(0)
   }
   return <AgentOpenUiProvider value={openUiHost}>
+  <AgentCitationContext.Provider value={citationContext}>
   <main className="ln-conversation" aria-label={`与${title}的对话`}>
     <header className="ln-chat-header">
       {sidebarHidden && <IconButton icon="panel" label="展开会话列表" onClick={onShowSidebar} className="ln-chat-sidebar-toggle"/>}
@@ -344,6 +377,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
       </form>}
     </div>
   </main>
+  </AgentCitationContext.Provider>
   </AgentOpenUiProvider>
 }
 

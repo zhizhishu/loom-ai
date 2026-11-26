@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import { AgentMarkdown } from './AgentMarkdown'
 import { AgentMermaid } from './AgentMermaid'
+import { AgentCitationContext } from './AgentCitations'
 
 const render = (text: string, isStreaming = false): string => renderToStaticMarkup(createElement(AgentMarkdown, { text, isStreaming }))
 const mermaidFence = '```mermaid\ngraph LR\n  A-->B\n```'
@@ -55,6 +56,35 @@ describe('agent Markdown in the native conversation', () => {
     const html = render('[来源](https://example.test/doc)')
     expect(html).toContain('target="_blank"')
     expect(html).toContain('rel="noreferrer noopener"')
+  })
+  it('draws issue and run citations as compact chips', () => {
+    const issue = '3f6c1a52-8d0e-4b7a-9c3e-1f2a3b4c5d6e'
+    const run = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'
+    const html = render(`完成 [[issue:${issue}]]，见 [[run:${run}]]`)
+    expect(html).toContain('ln-citation-chip')
+    expect(html).toContain(`data-citation-kind="issue" data-citation-id="${issue}"`)
+    expect(html).toContain(`data-citation-kind="run" data-citation-id="${run}"`)
+    expect(html).toContain('任务 3f6c1a52')
+    expect(html).toContain('运行 a1b2c3d4')
+  })
+  it('uses conversation facts to label a citation and expose its click target', () => {
+    const issue = '3f6c1a52-8d0e-4b7a-9c3e-1f2a3b4c5d6e'
+    const html = renderToStaticMarkup(createElement(AgentCitationContext.Provider, {
+      value: {
+        resolve: (id: string, kind: 'issue' | 'run' | 'any') => kind !== 'run' && id === issue ? { kind: 'issue' as const, id, label: '修好登录页' } : null,
+        onOpen: () => undefined
+      }
+    }, createElement(AgentMarkdown, { text: `完成 [[issue:${issue}]]` })))
+    expect(html).toContain('<button type="button" class="ln-citation-chip"')
+    expect(html).toContain('打开任务引用：修好登录页')
+    expect(html).toContain('修好登录页')
+  })
+  it('keeps an unresolved bare id as words and hides a partial streamed citation', () => {
+    const id = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'
+    expect(render(`处理 ${id}`)).toContain(`处理 ${id}`)
+    const streaming = render(`正在看 [[run:${id.slice(0, 12)}`, true)
+    expect(streaming).toContain('正在看</p>')
+    expect(streaming).not.toContain('[[run:')
   })
   it('does not turn raw HTML in a reply into markup', () => {
     expect(render('<script>alert(1)</script>')).not.toContain('<script')

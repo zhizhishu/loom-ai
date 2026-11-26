@@ -7,8 +7,10 @@ import { AgentMermaid } from './AgentMermaid'
 import { AgentOpenUi } from './AgentOpenUi'
 import { imageSourceInMessage, plainText } from './agent-images'
 import { parseOpenUI } from './openui-lang'
+import { remarkCitations, withoutPartialCitation } from './citations'
+import { CitationAnchor } from './AgentCitations'
 
-const MARKDOWN_PLUGINS = [remarkGfm]
+const MARKDOWN_PLUGINS = [remarkGfm, remarkCitations]
 
 export type AgentMarkdownProps = {
   text: string
@@ -20,16 +22,17 @@ const MarkdownStreaming = createContext(false)
 
 /**
  * Counterpart of Mikka `components/workspace/agent-markdown.tsx`, cut down to what this round carries:
- * GFM Markdown, Mermaid fences, OpenUI card fences and message pictures. Upstream's math split (`agent-math-markdown`, KaTeX) and
- * citation remark plugin are not part of LOOM yet and are left out instead of stubbed. `img` is upstream's
+ * GFM Markdown, Mermaid fences, OpenUI card fences, citation chips and message pictures. Upstream's math split (`agent-math-markdown`, KaTeX)
+ * is not part of LOOM yet and is left out instead of stubbed. `img` is upstream's
  * `MarkdownImage` (agent-markdown.tsx:37-40) with one difference: upstream can refuse the picture because it
  * ships a lookup-driven illustration component, LOOM has no such lookup, so a message's own https URL is shown
  * and only an unusable one degrades to its alt text.
  */
 export const AgentMarkdown = memo(function AgentMarkdown({ text, isStreaming = false }: AgentMarkdownProps) {
+  const shown = isStreaming ? withoutPartialCitation(text) : text
   return <div data-agent-markdown className="ln-markdown">
     <MarkdownStreaming value={isStreaming}>
-      <ReactMarkdown remarkPlugins={MARKDOWN_PLUGINS} skipHtml components={components}>{text}</ReactMarkdown>
+      <ReactMarkdown remarkPlugins={MARKDOWN_PLUGINS} skipHtml components={components}>{shown}</ReactMarkdown>
     </MarkdownStreaming>
   </div>
 })
@@ -63,7 +66,7 @@ function MarkdownPre({ children }: { children?: ReactNode }) {
  * paragraph, chip and code block on each streamed token, replaying their enter animations (the chat flashed).
  */
 const components: NonNullable<ComponentProps<typeof ReactMarkdown>['components']> = {
-  a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer noopener" />,
+  a: ({ node: _node, ...props }) => <CitationAnchor {...props} />,
   img: MarkdownImage,
   pre: MarkdownPre,
   table: MarkdownTable,
