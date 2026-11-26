@@ -14,8 +14,10 @@ export function botBoardBucket(item: BoardTarget, seenId?: string): BoardBucket 
   if (item.resultId && item.resultId !== seenId) return 'review'
   return 'idle'
 }
-// PiBot runtime-bot-board derives global tasks; LOOM has no per-Bot live projection.
-// Pending acceptance alone never means a user action: workStatus checks control facts.
+// PiBot runtime-bot-board derives global tasks; LOOM's first live projection uses only
+// existing facts: member presence/removal, runtime readiness, Mission runningAgentIds,
+// assigned work, and review candidates. Pending acceptance alone never means a user action:
+// workStatus checks control facts.
 export function botBoardTargets(agents: readonly AgentProfile[], conversations: readonly ConversationItem[],
   missions: readonly MissionRecord[], bundles: WorkBundle[]): BoardTarget[] {
   const work = flattenWork(bundles)
@@ -28,12 +30,19 @@ export function botBoardTargets(agents: readonly AgentProfile[], conversations: 
       .sort((a,b) => (b.candidate?.createdAt??'').localeCompare(a.candidate?.createdAt??''))[0]
     const mission = related.find(m=>m.status==='needs_you') ?? related.find(m=>m.runningAgentIds.includes(agent.agentId))
     const active = attention ?? working ?? result ?? tasks[0]
-    return { key:agent.agentId, name:agent.displayName, attention:!!attention||mission?.status==='needs_you',
-      working:!!working||related.some(m=>m.runningAgentIds.includes(agent.agentId)),
+    const online = agent.removedAt == null && agent.presence !== 'away' && agent.presence !== 'removed'
+    const runtimeNeedsAttention = online && agent.runtimeReadiness?.status === 'needs_attention'
+    const running = related.some(m=>m.runningAgentIds.includes(agent.agentId))
+    const busy = !!working || running
+    const needsUser = !!attention || mission?.status==='needs_you' || runtimeNeedsAttention
+    return { key:agent.agentId, name:agent.displayName, attention:needsUser,
+      working:busy,
       resultId:result?.candidate?.candidateId,
       threadId:active?.mission.threadId ?? mission?.threadId ?? conversations.find(c=>c.agentId===agent.agentId)?.threadId ?? null,
-      taskId:active?.task.taskId ?? null, title:active?.task.title ?? mission?.title ?? '',
-      status:active?workStatus(active).label:mission?.status==='needs_you'?'需要你':mission?'进行中':'空闲', online:true,
+      taskId:active?.task.taskId ?? null,
+      title:active?.task.title ?? mission?.title ?? (runtimeNeedsAttention?'运行配置需要处理':''),
+      status:!online?(agent.presence==='away'?'离开':'已移除'):active?workStatus(active).label:runtimeNeedsAttention?'运行需处理':mission?.status==='needs_you'?'需要你':mission?'进行中':'空闲',
+      online,
       runtimeLabel:agent.runtimeConfiguration?.adapterKind?RUNTIME_LABELS[agent.runtimeConfiguration.adapterKind]??agent.runtimeConfiguration.adapterKind:'未配置' }
   })
 }
