@@ -488,6 +488,18 @@ pub fn configure_skill_roots(root: &Path, bootstrap: Option<&str>) -> Result<()>
     Ok(())
 }
 
+fn native_acp_default_model() -> Option<Value> {
+    let path = native_home().ok()?.join("cordis.patch.yml");
+    let rows: Value = serde_yaml::from_slice(&fs::read(path).ok()?).ok()?;
+    let row = rows
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str() == Some("agent-default-model"))?;
+    let provider = row["config"]["provider"].as_str()?;
+    let model = row["config"]["model"].as_str()?;
+    Some(json!({"provider":provider,"model":model}))
+}
+
 pub fn configure_host(
     command: &mut Command,
     root: &Path,
@@ -533,6 +545,15 @@ pub fn configure_host(
         {"id":"acp","inject":["acpAppStartup","rovaiDshReady"]},
         {"insert":[{"id":"rovai-bootstrap","name":plugin_path,"config":{"bindingRoot":binding_root,"observationRoot":observation_root,"mcpServerNames":mcp_server_names}}]}
     ]);
+    if let Some(config) = native_acp_default_model()
+        && let Some(row) = patch
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["id"] == "acp")
+    {
+        row["config"] = config;
+    }
     // Model overrides are applied only in memory after native initialization.
     // A CLI llm-pi-ai override here can be absorbed into DSH's Profile import.
     patch
