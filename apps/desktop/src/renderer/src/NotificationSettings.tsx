@@ -202,7 +202,7 @@ export function NotificationSettings(): React.JSX.Element {
   return (
     <>
       <SettingsPageHeader
-        eyebrow="Settings / Reminders"
+        eyebrow={uiAttribute("设置 / 提醒")}
         title={uiAttribute("提醒")}
         description={uiAttribute("设置需要显示临时浮层的提醒。")}
       />
@@ -255,7 +255,7 @@ export function NotificationPreferenceEditor({
       <legend><UiText zh={"应用内提醒类别"} /></legend>
       <div className="notification-master-panel">
         <span className="notification-master-icon" aria-hidden="true">
-          <svg viewBox="0 0 20 20">
+          <svg width="20" height="20" viewBox="0 0 20 20">
             <path d="M5.25 8.5a4.75 4.75 0 0 1 9.5 0v3.25l1.35 1.65H3.9l1.35-1.65V8.5Z" />
             <path d="M8.25 15.1a1.9 1.9 0 0 0 3.5 0" />
           </svg>

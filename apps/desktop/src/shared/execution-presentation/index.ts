@@ -279,18 +279,18 @@ export function agentRunPresentation(
   }
   if (run.status === 'failed') {
     const reasons: Record<string, string> = {
-      runtime_not_configured: '尚未配置 Runtime',
-      runtime_configuration_invalid: 'Runtime 配置不完整',
-      adapter_installation_missing: '未找到所选 Runtime 安装',
-      adapter_installation_disabled: '所选 Runtime 已停用',
-      runtime_configuration_adapter_mismatch: 'Runtime 与权限配置不匹配',
-      runtime_permission_adapter_mismatch: 'Runtime 与权限配置不匹配',
-      conversation_runtime_override_unsupported: '当前会话的 Runtime 覆盖配置不受支持',
-      runtime_adapter_not_implemented: '当前平台尚不支持所选 Runtime'
+      runtime_not_configured: '尚未配置运行端',
+      runtime_configuration_invalid: '运行端配置不完整',
+      adapter_installation_missing: '未找到所选运行端安装',
+      adapter_installation_disabled: '所选运行端已停用',
+      runtime_configuration_adapter_mismatch: '运行端与权限配置不匹配',
+      runtime_permission_adapter_mismatch: '运行端与权限配置不匹配',
+      conversation_runtime_override_unsupported: '当前会话的运行端覆盖配置不受支持',
+      runtime_adapter_not_implemented: '当前平台尚不支持所选运行端'
     }
     const code = run.terminalReasonCode ?? ''
     return { label: reasons[code] ?? (code.startsWith('runtime_permission_')
-      ? 'Runtime 权限配置无效' : code.startsWith('runtime_model_') ? 'Runtime 模型配置无效' : '失败'), tone: 'danger' }
+      ? '运行端权限配置无效' : code.startsWith('runtime_model_') ? '运行端模型配置无效' : '失败'), tone: 'danger' }
   }
   if (run.status === 'cancelled') {
     return run.terminalReasonCode === 'planned_shutdown_cancelled'

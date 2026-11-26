@@ -147,7 +147,7 @@ export function AboutUpdatesSettingsView({
   return (
     <div className="about-updates-settings" data-update-read-only={readOnly}>
       <SettingsPageHeader
-        eyebrow="Settings / About & Updates"
+        eyebrow={uiAttribute("设置 / 关于与更新")}
         title={uiAttribute("关于与更新")}
         description={readOnly ? uiAttribute("版本信息与更新日志。") : uiAttribute("自动检查新版本，下载与安装由你决定。")}
       />
@@ -156,7 +156,7 @@ export function AboutUpdatesSettingsView({
         <section className="about-updates-overview" aria-label={uiAttribute("版本与更新")}>
           <div className="about-updates-topline">
             <div className="about-identity">
-              <svg className="about-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 L13.16 7.3 L17.76 8.84 L13.16 10.38 L12 15.68 L10.84 10.38 L6.24 8.84 L10.84 7.3 Z" fill="currentColor"/><path d="M3 20.96 Q12 15.96 21 20.96" fill="none" stroke="currentColor" strokeWidth="2.08" strokeLinecap="round"/><circle className="brand-rendezvous-point" data-brand-point="rendezvous" cx="12" cy="18.46" r="1.05" fill="currentColor"/></svg>
+              <svg className="about-mark" width="34" height="34" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 L13.16 7.3 L17.76 8.84 L13.16 10.38 L12 15.68 L10.84 10.38 L6.24 8.84 L10.84 7.3 Z" fill="currentColor"/><path d="M3 20.96 Q12 15.96 21 20.96" fill="none" stroke="currentColor" strokeWidth="2.08" strokeLinecap="round"/><circle className="brand-rendezvous-point" data-brand-point="rendezvous" cx="12" cy="18.46" r="1.05" fill="currentColor"/></svg>
               <div>
                 <strong>Rovai AI{product === 'server' ? ' Server' : ''}</strong>
                 <p><UiText zh={"当前版本 "} /><span data-installed-version>{snapshot ? displayVersion(snapshot.currentVersion) : loading ? uiAttribute("读取中…") : uiAttribute("暂不可用")}</span></p>
@@ -257,7 +257,7 @@ export function AboutUpdatesSettingsView({
 
         {!readOnly && snapshot && (snapshot.checkedAt || snapshot.lastSuccessfulCheckAt) && (
           <details className="settings-disclosure about-history">
-            <summary><span><UiText zh={"检查记录"} /></span><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4"/></svg></summary>
+            <summary><span><UiText zh={"检查记录"} /></span><svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4"/></svg></summary>
             <dl className="about-facts" aria-label={uiAttribute("更新检查记录")}>
               <div><dt><UiText zh={"本次检查"} /></dt><dd>{formatCheckAttempt(snapshot)}</dd></div>
               <div><dt><UiText zh={"上次成功"} /></dt><dd>{formatTimestamp(snapshot.lastSuccessfulCheckAt)}</dd></div>
@@ -463,7 +463,7 @@ function checkFailure(snapshot: AppUpdateSnapshot): {
 }
 
 function UpdateStatusIcon({ tone, busy }: { tone: string; busy: boolean }): React.JSX.Element {
-  return <svg className="about-update-status-icon" viewBox="0 0 16 16" aria-hidden="true">
+  return <svg className="about-update-status-icon" width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
     {tone === 'error' ? <path d="M8 2 14 13H2ZM8 6v3m0 2h.01" />
       : tone === 'success' ? <path d="m3 8 3 3 7-7" />
         : busy ? <path d="M8 2a6 6 0 1 1-5.2 3M2 2v4h4" />

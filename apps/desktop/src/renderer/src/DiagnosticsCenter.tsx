@@ -231,7 +231,7 @@ export function DiagnosticsCenter({
   return (
     <div className="diagnostics-center">
       <SettingsPageHeader
-        eyebrow="Settings / Diagnostics"
+        eyebrow={uiAttribute("设置 / 诊断")}
         title={uiAttribute("诊断与修复")}
         description={uiAttribute("检查运行环境并处理可安全修复的问题。")}
         aside={(
@@ -462,25 +462,25 @@ function DiagnosticDetails({ check, compact = false }: { check: DiagnosticCheck;
 
 function DiagnosticStatusIcon({ status }: { status: DiagnosticStatus }): React.JSX.Element {
   if (status === 'ok') {
-    return <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="m8 12 2.7 2.7L16.5 9" /></svg>
+    return <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="m8 12 2.7 2.7L16.5 9" /></svg>
   }
   if (status === 'attention') {
-    return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.3 4.2 2.8 17.1A2 2 0 0 0 4.5 20h15a2 2 0 0 0 1.7-2.9L13.7 4.2a2 2 0 0 0-3.4 0Z" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+    return <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path d="M10.3 4.2 2.8 17.1A2 2 0 0 0 4.5 20h15a2 2 0 0 0 1.7-2.9L13.7 4.2a2 2 0 0 0-3.4 0Z" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
   }
-  return <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M9.8 9a2.4 2.4 0 0 1 4.65.8c0 1.8-2.45 2.05-2.45 3.7" /><path d="M12 17h.01" /></svg>
+  return <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M9.8 9a2.4 2.4 0 0 1 4.65.8c0 1.8-2.45 2.05-2.45 3.7" /><path d="M12 17h.01" /></svg>
 }
 
 function DiagnosticGlyph({ name }: { name: 'shield' | 'close' | 'refresh' | 'chevron' }): React.JSX.Element {
   if (name === 'shield') {
-    return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6l-7-3Z" /><path d="m9 12 2 2 4-4" /></svg>
+    return <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6l-7-3Z" /><path d="m9 12 2 2 4-4" /></svg>
   }
   if (name === 'close') {
-    return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>
+    return <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>
   }
   if (name === 'refresh') {
-    return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5" /><path d="M4 17v-5h5" /><path d="M6.1 8.5A7 7 0 0 1 18.8 7L20 12M4 12l1.2 5a7 7 0 0 0 12.7-1.5" /></svg>
+    return <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5" /><path d="M4 17v-5h5" /><path d="M6.1 8.5A7 7 0 0 1 18.8 7L20 12M4 12l1.2 5a7 7 0 0 0 12.7-1.5" /></svg>
   }
-  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 9.5 5 5 5-5" /></svg>
+  return <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 9.5 5 5 5-5" /></svg>
 }
 
 export function diagnosticActionForCheck(check: DiagnosticCheck): DiagnosticAction | null {

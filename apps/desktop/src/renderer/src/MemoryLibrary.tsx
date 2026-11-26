@@ -685,7 +685,7 @@ export function MemoryLibrary({
           {scopeTabs.map(([value, label]) => <button key={value} type="button" data-memory-scope={value} className={scope === value ? 'active' : ''} aria-pressed={scope === value} disabled={loading} onClick={() => setScope(value)}>{uiAttribute(label)}</button>)}
         </nav>
         <label className="memory-search">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
+          <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
           <span className="sr-only"><UiText zh="搜索记忆" /></span>
           <input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder={uiAttribute("搜索记忆")} disabled={loading} />
         </label>
@@ -812,7 +812,7 @@ function MemoryDetail({
         </div>
         <div className="memory-detail-actions">
           <DropdownMenu.Root>
-            <DropdownMenu.Trigger asChild><button type="button" className="memory-more-button" aria-label={uiAttribute("更多记忆操作")} disabled={busy !== null}><svg viewBox="0 0 20 20" aria-hidden="true" fill="currentColor"><circle cx="4" cy="10" r="1.4" /><circle cx="10" cy="10" r="1.4" /><circle cx="16" cy="10" r="1.4" /></svg></button></DropdownMenu.Trigger>
+            <DropdownMenu.Trigger asChild><button type="button" className="memory-more-button" aria-label={uiAttribute("更多记忆操作")} disabled={busy !== null}><svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true" fill="currentColor"><circle cx="4" cy="10" r="1.4" /><circle cx="10" cy="10" r="1.4" /><circle cx="16" cy="10" r="1.4" /></svg></button></DropdownMenu.Trigger>
             <DropdownMenu.Portal><DropdownMenu.Content className="memory-actions-menu" align="end" sideOffset={5} onCloseAutoFocus={(event) => { if (openingDialog.current) { event.preventDefault(); openingDialog.current = false } }}>
               {memory.lifecycle === 'active' && <>
                 <DropdownMenu.Item onSelect={() => { openingDialog.current = true; onReview(memory) }}><UiText zh="设置下次复核" /></DropdownMenu.Item>
@@ -1018,7 +1018,7 @@ function ReviewScheduleDialog({
                       ? formatTime(customDate.toISOString())
                       : uiAttribute("选择日期和时间")}</small>
                   </span>
-                  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 3.5v3M15 3.5v3M3 8h14" /><rect x="3" y="5" width="14" height="12" rx="2" /></svg>
+                  <svg width="18" height="18" viewBox="0 0 20 20" aria-hidden="true"><path d="M5 3.5v3M15 3.5v3M3 8h14" /><rect x="3" y="5" width="14" height="12" rx="2" /></svg>
                 </button>
               </div>
 
@@ -1159,7 +1159,7 @@ function MemoryEditorDialog({
         <AppDialogContent className="memory-editor-dialog" onEscapeKeyDown={(event) => { if (busy) event.preventDefault() }} onPointerDownOutside={(event) => { if (busy) event.preventDefault() }}>
           <AppDialogHeader
             title={editor?.kind === 'create' ? uiAttribute("新增记忆") : uiAttribute("修订记忆")}
-            description={uiAttribute("正文应面向未来、可独立理解且不包含秘密。Retrieval Keys 只用于检索，不代替正文。")}
+            description={uiAttribute("正文应面向未来、可独立理解且不包含秘密。检索词只用于检索，不代替正文。")}
             icon="brain"
             closeDisabled={busy}
             hideDescription

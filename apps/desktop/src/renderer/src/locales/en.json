@@ -4739,5 +4739,18 @@
   "已隐藏列表读取结果不可用，请重试。": "The hidden list could not be read. Please try again.",
   "隐藏未完成，会话列表尚未更新。": "Hiding did not complete. Your conversation list is unchanged.",
   "恢复结果未确认，请刷新会话列表后重试。": "The restore result is unconfirmed. Refresh the conversation list and try again.",
-  "没有已隐藏的群": "No hidden groups"
+  "没有已隐藏的群": "No hidden groups",
+  "设置 / 关于与更新": "Settings / About and updates",
+  "设置 / 提醒": "Settings / Reminders",
+  "设置 / 诊断": "Settings / Diagnostics",
+  "尚未配置运行端": "Runtime is not configured",
+  "运行端配置不完整": "Runtime configuration is incomplete",
+  "未找到所选运行端安装": "The selected runtime installation was not found",
+  "所选运行端已停用": "The selected runtime is disabled",
+  "运行端与权限配置不匹配": "The runtime does not match the permission configuration",
+  "当前会话的运行端覆盖配置不受支持": "Runtime overrides for this conversation are not supported",
+  "当前平台尚不支持所选运行端": "This platform does not support the selected runtime yet",
+  "运行端权限配置无效": "Invalid runtime permission configuration",
+  "运行端模型配置无效": "Invalid runtime model configuration",
+  "正文应面向未来、可独立理解且不包含秘密。检索词只用于检索，不代替正文。": "Write memory for future use, self-contained, and without secrets. Retrieval keys are only for search and do not replace the body."
 }

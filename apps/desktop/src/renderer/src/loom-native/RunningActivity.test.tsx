@@ -137,7 +137,7 @@ describe('run failure block (Mikka thread-failure)', () => {
       agent: profile({ runtimeConfiguration: null }), sending: false,
       onRetry: () => {}, onConfigure: () => {}
     }))
-    expect(html).toContain('尚未配置 Runtime')
+    expect(html).toContain('尚未配置运行端')
   })
   it('says the runtime is not configured where the user got stuck', () => {
     expect(runRuntimeGuidance(profile())).toEqual({ available: false, status: '未配置智能体' })
