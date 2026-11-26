@@ -63,6 +63,7 @@ const approval = (over: Partial<ActionApprovalView> = {}): ActionApprovalView =>
 function conversation(over: {
   snapshot?: Partial<ThreadSnapshot>; agents?: AgentProfile[]; error?: string | null
   draft?: string; sending?: boolean; questions?: import('./pi-questions').PiQuestion[]
+  onStopRun?(run: AgentRunView): void; stoppingRunIds?: readonly string[]
 } = {}) {
   return renderToStaticMarkup(createElement(ConversationView, {
     item, snapshot: snapshot(over.snapshot ?? {}), agents: over.agents ?? [profile()], bundles: [],
@@ -70,7 +71,8 @@ function conversation(over: {
     error: over.error ?? null, onDraft: () => {}, onFiles: () => {}, onSend: () => {}, onProfile: () => {},
     onArtifact: () => {}, onShowSidebar: () => {}, sidebarHidden: false, onShowWork: () => {},
     inspectorHidden: false, onAttachment: () => {}, onResolveApproval: () => {}, approvalBusy: false,
-    onRetryRun: () => {}, onConfigureRuntime: () => {}, questions: over.questions, onAnswerQuestion: async () => {}
+    onRetryRun: () => {}, onConfigureRuntime: () => {}, questions: over.questions, onAnswerQuestion: async () => {},
+    onStopRun: over.onStopRun, stoppingRunIds: over.stoppingRunIds
   }))
 }
 
@@ -99,6 +101,23 @@ describe('running row (Mikka agent-activity working row)', () => {
     expect(html).toContain('aria-live="polite"')
     expect(html).toContain('data-size="sm"')
     expect(html).toContain('Hanzi正在处理')
+  })
+  it('offers stop for a running row, then leaves the stopped conclusion line', () => {
+    const active = conversation({
+      snapshot: { agentRuns: [run({ status: 'running', endedAt: null })] },
+      onStopRun: () => {}
+    })
+    expect(active).toContain('aria-label="停止本次运行"')
+    expect(active).toContain('>停止</button>')
+    const stopping = conversation({
+      snapshot: { agentRuns: [run({ status: 'running', endedAt: null })] },
+      onStopRun: () => {}, stoppingRunIds: ['r1']
+    })
+    expect(stopping).toContain('data-state="stopping"')
+    expect(stopping).toContain('正在停止…')
+    const stopped = conversation({ snapshot: { agentRuns: [run({ status: 'cancelled' })] } })
+    expect(stopped).not.toContain('aria-label="停止本次运行"')
+    expect(stopped).toContain('工作了 39 分 17 秒 · 已停止')
   })
   it('keeps the working row in the transcript and drops it once the run failed', () => {
     expect(conversation({ snapshot: { agentRuns: [run({ status: 'running', endedAt: null })] } }))

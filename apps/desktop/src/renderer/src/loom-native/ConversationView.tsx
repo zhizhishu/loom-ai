@@ -88,7 +88,7 @@ export function memberSystemLines(
   return lines
 }
 
-export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, onDraft, onFiles, onSend, onPrompt, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onPreviewAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager, onRetryRun, onConfigureRuntime, onOpenRuntimeSetup, hostPlatform = null, questions = [], onAnswerQuestion }: {
+export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, onDraft, onFiles, onSend, onPrompt, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onPreviewAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager, onRetryRun, onConfigureRuntime, onOpenRuntimeSetup, hostPlatform = null, questions = [], onAnswerQuestion, onStopRun, stoppingRunIds = [] }: {
   item: ConversationItem | null; snapshot: ThreadSnapshot | null; agents: AgentProfile[]; bundles: WorkBundle[]; loading: boolean; sending: boolean
   draft: string; files: File[]; error: string | null; onDraft(value: string): void; onFiles(files: File[]): void
   onSend(agentId?: string): void; onPrompt?(text: string): Promise<boolean>; onProfile(): void; onArtifact(selection: ArtifactSelection): void
@@ -99,6 +99,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   onResolveApproval(approvalId: string, optionId: string): void; approvalBusy: boolean; onMembers?(): void; onWorkspaceManager?(): void
   questions?: PiQuestion[]; onAnswerQuestion?(question: PiQuestion, answer: PiAnswer): Promise<void>
   onRetryRun?(): void; onConfigureRuntime?(): void; onOpenRuntimeSetup?(): void; hostPlatform?: HostPlatformKey | null
+  onStopRun?(run: AgentRunView): void; stoppingRunIds?: readonly string[]
 }) {
   const scroll = useRef<HTMLDivElement>(null)
   const input = useRef<HTMLTextAreaElement>(null)
@@ -250,7 +251,9 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
       {pendingQuestions.map(question => onAnswerQuestion && <PiQuestionCard key={questionKey(question)} question={question} name={agents.find(agent => agent.agentId === question.agentId)?.displayName || '助手'} onAnswer={onAnswerQuestion}/>)}
       {running.map(run => waitingRuns.has(run.id)
         ? <p key={run.id} role="status">{agents.find(agent => agent.agentId === run.agentId)?.displayName || '助手'} · 等你回答</p>
-        : <RunningActivity key={run.id} label={`${agents.find(agent => agent.agentId === run.agentId)?.displayName || '助手'}正在处理`}/>)}
+        : <RunningActivity key={run.id} label={`${agents.find(agent => agent.agentId === run.agentId)?.displayName || '助手'}正在处理`}
+          stopping={stoppingRunIds.includes(run.id) || run.cancelRequestedAt !== null}
+          onStop={onStopRun ? () => onStopRun(run) : undefined}/>)}
       {endedRun && <RunActivityLine run={endedRun}/>}
       {endedRun?.status === 'failed' && <RunFailure run={endedRun} agent={agents.find(agent => agent.agentId === endedRun.agentId) ?? null} sending={sending} onRetry={onRetryRun} onConfigure={onConfigureRuntime} onOpenRuntimeSetup={onOpenRuntimeSetup} platform={hostPlatform}/>}
       {systemMessages.length > 0 && <details className="ln-system-records"><summary>会话记录 <span>{systemMessages.length}</span></summary>{systemMessages.map(message => <AgentMarkdown key={message.id} text={message.body}/>)}</details>}

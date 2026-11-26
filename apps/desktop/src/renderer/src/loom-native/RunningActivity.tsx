@@ -222,14 +222,26 @@ export function ThinkingLoader({
  * `role="status"` 的一行，内容是 `ThinkingLoader size="sm" phases={[liveLabel]}`。
  * 位置沿用本壳既有的 `ln-running-status`（ConversationView 里 run 正在跑的那一格）。
  */
-export function RunningActivity({ label, className }: { label: string; className?: string }) {
+export function RunningActivity({ label, className, stopping = false, onStop }: {
+  label: string
+  className?: string
+  stopping?: boolean
+  onStop?(): void
+}) {
   return (
     <div
       className={['ln-running-status', className].filter(Boolean).join(' ')}
-      data-state="working"
+      data-state={stopping ? 'stopping' : 'working'}
       aria-busy="true"
     >
       <ThinkingLoader size="sm" phases={[label]}/>
+      {onStop && <button
+        type="button"
+        className="ln-action is-danger"
+        aria-label="停止本次运行"
+        disabled={stopping}
+        onClick={onStop}
+      >{stopping ? '正在停止…' : '停止'}</button>}
     </div>
   )
 }

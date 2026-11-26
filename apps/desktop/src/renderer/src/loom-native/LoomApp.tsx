@@ -1,7 +1,7 @@
 import { readOutbox } from './pending-outbox-store'
 import { BotBoard } from './BotBoard'
 import { PendingInbox } from './PendingInbox'
-import type { LocalAttachmentOwnerLocator, StoredCommandResult,WorkspaceSelection } from '@contracts'
+import type { AgentRunView, LocalAttachmentOwnerLocator, StoredCommandResult,WorkspaceSelection } from '@contracts'
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import type { BusinessEnvironment } from '../business-environment'
@@ -137,6 +137,7 @@ export function LoomApp({ environment, onLogout, initialSettingsSection = null, 
   const [notice, setNotice] = useState<string | null>(null)
   const [sending, setSending] = useState(false)
   const [approvalBusy, setApprovalBusy] = useState(false)
+  const [stoppingRunIds, setStoppingRunIds] = useState<readonly string[]>([])
   const [sendError, setSendError] = useState<string | null>(null)
   const [drafts, setDrafts] = useState<Record<string, Draft>>({})
   const selectionHistory = useRef<ConversationItem[]>([])
@@ -284,6 +285,23 @@ export function LoomApp({ environment, onLogout, initialSettingsSection = null, 
       await data.refresh()
     } catch (error) { report(error) } finally { setApprovalBusy(false) }
   }
+  const stopRun = async (run: AgentRunView) => {
+    const snapshot = data.snapshot
+    if (!snapshot || stoppingRunIds.includes(run.id) || run.cancelRequestedAt !== null) return
+    setStoppingRunIds(current => [...current, run.id])
+    try {
+      const result = await environment.client.request<StoredCommandResult>('agentRuns.cancel', {
+        commandId: crypto.randomUUID(),
+        command: { threadId: snapshot.thread.id, agentRunId: run.id, expectedVersion: run.version }
+      })
+      if (result.status === 'rejected') throw new Error(result.code || '停止未被接受，请刷新后重试。')
+      await data.refresh()
+    } catch (error) {
+      report(error)
+    } finally {
+      setStoppingRunIds(current => current.filter(id => id !== run.id))
+    }
+  }
   const searchResults = useMemo(() => searchWorkspace(query, data.conversations, data.agents, data.bundles), [query, data.conversations, data.agents, data.bundles])
   const searchWork = (item: WorkItem) => safeInspectorAction(() => {
     setModal(null); setInspectorMode('work'); setInspectorOpen(true); setExpanded(false)
@@ -330,7 +348,7 @@ export function LoomApp({ environment, onLogout, initialSettingsSection = null, 
       <section ref={frameRef} className="ln-frame" aria-label="LOOM 工作空间" style={{ '--ln-sidebar-width': `${panelWidths.sidebar}px`, '--ln-inspector-width': `${panelWidths.inspector}px` } as React.CSSProperties}>
         {settingsSection ? <SettingsPage section={settingsSection} onLeaveGuard={registerSettingsLeave} onSection={setSettingsSection} environment={environment} agents={data.agents} theme={theme} onTheme={setTheme} threadId={active?.threadId ?? undefined} onLogout={onLogout} onRefreshWorkspace={() => { void data.refresh().catch(report) }} onManageAssistants={() => manageAssistant(activeAgent?.agentId)} onStartWorkspace={root => { setSettingsSection(null); beginWorkIn(root) }} onChanged={() => { setCapabilityEpoch(value => value + 1); void data.refresh().catch(report) }}/>
         : <>{sidebarOpen && <Sidebar agents={data.agents} items={data.conversations} selectedId={data.selectedId} loading={data.loading} groupRosters={groupRosters} hidden={data.hidden} onRestoreHidden={threadId => { void data.setHidden(threadId, false) }} onSelect={item => safeInspectorAction(() => { setCapabilityDirty(false); void select(item) })} onCreate={beginConversation} onCollapse={() => setSidebarOpen(false)} onEditAssistant={agentId => manageAssistant(agentId)}/>}{sidebarOpen && <PanelResizeHandle side="sidebar" frame={frameRef} widths={panelWidths} sidebarOpen={sidebarOpen} inspectorOpen={inspectorOpen} onResize={resizePanel}/> }
-        <ConversationView item={active} agents={data.agents} snapshot={data.snapshot} bundles={data.bundles} loading={data.loading} sending={sending} draft={draft.text} files={draft.files} error={sendError ?? piQuestions.error} questions={piQuestions.questions} onAnswerQuestion={piQuestions.answer} onDraft={text => patchDraft({ text })} onFiles={files => patchDraft({ files })} onSend={agentId => { void send(agentId) }} onPrompt={sendPrompt} onRetryRun={retryLastRun} onConfigureRuntime={() => manageAssistant(activeAgent?.agentId)} onOpenRuntimeSetup={() => openSettings('runtime')} onProfile={() => manageAssistant(activeAgent?.agentId)} onWorkspaceManager={() => openSettings('workspace')} onMembers={() => setMembersOpen(true)} onArtifact={setArtifact} onShowSidebar={() => setSidebarOpen(true)} sidebarHidden={!sidebarOpen} onShowWork={() => openWork()} inspectorHidden={!inspectorOpen} onAttachment={(messageId,attachmentId) => { void openAttachment(messageId,attachmentId) }} onPreviewAttachment={previewAttachment} approvalBusy={approvalBusy} onResolveApproval={(approvalId,optionId) => { void resolveApproval(approvalId,optionId) }}/>
+        <ConversationView item={active} agents={data.agents} snapshot={data.snapshot} bundles={data.bundles} loading={data.loading} sending={sending} draft={draft.text} files={draft.files} error={sendError ?? piQuestions.error} questions={piQuestions.questions} onAnswerQuestion={piQuestions.answer} onDraft={text => patchDraft({ text })} onFiles={files => patchDraft({ files })} onSend={agentId => { void send(agentId) }} onPrompt={sendPrompt} onRetryRun={retryLastRun} onStopRun={run => { void stopRun(run) }} stoppingRunIds={stoppingRunIds} onConfigureRuntime={() => manageAssistant(activeAgent?.agentId)} onOpenRuntimeSetup={() => openSettings('runtime')} onProfile={() => manageAssistant(activeAgent?.agentId)} onWorkspaceManager={() => openSettings('workspace')} onMembers={() => setMembersOpen(true)} onArtifact={setArtifact} onShowSidebar={() => setSidebarOpen(true)} sidebarHidden={!sidebarOpen} onShowWork={() => openWork()} inspectorHidden={!inspectorOpen} onAttachment={(messageId,attachmentId) => { void openAttachment(messageId,attachmentId) }} onPreviewAttachment={previewAttachment} approvalBusy={approvalBusy} onResolveApproval={(approvalId,optionId) => { void resolveApproval(approvalId,optionId) }}/>
         {inspectorOpen && <PanelResizeHandle side="inspector" frame={frameRef} widths={panelWidths} sidebarOpen={sidebarOpen} inspectorOpen={inspectorOpen} onResize={resizePanel}/>}
         {inspectorOpen && <Inspector key={capabilityEpoch} questions={piQuestions.questions} selectedTaskId={dockSelection?.threadId === (active?.threadId ?? null) ? dockSelection?.taskId ?? null : null} onTaskSelect={taskId => setDockSelection({ threadId: active?.threadId ?? null, taskId })} threadId={active?.threadId} conversationTitle={active?.title} onCreateWork={beginWork} onConnectDevice={() => openSettings('devices')} workbench={environment.workbench} client={environment.client} theme={theme} onManageAssistant={manageAssistant} onCapabilityDirty={setCapabilityDirty} onLibrary={() => safeInspectorAction(() => { setCapabilityDirty(false); setLibraryOpen(true) })} agents={data.agents} bundles={data.bundles} agent={activeAgent} mode={inspectorMode} tab={tab} onTab={value => safeInspectorAction(() => { setTab(value); setCapabilityDirty(false) })} onMode={value => safeInspectorAction(() => { setInspectorMode(value); setCapabilityDirty(false) })} onClose={() => safeInspectorAction(() => { setInspectorOpen(false); setExpanded(false); setCapabilityDirty(false) })} onExpand={() => setExpanded(value => !value)} expanded={expanded} onArtifact={setArtifact} loading={data.loading} onOpenConversation={threadId => { const item = data.conversations.find(item => item.threadId === threadId); if (item) void select(item) }}/>}</>}</section>
     </div>
