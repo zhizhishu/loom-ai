@@ -4165,6 +4165,9 @@ pub fn review_record(
         }
     };
     transaction.commit()?;
+    if let Err(error) = acceptance_report_sync(database, &mission_id, &task_id, &candidate_id) {
+        eprintln!("LOOM acceptance report generation remains pending for {candidate_id}: {error:#}");
+    }
 
     Ok(LoomReviewRecordResult {
         review: LoomReview {
@@ -4185,6 +4188,252 @@ pub fn review_record(
         released_dependency_ids: released,
         replayed: false,
     })
+}
+
+/// Regenerate the Task's acceptance report as an ordinary immutable LOOM artifact. The artifact
+/// chain already supplies the versioning and sha256 replay semantics Mikka implements in TS:
+/// unchanged Markdown replays the existing registration, changed Markdown creates the next
+/// artifact id at the same logical path.
+fn acceptance_report_sync(
+    database: &mut Database,
+    mission_id: &str,
+    task_id: &str,
+    candidate_id: &str,
+) -> Result<Option<LoomArtifactRegisterResult>> {
+    let connection = database.connection();
+    let workspace = mission_workspace(connection, mission_id)?;
+    let (goal, task_title, criteria_json) = connection.query_row(
+        "SELECT plan.goal, task.title, task.acceptance_criteria_json
+         FROM loom_plan AS plan JOIN loom_task AS task ON task.plan_id=plan.plan_id
+         WHERE plan.mission_id=?1 AND task.task_id=?2",
+        params![mission_id, task_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
+    )?;
+    let Some((agent_run_id, content_hash, candidate_evidence_json)) = connection.query_row(
+        "SELECT agent_run_id, content_hash, evidence_ids_json FROM loom_candidate WHERE candidate_id=?1",
+        [candidate_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+    ).optional()? else {
+        return Ok(None);
+    };
+    let criteria: Vec<LoomAcceptanceCriterion> = serde_json::from_str(&criteria_json)
+        .with_context(|| format!("LOOM task {task_id} has unreadable acceptance criteria"))?;
+    let candidate_evidence: Vec<String> = serde_json::from_str(&candidate_evidence_json)
+        .with_context(|| format!("LOOM candidate {candidate_id} has unreadable evidence ids"))?;
+    let review = connection
+        .query_row(
+            "SELECT verdict, reason, criteria_results_json, reviewer_id, reviewed_at
+         FROM loom_review WHERE candidate_id=?1 ORDER BY reviewed_at DESC, review_id DESC LIMIT 1",
+            [candidate_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let verification = connection.query_row(
+        "SELECT verification_id, method, executor_id, result, evidence_ids_json, verified_at
+         FROM loom_verification WHERE candidate_id=?1 ORDER BY verified_at DESC, verification_id DESC LIMIT 1",
+        [candidate_id],
+        |row| Ok((
+            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?,
+        )),
+    ).optional()?;
+    let review_results: Vec<LoomAcceptanceCriterionResult> =
+        review.as_ref().map_or_else(Vec::new, |row| {
+            serde_json::from_str(&row.2).unwrap_or_default()
+        });
+    let mut evidence_rows = Vec::new();
+    for evidence_id in &candidate_evidence {
+        let row = connection
+            .query_row(
+                "SELECT relative_path, sha256, size_bytes FROM loom_artifact WHERE artifact_id=?1",
+                [evidence_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some(row) = row {
+            evidence_rows.push((evidence_id.clone(), row.0, row.1, row.2));
+        }
+    }
+    let file_projection = connection
+        .query_row(
+            "SELECT file_count, additions, deletions, files_summary_json
+         FROM agent_run_file_change_projection
+         WHERE agent_run_id=?1 AND status='complete'
+         ORDER BY execution_epoch DESC LIMIT 1",
+            [&agent_run_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let changed_files: Vec<crate::agent_run_file_change::AgentRunChangedFileSummaryView> =
+        file_projection
+            .as_ref()
+            .and_then(|row| serde_json::from_str(&row.3).ok())
+            .unwrap_or_default();
+
+    let mut markdown = String::new();
+    markdown.push_str(&format!("# acceptance · {task_title}\n\n"));
+    markdown.push_str("## Summary\n\n");
+    markdown.push_str(&format!("- Mission goal: {goal}\n"));
+    markdown.push_str(&format!("- Task: `{task_id}`\n"));
+    markdown.push_str(&format!("- Candidate: `{candidate_id}`\n"));
+    markdown.push_str(&format!("- Candidate SHA: `{content_hash}`\n"));
+    if let Some((verification_id, method, executor_id, result, evidence_json, verified_at)) =
+        &verification
+    {
+        let evidence_ids: Vec<String> = serde_json::from_str(evidence_json).unwrap_or_default();
+        markdown.push_str(&format!("- Verification: {result} (`{method}`, `{executor_id}`, {verified_at}, `{verification_id}`)\n"));
+        markdown.push_str(&format!(
+            "- Verification evidence: {}\n",
+            if evidence_ids.is_empty() {
+                "candidate evidence".to_string()
+            } else {
+                evidence_ids
+                    .iter()
+                    .map(|id| format!("`{id}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ));
+    } else {
+        markdown.push_str("- Verification: UNVERIFIED\n");
+    }
+    if let Some((verdict, reason, _, reviewer_id, reviewed_at)) = &review {
+        markdown.push_str(&format!(
+            "- Review: {verdict} (`{reviewer_id}`, {reviewed_at})\n- Review reason: {reason}\n"
+        ));
+    } else {
+        markdown.push_str("- Review: UNVERIFIED\n");
+    }
+    markdown.push_str("\n## Acceptance criteria\n\n");
+    for (index, criterion) in criteria.iter().enumerate() {
+        let result = review_results
+            .iter()
+            .find(|item| item.criterion_id == criterion.criterion_id);
+        let state = result.map_or(
+            "UNVERIFIED",
+            |item| if item.satisfied { "PASS" } else { "FAIL" },
+        );
+        markdown.push_str(&format!(
+            "{}. **{state}** — {}\n",
+            index + 1,
+            criterion.text
+        ));
+        if let Some(result) = result {
+            if !result.evidence_ids.is_empty() {
+                markdown.push_str(&format!(
+                    "   - evidence: {}\n",
+                    result
+                        .evidence_ids
+                        .iter()
+                        .map(|id| format!("`{id}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if let Some(note) = result
+                .note
+                .as_deref()
+                .filter(|note| !note.trim().is_empty())
+            {
+                markdown.push_str(&format!("   - note: {note}\n"));
+            }
+        }
+    }
+    markdown.push_str("\n## Evidence\n\n");
+    if evidence_rows.is_empty() {
+        markdown.push_str("- No registered candidate evidence.\n");
+    } else {
+        for (artifact_id, path, sha256, size) in &evidence_rows {
+            markdown.push_str(&format!(
+                "- `{artifact_id}` `{path}` — sha256 `{sha256}`, {size} bytes\n"
+            ));
+        }
+    }
+    markdown.push_str("\n## Changes\n\n");
+    match file_projection {
+        Some((file_count, additions, deletions, _)) => {
+            markdown.push_str(&format!(
+                "- Files changed: {file_count}; +{} / −{}\n",
+                additions.map_or("unknown".into(), |value| value.to_string()),
+                deletions.map_or("unknown".into(), |value| value.to_string())
+            ));
+            for file in &changed_files {
+                markdown.push_str(&format!(
+                    "- `{}` ({}, +{} / −{})\n",
+                    file.path,
+                    file.change_kind,
+                    file.additions.map_or("?".into(), |value| value.to_string()),
+                    file.deletions.map_or("?".into(), |value| value.to_string())
+                ));
+            }
+        }
+        None => markdown.push_str("- Files changed: no completed file-change projection.\n"),
+    }
+    let media: Vec<_> = evidence_rows
+        .iter()
+        .filter(|(_, path, _, _)| {
+            let lower = path.to_ascii_lowercase();
+            ["png", "jpg", "jpeg", "gif", "webp", "mp4", "webm", "mov"]
+                .iter()
+                .any(|extension| lower.ends_with(&format!(".{extension}")))
+        })
+        .collect();
+    markdown.push_str("\n## Screenshots and recordings\n\n");
+    if media.is_empty() {
+        markdown.push_str("- No screenshot or recording evidence registered.\n");
+    } else {
+        for (artifact_id, path, _, _) in media {
+            markdown.push_str(&format!("- `{artifact_id}` `{path}`\n"));
+        }
+    }
+    markdown.push_str("\n## Provenance\n\n");
+    markdown.push_str("- Versioning and sha256 dedupe are supplied by the immutable LOOM artifact chain: identical Markdown replays the existing artifact; changed Markdown creates the next artifact id at this path.\n");
+
+    let relative_path = format!(".loom/acceptance/{task_id}.md");
+    let target = workspace.join(&relative_path);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&target, markdown)?;
+    artifact_register(
+        database,
+        crate::current_user::CURRENT_USER_ID,
+        LoomArtifactRegisterInput {
+            mission_id: mission_id.to_string(),
+            task_id: Some(task_id.to_string()),
+            agent_run_id: None,
+            relative_path,
+            content_type: Some("text/markdown".to_string()),
+        },
+    )
+    .map(Some)
 }
 
 /// Evidence verification verdict: can the delivery be reproduced, independently of whether
@@ -4651,6 +4900,9 @@ fn verification_record_internal(
         LoomVerificationResult::Failed => vec![],
     };
     transaction.commit()?;
+    if let Err(error) = acceptance_report_sync(database, &mission_id, &task_id, &candidate_id) {
+        eprintln!("LOOM acceptance report generation remains pending for {candidate_id}: {error:#}");
+    }
 
     Ok(LoomVerificationRecordResult {
         verification: LoomVerification {
@@ -9580,6 +9832,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(verified.verification.result, LoomVerificationResult::Passed);
+        let report_path = mission_workspace(database.connection(), &mission_id)
+            .unwrap()
+            .join(".loom/acceptance/task_a.md");
+        let report = std::fs::read_to_string(&report_path).unwrap();
+        assert!(report.contains("# acceptance ·"));
+        assert!(report.contains("## Acceptance criteria"));
+        assert!(report.contains("## Changes"));
+        assert!(report.contains("## Screenshots and recordings"));
+        let report_registration = acceptance_report_sync(
+            &mut database,
+            &mission_id,
+            "task_a",
+            &candidate.candidate_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            report_registration.replayed,
+            "identical acceptance report bytes replay through the artifact sha256 dedupe"
+        );
 
         // Corrupting the archived Blob is a hard failure for the same check, and there is no
         // second Candidate to record it against: the bytes cannot be substituted by the file.
