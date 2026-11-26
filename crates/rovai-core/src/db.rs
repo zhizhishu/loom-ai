@@ -8682,7 +8682,7 @@ impl Database {
                 available_at = ?1, last_error = 'core_restarted_during_delivery',
                 version = version + 1, updated_at = ?1
             WHERE status = 'delivering'
-              AND delivery_kind IN ('action_result', 'cancellation')
+              AND delivery_kind IN ('authorization_resolution', 'action_result', 'cancellation')
             "#,
             [&now],
         )? as i64;

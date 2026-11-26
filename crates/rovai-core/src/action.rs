@@ -5348,11 +5348,20 @@ mod tests {
                 ),
             )
             .unwrap();
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE runtime_delivery_checkpoint SET status = 'delivering', lease_owner = 'runtime-adapter:test', lease_expires_at = '2999-01-01T00:00:00Z' WHERE action_id = 'action-awaiting-runtime'",
+                [],
+            )
+            .unwrap();
         let directory = fixture.directory.clone();
         drop(fixture.database);
 
         let mut reopened = Database::open(&directory).unwrap();
         let recovery = reopened.prepare_v2_recovery().unwrap();
+        assert_eq!(recovery.deliveries_returned_to_pending, 1);
         assert_eq!(recovery.intercepted_actions_failed_closed, 0);
         assert_eq!(recovery.action_approvals_cancelled, 0);
         assert_eq!(recovery.authorization_deliveries_failed_closed, 0);
@@ -5437,6 +5446,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(checkpoint_count, 1);
+        let (pending_approval_id, pending_approval_version): (String, i64) = reopened
+            .connection()
+            .query_row(
+                "SELECT id, version FROM approval WHERE action_id = 'action-awaiting-user'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let answered_after_restart = service
+            .resolve_approval(
+                &mut reopened,
+                &user_envelope(
+                    "approve-after-restart",
+                    Some(&fixture.camp_id),
+                    ResolveActionApprovalCommand {
+                        approval_id: pending_approval_id,
+                        option_id: "accept".to_string(),
+                        expected_version: pending_approval_version,
+                        reason: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            answered_after_restart.result.status,
+            CommandResultStatus::Applied
+        );
+        assert_eq!(answered_after_restart.result.payload["replayed"], Value::Null);
+        let pending_checkpoint_count: i64 = reopened
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_delivery_checkpoint WHERE action_id = 'action-awaiting-user'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_checkpoint_count, 1);
         let second = reopened.prepare_v2_recovery().unwrap();
         assert_eq!(second.intercepted_actions_failed_closed, 0);
         assert_eq!(second.action_approvals_cancelled, 0);
