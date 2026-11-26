@@ -576,6 +576,9 @@ class PiLifecycle(unittest.TestCase):
             "LOOM_COMPUTER_AGENT_DIGEST": DIGEST,
             **IDENTITY,
         }
+        if "SYSTEMROOT" in os.environ:
+            # Windows process creation only; never a bridge input.
+            environment["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
         payload = ""
         for index in range(requests):
             payload += json.dumps(

@@ -264,7 +264,7 @@
       "version": "0.1.5",
       "license": "MPL-2.0",
       "file": "licenses/libreoffice-kit-published-licenses.txt",
-      "sha256": "6959fc1e460c5ca92d94cfcf5e2c8fecb0cc05fe96d53301b910686f760b3ce3",
+      "sha256": "d819697930a1967b89674f7751e081eab677075c3b02aa209b21948a6fa543fd",
       "source": {
         "kind": "published-package-license-files",
         "files": [
