@@ -6,6 +6,8 @@ import { SurfaceDialog } from './Controls'
 import { deleteOutbox, readOutbox, updateOutbox, type PendingRecord } from './pending-outbox-store'
 import { settleOutboxAttempt } from './service'
 import './pending-inbox.css'
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from './EmptyState'
+import { Icon } from './icons'
 export async function checkOutboxDelivery(client: ThreadClient, row: PendingRecord): Promise<StoredCommandResult> {
   const result=await client.request<{commandResult:StoredCommandResult}>('thread.messages.send',row.params)
   if(!result?.commandResult)throw new Error('可能已送达，请检查。')
@@ -68,7 +70,7 @@ export function PendingInboxList({rows,errors={},busy=false,loadError='',onActio
     {['unconfirmed','rejected'].includes(row.state)&&<button type="button" disabled={busy} onClick={()=>onAction(row,'check')}>{row.state==='rejected'?'再检查一次':'检查是否送达'}</button>}
     {errors[row.id]&&<p role="alert">{errors[row.id]}</p>}</article>
   return <section className="ln-pending-inbox">{loadError&&<p role="alert">{loadError}</p>}
-      {!rows.length&&!loadError&&<><h3>没有待发送的消息</h3><p>离线时发出的消息会暂存在这里，联网后可以继续发送。</p></>}
+      {!rows.length&&!loadError&&<Empty><EmptyHeader><EmptyMedia variant="icon"><Icon name="inbox" size={18}/></EmptyMedia><EmptyTitle>没有待发送的消息</EmptyTitle><EmptyDescription>离线时发出的消息会暂存在这里，联网后可以继续发送。</EmptyDescription></EmptyHeader></Empty>}
       <p>不会自动重发。附件不能稍后自动重发，请重新选择文件。</p>
       {rows.filter(r=>r.state!=='accepted').map(card)}
       <details><summary>已完成 ({rows.filter(r=>r.state==='accepted').length})</summary>{rows.filter(r=>r.state==='accepted').map(card)}</details>

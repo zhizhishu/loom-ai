@@ -2,7 +2,7 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import type { AgentProfile, ConversationItem, ThreadSnapshot } from './types'
-import type { DomainEventView, LoomArtifact, LoomCandidate, MissionRecord } from '@contracts'
+import type { ActionApprovalView, DomainEventView, LoomArtifact, LoomCandidate, MissionRecord } from '@contracts'
 import { ConversationView } from './ConversationView'
 import type { WorkBundle } from './types'
 
@@ -160,5 +160,26 @@ describe('聊天 | 成果 segmented toggle', () => {
     expect(html).toContain('ln-composer')
     // 成果段本体此刻未展开（默认聊天段），切换后的分组渲染在 ThreadResults 测试覆盖。
     expect(html).not.toContain('ln-result-group')
+  })
+})
+
+
+describe('approval cards above composer', () => {
+  it('shows per-card waiting age without inventing an expired state', () => {
+    const approval = {
+      id: 'ap1', actionId: 'ac1', actionKind: 'shell.command', actionSummary: '运行 npm test', canonicalInput: {},
+      reason: '这条命令会写入工作目录', agentRunId: 'r1', agentId: 'a1', adapterKind: 'pi',
+      nativeMethod: null, requestDigest: null, permissionSemantics: 'core_enforced_v1',
+      options: [{ optionId: 'o1', kind: 'allow_once', label: '允许一次', consequence: '只运行这一条命令', nativeResponseDigest: 'd1' }],
+      status: 'pending', requestedForUserId: 'local_user', resolvedByType: null, resolvedById: null,
+      resolutionCode: null, version: 1, requestedAt: '2026-11-22T00:00:00.000Z', resolvedAt: null
+    } as ActionApprovalView
+    const thread = { ...snapshot('发版群', [member('a1', 'Hanzi')]), approvals: [approval] }
+    const html = view(thread)
+    expect(html).toContain('ln-approval-age')
+    expect(html).toContain('已等待')
+    expect(html).toContain('等待较久')
+    expect(html).not.toContain('已过期')
+    expect(html.indexOf('ln-approval-request')).toBeLessThan(html.indexOf('class="ln-composer"'))
   })
 })

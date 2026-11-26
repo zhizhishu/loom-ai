@@ -16,6 +16,7 @@ import { MessageAttachments, PendingAttachments, addPickedAttachments, pasteAtta
 import { USER_ATTACHMENT_ACCEPT } from './user-attachments'
 import { RunEventLine, RunningActivity } from './RunningActivity'
 import { manualRetryUx } from './retry-ux'
+import { approvalAging, approvalAgingText } from './approval-aging'
 import { runtimeFailureMessage } from '../RuntimeFailureNotice'
 import { RuntimeInstallationGuide } from '../RuntimeInstallationGuide'
 import { runtimeInstallGuide } from '../runtime-install-guide'
@@ -90,6 +91,13 @@ export function memberSystemLines(
     })
   }
   return lines
+}
+
+function ApprovalAge({ requestedAt }: { requestedAt: string | null }) {
+  const aging = approvalAging(requestedAt, Date.now())
+  const text = approvalAgingText(aging)
+  if (!text) return null
+  return <small className="ln-approval-age" data-aged={aging.aged || undefined}>{text}</small>
 }
 
 export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, onDraft, onFiles, onSend, onPrompt, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onPreviewAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager, onRetryRun, onConfigureRuntime, onOpenRuntimeSetup, hostPlatform = null, questions = [], onAnswerQuestion, onStopRun, stoppingRunIds = [] }: {
@@ -290,7 +298,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
     <div className="ln-composer-area">
       {segment === 'chat' && showLatest && <button type="button" className="ln-jump-latest" title="回到最新消息" aria-label="回到最新消息" onClick={jump}><Icon name="down" size={18}/></button>}
       {error && <div className="ln-send-error" role="alert" data-slot="send-error"><strong>请求失败，请稍后重试。</strong>{error.trim() && error.trim() !== '请求失败，请稍后重试。' && <small>{error}</small>}<p>你的输入已保留。</p><button type="button" disabled={sending || (!draft.trim() && !files.length)} onClick={() => onSend(isGroup ? mentionRecipient(draft, activeMembers) : undefined)}>{sending ? '正在重试…' : '重试此回复'}</button></div>}
-      {snapshot?.approvals.filter(approval => approval.status === 'pending').map(approval => <section className="ln-approval-request" key={approval.id} aria-label="等待你的授权" data-state={approval.status} aria-busy={approvalBusy}><strong><Icon name="hand" size={16}/>需要你确认<span className="ln-approval-state" data-state={approval.status}>{approvalStatusLabel(approval.status)}</span></strong><p>{approval.actionSummary}</p>{approval.reason && <small>{approval.reason}</small>}<p className="ln-approval-scope">{agents.find(agent => agent.agentId === approval.agentId)?.displayName || '当前助手'} · {approval.options.some(option => option.kind === 'allow_session') ? '持续授权仅限此原生会话，具体范围见选项。' : '本次请求按运行端提供的范围授权。'}</p><div>{approval.options.map(option => <button type="button" disabled={approvalBusy} key={option.optionId} title={option.consequence} className={option.kind === 'allow_once' ? 'is-once' : option.kind === 'allow_session' ? 'is-persistent' : ''} onClick={() => onResolveApproval(approval.id, option.optionId)}>{option.label}</button>)}</div></section>)}
+      {snapshot?.approvals.filter(approval => approval.status === 'pending').map(approval => <section className="ln-approval-request" key={approval.id} aria-label="等待你的授权" data-state={approval.status} aria-busy={approvalBusy}><strong><Icon name="hand" size={16}/>需要你确认<span className="ln-approval-state" data-state={approval.status}>{approvalStatusLabel(approval.status)}</span></strong><p>{approval.actionSummary}</p>{approval.reason && <small>{approval.reason}</small>}<ApprovalAge requestedAt={approval.requestedAt}/><p className="ln-approval-scope">{agents.find(agent => agent.agentId === approval.agentId)?.displayName || '当前助手'} · {approval.options.some(option => option.kind === 'allow_session') ? '持续授权仅限此原生会话，具体范围见选项。' : '本次请求按运行端提供的范围授权。'}</p><div>{approval.options.map(option => <button type="button" disabled={approvalBusy} key={option.optionId} title={option.consequence} className={option.kind === 'allow_once' ? 'is-once' : option.kind === 'allow_session' ? 'is-persistent' : ''} onClick={() => onResolveApproval(approval.id, option.optionId)}>{option.label}</button>)}</div></section>)}
       {resolvedApproval && <p className="ln-approval-result" data-slot="approval-result" data-state={resolvedApproval.status} aria-label={`${approvalStatusLabel(resolvedApproval.status)}的授权`}><Icon name={resolvedApproval.status === 'approved' ? 'check' : 'blocked'} size={14}/><span>{resolvedApproval.actionSummary}</span><em>{approvalStatusLabel(resolvedApproval.status)}</em></p>}
       {segment === 'chat' && <form className="ln-composer" onPaste={event => { if (pasteAttachments(event.clipboardData, files, onFiles)) { event.preventDefault(); event.stopPropagation() } }} onSubmit={event => { event.preventDefault(); if (!sending && !composing.current && (draft.trim() || files.length)) onSend(isGroup ? mentionRecipient(draft, activeMembers) : undefined) }}>
         <PendingAttachments files={files} onRemove={onFiles}/>

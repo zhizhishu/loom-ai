@@ -4,6 +4,7 @@ import { Avatar, LoomMark } from './Avatar'
 import { GroupAvatar } from './GroupAvatar'
 import { Icon, IconButton } from './icons'
 import { sortConversationItems } from './conversation-order'
+import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from './EmptyState'
 
 export function Sidebar({ agents, items, selectedId, onSelect, onCreate, onCollapse, onEditAssistant, loading, groupRosters, hidden = [], onRestoreHidden }: {
   agents: AgentProfile[]; items: ConversationItem[]; selectedId: string | null; loading: boolean
@@ -51,7 +52,7 @@ export function Sidebar({ agents, items, selectedId, onSelect, onCreate, onColla
           {item.unread && <i className="ln-unread-dot" aria-label="有未读消息"/>}
         </div>
       })}
-      {!loading && rows.length === 0 && <div className="ln-sidebar-empty">还没有对话<button type="button" onClick={onCreate}>新建群聊</button></div>}
+      {!loading && rows.length === 0 && <Empty className="ln-sidebar-empty"><EmptyHeader><EmptyMedia variant="icon"><Icon name="chat" size={18}/></EmptyMedia><EmptyTitle>还没有对话</EmptyTitle><EmptyDescription>先建一个群聊，或从左侧 ＋ 开始单聊。</EmptyDescription></EmptyHeader><EmptyContent><button type="button" onClick={onCreate}>新建群聊</button></EmptyContent></Empty>}
     </div>
     {hidden.length > 0 && <div className="ln-hidden">
       <button type="button" className="ln-hidden-toggle" aria-expanded={showHidden} onClick={() => setShowHidden(value => !value)}>

@@ -5,6 +5,8 @@ import type { BusinessEnvironment } from '../business-environment'
 import { learnedBadges, learnedSkills } from './learned-skills'
 import { setSkillMetadata } from './capability-service'
 import { FormMessage } from './Controls'
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from './EmptyState'
+import { Icon } from './icons'
 
 export function LearnedSkillsPanel({ environment, agentId }: { environment: BusinessEnvironment; agentId: string }) {
   const [skills,setSkills] = useState<SkillView[]>([])
@@ -40,7 +42,7 @@ export function LearnedSkillsPanel({ environment, agentId }: { environment: Busi
     <nav aria-label="习得技能筛选">{[['active','已启用'],['all','本 Bot 习得'],['archived', '已归档 ('+learnedSkills(skills,agentId,'archived').length+')']].map(([value,label]) =>
       <button type="button" key={value} aria-pressed={filter===value} onClick={()=>setFilter(value)}>{label}</button>)}</nav>
     {error && <FormMessage error>{error}</FormMessage>}
-    {!rows.length && <p>还没有学到技能</p>}
+    {!rows.length && <Empty><EmptyHeader><EmptyMedia variant="icon"><Icon name="bulb" size={18}/></EmptyMedia><EmptyTitle>还没有学到技能</EmptyTitle><EmptyDescription>这个助手完成可复用成果后，习得技能会出现在这里。</EmptyDescription></EmptyHeader></Empty>}
     {rows.map(skill => <article key={skill.id}><h4>{skill.name}</h4><p>{learnedBadges(skill).join(' · ')}</p>
       <button type="button" disabled={busy} onClick={()=>void patch(skill,{pinned:!skill.learned?.pinned})}>{skill.learned?.pinned?'取消置顶':'置顶'}</button>
       <button type="button" disabled={busy} onClick={()=>void patch(skill,{locked:!skill.learned?.locked})}>{skill.learned?.locked?'解锁':'锁定'}</button>
