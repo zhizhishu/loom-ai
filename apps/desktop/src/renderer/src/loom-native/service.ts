@@ -4,6 +4,7 @@ import type {
   AgentProfile,
   ComposerDocument,
   ComposerSegment,
+  DomainEventView,
   LocalAttachmentSourceView,
   LoomArtifactsListResult,
   LoomCandidate,
@@ -196,12 +197,15 @@ export function bootstrapSelection(
 // ------------------------------------------------------------- thread reads
 
 export async function readThreadSnapshot(client: Reader, threadId: string): Promise<ThreadSnapshot> {
-  const projection = await client.request<ThreadOpenProjection>('threads.open', { threadId, traceId: newCommandId() })
+  const [projection, timeline] = await Promise.all([
+    client.request<ThreadOpenProjection>('threads.open', { threadId, traceId: newCommandId() }),
+    client.request<DomainEventView[]>('threads.memberTimeline', { threadId })
+  ])
   if (!projection || projection.schemaVersion !== 9 || projection.thread.id !== threadId) {
     throw new Error('会话打开数据版本不兼容，请重试。')
   }
-  // The Web-approved open projection is the conversation's authoritative surface.
-  // Unprojected audit collections are not rendered by this frontend.
+  // The Web-approved open projection is the conversation's authoritative surface; the narrow
+  // member-timeline read only carries the membership system events rendered inside that surface.
   return {
     schemaVersion: THREAD_SNAPSHOT_SCHEMA_VERSION,
     throughGlobalSequence: projection.throughGlobalSequence,
@@ -215,7 +219,7 @@ export async function readThreadSnapshot(client: Reader, threadId: string): Prom
     agentRunFileChanges: projection.agentRunFileChanges,
     agentRunImages: projection.agentRunImages,
     approvals: projection.approvals,
-    contextManifests: [], actions: [], timeline: []
+    contextManifests: [], actions: [], timeline
   }
 }
 

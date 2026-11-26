@@ -126,6 +126,13 @@ describe('native data boundary and read-only startup',()=>{
     expect((await readThreadSnapshot(mockClient(request),'t')).thread.id).toBe('t')
     expect(request).toHaveBeenCalledWith('threads.open',expect.objectContaining({threadId:'t'}))
   })
+  it('carries member timeline events into the opened conversation snapshot',async()=>{
+    const projection={schemaVersion:9,throughGlobalSequence:4,thread:{id:'t'},members:[],membershipReconciliations:[],tasksEnabled:false,messages:[],messageDeliveries:[],turns:[],agentRuns:[],executionEvidence:[],agentRunFileChanges:[],approvals:[]} as unknown as ThreadOpenProjection
+    const event={globalSequence:3,eventId:'evt-add',eventType:'thread.member_added',threadId:'t',entityType:'agent_profile',entityId:'agent',actorType:'user',actorId:'local_user',sourceAgentRunId:null,executionEpoch:null,payload:{agentId:'agent'},createdAt:'2026-11-26T00:00:00Z'}
+    const request=vi.fn(async(method:string)=>method==='threads.memberTimeline'?[event]:projection)
+    expect((await readThreadSnapshot(mockClient(request),'t')).timeline).toEqual([event])
+    expect(request).toHaveBeenCalledWith('threads.memberTimeline',{threadId:'t'})
+  })
   it('rejects a snapshot for a different conversation',async()=>{
     const request=vi.fn().mockResolvedValue({schemaVersion:9,thread:{id:'other'}})
     await expect(readThreadSnapshot(mockClient(request),'t')).rejects.toThrow()

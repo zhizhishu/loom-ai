@@ -1041,6 +1041,7 @@ fn request_uses_independent_read_queue(method: &str) -> bool {
         method,
         "camps.open"
             | "camps.enter"
+            | "camps.memberTimeline"
             | "navigation.snapshot"
             | "navigation.camps"
             | "navigation.groupCamps"
@@ -12036,6 +12037,14 @@ impl Core {
                     &projection,
                 );
                 Ok(value)
+            }
+            "camps.memberTimeline" => {
+                let params: ThreadIdParams = serde_json::from_value(request.params.clone())?;
+                let mut database = self.database.lock().await;
+                Ok(serde_json::to_value(ReadModelService.camp_member_timeline(
+                    &mut database,
+                    params.camp_id.as_str(),
+                )?)?)
             }
             "camps.open" => {
                 let params: ThreadOpenParams = serde_json::from_value(request.params.clone())?;

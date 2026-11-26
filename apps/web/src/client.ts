@@ -179,6 +179,7 @@ export const WEB_OPERATIONS = [
   'navigation.campViewed',
   'threads.exists',
   'threads.open',
+  'threads.memberTimeline',
   'threads.enter',
   'thread.messages.page',
   'thread.messages.anchors',

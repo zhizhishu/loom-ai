@@ -265,6 +265,8 @@ pub enum Operation {
 
     #[serde(rename = "threads.open", alias = "camps.open")]
     CampOpen,
+    #[serde(rename = "threads.memberTimeline", alias = "camps.memberTimeline")]
+    CampMemberTimeline,
     #[serde(rename = "threads.enter", alias = "camps.enter")]
     CampEnter,
     #[serde(rename = "navigation.campViewed")]
@@ -731,6 +733,7 @@ impl Operation {
             Self::RunFiles => "agentRunFileChanges.get",
             Self::RunDiagnostic => "agentRuns.diagnostic.get",
             Self::CampOpen => "camps.open",
+            Self::CampMemberTimeline => "camps.memberTimeline",
             Self::CampEnter => "camps.enter",
             Self::CampViewed => "navigation.campViewed",
             Self::MemoryReviews => "memory.hearthReviewItems.list",

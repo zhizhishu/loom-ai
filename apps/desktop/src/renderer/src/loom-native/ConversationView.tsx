@@ -46,8 +46,8 @@ function memberEventPayloadAgentId(payload: unknown): string | null {
 }
 
 function memberEventKind(eventType: string): 'added' | 'removed' | null {
-  if (eventType === 'camp.member_added') return 'added'
-  if (eventType === 'camp.member_removed') return 'removed'
+  if (eventType === 'camp.member_added' || eventType === 'thread.member_added') return 'added'
+  if (eventType === 'camp.member_removed' || eventType === 'thread.member_removed') return 'removed'
   return null
 }
 

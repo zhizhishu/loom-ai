@@ -1336,6 +1336,34 @@ impl ReadModelService {
         })
     }
 
+    pub fn camp_member_timeline(
+        &self,
+        database: &mut Database,
+        camp_id: &str,
+    ) -> Result<Vec<DomainEventView>> {
+        let transaction = database.connection_mut().transaction()?;
+        let through_global_sequence = current_global_sequence(&transaction)?;
+        let events = load_events(
+            &transaction,
+            Some(camp_id),
+            0,
+            through_global_sequence,
+            500,
+            true,
+            false,
+        )?
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "thread.member_added" | "thread.member_removed" | "camp.member_added" | "camp.member_removed"
+            )
+        })
+        .collect();
+        transaction.commit()?;
+        Ok(events)
+    }
+
     pub fn camp_open_projection(
         &self,
         database: &mut Database,

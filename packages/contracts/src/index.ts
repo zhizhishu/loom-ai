@@ -4543,6 +4543,7 @@ export type CoreMethod =
   | 'threads.exists'
   | 'threads.enter'
   | 'threads.open'
+  | 'threads.memberTimeline'
   | 'threads.delete'
   | 'threads.deletionIssues'
   | 'threads.retryDeletion'
