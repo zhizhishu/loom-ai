@@ -20,6 +20,7 @@ import { wakeRestoreLines } from './wake-restore'
 import { approvalAging, approvalAgingText } from './approval-aging'
 import { AgentCitationContext, type CitationContextValue, type CitationReference } from './AgentCitations'
 import { CollapsibleMessage } from './CollapsibleMessage'
+import { bottomUnreadCount, UnreadPill } from './UnreadPill'
 import { runtimeFailureMessage } from '../RuntimeFailureNotice'
 import { RuntimeInstallationGuide } from '../RuntimeInstallationGuide'
 import { runtimeInstallGuide } from '../runtime-install-guide'
@@ -130,6 +131,8 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   const hasResults = hasThreadResults(resultEntries)
   const [segment, setSegment] = useState<ThreadSegment>('chat')
   const [copied, setCopied] = useState<string | null>(null)
+  const [leftBottomKey, setLeftBottomKey] = useState<string | null>(null)
+  const [dismissedLatestKey, setDismissedLatestKey] = useState<string | null>(null)
   // 发送方式（回车 / Ctrl+Enter）：桌面端由 ShortcutProvider 托管，Web 直连走 localStorage。
   const sendPreference = useComposerSendPreference()
   // @ 候选状态带着作用域：换会话/换快照时旧候选同步失效，不可能被显示，也不可能被选中。
@@ -194,7 +197,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
     pendingCaret.current = null
     input.current.setSelectionRange(caret, caret)
   }, [draft])
-  useEffect(() => { pinned.current = true; setShowLatest(false) }, [item?.id])
+  useEffect(() => { pinned.current = true; setShowLatest(false); setLeftBottomKey(null); setDismissedLatestKey(null) }, [item?.id])
   useEffect(() => {
     if (pinned.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight
     else if (lastId) setShowLatest(true)
@@ -204,7 +207,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
     input.current.style.height = 'auto'
     input.current.style.height = `${Math.min(180, Math.max(36, input.current.scrollHeight))}px`
   }, [draft])
-  const jump = () => { pinned.current = true; scroll.current?.scrollTo({ top: scroll.current.scrollHeight, behavior: 'smooth' }); setShowLatest(false) }
+  const jump = () => { pinned.current = true; scroll.current?.scrollTo({ top: scroll.current.scrollHeight, behavior: 'smooth' }); setShowLatest(false); setLeftBottomKey(null); setDismissedLatestKey(null) }
   const jumpToMessage = (messageId: string) => {
     const target = scroll.current?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(messageId)}"]`)
     if (!target) return
@@ -241,6 +244,8 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
       }
     }
   }), [agents, bundles, snapshot?.agentRuns, onOpenTaskCitation])
+  const bottomNewCount = bottomUnreadCount(flowEntries, leftBottomKey)
+  const showUnreadPill = showLatest && bottomNewCount > 0 && lastId !== dismissedLatestKey
   const title = item?.title || activeAgent?.displayName || 'LOOM'
   // 群里说话是「给群名发消息」（Mikka `group-chat-view.tsx:271` 传的是 group.title）；
   // 只有单聊才写助手名（Mikka `messages/zh-CN.json:212` Nav.messageBot）。
@@ -296,7 +301,13 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
     </div>}
     {segment === 'chat' ? <div className="ln-transcript" ref={scroll} onScroll={event => {
       const el = event.currentTarget; pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 90
-      if (pinned.current) setShowLatest(false)
+      if (pinned.current) {
+        setShowLatest(false)
+        setLeftBottomKey(null)
+        setDismissedLatestKey(null)
+      } else {
+        setLeftBottomKey(current => current ?? lastId ?? null)
+      }
     }}>
       {loading && !snapshot && <div className="ln-loading" role="status">正在读取对话…</div>}
       {!loading && !flowEntries.length && <div className="ln-chat-empty">{isGroup ? <GroupAvatar title={title} members={activeMembers} size={52}/> : <Avatar agent={activeAgent} name={title} size={52}/>}<h1>{title}</h1><p>{item?.threadId ? '从一条消息开始。' : '聊聊想法，或交给我一件事。'}</p></div>}
@@ -333,7 +344,9 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
       {systemMessages.length > 0 && <details className="ln-system-records"><summary>会话记录 <span>{systemMessages.length}</span></summary>{systemMessages.map(message => <AgentMarkdown key={message.id} text={message.body}/>)}</details>}
     </div> : <ThreadResults entries={resultEntries} onArtifact={onArtifact}/>}
     <div className="ln-composer-area">
-      {segment === 'chat' && showLatest && <button type="button" className="ln-jump-latest" title="回到最新消息" aria-label="回到最新消息" onClick={jump}><Icon name="down" size={18}/></button>}
+      {segment === 'chat' && showLatest && (showUnreadPill
+        ? <UnreadPill count={bottomNewCount} onJump={jump} onDismiss={() => setDismissedLatestKey(lastId ?? null)}/>
+        : bottomNewCount === 0 && <button type="button" className="ln-jump-latest" title="回到最新消息" aria-label="回到最新消息" onClick={jump}><Icon name="down" size={18}/></button>)}
       {error && <div className="ln-send-error" role="alert" data-slot="send-error"><strong>请求失败，请稍后重试。</strong>{error.trim() && error.trim() !== '请求失败，请稍后重试。' && <small>{error}</small>}<p>你的输入已保留。</p><button type="button" disabled={sending || (!draft.trim() && !files.length)} onClick={() => onSend(isGroup ? mentionRecipient(draft, activeMembers) : undefined)}>{sending ? '正在重试…' : '重试此回复'}</button></div>}
       {snapshot?.approvals.filter(approval => approval.status === 'pending').map(approval => <section className="ln-approval-request" key={approval.id} aria-label="等待你的授权" data-state={approval.status} aria-busy={approvalBusy}><strong><Icon name="hand" size={16}/>需要你确认<span className="ln-approval-state" data-state={approval.status}>{approvalStatusLabel(approval.status)}</span></strong><p>{approval.actionSummary}</p>{approval.reason && <small>{approval.reason}</small>}<ApprovalAge requestedAt={approval.requestedAt}/><p className="ln-approval-scope">{agents.find(agent => agent.agentId === approval.agentId)?.displayName || '当前助手'} · {approval.options.some(option => option.kind === 'allow_session') ? '持续授权仅限此原生会话，具体范围见选项。' : '本次请求按运行端提供的范围授权。'}</p><div>{approval.options.map(option => <button type="button" disabled={approvalBusy} key={option.optionId} title={option.consequence} className={option.kind === 'allow_once' ? 'is-once' : option.kind === 'allow_session' ? 'is-persistent' : ''} onClick={() => onResolveApproval(approval.id, option.optionId)}>{option.label}</button>)}</div></section>)}
       {resolvedApproval && <p className="ln-approval-result" data-slot="approval-result" data-state={resolvedApproval.status} aria-label={`${approvalStatusLabel(resolvedApproval.status)}的授权`}><Icon name={resolvedApproval.status === 'approved' ? 'check' : 'blocked'} size={14}/><span>{resolvedApproval.actionSummary}</span><em>{approvalStatusLabel(resolvedApproval.status)}</em></p>}
