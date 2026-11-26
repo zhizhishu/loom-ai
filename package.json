@@ -211,6 +211,7 @@
     "@uiw/react-codemirror": "4.25.11",
     "acorn": "8.15.0",
     "cron-parser": "5.10.0",
+    "diff": "8.0.2",
     "dingtalk-stream": "2.1.6-beta.1",
     "electron-updater": "6.8.9",
     "lexical": "0.50.0",

@@ -49,3 +49,7 @@
  .ln-artifact-pdf-actions{margin-left:0}
  .ln-artifact-lightbox{width:calc(100vw - 24px);height:calc(100dvh - 24px);padding:42px 10px 10px}
 }
+
+.ln-markdown ins { background: rgba(34, 197, 94, .16); text-decoration: none; border-radius: 2px; }
+.ln-markdown del { background: rgba(239, 68, 68, .13); text-decoration: line-through; border-radius: 2px; }
+.ln-artifact-download[data-active="true"] { font-weight: 600; }

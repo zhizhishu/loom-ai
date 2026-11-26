@@ -6,6 +6,7 @@ import type { LoomReviewRecordReceipt } from '@contracts'
 import { useThreadClient } from '../camp-client'
 import { readErrorMessage } from '../error-message'
 import { ArtifactPdfPreview } from './ArtifactPdfPreview'
+import { markdownDiff, remarkDiff } from './artifact-diff'
 import { Icon } from './icons'
 import { ArtifactXlsxPreview } from './ArtifactXlsxPreview'
 import './artifact-ux.css'
@@ -115,6 +116,28 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
   const facts = useMemo(
     () => artifactCandidateFacts(bundle, artifact, selection.candidate),
     [bundle, artifact, selection.candidate])
+  const previousArtifact = useMemo(() => {
+    const previousCandidateId = selection.candidate?.previousCandidateId
+    if (!previousCandidateId) return null
+    const previous = bundle.candidates.find(candidate => candidate.candidateId === previousCandidateId)
+    if (!previous) return null
+    return bundle.artifacts.find(entry => entry.relativePath === artifact.relativePath && previous.evidenceIds.includes(entry.artifactId)) ?? null
+  }, [bundle, artifact.relativePath, selection.candidate])
+  const [comparing, setComparing] = useState(false)
+  const [previousPreview, setPreviousPreview] = useState<ArtifactPreviewState | null>(null)
+  useEffect(() => {
+    setComparing(false)
+    setPreviousPreview(null)
+  }, [artifact.artifactId])
+  useEffect(() => {
+    if (!comparing || previousArtifact === null) return
+    let live = true
+    setPreviousPreview({ status: 'reading' })
+    void readArtifactPreview(client, missionId, previousArtifact.artifactId).then(state => {
+      if (live) setPreviousPreview(state)
+    })
+    return () => { live = false }
+  }, [client, missionId, previousArtifact, comparing])
 
   const [preview, setPreview] = useState<ArtifactPreviewState>({ status: 'reading' })
   // 重试只递增票号：旧请求迟到时票号已变，结果直接丢弃。
@@ -289,13 +312,19 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
                 </div>
           : markdown
             ? <div className="ln-markdown">
-                <ReactMarkdown
-                  remarkPlugins={[[remarkGfm, { singleTilde: false }]]}
-                  skipHtml
-                  disallowedElements={['img', 'iframe', 'object', 'embed', 'script', 'style']}
-                  unwrapDisallowed
-                  urlTransform={defaultUrlTransform}
-                >{stripLeadingHeading(preview.text)}</ReactMarkdown>
+                {comparing && previousPreview?.status === 'reading' && <div className="ln-artifact-state">正在读取上一版…</div>}
+                {comparing && previousPreview?.status === 'error' && <div className="ln-artifact-state" role="alert">{previousPreview.message}</div>}
+                {comparing && previousPreview?.status !== 'ready'
+                  ? null
+                  : <ReactMarkdown
+                      remarkPlugins={[[remarkGfm, { singleTilde: false }], ...(comparing ? [remarkDiff] : [])]}
+                      skipHtml
+                      disallowedElements={['img', 'iframe', 'object', 'embed', 'script', 'style']}
+                      unwrapDisallowed
+                      urlTransform={defaultUrlTransform}
+                    >{comparing && previousPreview?.status === 'ready'
+                      ? stripLeadingHeading(markdownDiff(previousPreview.text, preview.text))
+                      : stripLeadingHeading(preview.text)}</ReactMarkdown>}
               </div>
             : <pre className="ln-artifact-text">{preview.text}</pre>
 
@@ -328,6 +357,11 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
                 {versionLabel}
               </span>}
             <span className="ln-artifact-head-actions">
+              {markdown && previousArtifact !== null && <button
+                type="button" className="ln-artifact-download" title="对比上一版" aria-label="对比上一版"
+                data-active={comparing ? 'true' : 'false'}
+                onClick={() => setComparing(value => !value)}
+              ><span>{comparing ? '关闭对比' : '版本对比'}</span></button>}
               {download !== null && <button
                 type="button" className="ln-artifact-download" title="下载文件" aria-label="下载文件"
                 onClick={startDownload}
