@@ -203,7 +203,7 @@ export function NotificationSettings(): React.JSX.Element {
     <>
       <SettingsPageHeader
         eyebrow={uiAttribute("设置 / 提醒")}
-        title={uiAttribute("提醒")}
+        title="通知"
         description={uiAttribute("设置需要显示临时浮层的提醒。")}
       />
       <section className="section-block notification-settings" aria-label={uiAttribute("应用内提醒设置")}>

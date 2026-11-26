@@ -65,7 +65,7 @@ export function ShortcutSettings(): React.JSX.Element | null {
     const timer = setTimeout(() => setToast(''), 2500)
     return () => clearTimeout(timer)
   }, [toast])
-  if (!shortcuts) return null
+  if (!shortcuts) return <div className="general-settings shortcut-settings" data-layout="side"><SettingsPageHeader eyebrow="" title="快捷键" description="此环境暂无快捷键" /></div>
   const { platform, snapshot } = shortcuts
   const preferences = snapshot?.preferences
   const focusBinding = (id: ShortcutActionId): void => { requestAnimationFrame(() => document.querySelector<HTMLButtonElement>(`[data-edit="${id}"]`)?.focus({ preventScroll: true })) }
@@ -155,7 +155,7 @@ export function ShortcutSettings(): React.JSX.Element | null {
   }
   const group = (key: Command['group'], title: string): React.JSX.Element => <section className={`shortcut-section${key === 'workspace' ? ' shortcut-workspace-section' : ''}`} aria-label={t(title)}><div className="section-heading"><h2>{t(title)}</h2></div><div className="shortcut-fields">{SHORTCUTS.filter(row => row.group === key && available(row.id)).map(renderField)}</div></section>
   return <div className="general-settings shortcut-settings" data-layout="side" aria-busy={busy}>
-    <SettingsPageHeader eyebrow="" title={t('快捷键')} description={t('点击右侧按键区，再按键盘快捷键或鼠标侧键。')} />
+    <SettingsPageHeader eyebrow="" title="快捷键" description={t('点击右侧按键区，再按键盘快捷键或鼠标侧键。')} />
     {shortcuts.error && <div className="shortcut-save-error" role="alert"><span>{shortcuts.error}</span><button type="button" className="quiet-button" onClick={() => { void shortcuts.reload() }}>{t('重试')}</button></div>}
     {snapshot?.degraded && <div className="shortcut-save-error" role="alert">{t('快捷键配置无法读取，暂时使用默认设置。保存后会替换原配置。')}</div>}
     {!preferences ? <p role="status">{t('正在加载…')}</p> : <>

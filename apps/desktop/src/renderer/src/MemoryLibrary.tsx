@@ -660,7 +660,7 @@ export function MemoryLibrary({
       {mobile && selectedMemory && <div className="mobile-memory-back"><MobileBack label={uiAttribute("返回记忆列表")} onClick={() => setSelectedMemoryId(null)} /><span><UiText zh={"记忆"} /></span></div>}
       <header className="memory-library-header">
         <div>
-          <h2 id="memory-library-title"><UiText zh={"记忆"} /></h2>
+          <h2 id="memory-library-title">记忆</h2>
           <p><UiText zh={"查看、搜索和管理长期记忆。"} /></p>
         </div>
         <div className="memory-header-actions">
