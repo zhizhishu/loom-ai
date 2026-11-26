@@ -13,7 +13,7 @@ describe('agent Markdown in the native conversation', () => {
     expect(html).toContain('role="status"')
     expect(html).toContain('图表暂时无法渲染，已保留源码。')
     expect(html).toContain('graph LR')
-    expect(html).not.toContain('<svg')
+    expect(html).not.toContain('ln-mermaid-surface')
   })
   it('says a diagram is still being drawn while the reply streams', () => {
     expect(render(mermaidFence, true)).toContain('图表生成中，完成后显示预览。')
@@ -26,8 +26,23 @@ describe('agent Markdown in the native conversation', () => {
   it('keeps the fence language on non-Mermaid code', () => {
     const html = render('```ts\nconst a = 1\n```')
     expect(html).toContain('data-language="ts"')
-    expect(html).toContain('<pre><code>const a = 1</code></pre>')
+    expect(html).toContain('const a = 1')
     expect(html).not.toContain('ln-agent-mermaid')
+  })
+  it('draws the Mikka code-block header, copy action and line numbers', () => {
+    const html = render('```ts\nconst a = 1\nconst b = 2\n```')
+    expect(html).toContain('ln-agent-code-head')
+    expect(html).toContain('ln-agent-code-language')
+    expect(html).toContain('aria-label="复制代码"')
+    expect(html).toContain('class="ln-agent-code-line-no" aria-hidden="true">1</span>')
+    expect(html).toContain('class="ln-agent-code-line-no" aria-hidden="true">2</span>')
+  })
+  it('marks streaming code as a live writing surface', () => {
+    const html = render('```ts\nconst a = 1\n```', true)
+    expect(html).toContain('aria-busy="true"')
+    expect(html).toContain('role="log"')
+    expect(html).toContain('aria-live="polite"')
+    expect(html).toContain('正在编写')
   })
   it('labels a wide table as its own region without flattening it', () => {
     const html = render('| PR | Status |\n|---|---|\n| #1 | Review |')

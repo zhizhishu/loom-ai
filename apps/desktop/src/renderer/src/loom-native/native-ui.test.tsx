@@ -63,7 +63,7 @@ describe('native reference frontend boundaries', () => {
   })
   it('keeps rich table/code/list structure instead of flattening messages', () => {
     const html=renderToStaticMarkup(createElement(AgentMarkdown,{text:'| PR | Status |\n|---|---|\n| #1 | Review |\n\n1. First\n2. Next\n\n```ts\nconst a = 1\n```'}))
-    expect(html).toContain('<table>');expect(html).toContain('<ol>');expect(html).toContain('<pre>')
+    expect(html).toContain('<table>');expect(html).toContain('<ol>');expect(html).toContain('data-agent-code-pre')
   })
   it('does not turn arbitrary Markdown scripts into executable HTML', () => {
     const html=renderToStaticMarkup(createElement(AgentMarkdown,{text:'<script>alert(1)</script>'}))
