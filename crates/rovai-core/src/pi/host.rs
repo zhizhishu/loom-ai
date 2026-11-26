@@ -3679,7 +3679,7 @@ write_session() {
 emit_managed_session_state() {
   host_instance_id=$(/usr/bin/sed -n 's/.*"hostInstanceId":"\([^"]*\)".*/\1/p' "$ROVAI_PI_HOST_BINDING_FILE")
   host_binding_generation=$(/usr/bin/sed -n 's/.*"hostBindingGeneration":\([0-9][0-9]*\).*/\1/p' "$ROVAI_PI_HOST_BINDING_FILE")
-  event=$(printf '{"type":"extension_ui_request","method":"setStatus","statusKey":"rovai-managed-session-state","statusText":"{\\"schemaVersion\\":3,\\"extensionVersion\\":\\"rovai-pi-host-v11\\",\\"hostInstanceId\\":\\"%s\\",\\"hostBindingGeneration\\":%s,\\"sessionId\\":\\"%s\\",\\"sessionFile\\":\\"%s\\",\\"cwd\\":\\"%s\\"}"}' "$host_instance_id" "$host_binding_generation" "$session_id" "$session_file" "$PWD")
+  event=$(printf '{"type":"extension_ui_request","method":"setStatus","statusKey":"rovai-managed-session-state","statusText":"{\\"schemaVersion\\":3,\\"extensionVersion\\":\\"rovai-pi-host-v12\\",\\"hostInstanceId\\":\\"%s\\",\\"hostBindingGeneration\\":%s,\\"sessionId\\":\\"%s\\",\\"sessionFile\\":\\"%s\\",\\"cwd\\":\\"%s\\"}"}' "$host_instance_id" "$host_binding_generation" "$session_id" "$session_file" "$PWD")
   printf '%s\n' "$event" >> "$event_log"
   printf '%s\n' "$event"
 }
@@ -4500,7 +4500,7 @@ done
 
     #[test]
     fn production_host_launch_preserves_pi_native_resources() {
-        let extension = Path::new("/private/rovai-pi-host-v11.ts");
+        let extension = Path::new("/private/rovai-pi-host-v12.ts");
         let mut production = Command::new("pi");
         append_host_arguments(&mut production, extension, None, None);
         let production_args = production
@@ -4516,7 +4516,7 @@ done
                 "--no-themes",
                 "--approve",
                 "--extension",
-                "/private/rovai-pi-host-v11.ts",
+                "/private/rovai-pi-host-v12.ts",
                 "--extension",
                 "/private/ask-user-question.mjs",
             ]
@@ -4535,7 +4535,7 @@ done
 
     #[test]
     fn guarded_host_launch_adds_only_the_granted_tools_and_the_managed_guard() {
-        let extension = Path::new("/private/rovai-pi-host-v11.ts");
+        let extension = Path::new("/private/rovai-pi-host-v12.ts");
         let guard = Path::new("/private/rovai-pi-file-guard.ts");
         // One table over the three exact frozen tool sets Core can emit; the joined spelling is what the
         // Host receives, so it is asserted verbatim. The workflow set adds exactly one managed business
@@ -4560,7 +4560,7 @@ done
                     "--extension",
                     "/private/rovai-pi-file-guard.ts",
                     "--extension",
-                    "/private/rovai-pi-host-v11.ts",
+                    "/private/rovai-pi-host-v12.ts",
                     "--extension",
                     "/private/ask-user-question.mjs",
                 ]

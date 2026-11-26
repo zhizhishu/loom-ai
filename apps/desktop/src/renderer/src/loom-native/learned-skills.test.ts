@@ -24,7 +24,7 @@ it('filters agent and state and puts pinned learned skills first',()=>{
   expect(learnedBadges(rows[2]!)).toEqual(['已归档','已锁定'])
   expect(learnedBadges(rows[3]!)).toEqual(['待复审','已锁定'])
 })
-it('renders the honest no-producer empty state',()=>{
+it('renders the pending-review producer empty state',()=>{
   const html=renderToStaticMarkup(createElement(LearnedSkillsPanel,{environment:{client:{}} as BusinessEnvironment,agentId:'bot'}))
-  expect(html).toContain('还没有学到技能');expect(html).toContain('学习管线尚未接入')
+  expect(html).toContain('还没有学到技能');expect(html).toContain('提交为待复审技能')
 })

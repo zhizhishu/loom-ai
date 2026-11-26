@@ -10,6 +10,42 @@
       }
     },
     {
+      "operation": "loom.skill_suggest",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "description",
+          "instructions",
+          "rationale"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "instructions": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          },
+          "rationale": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000
+          }
+        }
+      }
+    },
+    {
       "operation": "loom.plan",
       "inputSchema": {
         "type": "object",

@@ -21,7 +21,9 @@ pub(crate) use hook_review::{
 };
 pub(crate) use skill_source::{
     ID_PREFIX as SKILL_SOURCE_ID_PREFIX, SCHEMA_SQL as SKILL_SOURCE_SCHEMA_SQL, SelectedSource,
-    schema_matches as skill_source_schema_matches, selected_library_sources,
+    admit_library_root as admit_skill_library_root,
+    require_selectable as require_selectable_skill_source, schema_matches as skill_source_schema_matches,
+    selected_library_sources,
     verify_selected_source as verify_selected_skill_source,
 };
 

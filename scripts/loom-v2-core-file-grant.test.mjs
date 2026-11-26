@@ -346,7 +346,7 @@ test('workflow policy: the managed loom tool reaches the eight operations only, 
     }
 
     // Every operation without a path argument is allowed.
-    for (const operation of ['loom.status', 'loom.plan', 'loom.release', 'loom.claim', 'loom.submit', 'loom.inspect', 'loom.stage-review']) {
+    for (const operation of ['loom.status', 'loom.skill_suggest', 'loom.plan', 'loom.release', 'loom.claim', 'loom.submit', 'loom.inspect', 'loom.stage-review']) {
       assert.equal(
         workflow(toolEvent('rovai_loom', `op_${operation}`, { operation, input: {} }), ctx),
         undefined,
@@ -354,7 +354,7 @@ test('workflow policy: the managed loom tool reaches the eight operations only, 
       )
     }
 
-    // Nothing outside the nine operations is reachable, even with a plausible looking name.
+    // Nothing outside the ten operations is reachable, even with a plausible looking name.
     for (const operation of ['loom.workspace.run', 'loom.accept', 'thread.message.send', 'bash', 'memory.write', '']) {
       const outcome = workflow(toolEvent('rovai_loom', `op_bad_${operation}`, { operation, input: {} }), ctx)
       assert.equal(outcome?.block, true, `${operation} must be refused`)

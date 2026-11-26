@@ -1,4 +1,4 @@
-// 无参考，按用户定（学到只读空态）
+// 无参考，按用户定（待复审习得技能）
 import type { SkillView } from '@contracts'
 export function learnedSkills(skills: readonly SkillView[], agentId: string, state = 'active'): SkillView[] {
   return skills.filter(s => s.learned?.agentId === agentId && (state === 'all' || s.learned.state === state))

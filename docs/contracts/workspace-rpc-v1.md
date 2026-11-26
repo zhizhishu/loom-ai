@@ -12,7 +12,7 @@ last_updated: 2026-11-05
 
 本合同定义同一 AgentRun 会话对另一节点已准备工作区的连续 list、read、受控 run。Core A 保留身份、授权和结果账本权威；R2 不迁移父 Run。调用 Runtime 可以在本机或远端，均复用同一个已认证 Built-in Tool 入口。
 
-[Built-in Tool Transport v45](builtin-tool-transport-v45.md)拥有 CLI、IPC、Agent-facing 投影和版本准入。旧一次性 Start、R1 Runtime process pipe、B4 shim 与 R2 是不同协议边界；不能用旧 run credential 自造当前 AgentRun scope。
+[Built-in Tool Transport v46](builtin-tool-transport-v46.md)拥有 CLI、IPC、Agent-facing 投影和版本准入。旧一次性 Start、R1 Runtime process pipe、B4 shim 与 R2 是不同协议边界；不能用旧 run credential 自造当前 AgentRun scope。
 
 ## 请求、可信 dispatch 与所有者
 
@@ -58,7 +58,7 @@ authority.admit 在使用时重验固定事实。不允许从 Open.cwd、Dispatc
 
 相对路径使用 /；拒绝绝对路径、盘符/UNC、反斜线、空组件、. / .. 组件和 NUL。Node 在已准备根下重新解析并核对链接边界，不信任 A 提供绝对 root。
 
-Wire 上 args 最多 128 项，每项最多 8192 bytes，总计最多 32768 bytes；当前 Builtin git.status 政策将外部 args 限为零项。每个 Output chunk 最多 16384 raw bytes，stdout/stderr 合计保留最多 1048576 bytes；省略量必须产生 OutputTruncated，不能静默丢弃。base64 是 wire/journal 的无损字节格式，Agent-facing UTF-8 投影由 Transport v45 定义。
+Wire 上 args 最多 128 项，每项最多 8192 bytes，总计最多 32768 bytes；当前 Builtin git.status 政策将外部 args 限为零项。每个 Output chunk 最多 16384 raw bytes，stdout/stderr 合计保留最多 1048576 bytes；省略量必须产生 OutputTruncated，不能静默丢弃。base64 是 wire/journal 的无损字节格式，Agent-facing UTF-8 投影由 Transport v46 定义。
 
 单次 read 是一次有界读取的实际字节。offset 分片之间没有稳定文件版本或 snapshot 保证；不能拼接多次 read 后宣称原子文件快照。
 

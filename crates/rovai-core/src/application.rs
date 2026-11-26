@@ -7904,8 +7904,9 @@ impl Core {
                         ).await.map_err(rovai_core::loom_tool::map_domain_error)
                         .map_err(map_loom_tool_error)?
                     } else {
-                        let output = rovai_core::loom_tool::invoke(
+                        let output = rovai_core::loom_tool::invoke_with_skill_root(
                             &mut database,&caller,&tool_name,request.input,
+                            self.skill_library.root(),
                         ).map_err(map_loom_tool_error)?;
                         // P0 step 3 (c) + step 6: `loom.claim` is the moment this Run earns the
                         // right to write, and `loom.claim_heartbeat` is the moment it extends the

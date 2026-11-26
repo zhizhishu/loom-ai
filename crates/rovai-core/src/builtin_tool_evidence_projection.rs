@@ -139,6 +139,16 @@ fn project_input(operation: &str, input: &Value) -> Result<Value> {
             }
         }
         "loom.status" => {}
+        "loom.skill_suggest" => {
+            insert_identifier(&mut projected, "name", input.get("name"));
+            insert_semantic_text(&mut projected, "description", input.get("description"));
+            if let Some(instructions) = input.get("instructions").and_then(Value::as_str) {
+                projected.insert("instructionChars".into(), json!(instructions.chars().count()));
+            }
+            if let Some(rationale) = input.get("rationale").and_then(Value::as_str) {
+                projected.insert("rationaleChars".into(), json!(rationale.chars().count()));
+            }
+        }
         "loom.plan" => {
             insert_semantic_text(&mut projected, "goal", input.get("goal"));
             if let Some(tasks) = input.get("tasks").and_then(Value::as_array) {
@@ -484,6 +494,14 @@ fn project_result(operation: &str, result: &Value) -> Result<Value> {
         }
         "loom.status" => {
             insert_identifier(&mut projected, "missionId", result.get("missionId"));
+        }
+        "loom.skill_suggest" => {
+            insert_identifier(&mut projected, "skillId", result.get("skillId"));
+            insert_identifier(&mut projected, "revisionId", result.get("revisionId"));
+            insert_bool(&mut projected, "updated", result.get("updated"));
+            insert_bool(&mut projected, "unchanged", result.get("unchanged"));
+            insert_enum(&mut projected, "state", result.get("state"));
+            insert_bool(&mut projected, "enabled", result.get("enabled"));
         }
         "loom.plan" => {
             insert_identifier(&mut projected, "planId", result.get("planId"));
@@ -1262,6 +1280,36 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("missing terminal projection for {operation}: {error}"));
         }
+    }
+
+    #[test]
+    fn skill_suggest_projects_learning_facts_without_skill_body_or_rationale() {
+        let projected = projection(
+            "loom.skill_suggest",
+            json!({
+                "name": "triage-release",
+                "description": "Triage a release",
+                "instructions": "secret procedure body",
+                "rationale": "private rationale"
+            }),
+            json!({
+                "skillId": "skill-1",
+                "revisionId": "revision-1",
+                "updated": false,
+                "unchanged": false,
+                "state": "stale",
+                "enabled": true,
+                "message": "not evidence"
+            }),
+        );
+        assert_eq!(projected["canonicalInput"]["name"], "triage-release");
+        assert_eq!(projected["canonicalInput"]["instructionChars"], 21);
+        assert_eq!(projected["canonicalResult"]["skillId"], "skill-1");
+        assert_eq!(projected["canonicalResult"]["state"], "stale");
+        let encoded = serde_json::to_string(&projected).unwrap();
+        assert!(!encoded.contains("secret procedure body"));
+        assert!(!encoded.contains("private rationale"));
+        assert!(!encoded.contains("not evidence"));
     }
 
     #[test]

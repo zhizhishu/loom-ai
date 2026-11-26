@@ -10,12 +10,12 @@ use serde_json::{Map, Value, json};
 
 use crate::team_tool_catalog::builtin_tool_definitions;
 
-pub const BUILTIN_TOOL_CONTRACT_VERSION: u32 = 45;
+pub const BUILTIN_TOOL_CONTRACT_VERSION: u32 = 46;
 pub const BUILTIN_TOOL_IPC_PROTOCOL_VERSION: u32 = 3;
 pub const BUILTIN_TOOL_ENVELOPE_VERSION: u32 = 2;
-pub const BUILTIN_TOOL_CLI_COMMAND_VERSION: u32 = 45;
+pub const BUILTIN_TOOL_CLI_COMMAND_VERSION: u32 = 46;
 pub const BUILTIN_TOOL_AGENT_OUTPUT_CONTRACT_VERSION: u32 = 15;
-pub const BUILTIN_TOOL_RUNTIME_CAPABILITY: &str = "builtin_cli.transport.v45";
+pub const BUILTIN_TOOL_RUNTIME_CAPABILITY: &str = "builtin_cli.transport.v46";
 pub const ROVAI_AGENT_CLI_ENV: &str = "ROVAI_AGENT_CLI";
 pub const ROVAI_CLI_CONTEXT_ENV: &str = "ROVAI_CLI_CONTEXT";
 pub const ROVAI_RUN_TMP_ENV: &str = "ROVAI_RUN_TMP";
@@ -23,13 +23,14 @@ pub const ROVAI_RUN_TMP_ENV: &str = "ROVAI_RUN_TMP";
 ///
 /// The Pi managed bridge sets this on the exact child process it spawns, derived from the provider
 /// tool-call id plus the authenticated Run binding and the operation. It is never read from model
-/// output, so a payload can never name its own command identity. The CLI accepts it for the nine
+/// output, so a payload can never name its own command identity. The CLI accepts it for the ten
 /// `loom.*` operations only; every other operation keeps its previous request-id behaviour.
 pub const ROVAI_BUILTIN_REQUEST_ID_ENV: &str = "ROVAI_BUILTIN_REQUEST_ID";
-/// The complete operation set the managed workflow tool may reach: the nine LOOM business
+/// The complete operation set the managed workflow tool may reach: the ten LOOM business
 /// operations the CLI already ships. `bash`, MCP, and every other operation stay outside it.
-pub const MANAGED_WORKFLOW_OPERATIONS: [&str; 9] = [
+pub const MANAGED_WORKFLOW_OPERATIONS: [&str; 10] = [
     "loom.status",
+    "loom.skill_suggest",
     "loom.plan",
     "loom.release",
     "loom.claim",
@@ -165,7 +166,7 @@ pub struct BuiltinToolCliIdentity {
     pub action: &'static str,
 }
 
-pub const BUILTIN_TOOL_CLI_IDENTITIES: [BuiltinToolCliIdentity; 44] = [
+pub const BUILTIN_TOOL_CLI_IDENTITIES: [BuiltinToolCliIdentity; 45] = [
     BuiltinToolCliIdentity {
         operation: "thread.message.send",
         group: "send",
@@ -285,6 +286,11 @@ pub const BUILTIN_TOOL_CLI_IDENTITIES: [BuiltinToolCliIdentity; 44] = [
         operation: "loom.status",
         group: "loom",
         action: "status",
+    },
+    BuiltinToolCliIdentity {
+        operation: "loom.skill_suggest",
+        group: "loom",
+        action: "skill-suggest",
     },
     BuiltinToolCliIdentity {
         operation: "loom.plan",
@@ -1203,6 +1209,7 @@ pub fn projection_identity(operation: &str) -> Result<&'static str> {
         | "mission.update"
         | "mission.status"
         | "loom.status"
+        | "loom.skill_suggest"
         | "loom.plan"
         | "loom.release"
         | "loom.claim"
@@ -1340,8 +1347,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn managed_workflow_operations_are_exactly_the_nine_loom_business_operations() {
-        assert_eq!(MANAGED_WORKFLOW_OPERATIONS.len(), 9);
+    fn managed_workflow_operations_are_exactly_the_ten_loom_business_operations() {
+        assert_eq!(MANAGED_WORKFLOW_OPERATIONS.len(), 10);
         for operation in MANAGED_WORKFLOW_OPERATIONS {
             assert!(operation.starts_with("loom."), "{operation} is not a loom operation");
             assert!(is_managed_workflow_operation(operation));
@@ -1373,10 +1380,10 @@ mod tests {
 
     #[test]
     fn cli_mapping_is_complete_unique_and_contract_valid() {
-        assert_eq!(BUILTIN_TOOL_CONTRACT_VERSION, 45);
-        assert_eq!(BUILTIN_TOOL_CLI_COMMAND_VERSION, 45);
+        assert_eq!(BUILTIN_TOOL_CONTRACT_VERSION, 46);
+        assert_eq!(BUILTIN_TOOL_CLI_COMMAND_VERSION, 46);
         assert_eq!(BUILTIN_TOOL_AGENT_OUTPUT_CONTRACT_VERSION, 15);
-        assert_eq!(BUILTIN_TOOL_RUNTIME_CAPABILITY, "builtin_cli.transport.v45");
+        assert_eq!(BUILTIN_TOOL_RUNTIME_CAPABILITY, "builtin_cli.transport.v46");
         validate_builtin_tool_contract().unwrap();
         let operations = BUILTIN_TOOL_CLI_IDENTITIES
             .iter()

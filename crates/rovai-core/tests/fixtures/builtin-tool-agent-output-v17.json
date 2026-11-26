@@ -805,6 +805,26 @@
       "missionStatus": "not_started"
     }
   },
+  "loom.skill_suggest": {
+    "canonicalResult": {
+      "skillId": "skill_learned_1",
+      "revisionId": "revision_1",
+      "updated": false,
+      "unchanged": false,
+      "state": "stale",
+      "enabled": true,
+      "message": "已记录为待复审技能；复审并分配给助手后才会生效。"
+    },
+    "agentOutput": {
+      "skillId": "skill_learned_1",
+      "revisionId": "revision_1",
+      "updated": false,
+      "unchanged": false,
+      "state": "stale",
+      "enabled": true,
+      "message": "已记录为待复审技能；复审并分配给助手后才会生效。"
+    }
+  },
   "loom.plan": {
     "canonicalResult": {
       "planId": "lp_example",

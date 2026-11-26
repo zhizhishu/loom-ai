@@ -27,7 +27,7 @@ const SCHEMA_VERSION = 3;
 // not change). Core's matching constant is `PI_MANAGED_GUARD_SCHEMA_VERSION` in `pi.rs`; the two must
 // move together or every guarded Run is refused by `await_guard_ready`.
 const GRANT_SCHEMA_VERSION = 5;
-const EXTENSION_VERSION = "rovai-pi-host-v11";
+const EXTENSION_VERSION = "rovai-pi-host-v12";
 // Optional per-Run file-access policy. Absent => the unchanged legacy native policy (no guard).
 // Core writes the grant to a private file and points this env var at it; the same file is what the
 // shared guard reads, so the extension and the guard can never disagree about the policy.
@@ -343,7 +343,7 @@ function loomRegistration(pi: any): void {
     name: LOOM_TOOL_NAME,
     label: "LOOM workflow",
     description: loomToolDescription(contracts),
-    promptSnippet: "rovai_loom — record delivery evidence and submit a claimed task (9 LOOM operations only)",
+    promptSnippet: "rovai_loom — record delivery evidence and submit a claimed task (10 LOOM operations only)",
     parameters: loomToolParameters(contracts),
     async execute(toolCallId: string, params: any, signal?: AbortSignal) {
       let binding: any;

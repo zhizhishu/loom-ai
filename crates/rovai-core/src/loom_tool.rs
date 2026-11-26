@@ -27,9 +27,11 @@ pub const LOOM_EVIDENCE_TOOL_NAME: &str = "loom.evidence";
 pub const LOOM_SUBMIT_TOOL_NAME: &str = "loom.submit";
 pub const LOOM_INSPECT_TOOL_NAME: &str = "loom.inspect";
 pub const LOOM_STAGE_REVIEW_TOOL_NAME: &str = "loom.stage-review";
+pub const LOOM_SKILL_SUGGEST_TOOL_NAME: &str = "loom.skill_suggest";
 
-pub const LOOM_TOOL_NAMES: [&str; 9] = [
+pub const LOOM_TOOL_NAMES: [&str; 10] = [
     LOOM_STATUS_TOOL_NAME,
+    LOOM_SKILL_SUGGEST_TOOL_NAME,
     LOOM_PLAN_TOOL_NAME,
     LOOM_RELEASE_TOOL_NAME,
     LOOM_CLAIM_TOOL_NAME,
@@ -198,6 +200,15 @@ pub struct LoomInspectToolInput {
 /// domain validation cannot drift apart and no adapter field can become a second source of truth.
 pub type LoomStageReviewToolInput = loom::control::LoomStageReviewInput;
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoomSkillSuggestToolInput {
+    pub name: String,
+    pub description: String,
+    pub instructions: String,
+    pub rationale: String,
+}
+
 /// Schema-level validation used by the closed tool catalog.
 pub fn validate_input(name: &str, input: &Value) -> Result<()> {
     match name {
@@ -225,6 +236,9 @@ pub fn validate_input(name: &str, input: &Value) -> Result<()> {
         LOOM_INSPECT_TOOL_NAME => {
             serde_json::from_value::<LoomInspectToolInput>(input.clone()).map(|_| ())
         }
+        LOOM_SKILL_SUGGEST_TOOL_NAME => {
+            serde_json::from_value::<LoomSkillSuggestToolInput>(input.clone()).map(|_| ())
+        }
         LOOM_STAGE_REVIEW_TOOL_NAME => {
             let input = serde_json::from_value::<LoomStageReviewToolInput>(input.clone())
                 .map_err(|error| LoomToolError::new("loom.invalid_input", error.to_string()))?;
@@ -250,10 +264,34 @@ pub fn invoke(
     name: &str,
     input: Value,
 ) -> Result<Value> {
+    let root = crate::skill::SkillLibraryService::default_root()?;
+    invoke_with_skill_root(database, caller, name, input, &root)
+}
+
+pub fn invoke_with_skill_root(
+    database: &mut Database,
+    caller: &LoomToolCaller<'_>,
+    name: &str,
+    input: Value,
+    skill_library_root: &std::path::Path,
+) -> Result<Value> {
     // Full closed-schema check (lengths, enums, item shapes) as well as the serde shape; Core
     // never trusts that the CLI validated before sending.
     crate::team_tool_catalog::validate_builtin_tool_input(name, &input)
         .map_err(|error| LoomToolError::new("loom.invalid_input", format!("{error:#}")))?;
+    if name == LOOM_SKILL_SUGGEST_TOOL_NAME {
+        let input: LoomSkillSuggestToolInput = serde_json::from_value(input)?;
+        let service = crate::skill::SkillLibraryService::new(skill_library_root.to_path_buf())?;
+        return service.suggest_learned(database, crate::skill::LearnedSkillSuggestionInput {
+            camp_id: caller.camp_id.to_string(),
+            agent_id: caller.agent_id.to_string(),
+            agent_run_id: caller.agent_run_id.to_string(),
+            name: input.name,
+            description: input.description,
+            instructions: input.instructions,
+            rationale: input.rationale,
+        });
+    }
     let mission_id = current_mission_id(database.connection(), caller.camp_id)?;
     match name {
         LOOM_STATUS_TOOL_NAME => status(database, &mission_id),
@@ -675,7 +713,7 @@ fn open_object() -> Value {
     json!({"type": "object"})
 }
 
-/// The nine closed tool definitions, in `TEAM_TOOL_NAMES` order. Model-visible text follows the
+/// The ten closed tool definitions, in `TEAM_TOOL_NAMES` order. Model-visible text follows the
 /// confirmed revision of `docs/versions/v1.72/model-context-change-loom-accp.md` (the `loom.plan`
 /// description is r3), and the two control tools follow the confirmed r1 of
 /// `docs/versions/v1.72/model-context-change-loom-control.md`. Edit that text only through a new
@@ -722,6 +760,48 @@ pub fn tool_definitions() -> Vec<Value> {
                     "claims": {"type": "array", "items": open_object()},
                     "evaluatedAt": {"type": "string"}
                 }
+            }
+        }),
+        json!({
+            "name": LOOM_SKILL_SUGGEST_TOOL_NAME,
+            "title": "Suggest a learned skill",
+            "description": "Record one reusable procedure this assistant learned as a pending-review Skill. Use only for durable workflow knowledge, never for secrets, one-off task facts, or memory-owned preferences. The suggestion stays private to this assistant until reviewed and assigned.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": false,
+                "required": ["name", "description", "instructions", "rationale"],
+                "properties": {
+                    "name": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+                    "description": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "instructions": {"type": "string", "minLength": 1, "maxLength": 32768},
+                    "rationale": {"type": "string", "minLength": 1, "maxLength": 4000}
+                }
+            },
+            "outputSchema": {
+                "oneOf": [
+                    {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["skillId", "unchanged", "state", "message"],
+                        "properties": {
+                            "skillId": {"type": "string"},
+                            "unchanged": {"const": true},
+                            "state": {"enum": ["stale", "active", "archived"]},
+                            "message": {"type": "string"}
+                        }
+                    },
+                    {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["skillId", "revisionId", "updated", "unchanged", "state", "enabled", "message"],
+                        "properties": {
+                            "skillId": {"type": "string"},
+                            "revisionId": {"type": "string"},
+                            "updated": {"type": "boolean"},
+                            "unchanged": {"const": false},
+                            "state": {"const": "stale"},
+                            "enabled": {"type": "boolean"},
+                            "message": {"type": "string"}
+                        }
+                    }
+                ]
             }
         }),
         json!({
@@ -1068,6 +1148,37 @@ mod tests {
             .unwrap_or_else(|| panic!("expected a LOOM tool rejection, got: {error:#}"))
             .code()
             .to_string()
+    }
+
+    #[test]
+    fn skill_suggestion_uses_authenticated_caller_identity() {
+        let mut database = fixture();
+        let skill_root = database.directory().join("skill-library");
+        let result = invoke_with_skill_root(
+            &mut database,
+            &caller("camp_learning", "agent_2", "run_learning", "cmd_skill"),
+            LOOM_SKILL_SUGGEST_TOOL_NAME,
+            json!({
+                "name": "triage-release",
+                "description": "Triage a release",
+                "instructions": "Inspect evidence before shipping.",
+                "rationale": "The user confirmed this repeatable workflow."
+            }),
+            &skill_root,
+        )
+        .unwrap();
+        assert_eq!(result["state"], "stale");
+        assert_eq!(result["unchanged"], false);
+        let metadata: String = database.connection().query_row(
+            "SELECT revision.source_metadata_json FROM skill
+             JOIN skill_revision AS revision ON revision.id=skill.current_revision_id
+             WHERE skill.name='triage-release'",
+            [], |row| row.get(0),
+        ).unwrap();
+        let metadata: Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(metadata["learning"]["campId"], "camp_learning");
+        assert_eq!(metadata["learning"]["agentId"], "agent_2");
+        assert_eq!(metadata["learning"]["agentRunId"], "run_learning");
     }
 
     #[test]
@@ -1427,6 +1538,7 @@ mod tests {
             untouched,
             vec![
                 LOOM_STATUS_TOOL_NAME,
+                LOOM_SKILL_SUGGEST_TOOL_NAME,
                 LOOM_PLAN_TOOL_NAME,
                 LOOM_RELEASE_TOOL_NAME,
                 LOOM_EVIDENCE_TOOL_NAME,
@@ -1446,6 +1558,10 @@ mod tests {
     fn closed_inputs_refuse_injected_identity() {
         for (name, input) in [
             (LOOM_STATUS_TOOL_NAME, json!({"missionId": "m"})),
+            (
+                LOOM_SKILL_SUGGEST_TOOL_NAME,
+                json!({"name": "triage-release", "description": "d", "instructions": "i", "rationale": "r", "campId": "forged"}),
+            ),
             (
                 LOOM_RELEASE_TOOL_NAME,
                 json!({"taskId": "t", "missionId": "m"}),

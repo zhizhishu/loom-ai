@@ -33,7 +33,7 @@ pub(crate) use host::{
 pub use host::{PiAgentRunRuntimeRequest, PiMcpProjection, PiRpcRuntimeAdapter, PiRuntime};
 
 pub(crate) const PI_PROTOCOL_VERSION: &str = "pi-jsonl-rpc-v1";
-pub(crate) const PI_HOST_EXTENSION_VERSION: &str = "rovai-pi-host-v11";
+pub(crate) const PI_HOST_EXTENSION_VERSION: &str = "rovai-pi-host-v12";
 /// The schema version of the `rovai-managed-guard-state` acknowledgement (the grant receipt).
 ///
 /// P0 step 2 / plan decision E2: the grant carries the LOOM claim triple
@@ -1098,13 +1098,13 @@ mod managed_workflow_source_tests {
     use super::*;
 
     #[test]
-    fn workflow_tool_sources_agree_on_one_tool_name_and_the_nine_operations() {
+    fn workflow_tool_sources_agree_on_one_tool_name_and_the_ten_operations() {
         // One fixture owns the Node seam; its contents must remain the actual Core schemas.
         let fixture: Value = serde_json::from_str(include_str!(
             "../../../scripts/fixtures/pi-workflow/core-input-contract.json"
         )).unwrap();
         assert_eq!(managed_workflow_contract(), fixture);
-        assert_eq!(fixture["operations"].as_array().unwrap().len(), 9);
+        assert_eq!(fixture["operations"].as_array().unwrap().len(), 10);
         // The name and the operation set live in three places that MUST agree: the Rust contract
         // (file_grant.rs / builtin_tool_transport.rs), the managed Host extension that registers the
         // tool, and the shared guard that re-checks every call. A drift here is a silent policy hole,

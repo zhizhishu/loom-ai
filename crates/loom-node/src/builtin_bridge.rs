@@ -21,7 +21,7 @@ use tokio::{
     sync::{Semaphore, oneshot, watch},
 };
 
-const CONTRACT_VERSION: u32 = 45;
+const CONTRACT_VERSION: u32 = 46;
 const IPC_VERSION: u32 = 3;
 const LOCAL_FRAME_BUDGET: Duration = Duration::from_secs(5);
 const CALL_BUDGET: Duration = Duration::from_secs(25);

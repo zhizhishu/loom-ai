@@ -36,16 +36,17 @@ export function LearnedSkillsPanel({ environment, agentId }: { environment: Busi
   const rows = learnedSkills(skills,agentId,filter)
   return <section aria-label="学到的技能">
     <p>只展示这个助手自己学到的技能，不把导入技能当成习得成果。</p>
-    <p>学习管线尚未接入；自动提炼和高级学习策略暂不可用。</p>
+    <p>助手可把可复用流程提交为待复审技能；自动提炼和高级学习策略暂不可用。</p>
     <label><input type="checkbox" disabled/>空闲时自动提炼技能</label>
-    <details><summary>高级学习策略</summary><p>自动标记待复审、自动归档将在学习管线接入后开放。</p></details>
-    <nav aria-label="习得技能筛选">{[['active','已启用'],['all','本 Bot 习得'],['archived', '已归档 ('+learnedSkills(skills,agentId,'archived').length+')']].map(([value,label]) =>
+    <details><summary>高级学习策略</summary><p>自动提炼、自动标记待复审、自动归档将在后续学习管线开放。</p></details>
+    <nav aria-label="习得技能筛选">{[['active','已启用'],['stale','待复审'],['all','本 Bot 习得'],['archived', '已归档 ('+learnedSkills(skills,agentId,'archived').length+')']].map(([value,label]) =>
       <button type="button" key={value} aria-pressed={filter===value} onClick={()=>setFilter(value)}>{label}</button>)}</nav>
     {error && <FormMessage error>{error}</FormMessage>}
     {!rows.length && <Empty><EmptyHeader><EmptyMedia variant="icon"><Icon name="bulb" size={18}/></EmptyMedia><EmptyTitle>还没有学到技能</EmptyTitle><EmptyDescription>这个助手完成可复用成果后，习得技能会出现在这里。</EmptyDescription></EmptyHeader></Empty>}
     {rows.map(skill => <article key={skill.id}><h4>{skill.name}</h4><p>{learnedBadges(skill).join(' · ')}</p>
       <button type="button" disabled={busy} onClick={()=>void patch(skill,{pinned:!skill.learned?.pinned})}>{skill.learned?.pinned?'取消置顶':'置顶'}</button>
       <button type="button" disabled={busy} onClick={()=>void patch(skill,{locked:!skill.learned?.locked})}>{skill.learned?.locked?'解锁':'锁定'}</button>
+      {skill.learned?.state==='stale' && <button type="button" disabled={busy} onClick={()=>void patch(skill,{learnedState:'active'})}>标记已复审</button>}
       <button type="button" disabled={busy} onClick={()=>void patch(skill,{learnedState:skill.learned?.state==='archived'?'active':'archived'})}>{skill.learned?.state==='archived'?'恢复':'归档'}</button>
     </article>)}
   </section>

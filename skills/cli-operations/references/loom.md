@@ -1,6 +1,6 @@
 # LOOM
 
-LOOM keeps a Mission's plan, task claims, deliveries and the User's verdicts on record. The User sees them in the Mission's Orchestration and Delivery tabs. Every `rovai loom` command targets the current Thread's Mission.
+LOOM keeps a Mission's plan, task claims, deliveries and the User's verdicts on record. The User sees them in the Mission's Orchestration and Delivery tabs. Most `rovai loom` commands target the current Thread's Mission; `skill-suggest` records this assistant's learning instead.
 
 ## Who does what
 
@@ -15,6 +15,21 @@ LOOM keeps a Mission's plan, task claims, deliveries and the User's verdicts on 
 | Submit the delivery | Assignee | `rovai loom submit --task-id <id> --evidence-ids <artifactId>` |
 | Accept or reject | User only | Delivery tab |
 | Continue after acceptance | Default Lead | `rovai loom status`, then message the next assignees |
+
+## Learned Skill suggestions
+
+When a completed interaction reveals a durable reusable procedure, record it once with `rovai loom skill-suggest --input-file skill.json`. Do not use this for secrets, one-off task facts, user preferences, or memory-owned content. The result is private and pending review; it becomes authority only after review and assignment.
+
+Skill file shape. Every object has exactly these fields:
+
+```json
+{
+  "name": "triage-release",
+  "description": "Triage a release before shipping.",
+  "instructions": "1. Inspect evidence.\n2. Ship only after gates pass.",
+  "rationale": "The user confirmed this repeatable workflow."
+}
+```
 
 ## Plan
 

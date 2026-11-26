@@ -3545,13 +3545,13 @@ fn zcode_permission_options() -> Vec<PermissionOptionDescriptor> {
 /// working directory; `bash`/`write`/`edit` and every undeclared extension/MCP tool are refused.
 /// `workspace_read_write` keeps the same workspace boundary and adds Pi's other two native file tools
 /// `write`/`edit`; `bash` and every extension/MCP tool stay refused. `workspace_workflow` is the same
-/// file boundary plus exactly one managed Core business tool (`rovai_loom`) that reaches only the nine
+/// file boundary plus exactly one managed Core business tool (`rovai_loom`) that reaches only the ten
 /// `loom.*` operations Core already ships — never `bash`, never an arbitrary CLI or MCP server.
 fn pi_permission_options() -> Vec<PermissionOptionDescriptor> {
     vec![PermissionOptionDescriptor {
         key: "loom_file_access".to_string(),
         label: "file-access".to_string(),
-        description: "Pi 原生工具权限，未限制到工作目录（native）；workspace_read_only 是保守选项：只允许原生 read；workspace_read_write 在同一工作目录边界内允许原生 read/write/edit；workspace_workflow 在同一文件边界内额外提供一个受管 Core 业务工具，只能执行既有 8 个 loom.* 操作（status/plan/release/claim/evidence/submit/inspect/stage-review）。三种受控模式都禁止 bash 与所有未声明的扩展工具（含 MCP），不提供四能力齐全。"
+        description: "Pi 原生工具权限，未限制到工作目录（native）；workspace_read_only 是保守选项：只允许原生 read；workspace_read_write 在同一工作目录边界内允许原生 read/write/edit；workspace_workflow 在同一文件边界内额外提供一个受管 Core 业务工具，只能执行既有 10 个 loom.* 操作（status/skill_suggest/plan/release/claim/claim_heartbeat/evidence/submit/inspect/stage-review）。三种受控模式都禁止 bash 与所有未声明的扩展工具（含 MCP），不提供四能力齐全。"
             .to_string(),
         value_type: "enum".to_string(),
         choices: vec![
@@ -3569,7 +3569,7 @@ fn pi_permission_options() -> Vec<PermissionOptionDescriptor> {
             ),
             choice(
                 "workspace_workflow",
-                "workspace_workflow — 工作目录内原生 read/write/edit + 一个受管 loom 业务工具（仅 8 个 loom.*），禁止 bash 与未声明扩展工具",
+                "workspace_workflow — 工作目录内原生 read/write/edit + 一个受管 loom 业务工具（仅 10 个 loom.*），禁止 bash 与未声明扩展工具",
             ),
         ],
         // Default stays native: nothing is silently enabled or migrated for existing members.
@@ -3684,7 +3684,7 @@ fn resolve_pi_runtime(
         "runtimeEntrypoint": runtime_entrypoint_compatibility(&input)?,
         "authScope": input.auth_scope,
         "protocolVersion": protocol_version,
-        "managedExtension": "rovai-pi-host-v11",
+        "managedExtension": "rovai-pi-host-v12",
     }))?;
     Ok(AdapterRuntimeProjection {
         protocol_version,

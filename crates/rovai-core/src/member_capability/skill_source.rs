@@ -200,6 +200,13 @@ pub(crate) fn require_selectable(
             json!({ "skillId": skill_id }),
         ));
     }
+    if skill.learned.as_ref().is_some_and(|learned| learned.state != "active") {
+        return Err(MemberCapabilityError::with_details(
+            "capability.skill_source_unavailable",
+            "这个习得技能还在待复审或已归档，请处理后再勾选。",
+            json!({ "skillId": skill_id }),
+        ));
+    }
     library
         .verify_revision_content(&skill.current_revision)
         .map_err(|_| unreadable(skill_id))
@@ -340,7 +347,7 @@ fn unreadable(skill_id: &str) -> anyhow::Error {
 }
 
 /// Admits the current Library root exactly where it is; never creates, repairs or follows a link.
-fn admit_library_root(root: &Path) -> Result<PathBuf> {
+pub(crate) fn admit_library_root(root: &Path) -> Result<PathBuf> {
     let metadata = std::fs::symlink_metadata(root).map_err(|_| {
         MemberCapabilityError::new("capability.skill_source_unavailable", "技能库目录不可用。")
     })?;

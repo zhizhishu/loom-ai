@@ -457,7 +457,7 @@ def new_session():
     with open(session_file, 'w') as output: output.write(json.dumps({'type':'session','id':sid,'cwd':os.getcwd()}) + '\\n')
 def managed_state():
     with open(os.environ['ROVAI_PI_HOST_BINDING_FILE']) as source: binding = json.load(source)
-    state = {'schemaVersion':3,'extensionVersion':'rovai-pi-host-v11','hostInstanceId':binding['hostInstanceId'],'hostBindingGeneration':binding['hostBindingGeneration'],'sessionId':sid,'sessionFile':session_file,'cwd':os.getcwd()}
+    state = {'schemaVersion':3,'extensionVersion':'rovai-pi-host-v12','hostInstanceId':binding['hostInstanceId'],'hostBindingGeneration':binding['hostBindingGeneration'],'sessionId':sid,'sessionFile':session_file,'cwd':os.getcwd()}
     emit({'type':'extension_ui_request','method':'setStatus','statusKey':'rovai-managed-session-state','statusText':json.dumps(state)})
 new_session()
 for line in sys.stdin:

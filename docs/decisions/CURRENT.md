@@ -8,7 +8,7 @@ last_updated: 2026-11-05
 
 助手看板、技能三档与离线待发送的边界见 [V1.72-D69](../versions/v1.72/decisions.md#v1-72-d69)；现行 LOOM 范围由 [LOOM 架构](../loom/LOOM-ARCHITECTURE.md)拥有。
 
-跨主机执行与独立能力选择：[跨主机架构](../architecture/cross-host-execution.md)、[Workspace RPC v1](../contracts/workspace-rpc-v1.md)、[Built-in Tool Transport v45](../contracts/builtin-tool-transport-v45.md)；Core 单一权威、原生 driver 与逐工具调用的取舍见 [V1.72-D68](../versions/v1.72/decisions.md#v1-72-d68)。B7 模型上下文及技术/人工确认事实由[原变更记录](../versions/v1.72/model-context-change-loom-run-bundle.md)拥有；导航不推断实施或验收已完成。
+跨主机执行与独立能力选择：[跨主机架构](../architecture/cross-host-execution.md)、[Workspace RPC v1](../contracts/workspace-rpc-v1.md)、[Built-in Tool Transport v46](../contracts/builtin-tool-transport-v46.md)；Core 单一权威、原生 driver 与逐工具调用的取舍见 [V1.72-D68](../versions/v1.72/decisions.md#v1-72-d68)。B7 模型上下文及技术/人工确认事实由[原变更记录](../versions/v1.72/model-context-change-loom-run-bundle.md)拥有；导航不推断实施或验收已完成。
 
 Team 创建模板与启动指引：[Team Templates v1](../contracts/team-templates-v1.md)、[Bootstrap v6](../contracts/native-session-bootstrap-v6.md)、[架构](../architecture/team-management.md)；理由见 [V1.72-D57](../versions/v1.72/decisions.md#v1-72-d57)。
 
@@ -17,13 +17,13 @@ Team 创建模板与启动指引：[Team Templates v1](../contracts/team-templat
 队员单文件头像当前规范：[Member Avatar v4](../contracts/member-avatar-v4.md)、[队员身份 UI](../ui/components/member-identity.md)；取舍见 [V1.72-D42](../versions/v1.72/decisions.md#v1-72-d42)。
 
 成员路由与职责扩容当前规范：[Collaboration State v4](../contracts/collaboration-state-v4.md)、
-[Built-in Transport v45](../contracts/builtin-tool-transport-v45.md)、[ContextManifest v34](../contracts/context-manifest-evidence-v34.md)；
+[Built-in Transport v46](../contracts/builtin-tool-transport-v46.md)、[ContextManifest v34](../contracts/context-manifest-evidence-v34.md)；
 分层与保持 resume 的取舍见 [V1.72-D40](../versions/v1.72/decisions.md#v1-72-d40)。
 
 
-内部减重当前规范：[输入快照/数据库准入](../contracts/input-snapshot-storage-v1.md)、[Built-in Tool Transport v45](../contracts/builtin-tool-transport-v45.md)、[Domain Command Result v2](../contracts/domain-command-result-v2.md)；取舍见 [V1.72-D38](../versions/v1.72/decisions.md#v1-72-d38)。
+内部减重当前规范：[输入快照/数据库准入](../contracts/input-snapshot-storage-v1.md)、[Built-in Tool Transport v46](../contracts/builtin-tool-transport-v46.md)、[Domain Command Result v2](../contracts/domain-command-result-v2.md)；取舍见 [V1.72-D38](../versions/v1.72/decisions.md#v1-72-d38)。
 
-Send 正文文件与旧调用兼容：当前规范为 [Built-in Tool Transport v45](../contracts/builtin-tool-transport-v45.md)和
+Send 正文文件与旧调用兼容：当前规范为 [Built-in Tool Transport v46](../contracts/builtin-tool-transport-v46.md)和
 [Built-in 运输不变量](../architecture/foundational-invariants.md#skills-builtin-transport)；单入口与精简教学的取舍见
 [V1.72-D33](../versions/v1.72/decisions.md#v1-72-d33)。
 

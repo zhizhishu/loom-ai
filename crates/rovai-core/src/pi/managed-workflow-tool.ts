@@ -8,7 +8,7 @@
  *   deliberately outside every guarded policy. The result was that a human/test host recorded the
  *   Run's own artifacts for it.
  * - This module is the *typed bridge* for exactly that gap: one tool (`rovai_loom`) that can reach
- *   only the nine `loom.*` operations Core already ships, spawned as a fixed trusted executable with
+ *   only the ten `loom.*` operations Core already ships, spawned as a fixed trusted executable with
  *   no shell, with the operation parameters on stdin as one JSON object.
  *
  * This file is a pure contract plus one injected-runtime helper:
@@ -39,9 +39,10 @@ export const REQUEST_ID_ENV = "ROVAI_BUILTIN_REQUEST_ID"
 /** Core-filled absolute path of the bundled Rovai Agent CLI for this Run. */
 export const CLI_ENV = "ROVAI_AGENT_CLI"
 
-/** The only operations this tool may reach: the nine LOOM business operations the CLI already ships. */
+/** The only operations this tool may reach: the ten LOOM business operations the CLI already ships. */
 export const LOOM_OPERATIONS = Object.freeze([
   "loom.status",
+  "loom.skill_suggest",
   "loom.plan",
   "loom.release",
   "loom.claim",
@@ -55,6 +56,7 @@ export const LOOM_OPERATIONS = Object.freeze([
 /** Operation → the two fixed CLI words. Never assembled from model text. */
 export const LOOM_OPERATION_ARGV: Readonly<Record<string, readonly string[]>> = Object.freeze({
   "loom.status": ["loom", "status"],
+  "loom.skill_suggest": ["loom", "skill-suggest"],
   "loom.plan": ["loom", "plan"],
   "loom.release": ["loom", "release"],
   "loom.claim": ["loom", "claim"],
@@ -78,6 +80,7 @@ export const LOOM_OPERATION_ARGV: Readonly<Record<string, readonly string[]>> = 
  */
 export const LOOM_INPUT_KEYS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   "loom.status": [],
+  "loom.skill_suggest": ["name", "description", "instructions", "rationale"],
   "loom.plan": ["goal", "acceptanceCriteriaVersion", "criteria", "tasks", "dependencies"],
   "loom.release": ["taskId"],
   "loom.claim": ["taskId", "leaseSeconds"],
@@ -291,7 +294,7 @@ export function readWorkflowContracts(file: string): WorkflowContracts {
   return workflowContracts(JSON.parse(readFileSync(file, "utf8")))
 }
 
-/** Accept exactly `{ operation, input? }` for one of the nine operations with its closed key set. */
+/** Accept exactly `{ operation, input? }` for one of the ten operations with its closed key set. */
 export function validateLoomParams(
   params: unknown,
   contracts: WorkflowContracts,
@@ -356,6 +359,7 @@ export function loomToolParameters(contracts: WorkflowContracts): Record<string,
 export function loomToolDescription(contracts: WorkflowContracts): string {
   const examples: Record<string, Record<string, unknown>> = {
     "loom.status": {},
+    "loom.skill_suggest": { name: "triage-release", description: "Triage a release", instructions: "Inspect evidence before shipping.", rationale: "The user confirmed this repeatable workflow." },
     "loom.plan": { goal: "Deliver the requested file", criteria: [{ criterionId: "file", text: "File is registered and awaits User acceptance" }], tasks: [{ taskId: "task-1", title: "Write the requested file" }] },
     "loom.release": { taskId: "task-1" },
     "loom.claim": { taskId: "task-1" },

@@ -1621,7 +1621,7 @@ fn print_root_help() {
 }
 
 fn root_help_text(managed_runtime: bool, tasks_enabled: bool) -> String {
-    let mut text = "Rovai CLI\n\nAgent operations:\n  rovai send\n  rovai member list|get|create|update\n  rovai task create|get|list|update\n  rovai thread list|search|read|runs\n  rovai history search\n  rovai memory view|search|read|write\n  rovai automation list|get|create|run|close|update|delete\n  rovai mission list|get|update|status\n  rovai loom status|plan|release|claim|evidence|submit|inspect|stage-review\n  rovai workspace list|read|run|poll|cancel\n\nRun an Agent operation's exact `--help` for its closed inputs.\n".to_string();
+    let mut text = "Rovai CLI\n\nAgent operations:\n  rovai send\n  rovai member list|get|create|update\n  rovai task create|get|list|update\n  rovai thread list|search|read|runs\n  rovai history search\n  rovai memory view|search|read|write\n  rovai automation list|get|create|run|close|update|delete\n  rovai mission list|get|update|status\n  rovai loom status|skill-suggest|plan|release|claim|evidence|submit|inspect|stage-review\n  rovai workspace list|read|run|poll|cancel\n\nRun an Agent operation's exact `--help` for its closed inputs.\n".to_string();
     if !tasks_enabled {
         text = text.replace("  rovai task create|get|list|update\n", "");
     }
@@ -1637,7 +1637,7 @@ fn task_family_help_text() -> &'static str {
 
 /// Confirmed r1 text of `docs/versions/v1.72/model-context-change-loom-accp.md`.
 fn loom_family_help_text() -> &'static str {
-    "rovai loom\n\nUse LOOM when a Mission needs a plan whose tasks, claims, deliveries and User acceptance stay on record.\nThe target is always the current Thread's Mission. Only the User accepts or rejects a delivery, in the Mission's Delivery tab.\n\n  status    Read the current Mission's plan, tasks and claims.\n  plan      Import the Mission's one plan (Default Lead only).\n  release   Make planned tasks claimable (Default Lead only).\n  claim     Claim a released task for this Run.\n  evidence  Register a file you produced as delivery evidence.\n  submit    Submit a claimed task's delivery for User acceptance.\n  inspect       Read a task's latest candidate and review authorization.\n  stage-review  Record an authorized internal review; never User acceptance.\n\nUse rovai loom <command> --help for arguments.\n"
+    "rovai loom\n\nUse LOOM when a Mission needs a plan whose tasks, claims, deliveries and User acceptance stay on record.\nThe target is always the current Thread's Mission. Only the User accepts or rejects a delivery, in the Mission's Delivery tab.\n\n  status    Read the current Mission's plan, tasks and claims.\n  skill-suggest  Record a reusable procedure as a pending-review Skill.\n  plan      Import the Mission's one plan (Default Lead only).\n  release   Make planned tasks claimable (Default Lead only).\n  claim     Claim a released task for this Run.\n  evidence  Register a file you produced as delivery evidence.\n  submit    Submit a claimed task's delivery for User acceptance.\n  inspect       Read a task's latest candidate and review authorization.\n  stage-review  Record an authorized internal review; never User acceptance.\n\nUse rovai loom <command> --help for arguments.\n"
 }
 
 fn user_automation_available_in_current_process() -> bool {
@@ -2215,7 +2215,7 @@ fn invocation_request_id(operation: &str, input: &Value) -> Result<String> {
 /// environment variable, never through the payload: a retry of the same provider call inside the same
 /// Run must replay in Core instead of executing the operation twice.
 ///
-/// Only the nine `loom.*` operations accept it. Every other operation keeps its previous behaviour,
+/// Only the ten `loom.*` operations accept it. Every other operation keeps its previous behaviour,
 /// and a malformed value is an error rather than a silent fallback, so a broken bridge can never
 /// quietly turn a retry into a second execution. The value carries no authority: Core still derives the
 /// command identity from the authenticated Run plus this request id.
@@ -2264,6 +2264,7 @@ fn operation_help_examples(operation: &str) -> &'static [&'static str] {
             "rovai workspace cancel --request-id wrpc_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         ],
         "loom.status" => &["rovai loom status"],
+        "loom.skill_suggest" => &["rovai loom skill-suggest --input-file skill.json"],
         "loom.plan" => &["rovai loom plan --input-file plan.json"],
         "loom.release" => &["rovai loom release --task-id report-draft"],
         "loom.claim" => &["rovai loom claim --task-id report-draft"],
@@ -2659,10 +2660,10 @@ mod tests {
         assert!(!is_family_help(&loom_help));
         assert_eq!(
             loom_family_help_text(),
-            "rovai loom\n\nUse LOOM when a Mission needs a plan whose tasks, claims, deliveries and User acceptance stay on record.\nThe target is always the current Thread's Mission. Only the User accepts or rejects a delivery, in the Mission's Delivery tab.\n\n  status    Read the current Mission's plan, tasks and claims.\n  plan      Import the Mission's one plan (Default Lead only).\n  release   Make planned tasks claimable (Default Lead only).\n  claim     Claim a released task for this Run.\n  evidence  Register a file you produced as delivery evidence.\n  submit    Submit a claimed task's delivery for User acceptance.\n  inspect       Read a task's latest candidate and review authorization.\n  stage-review  Record an authorized internal review; never User acceptance.\n\nUse rovai loom <command> --help for arguments.\n"
+            "rovai loom\n\nUse LOOM when a Mission needs a plan whose tasks, claims, deliveries and User acceptance stay on record.\nThe target is always the current Thread's Mission. Only the User accepts or rejects a delivery, in the Mission's Delivery tab.\n\n  status    Read the current Mission's plan, tasks and claims.\n  skill-suggest  Record a reusable procedure as a pending-review Skill.\n  plan      Import the Mission's one plan (Default Lead only).\n  release   Make planned tasks claimable (Default Lead only).\n  claim     Claim a released task for this Run.\n  evidence  Register a file you produced as delivery evidence.\n  submit    Submit a claimed task's delivery for User acceptance.\n  inspect       Read a task's latest candidate and review authorization.\n  stage-review  Record an authorized internal review; never User acceptance.\n\nUse rovai loom <command> --help for arguments.\n"
         );
         assert!(root_help_text(true, true).contains(
-            "  rovai mission list|get|update|status\n  rovai loom status|plan|release|claim|evidence|submit|inspect|stage-review\n  rovai workspace list|read|run|poll|cancel\n\n"
+            "  rovai mission list|get|update|status\n  rovai loom status|skill-suggest|plan|release|claim|evidence|submit|inspect|stage-review\n  rovai workspace list|read|run|poll|cancel\n\n"
         ));
         assert_eq!(
             task_family_help_text(),
@@ -2704,6 +2705,7 @@ mod tests {
             &["mission", "update", "--help"],
             &["mission", "status", "--help"],
             &["loom", "status", "--help"],
+            &["loom", "skill-suggest", "--help"],
             &["loom", "plan", "--help"],
             &["loom", "release", "--help"],
             &["loom", "claim", "--help"],
@@ -3600,9 +3602,10 @@ mod managed_workflow_request_id_tests {
     const ID: &str = "6e71a1b4-6b19-4f86-8c18-988552586a37";
 
     #[test]
-    fn managed_workflow_request_id_is_accepted_for_the_nine_loom_operations_only() {
+    fn managed_workflow_request_id_is_accepted_for_the_ten_loom_operations_only() {
         for operation in [
             "loom.status",
+            "loom.skill_suggest",
             "loom.plan",
             "loom.release",
             "loom.claim",

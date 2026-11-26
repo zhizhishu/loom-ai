@@ -403,6 +403,20 @@ pub struct LearnedSkillView {
     pub pinned: bool,
     pub locked: bool,
 }
+
+/// Authenticated facts for one Bot-initiated learned Skill suggestion. The
+/// caller identity is injected by the Run dispatcher; the payload supplies only
+/// the reusable procedure and why it is durable.
+#[derive(Debug, Clone)]
+pub struct LearnedSkillSuggestionInput {
+    pub camp_id: String,
+    pub agent_id: String,
+    pub agent_run_id: String,
+    pub name: String,
+    pub description: String,
+    pub instructions: String,
+    pub rationale: String,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SkillMetadataPatch {
@@ -1009,6 +1023,150 @@ impl SkillLibraryService {
             skill.group_assignments = load_group_assignments(connection, &skill.id)?;
         }
         Ok(skill)
+    }
+
+    /// Write one learned Skill suggestion as a private, stale Library Skill.
+    ///
+    /// PiBot@6741737 center-server/learning/tools.js:1-86 keeps learning writes
+    /// behind a narrow whitelist; LOOM's first slice exposes only this one write
+    /// and stores every fact in the existing Skill tables. No job table or schema
+    /// migration is needed because the Run itself is the restricted producer.
+    pub fn suggest_learned(
+        &self,
+        database: &mut Database,
+        input: LearnedSkillSuggestionInput,
+    ) -> Result<Value> {
+        validate_skill_name(&input.name)?;
+        if input.description.trim().is_empty() || input.description.len() > 500 {
+            anyhow::bail!("Skill description must contain between 1 and 500 characters");
+        }
+        if input.instructions.trim().is_empty() || input.instructions.len() > 32 * 1024 {
+            anyhow::bail!("Skill instructions must contain between 1 and 32768 characters");
+        }
+        if input.rationale.trim().is_empty() || input.rationale.len() > 4000 {
+            anyhow::bail!("Skill rationale must contain between 1 and 4000 characters");
+        }
+
+        let existing = load_existing_skill_by_name(database, &input.name)?;
+        if let Some(existing) = &existing {
+            if existing.origin == SkillOrigin::Official || existing.lifecycle_status != "active" {
+                anyhow::bail!("Skill name is not available for learning");
+            }
+            let learned: (Option<String>, bool, String) = database.connection().query_row(
+                "SELECT learned_by_agent_id, learned_locked, learned_state FROM skill WHERE id=?1",
+                [&existing.id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            if learned.1 || learned.0.as_deref() != Some(input.agent_id.as_str()) {
+                anyhow::bail!("Skill is locked or belongs to another assistant");
+            }
+        }
+
+        let source_root = self.root.join(".learning").join(Uuid::new_v4().to_string());
+        prepare_private_directory(&source_root)?;
+        let markdown = format!(
+            "---\nname: {}\ndescription: {}\n---\n\n{}\n",
+            input.name,
+            serde_json::to_string(&input.description.replace('\n', " "))?,
+            input.instructions.trim()
+        );
+        fs::write(source_root.join("SKILL.md"), markdown.as_bytes())?;
+        let verified_path = self.root.join(".learning").join(format!("verify-{}", Uuid::new_v4()));
+        let candidate = match stage_candidate(&source_root, &input.name, &verified_path) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                let _ = remove_directory_if_present(&source_root);
+                return Err(error);
+            }
+        };
+        let _ = remove_directory_if_present(&source_root);
+        if let Some(existing) = &existing {
+            if existing.current_digest == candidate.content_digest {
+                let _ = remove_directory_if_present(&verified_path);
+                let state: String = database.connection().query_row(
+                    "SELECT learned_state FROM skill WHERE id=?1",
+                    [&existing.id], |row| row.get(0),
+                )?;
+                return Ok(json!({
+                    "skillId": existing.id,
+                    "unchanged": true,
+                    "state": state,
+                    "message": "相同内容已经记录，未产生新的技能修订。"
+                }));
+            }
+        }
+
+        let skill_id = existing.as_ref().map(|skill| skill.id.clone()).unwrap_or_else(|| Uuid::new_v4().to_string());
+        let revision_id = Uuid::new_v4().to_string();
+        let library_root = crate::member_capability::admit_skill_library_root(self.root())?
+            .to_string_lossy()
+            .into_owned();
+        let final_content = self.revision_content_path(&skill_id, &revision_id);
+        if let Err(error) = publish_directory(&verified_path, &final_content) {
+            let _ = remove_directory_if_present(&verified_path);
+            return Err(error);
+        }
+        let now = Utc::now().to_rfc3339();
+        let source_metadata = json!({
+            "learning": {
+                "producer": "run_tool",
+                "campId": input.camp_id,
+                "agentId": input.agent_id,
+                "agentRunId": input.agent_run_id,
+                "rationale": input.rationale,
+                "snapshot": {"kind":"current_run_context","maxEntries":120,"maxBytes":262144},
+                "allowedTools": ["loom.skill_suggest"],
+            },
+            "suggestedAt": now,
+        });
+        let revision_candidate = StagedCandidate {
+            name: input.name.clone(),
+            description: input.description.clone(),
+            content_digest: candidate.content_digest.clone(),
+            risk_summary: candidate.risk_summary.clone(),
+            file_count: candidate.file_count,
+            total_bytes: candidate.total_bytes,
+            source_path: "learned://run".to_string(),
+            relative_content_path: input.name.clone(),
+        };
+        let transaction = database.connection_mut().transaction()?;
+        let is_update = existing.is_some();
+        if let Some(existing) = &existing {
+            insert_revision(&transaction,&revision_id,&existing.id,&revision_candidate,
+                SkillRevisionSourceType::LocalFolder,&source_metadata,&now)?;
+            let changed = transaction.execute(
+                "UPDATE skill SET current_revision_id=?1, version=version+1, updated_at=?2,
+                 learned_state='stale' WHERE id=?3 AND version=?4",
+                params![revision_id,now,existing.id,existing.version])?;
+            if changed != 1 { anyhow::bail!("Skill changed while recording the suggestion"); }
+            transaction.execute(
+                "UPDATE skill_group_assignment SET revision_id=?1, updated_at=?2 WHERE skill_id=?3",
+                params![revision_id,now,existing.id])?;
+        } else {
+            transaction.execute(
+                "INSERT INTO skill(id,name,origin,enabled,lifecycle_status,current_revision_id,version,created_at,updated_at,learned_by_agent_id,learned_state)
+                 VALUES(?1,?2,'imported',1,'active',NULL,1,?3,?3,?4,'stale')",
+                params![skill_id,input.name,now,input.agent_id])?;
+            insert_revision(&transaction,&revision_id,&skill_id,&revision_candidate,
+                SkillRevisionSourceType::LocalFolder,&source_metadata,&now)?;
+            transaction.execute("UPDATE skill SET current_revision_id=?1 WHERE id=?2",params![revision_id,skill_id])?;
+            insert_default_group_assignments(&transaction,&skill_id,&revision_id,&now)?;
+            transaction.execute(
+                "INSERT INTO member_skill_source(skill_id,library_root,registered_at,owner_agent_id,visibility_scope)
+                 VALUES(?1,?2,?3,?4,'private')",
+                params![skill_id,library_root,now,input.agent_id])?;
+        }
+        append_skill_event(&transaction,"skill.learned_suggested",&skill_id,
+            &ActorRef::Agent { agent_id: input.agent_id.clone(), source_agent_run_id: input.agent_run_id.clone() },
+            json!({"skillId":skill_id,"revisionId":revision_id,"state":"stale"}))?;
+        transaction.commit()?;
+        Ok(json!({
+            "skillId": skill_id,
+            "revisionId": revision_id,
+            "updated": is_update,
+            "unchanged": false,
+            "state": "stale",
+            "enabled": true,
+            "message": "已记录为待复审技能；复审并分配给助手后才会生效。"
+        }))
     }
 
     pub fn read_content(
@@ -4345,6 +4503,38 @@ mod slow_tests {
         db.connection().execute("UPDATE member_skill_source SET owner_agent_id=NULL WHERE skill_id=?1",[&skill.id]).unwrap();
         assert_eq!(library.set_metadata(&mut db,&command("meta-unowned",skill.version+2,"global")).unwrap().result.status,CommandResultStatus::Rejected);
         drop(db);remove_directory_if_present(&root).unwrap();
+    }
+
+    #[test]
+    fn learned_skill_suggestion_is_private_enabled_pending_review() {
+        let root = temporary_directory("loom-learned-skill");
+        let mut db = Database::open(&root.join("db")).unwrap();
+        let library = SkillLibraryService::new(root.join("skills")).unwrap();
+        let input = |agent: &str| LearnedSkillSuggestionInput {
+            camp_id: "camp".into(), agent_id: agent.into(), agent_run_id: "run".into(),
+            name: "triage-release".into(), description: "Triage a release".into(),
+            instructions: "1. Inspect evidence.\n2. Ship only after gates pass.".into(),
+            rationale: "The user confirmed this repeatable release workflow.".into(),
+        };
+        let first = library.suggest_learned(&mut db, input("bot-a")).unwrap();
+        assert_eq!(first["state"], "stale");
+        let skill = library.list(&db).unwrap().into_iter().find(|s| s.name=="triage-release").unwrap();
+        assert!(skill.enabled);
+        assert_eq!(skill.visibility_scope, "private");
+        assert_eq!(skill.learned.unwrap(), LearnedSkillView{agent_id:"bot-a".into(),state:"stale".into(),pinned:false,locked:false});
+        let stored_root: String = db.connection().query_row(
+            "SELECT library_root FROM member_skill_source WHERE skill_id=?1",
+            [&skill.id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(stored_root, std::fs::canonicalize(library.root()).unwrap().to_string_lossy());
+        assert!(crate::member_capability::require_selectable_skill_source(db.connection(), &library, &skill.id).is_err());
+        db.connection().execute("UPDATE skill SET learned_state='active' WHERE id=?1", [&skill.id]).unwrap();
+        crate::member_capability::require_selectable_skill_source(db.connection(), &library, &skill.id).unwrap();
+        let again = library.suggest_learned(&mut db, input("bot-a")).unwrap();
+        assert_eq!(again["unchanged"], true);
+        assert_eq!(again["state"], "active");
+        assert!(library.suggest_learned(&mut db, input("bot-b")).is_err());
+        drop(db); remove_directory_if_present(&root).unwrap();
     }
 
     fn user_envelope<P>(command_id: &str, payload: P) -> CommandEnvelope<P> {

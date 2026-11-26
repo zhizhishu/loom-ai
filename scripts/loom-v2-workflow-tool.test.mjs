@@ -3,7 +3,7 @@
 // Run (Root, from loom/): node --test --test-force-exit --test-timeout=120000 scripts/loom-v2-workflow-tool.test.mjs
 //
 // What this proves (no network, no model, no real CLI process, no user data):
-//   1  the operation table is exactly the nine LOOM business operations, and argv is two fixed words
+//   1  the operation table is exactly the ten LOOM business operations, and argv is two fixed words
 //      taken from that table — never model text, never a shell, never `--input-file`;
 //   2  the tool parameters are closed: `operation` plus an `input` object whose keys follow the existing
 //      Core schemas; Run/bot/Mission/creator/command identity is refused before any child starts;
@@ -94,7 +94,7 @@ test('Core input contracts replace guessed fields and reject incomplete operatio
   const bindingFile = join(current.root, 'binding.json')
   const grantFile = join(current.root, 'grant.json')
   writeFileSync(bindingFile, JSON.stringify({
-    schemaVersion: 3, extensionVersion: 'rovai-pi-host-v11', hostInstanceId: 'fixture-host',
+    schemaVersion: 3, extensionVersion: 'rovai-pi-host-v12', hostInstanceId: 'fixture-host',
     hostBindingGeneration: 1, agentRunId: current.grant.runId, executionEpoch: current.grant.executionEpoch,
     nativeBindingId: 'fixture-binding', nativeBindingGeneration: 1, expectedNativeSessionId: null,
     bootstrap, bootstrapPayloadDigest: createHash('sha256').update(bootstrap).digest('hex')
@@ -199,6 +199,7 @@ test('Pi 0.85 SDK distinguishes a returned error flag from a thrown Core rejecti
 
 const LOOM_OPERATION_NAMES = [
   'loom.status',
+  'loom.skill_suggest',
   'loom.plan',
   'loom.release',
   'loom.claim',
@@ -293,7 +294,7 @@ function fakeSpawn(options = {}) {
 // 1 · operation table and argv
 // ---------------------------------------------------------------------------
 
-test('1 · the tool reaches exactly the nine LOOM operations through fixed argv words', () => {
+test('1 · the tool reaches exactly the ten LOOM operations through fixed argv words', () => {
   assert.equal(LOOM_TOOL_NAME, 'rovai_loom')
   assert.deepEqual([...LOOM_OPERATIONS], LOOM_OPERATION_NAMES)
   assert.equal(new Set(LOOM_OPERATIONS).size, LOOM_OPERATION_NAMES.length, 'no duplicate operations')
@@ -307,7 +308,7 @@ test('1 · the tool reaches exactly the nine LOOM operations through fixed argv 
     assert.equal(argv[1], operation.slice('loom.'.length).replace(/_/gu, '-'))
     assert.ok(LOOM_INPUT_KEYS[operation], `${operation} must declare its closed input keys`)
   }
-  // Anything outside the nine has no argv and no input keys.
+  // Anything outside the ten has no argv and no input keys.
   for (const operation of ['loom.workspace.list', 'loom.workspace.run', 'bash', 'thread.message.send', '']) {
     assert.equal(LOOM_OPERATION_ARGV[operation], undefined)
     assert.equal(LOOM_INPUT_KEYS[operation], undefined)

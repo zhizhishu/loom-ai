@@ -22,7 +22,7 @@
 //   `read`/`write`/`edit`. `bash` and every extension/MCP tool stay outside the grant; the tool set is
 //   derived here from the frozen mode, never from the caller.
 // - `workspace_workflow`: the same three native file tools plus exactly one managed Core business
-//   tool (`rovai_loom`) that reaches only the nine `loom.*` operations Core already ships. The
+//   tool (`rovai_loom`) that reaches only the ten `loom.*` operations Core already ships. The
 //   additional tool can never be composed by a caller: the name and the operation set live here (Rust)
 //   and in the shared guard / managed Host extension (TypeScript), and a Run without this frozen mode
 //   neither loads nor may call it. `bash`, arbitrary CLI, MCP and every other tool stay outside.
@@ -61,7 +61,7 @@ pub(crate) const PI_FILE_ACCESS_WORKSPACE_READ_WRITE: &str = "workspace_read_wri
 pub(crate) const PI_FILE_ACCESS_WORKSPACE_WORKFLOW: &str = "workspace_workflow";
 
 /// The one managed Core business tool the workflow policy adds. It is a Core-owned, typed bridge to
-/// the nine `loom.*` operations — never `bash`, never an arbitrary command, never MCP.
+/// the ten `loom.*` operations — never `bash`, never an arbitrary command, never MCP.
 pub(crate) const PI_LOOM_TOOL_NAME: &str = "rovai_loom";
 
 /// Must match `RUNTIME_GUARD_SCHEMA` in scripts/loom-v2-runtime-execution.mjs.
