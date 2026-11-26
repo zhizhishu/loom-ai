@@ -3,6 +3,8 @@ import type { ActionApprovalView, AgentRunView, DomainEventView, HostPlatformKey
 import type { AgentProfile, ArtifactSelection, ConversationItem, ThreadSnapshot, WorkBundle } from './types'
 import { AgentMarkdown } from './AgentMarkdown'
 import { AgentOpenUiProvider, type AgentOpenUiHost } from './AgentOpenUiButton'
+import { PiQuestionCard } from './PiQuestionCard'
+import { questionKey, type PiAnswer, type PiQuestion } from './pi-questions'
 import { Avatar } from './Avatar'
 import { GroupAvatar } from './GroupAvatar'
 import { mentionRecipient } from './group-mentions'
@@ -86,7 +88,7 @@ export function memberSystemLines(
   return lines
 }
 
-export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, onDraft, onFiles, onSend, onPrompt, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onPreviewAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager, onRetryRun, onConfigureRuntime, onOpenRuntimeSetup, hostPlatform = null }: {
+export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, onDraft, onFiles, onSend, onPrompt, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onPreviewAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager, onRetryRun, onConfigureRuntime, onOpenRuntimeSetup, hostPlatform = null, questions = [], onAnswerQuestion }: {
   item: ConversationItem | null; snapshot: ThreadSnapshot | null; agents: AgentProfile[]; bundles: WorkBundle[]; loading: boolean; sending: boolean
   draft: string; files: File[]; error: string | null; onDraft(value: string): void; onFiles(files: File[]): void
   onSend(agentId?: string): void; onPrompt?(text: string): Promise<boolean>; onProfile(): void; onArtifact(selection: ArtifactSelection): void
@@ -95,6 +97,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   /** Image thumbnails for a sent attachment read back through Core; absent when the connection cannot preview. */
   onPreviewAttachment?: AttachmentPreviewLoader
   onResolveApproval(approvalId: string, optionId: string): void; approvalBusy: boolean; onMembers?(): void; onWorkspaceManager?(): void
+  questions?: PiQuestion[]; onAnswerQuestion?(question: PiQuestion, answer: PiAnswer): Promise<void>
   onRetryRun?(): void; onConfigureRuntime?(): void; onOpenRuntimeSetup?(): void; hostPlatform?: HostPlatformKey | null
 }) {
   const scroll = useRef<HTMLDivElement>(null)
@@ -115,6 +118,8 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   const messages = useMemo(() => snapshot?.messages.filter(message => !message.withdrawn) ?? [], [snapshot?.messages])
   const visibleMessages = useMemo(() => messages.filter(message => message.authorType !== 'system'), [messages])
   const systemMessages = useMemo(() => messages.filter(message => message.authorType === 'system'), [messages])
+  const pendingQuestions = questions.filter(question => question.threadId === snapshot?.thread.id)
+  const waitingRuns = new Set(pendingQuestions.map(question => question.agentRunId))
   const running = useMemo(() => snapshot?.agentRuns.filter(run => ['running', 'queued', 'waiting'].includes(run.status)) ?? [], [snapshot?.agentRuns])
   // 最近一次运行：只有在它已经终止时才在 transcript 末尾留一条状态行（Mikka 的 activityLine）。
   const latestRun = useMemo(() => {
@@ -242,7 +247,10 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
         </article>
       })}
       {artifacts.length > 0 && <div className="ln-delivered-files">{artifacts.map(selection => <button type="button" className="ln-artifact-card" key={selection.artifact.artifactId} onClick={() => onArtifact(selection)}><span className="ln-document-icon"><Icon name="file" size={22}/></span><span><strong>{selection.artifact.relativePath.split(/[\\/]/).pop()}</strong><small>{selection.candidate?.acceptanceStatus === 'accepted' ? '已接受' : selection.candidate?.acceptanceStatus === 'rejected' ? '已退回' : '等待审阅'}</small></span><Icon name="right" size={15}/></button>)}</div>}
-      {running.map(run => <RunningActivity key={run.id} label={`${agents.find(agent => agent.agentId === run.agentId)?.displayName || '助手'}正在处理`}/>)}
+      {pendingQuestions.map(question => onAnswerQuestion && <PiQuestionCard key={questionKey(question)} question={question} name={agents.find(agent => agent.agentId === question.agentId)?.displayName || '助手'} onAnswer={onAnswerQuestion}/>)}
+      {running.map(run => waitingRuns.has(run.id)
+        ? <p key={run.id} role="status">{agents.find(agent => agent.agentId === run.agentId)?.displayName || '助手'} · 等你回答</p>
+        : <RunningActivity key={run.id} label={`${agents.find(agent => agent.agentId === run.agentId)?.displayName || '助手'}正在处理`}/>)}
       {endedRun && <RunActivityLine run={endedRun}/>}
       {endedRun?.status === 'failed' && <RunFailure run={endedRun} agent={agents.find(agent => agent.agentId === endedRun.agentId) ?? null} sending={sending} onRetry={onRetryRun} onConfigure={onConfigureRuntime} onOpenRuntimeSetup={onOpenRuntimeSetup} platform={hostPlatform}/>}
       {systemMessages.length > 0 && <details className="ln-system-records"><summary>会话记录 <span>{systemMessages.length}</span></summary>{systemMessages.map(message => <AgentMarkdown key={message.id} text={message.body}/>)}</details>}

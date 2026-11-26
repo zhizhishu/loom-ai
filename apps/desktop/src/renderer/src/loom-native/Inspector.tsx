@@ -3,6 +3,7 @@ import { loomLatestCandidate } from '@contracts'
 import type { ThreadClient } from '../camp-client'
 import type { HostWorkbench } from './host-services'
 import type { AgentProfile, ArtifactSelection, InspectorTab, InspectorMode, LoomReview, WorkBundle, WorkControlFacts, WorkItem } from './types'
+import type { PiQuestion } from './pi-questions'
 import { Avatar } from './Avatar'
 import { Icon, IconButton, type IconName } from './icons'
 import { AgentMarkdown } from './AgentMarkdown'
@@ -28,6 +29,7 @@ export function relativeDate(value: string): string {
  * 全部取自同一个 Bundle，不在界面里另存一份状态。
  */
 export type WorkItemFacts = WorkItem & {
+  waitingForAnswer?: boolean
   /** 链头候选的证据确实在归档里（false＝候选已登记但归档还没见到） */
   hasArtifact: boolean
   reviews: readonly LoomReview[]
@@ -36,6 +38,7 @@ export type WorkItemFacts = WorkItem & {
 
 /** `flattenWork` 之外调用时可缺省：缺省不当作「没有评审」，只是界面还没拿到那几份事实。 */
 export type WorkStatusInput = WorkItem & {
+  waitingForAnswer?: boolean
   hasArtifact?: boolean
   reviews?: readonly LoomReview[]
   control?: WorkControlFacts
@@ -68,6 +71,7 @@ const REVIEW_ICON: Record<ArtifactReviewKind, IconName | null> = {
  * 关键约束：助手审查还在办、或控制事实还没读到，候选的 `pending` 都不是「等你」。
  */
 export function workStatus(item: WorkStatusInput): { label: string; group: string; icon: IconName } {
+  if (item.waitingForAnswer) return { label: '等你回答', group: '等待你', icon: 'chat' }
   const kind = artifactReviewKind({
     // 卡片只跟链头候选：链头没有归档证据时才是「准备中」。
     hasArtifact: item.hasArtifact ?? item.candidate !== null,
@@ -90,13 +94,14 @@ export function workStatus(item: WorkStatusInput): { label: string; group: strin
   return { label: item.task.status === 'draft' ? '计划中' : '待开始', group: '待开始', icon: 'clock' }
 }
 
-export function flattenWork(bundles: WorkBundle[]): WorkItemFacts[] {
+export function flattenWork(bundles: WorkBundle[], questions: readonly PiQuestion[] = []): WorkItemFacts[] {
   return bundles.flatMap(bundle => {
     const archived = new Set(bundle.artifacts.map(artifact => artifact.artifactId))
     return bundle.tasks.map(task => {
       const candidate = loomLatestCandidate(task.taskId, bundle.candidates)
       return {
         task,
+        waitingForAnswer: questions.some(question => question.taskId === task.taskId && question.threadId === bundle.mission.threadId),
         mission: bundle.mission,
         candidate,
         hasArtifact: candidate !== null && candidate.evidenceIds.some(id => archived.has(id)),
@@ -112,6 +117,7 @@ const PANELS: { id: WorkspacePanel; label: string; icon: IconName }[] = [
   { id: 'flow', label: '流程', icon: 'branch' }, { id: 'computer', label: '电脑', icon: 'computer' }
 ]
 type Props = {
+  questions?: PiQuestion[]
   agents: AgentProfile[]; bundles: WorkBundle[]; agent: AgentProfile | null; mode: InspectorMode; tab: InspectorTab
   onTab(tab: InspectorTab): void; onMode(mode: InspectorMode): void; onClose(): void; onExpand(): void; expanded: boolean
   onArtifact(selection: ArtifactSelection): void; onOpenConversation(threadId: string): void; loading: boolean
@@ -122,7 +128,7 @@ type Props = {
 }
 
 /** One contextual workspace: tabs change the view, never the selected conversation. */
-export function Inspector({ agents, bundles, agent, mode, tab, onMode, onClose, onExpand, expanded,
+export function Inspector({ agents, bundles, questions = [], agent, mode, tab, onMode, onClose, onExpand, expanded,
   onArtifact, onOpenConversation, loading, client, theme = 'day', onManageAssistant, workbench,
   threadId = null, conversationTitle, onCreateWork, onConnectDevice, selectedTaskId: controlledTaskId, onTaskSelect }: Props) {
   const panel = panelFor(mode, tab)
@@ -136,7 +142,7 @@ export function Inspector({ agents, bundles, agent, mode, tab, onMode, onClose, 
   const [assetView, setAssetView] = useState<'files' | 'lineage'>('files')
   useEffect(() => { setLocalTaskId(null); setQuery(''); setOwner('') }, [threadId])
   const currentBundles = useMemo(() => scopedBundles(bundles, threadId, scope), [bundles, threadId, scope])
-  const all = useMemo(() => flattenWork(currentBundles), [currentBundles])
+  const all = useMemo(() => flattenWork(currentBundles, questions), [currentBundles, questions])
   const shown = all.filter(item => (!query || `${item.task.title} ${item.task.description}`.toLocaleLowerCase().includes(query.toLocaleLowerCase())) && (!owner || item.task.assigneeAgentId === owner))
   const selectedTask = all.find(item => item.task.taskId === selectedTaskId) ?? null
   const assets = currentBundles.flatMap(bundle => bundle.artifacts.map(artifact => {

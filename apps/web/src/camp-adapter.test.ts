@@ -34,6 +34,13 @@ it('routes public reference directory and availability reads through the Web ada
     expect(await client.request('threadReferences.list', list)).toEqual({ items: [item], nextCursor: null })
     expect(await client.request('threadReferences.resolve', resolve)).toEqual([item, null])
     expect(requests).toEqual([{ operation: 'threadReferences.list', params: list }, { operation: 'threadReferences.resolve', params: resolve }])
+    const answer = { threadId: 'current', agentRunId: 'run', executionEpoch: 2, hostInstanceId: 'host', requestId: 'native', confirmed: false }
+    await client.request('pi.extensionUi.pending', { threadId: 'current' })
+    await client.request('pi.extensionUi.respond', answer)
+    expect(requests.slice(-2)).toEqual([
+      { operation: 'pi.extensionUi.pending', params: { threadId: 'current' } },
+      { operation: 'pi.extensionUi.respond', params: answer }
+    ])
     expect(transport.pendingCommandCount).toBe(0)
   } finally { transport.clear() }
 })
