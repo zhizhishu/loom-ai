@@ -457,8 +457,12 @@ test('official rovai-host + two real guarded Pi writes -> production Web LoomApp
     assert.deepEqual(await candidateStatuses(reopened.body.token),
       { [WORKERS[0].taskId]: 'accepted', [WORKERS[1].taskId]: 'pending' })
     const restoredArtifacts = (await host.request('loom.artifacts.list', { missionId })).artifacts
-    assert.deepEqual(restoredArtifacts.map(row => row.sha256).sort(), digests.sort(),
-      'the same SQLite keeps both Host-computed Pi digests')
+    const acceptanceReportPath = `.loom/acceptance/${WORKERS[0].taskId}.md`
+    const acceptanceReport = restoredArtifacts.find(row => row.relativePath === acceptanceReportPath)
+    assert.ok(acceptanceReport, 'the accepted Candidate produces the durable acceptance report artifact')
+    assert.equal(restoredArtifacts.length, 3, 'the same SQLite keeps two Pi digests plus the acceptance report')
+    assert.deepEqual(restoredArtifacts.map(row => row.sha256).sort(), [...digests, acceptanceReport.sha256].sort(),
+      'the same SQLite keeps both Host-computed Pi digests and the acceptance report digest')
     for (const run of runs) {
       const artifact = restoredArtifacts.find(row => row.taskId === run.worker.taskId)
       const preview = await request(reopened.body.token, 'loom.artifact.preview',
