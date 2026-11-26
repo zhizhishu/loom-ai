@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { AgentProfile, ThreadSnapshot } from '@contracts'
 import { SurfaceDialog } from './Controls'
+import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from './EmptyState'
+import { Icon } from './icons'
 import { ControlPanel } from './ControlPanel'
 import type { ControlAttempt } from './control-service'
 import { V2BotStatusPanel } from './V2BotStatusPanel'
@@ -145,14 +147,14 @@ export function RunStatusDialog({ open, port, bundle, thread, agents = [], theme
   return <SurfaceDialog open={open} title="运行与成果" theme={theme} onClose={onClose} className="ln-run-dialog"
     onOpenAutoFocus={()=>{opener.current=document.activeElement instanceof HTMLElement?document.activeElement:null}}
     onCloseAutoFocus={event=>{if(opener.current?.isConnected){event.preventDefault();opener.current.focus({preventScroll:true})}}}>
-    {!bundle ? <div className="ln-run-state"><p>选择一项工作，查看助手分工、执行记录和成果。</p>{onCreateWork && <button type="button" onClick={onCreateWork}>创建一项工作</button>}</div>
+    {!bundle ? <Empty className="ln-empty--inline"><EmptyHeader><EmptyMedia variant="icon"><Icon name="board" size={18}/></EmptyMedia><EmptyTitle>还没有选择工作</EmptyTitle><EmptyDescription>选择一项工作，查看助手分工、执行记录和成果。</EmptyDescription></EmptyHeader>{onCreateWork && <EmptyContent><button type="button" onClick={onCreateWork}>创建一项工作</button></EmptyContent>}</Empty>
       : !threadMatches ? <div className="ln-run-state" role="status">正在加载工作记录…</div>
       : <>
         <div className="ln-run-toolbar"><span role="status">{busy || refreshingWork ? current?'正在更新…':'正在读取工作记录…' : error?'更新失败':'工作记录'}</span>
           <button type="button" disabled={busy || refreshingWork} onClick={()=>{void refreshVisibleWork()}} aria-label="刷新运行与成果">{error?'重试读取':'刷新'}</button></div>
         {error && <div className="ln-run-state" role="alert">读取失败：{error}{current && <p>当前显示上次的记录。</p>}</div>}
         {current ? <V2BotStatusPanel facts={current.facts} bundle={current.bundle} onArtifact={onArtifact}/>
-          : !busy && !error ? <p className="ln-run-state">尚未读取到这项工作的记录。</p> : null}
+          : !busy && !error ? <Empty className="ln-empty--inline"><EmptyHeader><EmptyMedia variant="icon"><Icon name="progress" size={18}/></EmptyMedia><EmptyTitle>还没有运行记录</EmptyTitle><EmptyDescription>这项工作还没有可显示的执行记录；助手开始执行后会出现在这里。</EmptyDescription></EmptyHeader><EmptyContent><button type="button" onClick={()=>{void refreshVisibleWork()}}>刷新</button></EmptyContent></Empty> : null}
       </>}
     {controlScope && <div hidden={!threadMatches} aria-hidden={!threadMatches}>
       {/* This is only a local editor while the Thread is aligned. The Core

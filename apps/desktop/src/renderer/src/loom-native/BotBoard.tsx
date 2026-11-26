@@ -4,6 +4,8 @@ import type { AgentProfile, ConversationItem, MissionRecord, WorkBundle } from '
 import { botBoardBucket, botBoardTargets, type BoardBucket, type BoardTarget } from './bot-board'
 import { markViewed, readSeen } from './bot-board-seen'
 import { SurfaceDialog } from './Controls'
+import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from './EmptyState'
+import { Icon } from './icons'
 import './bot-board.css'
 export function BotBoard({ open, agents, conversations, missions, bundles, error, refresh, onOpen, onDetails, onClose, onCreate, theme='day' }: {
   open:boolean; agents:AgentProfile[]; conversations:ConversationItem[]; missions:MissionRecord[]; bundles:WorkBundle[];
@@ -56,7 +58,7 @@ export function BotBoard({ open, agents, conversations, missions, bundles, error
       {storageError&&<p role="alert">{storageError}</p>}
       {error&&<p role="alert">状态未确认：{error} · 上次更新 {updated||'尚无成功更新'}</p>}
       <div className="ln-board-columns">{columns.map(([key,label])=><section key={key}><h3>{label}</h3>{filtered.filter(r=>botBoardBucket(r,seen[r.key])===key).map(card)}</section>)}</div>
-      {!filtered.length&&<p>没有符合条件的助手</p>}
+      {!filtered.length&&!error&&<Empty className="ln-empty--inline"><EmptyHeader><EmptyMedia variant="icon"><Icon name={rows.length?'search':'board'} size={18}/></EmptyMedia><EmptyTitle>{rows.length?'没有匹配的助手':'还没有助手'}</EmptyTitle><EmptyDescription>{rows.length?'换一个关键词，或清除搜索和状态筛选。':'先创建一位助手；看板会按需要你、进行中、待查看分组。'}</EmptyDescription></EmptyHeader><EmptyContent>{rows.length?<button type="button" onClick={()=>{setQuery('');setFilter('all')}}>清除筛选</button>:<button type="button" onClick={onCreate}>新建助手</button>}</EmptyContent></Empty>}
       <details><summary>空闲 {rows.filter(r=>botBoardBucket(r,seen[r.key])==='idle').length} · 离线 {rows.filter(r=>botBoardBucket(r,seen[r.key])==='offline').length}</summary>{filtered.filter(r=>['idle','offline'].includes(botBoardBucket(r,seen[r.key]))).map(card)}</details>
     </section>
   </SurfaceDialog>

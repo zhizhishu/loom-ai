@@ -19,8 +19,14 @@ vi.mock('./Controls',async original=>({...await original<typeof import('./Contro
 it('renders exactly three main columns, collapsed idle rows, and an honest read failure',()=>{
  const html=renderToStaticMarkup(createElement(BotBoard,{open:true,agents:[],conversations:[],missions:[],bundles:[],error:'offline',refresh:async()=>{},onOpen:()=>{},onClose:()=>{},onCreate:()=>{}}))
  expect(html.match(/<h3>/g)).toHaveLength(3)
- for(const label of ['需要你','进行中','待查看','空闲 0 · 离线 0','没有符合条件的助手','上次更新','新建助手'])expect(html).toContain(label)
+ for(const label of ['需要你','进行中','待查看','空闲 0 · 离线 0','上次更新','新建助手'])expect(html).toContain(label)
+ expect(html).not.toContain('data-slot="empty"')
  expect(html).toContain('<details>');expect(html).not.toContain('<details open')
+})
+it('uses the shared empty pattern for a confirmed empty board',()=>{
+ const html=renderToStaticMarkup(createElement(BotBoard,{open:true,agents:[],conversations:[],missions:[],bundles:[],error:null,refresh:async()=>{},onOpen:()=>{},onClose:()=>{},onCreate:()=>{}}))
+ for(const label of ['还没有助手','看板会按需要你、进行中、待查看分组','新建助手'])expect(html).toContain(label)
+ expect(html).toContain('data-slot="empty"');expect(html).toContain('data-slot="empty-title"');expect(html).toContain('data-slot="empty-icon"')
 })
 it('derives running agents from mission facts instead of inventing per-bot runtime activity',()=>{
  const agent={agentId:'a',displayName:'A'} as AgentProfile
