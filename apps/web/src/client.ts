@@ -49,6 +49,10 @@ export class SessionRequired extends Error {
   constructor() { super('会话已失效，请重新登录。') }
 }
 
+class EditorResumeDenied extends Error {
+  constructor() { super('编辑恢复身份已被拒绝。') }
+}
+
 class ConnectionUnavailable extends Error {
   readonly code = 'transport.unavailable'
   constructor() { super('服务连接已中断，请恢复连接后重试。') }
@@ -534,9 +538,17 @@ export class ConsoleClient {
     const newEditor = fork || !saved
     this.#token = source.token
     try {
-      const response = await this.#json<SessionResponse>('session', { method: 'POST', body: JSON.stringify({ ...(saved ? { editor: saved.editor } : {}), fork: newEditor }) })
-      if (response.ownerId !== source.ownerId || (!newEditor && response.clientId !== saved?.editor.clientId)) throw new Error('Host 或编辑归属已变化，无法恢复当前页面。')
-      this.#acceptSession({ ...response, token: newEditor ? response.token : source.token })
+      const resume = async (forkEditor: boolean) => await this.#json<SessionResponse>('session', { method: 'POST', body: JSON.stringify({ ...(saved && !forkEditor ? { editor: saved.editor } : {}), fork: forkEditor }) })
+      let editorForked = newEditor
+      let response: SessionResponse
+      try { response = await resume(newEditor) } catch (error) {
+        if (newEditor || !(error instanceof EditorResumeDenied)) throw error
+        this.#editor = null
+        editorForked = true
+        response = await resume(true)
+      }
+      if (response.ownerId !== source.ownerId || (!editorForked && response.clientId !== saved?.editor.clientId)) throw new Error('Host 或编辑归属已变化，无法恢复当前页面。')
+      this.#acceptSession({ ...response, token: editorForked ? response.token : source.token })
       await this.#saveAuthentication(source.token)
       if (generation !== this.#generation) throw new DOMException('Connection replaced', 'AbortError')
       this.#notifyAuthentication()
@@ -588,14 +600,24 @@ export class ConsoleClient {
     if (this.#assertTab) await this.#assertTab()
     await this.#forgetAuthentication()
     const generation = this.#generation
-    const response = await this.#fetch(`${this.origin}/api/v1/${path}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ protocolVersion: HOST_WEB_PROTOCOL_VERSION, ...credential, ...(this.#editor ? { editor: this.#editor } : {}) }), credentials: 'omit', redirect: 'error', cache: 'no-store',
-      signal: this.#lifetime.signal
-    })
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}))
-      throw new Error(sessionStorageMessage(body) || (response.status === 409 ? 'Web 与 Host 协议不兼容，请使用同一版本。' : response.status === 429 ? '登录暂受限，请稍后再试。' : response.status >= 500 ? '服务暂不可用，请稍后重试。' : path === 'login-ticket' ? '扫码登录未完成，二维码可能已过期或已使用。请在运行服务的 Desktop 重新生成，或使用登录 Token 登录。' : 'Token 无效，请检查后重试。'))
+    let resumeEditor = this.#editor
+    let response: Response
+    for (;;) {
+      response = await this.#fetch(`${this.origin}/api/v1/${path}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ protocolVersion: HOST_WEB_PROTOCOL_VERSION, ...credential, ...(resumeEditor ? { editor: resumeEditor } : {}) }), credentials: 'omit', redirect: 'error', cache: 'no-store',
+        signal: this.#lifetime.signal
+      })
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}))
+        if (response.status === 401 && body?.error?.code === 'editor_resume_denied' && resumeEditor) {
+          resumeEditor = null
+          this.#editor = null
+          continue
+        }
+        throw new Error(sessionStorageMessage(body) || (response.status === 409 ? 'Web 与 Host 协议不兼容，请使用同一版本。' : response.status === 429 ? '登录暂受限，请稍后再试。' : response.status >= 500 ? '服务暂不可用，请稍后重试。' : path === 'login-ticket' ? '扫码登录未完成，二维码可能已过期或已使用。请在运行服务的 Desktop 重新生成，或使用登录 Token 登录。' : 'Token 无效，请检查后重试。'))
+      }
+      break
     }
     const session = await response.json() as SessionResponse
     if (generation !== this.#generation) throw new SessionRequired()
@@ -1268,7 +1290,11 @@ export class ConsoleClient {
       throw error
     }
     if (generation !== this.#generation) throw new DOMException('Connection replaced', 'AbortError')
-    if (response.status === 401) { await this.#forgetAuthentication(); throw new SessionRequired() }
+    if (response.status === 401) {
+      const body = await response.clone().json().catch(() => ({}))
+      if (path === 'session' && body?.error?.code === 'editor_resume_denied') throw new EditorResumeDenied()
+      await this.#forgetAuthentication(); throw new SessionRequired()
+    }
     if (!response.ok) {
       const error = await this.#readResponse(() => response.json().catch(error => {
         if (error instanceof SyntaxError) return {}

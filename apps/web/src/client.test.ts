@@ -65,6 +65,32 @@ describe('console transport', () => {
     expect(client.editingScope).toBe(scope)
   })
 
+  it('drops a denied editor resume identity and retries login without it', async () => {
+    const first = { protocolVersion: 5, token: 'a'.repeat(64), clientId: 'd'.repeat(64), editorProof: 'e'.repeat(64), ownerId: 'local_user' }
+    const renewed = { protocolVersion: 5, token: 'c'.repeat(64), clientId: 'f'.repeat(64), editorProof: 'f'.repeat(64), ownerId: 'local_user' }
+    const loginBodies: Array<{ editor?: unknown }> = []
+    let initial = true
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (url, init) => {
+      if (String(url).endsWith('/login')) {
+        const body = JSON.parse(String(init?.body))
+        loginBodies.push(body)
+        if (initial) { initial = false; return Response.json(first) }
+        if (body.editor) return Response.json({ error: { code: 'editor_resume_denied' } }, { status: 401 })
+        return Response.json(renewed)
+      }
+      return Response.json({ result: {} })
+    })
+    const client = new ConsoleClient('http://127.0.0.1:4317', fetcher)
+    await client.login('b'.repeat(64))
+    await client.login('b'.repeat(64))
+    expect(loginBodies).toHaveLength(3)
+    expect(loginBodies[1].editor).toEqual({ clientId: 'd'.repeat(64), proof: 'e'.repeat(64) })
+    expect(loginBodies[2].editor).toBeUndefined()
+    expect(client.editingScope).toBe(`http://127.0.0.1:4317/local_user/${'f'.repeat(64)}`)
+    expect(client.authenticated).toBe(true)
+    client.clear()
+  })
+
   it('keeps credentials in explicit headers on the fixed origin and rejects old generations', async () => {
     const token = 'a'.repeat(64)
     let delayed: ((value: Response) => void) | undefined
