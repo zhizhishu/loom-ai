@@ -2788,6 +2788,10 @@ interface MessageDeliveryBaseView {
   targetAgentRunId: string | null
   manualInterventionRequired: boolean
   failureCode: string | null
+  wakeAttempts?: number | null
+  nextWakeAt?: string | null
+  wakeLeaseUntil?: string | null
+  wakeState?: 'wake_waiting' | 'wake_start_unconfirmed' | 'wake_exhausted' | 'wake_failed' | null
   version: number
   createdAt: string
   updatedAt: string

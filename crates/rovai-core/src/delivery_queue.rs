@@ -403,7 +403,7 @@ fn delivery_recovery_now_ms() -> i64 {
 
 /// Timestamps here are written both by `chrono` (`+00:00`) and by SQLite (`YYYY-MM-DD HH:MM:SS`),
 /// so both spellings are read, exactly as `thread_runs::parse_timestamp` does.
-fn parse_delivery_timestamp(value: &str) -> Option<i64> {
+pub(crate) fn parse_delivery_timestamp(value: &str) -> Option<i64> {
     if let Ok(value) = chrono::DateTime::parse_from_rfc3339(value) {
         return Some(value.timestamp_millis());
     }

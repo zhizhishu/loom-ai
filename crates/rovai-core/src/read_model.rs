@@ -938,6 +938,15 @@ pub struct MessageDeliveryView {
     pub target_agent_run_id: Option<String>,
     pub manual_intervention_required: bool,
     pub failure_code: Option<String>,
+    /// Persisted wake recovery facts of the current Delivery row. Legacy Delivery rows never had
+    /// them, so they project as NULL rather than as a fabricated fresh wake.
+    /// upstream: Mikka 250d2451 lib/coordinator/wake-recovery.ts:WakeDeadlineTicket
+    pub wake_attempts: Option<i64>,
+    pub next_wake_at: Option<String>,
+    pub wake_lease_until: Option<String>,
+    /// Restore-facing state derived from those durable facts; NULL outside a waiting current Delivery.
+    /// upstream: Mikka 250d2451 lib/coordinator/chat-state.ts:coordinatorChatState
+    pub wake_state: Option<String>,
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -2866,6 +2875,42 @@ fn load_turns(
         .context("failed to load CampTurns")
 }
 
+/// The restore-facing state of one waiting Delivery, derived only from durable wake facts.
+///
+/// Mikka's first wake lease means "the start is being confirmed"; later leases prove an earlier
+/// start was not confirmed, so they do not spin the chat as a fresh first attempt. LOOM has no
+/// separate `wakeLastError` column and this branch adds no migration: `wake_failed` is projected
+/// only when the existing failure column already carries that exact durable fact.
+/// upstream: Mikka 250d2451 lib/coordinator/chat-state.ts:coordinatorChatState
+fn delivery_wake_restore_state(
+    status: &str,
+    wake_attempts: Option<i64>,
+    wake_lease_until: Option<&str>,
+    failure_code: Option<&str>,
+) -> Option<&'static str> {
+    if status != "waiting" {
+        return None;
+    }
+    let attempts = wake_attempts?;
+    if attempts == 0 {
+        return Some("wake_waiting");
+    }
+    let lease_live = wake_lease_until.is_some_and(|value| {
+        crate::delivery_queue::parse_delivery_timestamp(value)
+            .is_some_and(|at| at > chrono::Utc::now().timestamp_millis())
+    });
+    if attempts == 1 && lease_live {
+        return Some("wake_waiting");
+    }
+    if attempts >= crate::delivery_queue::MAX_WAKE_ATTEMPTS && !lease_live {
+        return Some("wake_exhausted");
+    }
+    if failure_code == Some("wake_failed") {
+        return Some("wake_failed");
+    }
+    Some("wake_start_unconfirmed")
+}
+
 fn load_message_deliveries(
     transaction: &Transaction<'_>,
     camp_id: &str,
@@ -2900,6 +2945,9 @@ fn load_message_deliveries(
                  current_delivery.claimed_agent_run_id AS target_agent_run_id,
                  0 AS manual_intervention_required,
                  current_delivery.failure_code,
+                 current_delivery.wake_attempts,
+                 current_delivery.next_wake_at,
+                 current_delivery.wake_lease_until,
                  current_delivery.version,
                  current_delivery.created_at,
                  current_delivery.updated_at,
@@ -2956,6 +3004,9 @@ fn load_message_deliveries(
                  legacy_delivery.target_agent_run_id,
                  legacy_delivery.manual_intervention_required,
                  legacy_delivery.failure_code,
+                 NULL AS wake_attempts,
+                 NULL AS next_wake_at,
+                 NULL AS wake_lease_until,
                  legacy_delivery.version,
                  legacy_delivery.created_at,
                  legacy_delivery.updated_at,
@@ -2998,7 +3049,8 @@ fn load_message_deliveries(
                recipient_membership_version_at_admission, source_agent_run_id, continuation_request, input_message_ids,
                (SELECT requested_mode FROM camp_message_delivery d WHERE d.id=projected_delivery.id),
                (SELECT i.status FROM context_manifest m JOIN runtime_input_delivery i ON i.context_manifest_id=m.id
-                WHERE m.source_delivery_id=projected_delivery.id ORDER BY i.input_sequence DESC LIMIT 1)
+                WHERE m.source_delivery_id=projected_delivery.id ORDER BY i.input_sequence DESC LIMIT 1),
+               wake_attempts, next_wake_at, wake_lease_until
         FROM projected_delivery
         ORDER BY
           CASE
@@ -3096,6 +3148,16 @@ fn load_message_deliveries(
                 target_agent_run_id: row.get(11)?,
                 manual_intervention_required: row.get::<_, i64>(12)? != 0,
                 failure_code: row.get(13)?,
+                wake_attempts: row.get(34)?,
+                next_wake_at: row.get(35)?,
+                wake_lease_until: row.get(36)?,
+                wake_state: delivery_wake_restore_state(
+                    row.get::<_, String>(5)?.as_str(),
+                    row.get::<_, Option<i64>>(34)?,
+                    row.get::<_, Option<String>>(36)?.as_deref(),
+                    row.get::<_, Option<String>>(13)?.as_deref(),
+                )
+                .map(str::to_string),
                 version: row.get(14)?,
                 created_at: row.get(15)?,
                 updated_at: row.get(16)?,
@@ -4675,6 +4737,9 @@ mod tests {
                 target_conversation_id TEXT, recipient_membership_version_at_admission INTEGER DEFAULT 1,
                 source_agent_run_id TEXT, queue_sequence INTEGER DEFAULT 1
             );
+            ALTER TABLE camp_message_delivery ADD COLUMN wake_attempts INTEGER;
+            ALTER TABLE camp_message_delivery ADD COLUMN next_wake_at TEXT;
+            ALTER TABLE camp_message_delivery ADD COLUMN wake_lease_until TEXT;
             INSERT INTO agent_run VALUES ('current-sender', NULL);
             INSERT INTO camp_message VALUES
                 ('current-message', 'camp', 'agent', NULL, NULL,
@@ -4684,10 +4749,10 @@ mod tests {
             INSERT INTO camp_message_delivery VALUES
                 ('current', 'camp', 'current-message', 'current-recipient', 1, 2,
                  'claimed', 'current-target', NULL, 1,
-                 '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z', NULL),
+                 '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z', NULL, NULL, NULL, NULL),
                 ('user-current', 'camp', 'user-message', 'current-recipient', 1, 1,
                  'waiting', NULL, NULL, 1,
-                 '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z', NULL);
+                 '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z', NULL, NULL, NULL, NULL);
             INSERT INTO message_delivery (
                 id, camp_id, status, delivery_kind, recipient_canonical_position, edge_kind,
                 source_agent_run_id, target_parent_agent_run_id, target_agent_run_id, return_to_agent_run_id
@@ -4759,7 +4824,58 @@ mod tests {
             Some("accepted")
         );
     }
+
+    /// upstream: Mikka 250d2451 lib/coordinator/chat-state.test.ts
+    /// ("failed and unacknowledged starts stop the spinner while preserving pending input",
+    ///  "the last live startup retry stays unconfirmed until consumption or exhaustion").
+    #[test]
+    fn delivery_wake_restore_state_uses_only_the_durable_wake_facts() {
+        let future = (chrono::Utc::now() + chrono::Duration::minutes(2)).to_rfc3339();
+        let past = (chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339();
+        let state = super::delivery_wake_restore_state;
+        assert_eq!(state("claimed", Some(0), None, None), None);
+        assert_eq!(state("waiting", None, None, None), None);
+        assert_eq!(state("waiting", Some(0), None, None), Some("wake_waiting"));
+        assert_eq!(
+            state("waiting", Some(1), Some(future.as_str()), None),
+            Some("wake_waiting"),
+            "the first live wake lease is still confirming the start"
+        );
+        assert_eq!(
+            state("waiting", Some(1), Some(past.as_str()), None),
+            Some("wake_start_unconfirmed")
+        );
+        assert_eq!(
+            state("waiting", Some(2), Some(future.as_str()), None),
+            Some("wake_start_unconfirmed"),
+            "a later lease proves the earlier start was never confirmed"
+        );
+        assert_eq!(
+            state(
+                "waiting",
+                Some(crate::delivery_queue::MAX_WAKE_ATTEMPTS),
+                Some(future.as_str()),
+                None
+            ),
+            Some("wake_start_unconfirmed"),
+            "even the last live startup retry is unconfirmed until it expires"
+        );
+        assert_eq!(
+            state(
+                "waiting",
+                Some(crate::delivery_queue::MAX_WAKE_ATTEMPTS),
+                Some(past.as_str()),
+                None
+            ),
+            Some("wake_exhausted")
+        );
+        assert_eq!(
+            state("waiting", Some(1), None, Some("wake_failed")),
+            Some("wake_failed")
+        );
+    }
 }
+
 
 #[cfg(all(test, feature = "slow-tests"))]
 #[path = "read_model/camp_open_tests.rs"]
