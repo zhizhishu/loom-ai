@@ -3769,7 +3769,7 @@ impl Core {
                             adapter_kind: AdapterKind::Pi,
                             schema_version: 1,
                             values: json!({
-                                "loom_file_access": pi::PI_FILE_ACCESS_WORKSPACE_READ_WRITE,
+                                "loom_file_access": pi::PI_FILE_ACCESS_WORKSPACE_WORKFLOW,
                             }),
                         },
                         // An absent Pi Purge is Off; a seeded member never starts with one.

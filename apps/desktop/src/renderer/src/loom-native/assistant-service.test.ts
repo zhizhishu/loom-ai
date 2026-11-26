@@ -458,14 +458,14 @@ describe('Pi Purge file policy', () => {
     expect(draft.permissions.values.loom_file_access).toBe('native')
   })
 
-  it('starts a new Pi assistant at workspace_read_write instead of an unchosen native policy', () => {
+  it('starts a new Pi assistant at workspace_workflow instead of an unchosen native policy', () => {
     const empty = assistantRuntimeSetupDefaults(piOption({}))!
-    expect(empty.permissions.values).toEqual({ loom_file_access: 'workspace_read_write' })
+    expect(empty.permissions.values).toEqual({ loom_file_access: 'workspace_workflow' })
     expect(empty.adapterKind).toBe('pi')
     expect(empty.model).toEqual({ mode: 'runtime_default' })
 
     const native = assistantRuntimeSetupDefaults(piOption({ loom_file_access: 'native' }))!
-    expect(native.permissions.values).toEqual({ loom_file_access: 'workspace_read_write' })
+    expect(native.permissions.values).toEqual({ loom_file_access: 'workspace_workflow' })
 
     // A default the Host already guards is kept as reported, and other values survive.
     const readOnly = assistantRuntimeSetupDefaults(piOption({ loom_file_access: 'workspace_read_only', other: 1 }))!

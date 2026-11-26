@@ -256,6 +256,7 @@ export const PI_PURGE_FILE_ACCESS = [
 
 /** The one guarded policy this surface offers as a one-click repair. */
 export const PI_PURGE_FILE_ACCESS_FIX = 'workspace_read_write'
+export const PI_ASSISTANT_FILE_ACCESS_DEFAULT = 'workspace_workflow'
 
 /**
  * The mode Core would read out of `permissions.values`, by the same strictness:
@@ -293,16 +294,23 @@ export function piPurgeNeedsFileGrant(choice: MemberRuntimeConfiguration | null)
 }
 
 /** The one-click repair the caller offers next to that warning. */
-export function withPiPurgeFileGrant(
-  choice: MemberRuntimeConfiguration
+function withPiFileAccess(
+  choice: MemberRuntimeConfiguration,
+  mode: string
 ): MemberRuntimeConfiguration {
   return {
     ...choice,
     permissions: {
       ...choice.permissions,
-      values: { ...choice.permissions.values, [PI_FILE_ACCESS_KEY]: PI_PURGE_FILE_ACCESS_FIX }
+      values: { ...choice.permissions.values, [PI_FILE_ACCESS_KEY]: mode }
     }
   }
+}
+
+export function withPiPurgeFileGrant(
+  choice: MemberRuntimeConfiguration
+): MemberRuntimeConfiguration {
+  return withPiFileAccess(choice, PI_PURGE_FILE_ACCESS_FIX)
 }
 
 /**
@@ -310,9 +318,11 @@ export function withPiPurgeFileGrant(
  *
  * One Pi exception: an absent `loom_file_access` is read by Core as `native`
  * (pi/file_grant.rs:125-127), and `native` makes Pi Purge Append unsavable, so a
- * fresh Pi assistant starts at `workspace_read_write` instead of inheriting a
- * policy nobody chose. A default that is already guarded is kept as reported,
- * and no other Runtime, model or permission value is touched.
+ * fresh Pi assistant starts at `workspace_workflow` instead of inheriting a
+ * policy nobody chose. The workflow grant stays inside the same file boundary and adds
+ * only the managed loom business tool needed for controlled dispatch; it never enables
+ * shell. A default that is already guarded is kept as reported, and no other Runtime,
+ * model or permission value is touched.
  */
 export function assistantRuntimeSetupDefaults(
   option: AssistantRuntimeOption
@@ -320,7 +330,7 @@ export function assistantRuntimeSetupDefaults(
   if (!option.defaults) return null
   const value = structuredClone(option.defaults)
   if (option.kind !== 'pi' || guardsPiPurgeAppend(value.permissions.values)) return value
-  return withPiPurgeFileGrant(value)
+  return withPiFileAccess(value, PI_ASSISTANT_FILE_ACCESS_DEFAULT)
 }
 
 /**
