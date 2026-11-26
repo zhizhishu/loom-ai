@@ -51,7 +51,6 @@ verify_package() {
   require_file "$root/runtime/pi/pi-bundle.json" runtime/pi/pi-bundle.json
   require_exec "$root/runtime/pi/node/node" runtime/pi/node/node
   require_exec "$root/runtime/pi/pi" runtime/pi/pi
-  require_file "$root/runtime/dsh-hook-executor/executor-bundle.json" runtime/dsh-hook-executor/executor-bundle.json
   require_file "$root/runtime/computer/computer-bundle.json" runtime/computer/computer-bundle.json
   require_exec "$root/runtime/computer/python" runtime/computer/python
   require_file "$root/runtime/computer/host_desktop.py" runtime/computer/host_desktop.py

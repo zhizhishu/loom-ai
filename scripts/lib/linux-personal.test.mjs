@@ -10,6 +10,7 @@ const read = path => readFileSync(join(repository, path), 'utf8')
 test('linux personal workflow ships one linux x64 artifact and verifies the delivered archive', () => {
   const workflow = read('.github/workflows/loom-v2-e3-linux.yml')
   assert.match(workflow, /node scripts\/build-server\.mjs --target-key linux-x64 --debug/)
+  assert.match(workflow, /scripts\/runtime\/pi-source\/package\.json scripts\/runtime\/pi-source\/package-lock\.json/)
   assert.match(workflow, /package-computer-runtime-linux\.mjs/)
   assert.match(workflow, /package-linux-personal\.mjs/)
   assert.match(workflow, /loom-personal-preview-linux-\$\{\{ env\.LOOM_SOURCE_COMMIT \}\}/)
@@ -44,7 +45,7 @@ test('linux computer runtime packages helper bridge and pinned Pillow wheel sele
   assert.match(packager, /pillow==\$\{LINUX_PILLOW_VERSION\}/)
 })
 
-test('linux package manifest requires web frontend, Pi, DSH executor and computer runtime', () => {
+test('linux package manifest requires web frontend, Pi and computer runtime', () => {
   const packager = read('scripts/package-linux-personal.mjs')
-  for (const snippet of ['web-ui/index.html', 'runtime/pi/pi-bundle.json', 'runtime/dsh-hook-executor/executor-bundle.json', 'runtime/computer/computer-bundle.json', "target: 'linux-x64'"]) assert.ok(packager.includes(snippet), snippet)
+  for (const snippet of ['web-ui/index.html', 'runtime/pi/pi-bundle.json', 'runtime/computer/computer-bundle.json', "target: 'linux-x64'"]) assert.ok(packager.includes(snippet), snippet)
 })
