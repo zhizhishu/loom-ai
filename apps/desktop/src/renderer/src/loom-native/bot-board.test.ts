@@ -75,7 +75,7 @@ it('shows assigned task ownership even before control facts are observed',()=>{
 })
 
 it('uses existing presence and runtime-readiness facts for each bot live state',()=>{
- const present={agentId:'a',displayName:'A',presence:'present',removedAt:null,runtimeReadiness:{status:'ready',blockers:[]}} as AgentProfile
+ const present={agentId:'a',displayName:'A',presence:'present',removedAt:null,runtimeReadiness:{status:'ready',blockers:[]}} as unknown as AgentProfile
  const away={...present,agentId:'away',presence:'away'} as AgentProfile
  const removed={...present,agentId:'removed',removedAt:'2026-11-26T00:00:00Z'} as AgentProfile
  const broken={...present,agentId:'broken',runtimeReadiness:{status:'needs_attention',blockers:[{code:'runtime_configuration_invalid',detail:null}]}} as AgentProfile
