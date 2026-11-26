@@ -2,6 +2,7 @@ import {useCallback,useEffect,useMemo,useRef,useState} from 'react'
 import type {BusinessEnvironment} from '../business-environment'
 import type {NavigationSnapshot,NavigationPreferencesSnapshot,WorkspaceSelection} from '@contracts'
 import {SurfaceDialog,FormMessage} from './Controls'
+import {Empty,EmptyContent,EmptyDescription,EmptyHeader,EmptyMedia,EmptyTitle} from './EmptyState'
 import {Icon} from './icons'
 import {readWorkspaceDefault,writeWorkspaceDefault,validateWorkspaceDefault} from './workspace-defaults'
 
@@ -100,7 +101,7 @@ export function WorkspaceManager({open=true,embedded=false,environment,theme,onC
           <button type="button" className="ln-action is-primary" disabled={busy} onClick={()=>start(entry)} aria-label={'在目录新建工作：'+entry.name}>新建工作</button>
           {entry.threads===0&&<button type="button" className="ln-text-action" disabled={busy} onClick={()=>forget(entry)} aria-label={'取消收藏目录：'+entry.name}>移除</button>}
         </div>)}
-        {!entries.length&&<p className="ln-inspector-empty">还没有登记项目，可以从主机挑选目录。</p>}
+        {!entries.length&&<Empty className="ln-empty--inline"><EmptyHeader><EmptyMedia variant="icon"><Icon name="files" size={18}/></EmptyMedia><EmptyTitle>还没有登记项目</EmptyTitle><EmptyDescription>从主机挑选目录后，可以把它设为默认运行根或单独开始工作。</EmptyDescription></EmptyHeader><EmptyContent><button type="button" className="ln-action" disabled={busy} onClick={add}>添加目录</button></EmptyContent></Empty>}
       </div>
       <p className="ln-native-help">这里的「移除」仅管理项目列表，不删除文件，也不撤销已有原生 CLI 运行中的工具权限。真正跨根运行必须明确设定目标根或单独通过 Runtime 权限审批。</p>
       {!embedded&&<footer className="ln-form-actions"><button className="ln-action" type="button" disabled={busy} onClick={onClose}>关闭</button></footer>}

@@ -55,9 +55,12 @@ describe('ThreadResults (成果段)', () => {
     expect(html).toContain('已接受') // 候选状态词与聊天流产物卡一致
   })
 
-  it('says so plainly when the thread produced nothing', () => {
+  it('uses the shared empty pattern when the thread produced nothing', () => {
     const html = renderToStaticMarkup(createElement(ThreadResults, { entries: [], onArtifact: () => {} }))
-    expect(html).toContain('这场对话还没有成果。')
+    expect(html).toContain('data-slot="empty"')
+    expect(html).toContain('data-slot="empty-icon"')
+    expect(html).toContain('这场对话还没有成果')
+    expect(html).toContain('助手交付的文件会归档在这里。')
     expect(html).not.toContain('ln-result-group')
     expect(html).not.toContain('ln-result-count')
   })

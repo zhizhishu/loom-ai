@@ -7,6 +7,7 @@ import { Avatar } from './Avatar'
 import { Icon } from './icons'
 import { readWorkspaceDefault,validateWorkspaceDefault } from './workspace-defaults'
 import { FormMessage, SurfaceDialog, UnsavedNotice } from './Controls'
+import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from './EmptyState'
 import {
   roomPort, emptyRoomDraft, roomSubmitProblem, createRoom, chooseRoomWorkspace,
   readRoomCreationPreflight, addRoomMembers, changeRoomLead, removeRoomMembers, setRoomHidden,
@@ -174,7 +175,7 @@ export function RoomDialog({ open, environment, agents, initialAgentId, initialM
       {mode === 'work' && <label className="ln-field"><span>想要什么结果？</span><textarea aria-label="工作目标" rows={4} maxLength={12000} placeholder="描述目标、约束和你希望交付的成果。协调助手会组织队友，进度与成果显示在右侧。" disabled={busy || creationUnknown} value={goal} onChange={event => { setGoal(event.target.value); setChanged(true); setError(''); if (!creationUnknown) workAttempt.current = undefined }}/><small>工作会保留目标、任务进展和成果；不是只建一个空群。</small></label>}
       <div className="ln-panel-title"><h3>{mode === 'direct' ? '选择助手' : '邀请助手'}</h3><small>{draft.memberAgentIds.length} 位已选</small></div>
       {people.length > 0 ? <div className="ln-room-people">{people.map(agent => <label className="ln-room-person" key={agent.agentId}><input type={mode === 'direct' ? 'radio' : 'checkbox'} name="room-members" checked={draft.memberAgentIds.includes(agent.agentId)} onChange={() => toggle(agent.agentId)} disabled={busy || creationUnknown}/><Avatar agent={agent} size={32}/><span><strong>{agent.displayName}</strong><small>{agent.teamRole || '助手'}{!agent.runtimeConfiguration ? ' · 待配置运行端' : ''}</small></span>{mode !== 'direct' && draft.leadAgentId === agent.agentId && <span className="ln-room-lead-badge">负责回复</span>}</label>)}</div>
-        : <div className="ln-room-empty"><p>还没有可选的助手。</p>{onNewAssistant && <button type="button" className="ln-action" onClick={onNewAssistant}>新建助手</button>}</div>}
+        : <Empty className="ln-empty--inline"><EmptyHeader><EmptyMedia variant="icon"><Icon name="chat" size={18}/></EmptyMedia><EmptyTitle>还没有可选的助手</EmptyTitle><EmptyDescription>先建立一位助手，再开始单聊、群聊或共同工作。</EmptyDescription></EmptyHeader>{onNewAssistant && <EmptyContent><button type="button" className="ln-action" onClick={onNewAssistant}>新建助手</button></EmptyContent>}</Empty>}
       {mode !== 'direct' && draft.memberAgentIds.length > 0 && <p className="ln-native-help">第一个勾选的助手负责回复；群里写 @名字 时由被点名的助手先答。</p>}
       <div className="ln-panel-title"><h3>工作区 · 默认运行目录</h3></div>
       <p className="ln-native-help">助手开始执行文件任务时的项目根目录，不是聊天附件位置。</p>

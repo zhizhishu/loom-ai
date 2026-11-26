@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ThreadClient } from '../camp-client'
 import { createMcpPort, type McpConnectionRead, type McpConnectionsRead, type McpFieldEntry, type McpWriteOutcome } from './mcp-service'
 import { ChoiceMenu, FormMessage, SurfaceDialog } from './Controls'
+import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from './EmptyState'
 import { Icon, IconButton } from './icons'
 
 function outcomeError(value: McpWriteOutcome): string | null {
@@ -77,7 +78,7 @@ export function McpConnections({ client, theme, onChanged, onDirty }: {
         <footer className="ln-form-actions"><button type="button" className="ln-action" disabled={busy} onClick={() => { setCreating(false); setName(''); setEndpoint(''); setArgs(''); setPairs([]) }}>取消</button><button type="submit" className="ln-action is-primary" disabled={busy || !name.trim() || !endpoint.trim()}>{busy ? '保存中…' : '保存连接，暂不启用'}</button></footer>
       </form>}
       {read.connections.map(connection => <article className="ln-native-resource" key={connection.serverId}><span className="ln-native-type"><Icon name="globe" size={18}/></span><div className="ln-native-resource-copy"><strong>{connection.name}</strong><p>{connection.transport === 'http' ? 'HTTP 服务' : '本机程序'} · {connection.enabled ? '已启用' : '已停用'} · {connection.assignedAgentIds.length} 位助手</p><small>{connection.authentication.credential === 'none' ? '未声明凭据' : '凭据保留在主机'}{connection.risk.level === 'high' ? ' · 高风险定义' : ''}</small>{connection.configurationIssues.map((issue,index) => <p className="ln-native-warning" key={index}>{issue.message}</p>)}</div><button type="button" className="ln-action" disabled={busy || read.permissionIssue} onClick={() => { if (!connection.enabled && connection.risk.level === 'high') setRisk(connection); else void enable(connection) }}>{connection.enabled ? '停用' : '启用'}</button></article>)}
-      {!read.connections.length && !creating && <div className="ln-native-empty"><Icon name="globe" size={28}/><strong>还没有工具连接</strong><p>添加地址或本机程序，或从“客户端能力”导入已存在的连接。</p></div>}
+      {!read.connections.length && !creating && <Empty className="ln-empty--inline"><EmptyHeader><EmptyMedia variant="icon"><Icon name="globe" size={18}/></EmptyMedia><EmptyTitle>还没有工具连接</EmptyTitle><EmptyDescription>添加地址或本机程序；保存后默认停用，仍需要为助手明确授权。</EmptyDescription></EmptyHeader><EmptyContent><button type="button" className="ln-action" disabled={busy || read.permissionIssue} onClick={() => { setCreating(true); setError(''); setNotice('') }}>添加 MCP</button></EmptyContent></Empty>}
     </>}
     <SurfaceDialog open={risk !== null} title="启用高风险连接？" description="这一步允许后续运行使用此连接，不会自动为任何助手勾选。" theme={theme} onClose={() => { if (!busy) setRisk(null) }} className="ln-room-dialog"><div className="ln-room-content"><div className="ln-review-card"><h3>{risk?.name}</h3><p>{risk?.transport === 'stdio' ? '此连接可能启动本机程序并访问主机资源。' : '此连接可能访问外部资源并产生副作用。'}</p></div>{error && <FormMessage error>{error}</FormMessage>}<div className="ln-form-actions"><button type="button" className="ln-action" disabled={busy} onClick={() => setRisk(null)}>取消</button><button type="button" className="ln-action is-primary" disabled={busy || !risk} onClick={() => { if (risk) void enable(risk,true) }}>确认这条连接并启用</button></div></div></SurfaceDialog>
   </section>

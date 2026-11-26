@@ -2,6 +2,7 @@ import type { ArtifactSelection } from './types'
 import { artifactSizeLabel } from './artifact-service'
 import { Icon } from './icons'
 import { resultGroupViews, resultEntryTitle, resultStatusLabel } from './thread-artifacts'
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from './EmptyState'
 import type { ThreadResultEntry } from './thread-artifacts'
 
 /**
@@ -15,10 +16,7 @@ export function ThreadResults({ entries, onArtifact }: {
 }) {
   const groups = resultGroupViews(entries)
   return <div className="ln-results" role="tabpanel" aria-label="成果">
-    {groups.length === 0 && <div className="ln-results-empty">
-      <p>这场对话还没有成果。</p>
-      <p>助手交付的文件会归档在这里。</p>
-    </div>}
+    {groups.length === 0 && <Empty className="ln-empty--inline"><EmptyHeader><EmptyMedia variant="icon"><Icon name="file" size={18}/></EmptyMedia><EmptyTitle>这场对话还没有成果</EmptyTitle><EmptyDescription>助手交付的文件会归档在这里。</EmptyDescription></EmptyHeader></Empty>}
     {groups.map(({ group, label, count, entries: groupEntries }) => <section className="ln-result-group" data-group={group} key={group}>
       <h3>{label}<span className="ln-result-count">{count}</span></h3>
       <div className="ln-result-list">
