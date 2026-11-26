@@ -8,6 +8,8 @@ describe('office preview/extraction', () => {
     expect(isOfficeDocumentName('报告.docx')).toBe(true)
     expect(isOfficeDocumentName('slides.pptx')).toBe(true)
     expect(isOfficeDocumentName('table.xlsx')).toBe(true)
+    expect(isOfficeDocumentName('legacy.xls')).toBe(true)
+    expect(isOfficeDocumentName('book.ods')).toBe(true)
     expect(isOfficeDocumentName('notes.md')).toBe(false)
   })
 
@@ -17,8 +19,20 @@ describe('office preview/extraction', () => {
     XLSX.utils.book_append_sheet(workbook, sheet, 'Sheet1')
     const bytes = XLSX.write(workbook, { type: 'array', bookType: 'xlsx' })
     const text = await extractOfficeDocumentText(new File([bytes], 'table.xlsx'))
+    expect(text).toContain('# Sheet1')
     expect(text).toContain('名称')
     expect(text).toContain('苹果')
+  })
+
+  it('extracts legacy xls as sheet CSV for assistants', async () => {
+    const sheet = XLSX.utils.aoa_to_sheet([['名称', '数量'], ['苹果', 3]])
+    const workbook = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(workbook, sheet, 'Sheet1')
+    const bytes = XLSX.write(workbook, { type: 'array', bookType: 'xls' })
+    const text = await extractOfficeDocumentText(new File([bytes], 'legacy.xls'))
+    expect(text).toContain('# Sheet1')
+    expect(text).toContain('名称,数量')
+    expect(text).toContain('苹果,3')
   })
 
   it('admits xlsx artifact media as spreadsheet preview', () => {
