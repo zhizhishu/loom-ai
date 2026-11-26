@@ -248,6 +248,19 @@ fn routes(state: WebState) -> Router {
         .route("/computer/agents/grant", post(computer_agent::grant))
         .route("/computer/agents/list", post(computer_agent::list))
         .route("/computer/agents/revoke", post(computer_agent::revoke))
+        .route("/computer/agents/mode", post(computer_agent::set_control_mode))
+        .route(
+            "/computer/agents/mode/status",
+            post(computer_agent::control_mode_status),
+        )
+        .route(
+            "/computer/agents/approvals/list",
+            post(computer_agent::approvals_list),
+        )
+        .route(
+            "/computer/agents/approvals/decide",
+            post(computer_agent::approvals_decide),
+        )
         .route("/computer/status", post(computer::status))
         .route("/computer/preview", post(computer::preview))
         .route("/computer/view", post(computer::view))

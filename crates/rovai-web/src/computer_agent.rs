@@ -51,8 +51,8 @@
 
 use crate::auth::{Session, Sessions};
 use crate::computer::{
-    self, Computer, ControlBody, EventBody, EventKind, FrameBody, InputBody, ReleaseBody,
-    StopBody, ViewBody, WireButton, WireKey,
+    self, Computer, ControlBody, EventBody, EventKind, FrameBody, InputBody, ReleaseBody, StopBody,
+    ViewBody, WireButton, WireKey,
 };
 use crate::{WebState, error};
 use axum::{
@@ -70,7 +70,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, MutexGuard, TryLockError,
+        Arc, Condvar, Mutex, MutexGuard, TryLockError,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -87,7 +87,7 @@ const DEFAULT_GRANT_MS: u64 = 300_000;
 pub(crate) const MAX_RECEIPTS: usize = 512;
 const MAX_REQUEST_ID: usize = 64;
 const MAX_TOKEN_HEADER: usize = 128;
-const RPC_DEADLINE: Duration = Duration::from_secs(15);
+const RPC_DEADLINE: Duration = Duration::from_secs(310);
 const RETIRE_DEADLINE: Duration = Duration::from_secs(12);
 const CORE_DEADLINE: Duration = Duration::from_secs(20);
 /// What the transport deadline keeps in reserve, so a request that is still waiting for the
@@ -102,6 +102,8 @@ const CORE_DEADLINE: Duration = Duration::from_secs(20);
 /// authorization.
 const GATE_TRANSPORT_MARGIN: Duration = Duration::from_secs(2);
 const TOOL_CONTROL_TTL_SECONDS: u32 = 30;
+const MAX_APPROVALS: usize = 20;
+const APPROVAL_TTL_MS: u64 = 300_000;
 const TOKEN_PREFIX: &str = "grant-";
 const RPC_PATH: &str = "/api/v1/computer-agent/rpc";
 
@@ -170,9 +172,9 @@ fn http_status(code: &'static str) -> StatusCode {
         | "computer_agent_origin_denied"
         | "computer_agent_runtime_unsupported"
         | "computer_agent_target_unsupported" => StatusCode::FORBIDDEN,
-        "computer_agent_grant_unknown_for_owner" | "computer_agent_assistant_unknown" => {
-            StatusCode::NOT_FOUND
-        }
+        "computer_agent_grant_unknown_for_owner"
+        | "computer_agent_assistant_unknown"
+        | "computer_agent_approval_unknown" => StatusCode::NOT_FOUND,
         "computer_agent_invalid_request" | "computer_agent_assistant_removed" => {
             StatusCode::BAD_REQUEST
         }
@@ -182,7 +184,11 @@ fn http_status(code: &'static str) -> StatusCode {
         | "computer_agent_view_unavailable"
         | "computer_agent_request_replayed"
         | "computer_agent_grant_conflict"
-        | "computer_agent_digest_mismatch" => StatusCode::CONFLICT,
+        | "computer_agent_digest_mismatch"
+        | "computer_agent_human_control"
+        | "computer_agent_approval_denied"
+        | "computer_agent_approval_expired"
+        | "computer_agent_approval_decided" => StatusCode::CONFLICT,
         "computer_agent_limit" | "computer_agent_request_capacity" => StatusCode::TOO_MANY_REQUESTS,
         "computer_agent_mcp_unavailable"
         | "computer_agent_capture_failed"
@@ -264,6 +270,16 @@ impl Tool {
         match self {
             Self::Screenshot => Scope::View,
             Self::MouseClick | Self::Key | Self::Text | Self::Wheel => Scope::Control,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Screenshot => "screenshot",
+            Self::MouseClick => "mouse_click",
+            Self::Key => "key",
+            Self::Text => "text",
+            Self::Wheel => "wheel",
         }
     }
 }
@@ -428,7 +444,8 @@ impl Config {
     fn from_env(data_dir: &Path, port: u16) -> Option<Self> {
         let python = PathBuf::from(std::env::var_os("LOOM_COMPUTER_AGENT_PYTHON")?);
         let bridge = PathBuf::from(std::env::var_os("LOOM_COMPUTER_AGENT_BRIDGE")?);
-        if !python.is_absolute() || !python.is_file() || !bridge.is_absolute() || !bridge.is_file() {
+        if !python.is_absolute() || !python.is_file() || !bridge.is_absolute() || !bridge.is_file()
+        {
             return None;
         }
         let origin = match std::env::var("LOOM_COMPUTER_AGENT_ORIGIN") {
@@ -496,6 +513,33 @@ pub(crate) struct GrantBody {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RevokeBody {
     pub grant_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ModeBody {
+    pub assistant_id: String,
+    pub mode: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ModeStatusBody {
+    pub assistant_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ApprovalListBody {
+    #[serde(default)]
+    pub assistant_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ApprovalDecisionBody {
+    pub approval_id: String,
+    pub decision: String,
 }
 
 #[derive(Deserialize)]
@@ -590,6 +634,103 @@ impl Default for RunState {
             seq_high: 0,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentControlMode {
+    Ask,
+    Full,
+}
+
+impl AgentControlMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ask" => Some(Self::Ask),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApprovalStatus {
+    Pending,
+    Approved,
+    Denied,
+    Expired,
+}
+
+impl ApprovalStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+struct Approval {
+    id: String,
+    assistant_id: String,
+    grant_id: String,
+    tool: &'static str,
+    summary: String,
+    created_at: u64,
+    expires_at: u64,
+    status: ApprovalStatus,
+}
+
+fn approval_json(item: &Approval) -> Value {
+    json!({
+        "approvalId": item.id,
+        "assistantId": item.assistant_id,
+        "grantId": item.grant_id,
+        "runId": Value::Null,
+        "tool": item.tool,
+        "summary": item.summary,
+        "createdAt": item.created_at,
+        "expiresAt": item.expires_at,
+        "status": item.status.label(),
+    })
+}
+
+fn event_summary(tool: Tool, event: &EventBody) -> String {
+    let detail = match event.kind {
+        EventKind::Pointer => format!(
+            "({},{})",
+            event.x.unwrap_or_default(),
+            event.y.unwrap_or_default()
+        ),
+        EventKind::Wheel => format!("delta {}", event.delta.unwrap_or_default()),
+        EventKind::Key => format!("{:?}", event.key),
+        EventKind::Text => {
+            let mut text = event
+                .text
+                .clone()
+                .unwrap_or_default()
+                .chars()
+                .take(80)
+                .collect::<String>();
+            if event
+                .text
+                .as_deref()
+                .is_some_and(|value| value.chars().count() > 80)
+            {
+                text.push('…');
+            }
+            text
+        }
+    };
+    format!("{} {}", tool.label(), detail)
 }
 
 pub(crate) struct Grant {
@@ -953,9 +1094,11 @@ impl CoreMcp {
 /// Accepts only the shapes Core actually returns; an unknown or missing digest fails
 /// the grant closed instead of guessing.
 fn config_digest(value: &Value) -> Option<String> {
-    let candidate = value
-        .get("configDigest")
-        .or_else(|| value.get("config").and_then(|inner| inner.get("configDigest")))?;
+    let candidate = value.get("configDigest").or_else(|| {
+        value
+            .get("config")
+            .and_then(|inner| inner.get("configDigest"))
+    })?;
     canonical_digest(candidate.as_str()?)
 }
 
@@ -1056,9 +1199,7 @@ fn mutation(value: &Value) -> Result<MutationView, &'static str> {
         }),
         // Core's configuration moved past the reviewed digest: never retry blindly.
         Some("conflict") => Err("computer_agent_digest_mismatch"),
-        Some("invalid" | "risk_acknowledgement_required") => {
-            Err("computer_agent_mcp_unavailable")
-        }
+        Some("invalid" | "risk_acknowledgement_required") => Err("computer_agent_mcp_unavailable"),
         _ => Err("computer_agent_mcp_unavailable"),
     }
 }
@@ -1307,6 +1448,9 @@ pub(crate) struct AgentGrants {
     config: Option<Config>,
     mcp: Arc<dyn McpOps>,
     grants: Mutex<HashMap<[u8; 32], Arc<Grant>>>,
+    modes: Mutex<HashMap<String, AgentControlMode>>,
+    approvals: Mutex<Vec<Approval>>,
+    approval_wake: Condvar,
 }
 
 impl AgentGrants {
@@ -1349,12 +1493,16 @@ impl AgentGrants {
             config,
             mcp,
             grants: Mutex::new(HashMap::new()),
+            modes: Mutex::new(HashMap::new()),
+            approvals: Mutex::new(Vec::new()),
+            approval_wake: Condvar::new(),
         })
     }
 
     #[cfg(test)]
     fn for_test(mcp: Arc<dyn McpOps>) -> Arc<Self> {
-        let root = std::env::temp_dir().join(format!("loom-grants-{}", crate::new_token().unwrap()));
+        let root =
+            std::env::temp_dir().join(format!("loom-grants-{}", crate::new_token().unwrap()));
         Self::with_config(
             Some(Config {
                 python: PathBuf::from("/nonexistent/python"),
@@ -1364,6 +1512,152 @@ impl AgentGrants {
             }),
             mcp,
         )
+    }
+
+    fn mode(&self, assistant_id: &str) -> AgentControlMode {
+        self.modes
+            .lock()
+            .ok()
+            .and_then(|modes| modes.get(assistant_id).copied())
+            .unwrap_or(AgentControlMode::Ask)
+    }
+
+    fn set_mode(&self, assistant_id: &str, mode: AgentControlMode) {
+        if let Ok(mut modes) = self.modes.lock() {
+            modes.insert(assistant_id.to_owned(), mode);
+        }
+    }
+
+    fn queue_approval(
+        &self,
+        grant: &Grant,
+        tool: Tool,
+        event: &EventBody,
+    ) -> Result<String, Failure> {
+        if self.mode(&grant.authority.bot_id) == AgentControlMode::Full {
+            return Ok(String::new());
+        }
+        let now = wall_clock();
+        let expires_at = now
+            .saturating_add(APPROVAL_TTL_MS)
+            .min(grant.visible_until());
+        if !visible(now, expires_at) {
+            return Err(Failure::code("computer_agent_grant_expired"));
+        }
+        let id = crate::new_token().map_err(|_| Failure::code("computer_agent_endpoint_busy"))?;
+        let mut approvals = self
+            .approvals
+            .lock()
+            .map_err(|_| Failure::code("computer_agent_endpoint_busy"))?;
+        let pending = approvals
+            .iter()
+            .filter(|item| item.status == ApprovalStatus::Pending)
+            .count();
+        if pending >= MAX_APPROVALS {
+            return Err(Failure::code("computer_agent_request_capacity"));
+        }
+        approvals.push(Approval {
+            id: id.clone(),
+            assistant_id: grant.authority.bot_id.clone(),
+            grant_id: grant.id.clone(),
+            tool: tool.label(),
+            summary: event_summary(tool, event),
+            created_at: now,
+            expires_at,
+            status: ApprovalStatus::Pending,
+        });
+        drop(approvals);
+        self.approval_wake.notify_all();
+        Ok(id)
+    }
+
+    fn wait_for_approval(
+        &self,
+        grant: &Grant,
+        browser: &Sessions,
+        tool: Tool,
+        event: &EventBody,
+    ) -> Result<(), Failure> {
+        let approval_id = self.queue_approval(grant, tool, event)?;
+        if approval_id.is_empty() {
+            return Ok(());
+        }
+        loop {
+            admit(grant, browser).map_err(Failure::code)?;
+            let mut approvals = self
+                .approvals
+                .lock()
+                .map_err(|_| Failure::code("computer_agent_endpoint_busy"))?;
+            let now = wall_clock();
+            let Some(pos) = approvals.iter().position(|item| item.id == approval_id) else {
+                return Err(Failure::code("computer_agent_approval_expired"));
+            };
+            match approvals[pos].status {
+                ApprovalStatus::Approved => {
+                    approvals.remove(pos);
+                    return Ok(());
+                }
+                ApprovalStatus::Denied => {
+                    approvals.remove(pos);
+                    return Err(Failure::code("computer_agent_approval_denied"));
+                }
+                ApprovalStatus::Expired => {
+                    approvals.remove(pos);
+                    return Err(Failure::code("computer_agent_approval_expired"));
+                }
+                ApprovalStatus::Pending => {}
+            }
+            if now >= approvals[pos].expires_at {
+                approvals.remove(pos);
+                self.approval_wake.notify_all();
+                return Err(Failure::code("computer_agent_approval_expired"));
+            }
+            let _guard = self
+                .approval_wake
+                .wait_timeout(approvals, Duration::from_millis(50))
+                .map_err(|_| Failure::code("computer_agent_endpoint_busy"))?
+                .0;
+        }
+    }
+
+    fn decide_approval(&self, approval_id: &str, approve: bool) -> Result<Value, &'static str> {
+        let mut approvals = self
+            .approvals
+            .lock()
+            .map_err(|_| "computer_agent_endpoint_busy")?;
+        let Some(item) = approvals.iter_mut().find(|item| item.id == approval_id) else {
+            return Err("computer_agent_approval_unknown");
+        };
+        if item.status != ApprovalStatus::Pending {
+            return Err("computer_agent_approval_decided");
+        }
+        if wall_clock() >= item.expires_at {
+            item.status = ApprovalStatus::Expired;
+            self.approval_wake.notify_all();
+            return Err("computer_agent_approval_expired");
+        }
+        item.status = if approve {
+            ApprovalStatus::Approved
+        } else {
+            ApprovalStatus::Denied
+        };
+        let out = approval_json(item);
+        drop(approvals);
+        self.approval_wake.notify_all();
+        Ok(out)
+    }
+
+    fn list_approvals(&self, assistant_id: Option<&str>) -> Vec<Value> {
+        self.approvals
+            .lock()
+            .map(|approvals| {
+                approvals
+                    .iter()
+                    .filter(|item| assistant_id.is_none_or(|id| item.assistant_id == id))
+                    .map(approval_json)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub(crate) fn report(&self) -> Value {
@@ -1493,10 +1787,7 @@ fn definition_json(
 ) -> String {
     let mut servers = serde_json::Map::new();
     servers.insert(
-        format!(
-            "loom-computer-agent-{}",
-            &grant_id[..grant_id.len().min(8)]
-        ),
+        format!("loom-computer-agent-{}", &grant_id[..grant_id.len().min(8)]),
         json!({
             "command": config.python.display().to_string(),
             "args": [config.bridge.display().to_string()],
@@ -1768,17 +2059,11 @@ pub(crate) async fn grant(
     // desktop of the one paired node the page named. A node that is unknown, offline or
     // without a desktop has no device and is refused rather than falling back to the local
     // screen, so the consent review can never be answered by a different machine.
-    let (target, device_id, node_id) = match resolve_target(
-        &state,
-        &session,
-        body.node_id.as_deref(),
-        &body.device_id,
-    )
-    .await
-    {
-        Ok(resolved) => resolved,
-        Err(code) => return reject(code),
-    };
+    let (target, device_id, node_id) =
+        match resolve_target(&state, &session, body.node_id.as_deref(), &body.device_id).await {
+            Ok(resolved) => resolved,
+            Err(code) => return reject(code),
+        };
     let transport_origin = match state.network.public_origin() {
         Some(origin) => origin.to_owned(),
         None => match state.network.addresses() {
@@ -2104,6 +2389,70 @@ pub(crate) async fn revoke(
     }
 }
 
+pub(crate) async fn set_control_mode(
+    State(state): State<WebState>,
+    Extension(_session): Extension<Arc<Session>>,
+    body: Result<Json<ModeBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return reject("computer_agent_invalid_request");
+    };
+    if body.assistant_id.is_empty() {
+        return reject("computer_agent_invalid_request");
+    }
+    let Some(mode) = AgentControlMode::parse(&body.mode) else {
+        return reject("computer_agent_invalid_request");
+    };
+    state.agents.set_mode(&body.assistant_id, mode);
+    Json(json!({"assistantId": body.assistant_id, "mode": mode.label()})).into_response()
+}
+
+pub(crate) async fn control_mode_status(
+    State(state): State<WebState>,
+    Extension(_session): Extension<Arc<Session>>,
+    body: Result<Json<ModeStatusBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return reject("computer_agent_invalid_request");
+    };
+    if body.assistant_id.is_empty() {
+        return reject("computer_agent_invalid_request");
+    }
+    let mode = state.agents.mode(&body.assistant_id);
+    Json(json!({"assistantId": body.assistant_id, "mode": mode.label()})).into_response()
+}
+
+pub(crate) async fn approvals_list(
+    State(state): State<WebState>,
+    Extension(_session): Extension<Arc<Session>>,
+    body: Result<Json<ApprovalListBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return reject("computer_agent_invalid_request");
+    };
+    let items = state.agents.list_approvals(body.assistant_id.as_deref());
+    Json(json!({"items": items})).into_response()
+}
+
+pub(crate) async fn approvals_decide(
+    State(state): State<WebState>,
+    Extension(_session): Extension<Arc<Session>>,
+    body: Result<Json<ApprovalDecisionBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return reject("computer_agent_invalid_request");
+    };
+    let approve = match body.decision.as_str() {
+        "approve" => true,
+        "deny" => false,
+        _ => return reject("computer_agent_invalid_request"),
+    };
+    match state.agents.decide_approval(&body.approval_id, approve) {
+        Ok(item) => Json(item).into_response(),
+        Err(code) => reject(code),
+    }
+}
+
 /// The private transport. It is deliberately **outside** the browser `authenticate`
 /// middleware: the token is not a browser session and no general route accepts it. The
 /// route still sits inside the existing Origin/Host boundary.
@@ -2202,6 +2551,7 @@ pub(crate) async fn rpc(
 
     let computer = grant.target.clone();
     let browser = state.sessions.clone();
+    let agents = state.agents.clone();
     let task = grant.clone();
     let request_id = body.request_id.clone();
     let call_id = request_id.clone();
@@ -2215,7 +2565,15 @@ pub(crate) async fn rpc(
         spawn_blocking(move || {
             // Bounded admission: a burst is refused instead of flooding the pool.
             let _permit = permit;
-            run_tool(&computer, &browser, &task, tool, &call_id, arguments)
+            run_tool(
+                &computer,
+                &browser,
+                Some(agents.as_ref()),
+                &task,
+                tool,
+                &call_id,
+                arguments,
+            )
         }),
     )
     .await;
@@ -2273,7 +2631,10 @@ impl std::fmt::Debug for Failure {
 
 impl Failure {
     fn code(code: &'static str) -> Self {
-        Self { code, revoke: false }
+        Self {
+            code,
+            revoke: false,
+        }
     }
     fn fatal(code: &'static str) -> Self {
         Self { code, revoke: true }
@@ -2285,10 +2646,13 @@ fn map_computer(code: &'static str) -> Failure {
         return Failure::code(code);
     }
     match code {
+        "computer_human_control" => Failure::code("computer_agent_human_control"),
         "computer_control_held" | "computer_control_required" => {
             Failure::code("computer_agent_control_held")
         }
-        "computer_lease_expired" | "computer_input_stale" | "computer_view_unknown"
+        "computer_lease_expired"
+        | "computer_input_stale"
+        | "computer_view_unknown"
         | "computer_view_limit" => Failure::code("computer_agent_view_unavailable"),
         "computer_device_mismatch" => Failure::code("computer_agent_device_mismatch"),
         "computer_input_unknown" => Failure::fatal("computer_agent_input_unknown"),
@@ -2302,6 +2666,7 @@ fn map_computer(code: &'static str) -> Failure {
 fn run_tool(
     computer: &Computer,
     browser: &Sessions,
+    agents: Option<&AgentGrants>,
     grant: &Grant,
     tool: Tool,
     request_id: &str,
@@ -2350,6 +2715,11 @@ fn run_tool(
         }
         Tool::MouseClick | Tool::Wheel | Tool::Key | Tool::Text => {
             let event = event_for(tool, arguments)?;
+            if let Some(agents) = agents {
+                agents.wait_for_approval(grant, browser, tool, &event)?;
+            }
+            // Approved or full-permission input still re-proves the live grant at the
+            // physical boundary; a human takeover wins there even if it lands now.
             send(computer, grant, browser, &mut run, &view_id, event)
         }
     }
@@ -2435,7 +2805,7 @@ fn ensure_control(
     }
     admit(grant, browser).map_err(Failure::code)?;
     let value = computer
-        .acquire(
+        .acquire_agent(
             &grant.sessions,
             &grant.session,
             ControlBody {
@@ -2655,7 +3025,10 @@ mod tests {
             digest: String,
             definition: String,
         ) -> BoxFuture<'static, Result<(String, String), &'static str>> {
-            self.record("create", json!({"digest": digest, "definition": definition}));
+            self.record(
+                "create",
+                json!({"digest": digest, "definition": definition}),
+            );
             let next = self.next_digest();
             Box::pin(async move { Ok(("server-abc12345".to_owned(), next)) })
         }
@@ -2726,11 +3099,16 @@ mod tests {
             _server_id: String,
         ) -> BoxFuture<'static, Result<Option<ServerState>, &'static str>> {
             self.record("server", json!({}));
-            let state = self.current.lock().unwrap().as_ref().map(|state| ServerState {
-                enabled: state.enabled,
-                assigned: state.assigned.clone(),
-                definition: state.definition.clone(),
-            });
+            let state = self
+                .current
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|state| ServerState {
+                    enabled: state.enabled,
+                    assigned: state.assigned.clone(),
+                    definition: state.definition.clone(),
+                });
             Box::pin(async move { Ok(state) })
         }
     }
@@ -2877,6 +3255,84 @@ mod tests {
         ))
     }
 
+    fn approval_event() -> EventBody {
+        EventBody {
+            kind: EventKind::Pointer,
+            x: Some(20),
+            y: Some(30),
+            button: Some(WireButton::Left),
+            action: Some(computer::WireAction::Click),
+            delta: None,
+            key: None,
+            text: None,
+        }
+    }
+
+    fn pending_approval(agents: &AgentGrants) -> Value {
+        for _ in 0..100 {
+            let items = agents.list_approvals(Some("assistant-1"));
+            if let Some(item) = items.into_iter().find(|item| item["status"] == "pending") {
+                return item;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("approval was not queued");
+    }
+
+    #[test]
+    fn ask_mode_waits_for_a_decision_and_full_mode_does_not_queue() {
+        let (browser, owner, _) = browser();
+        let grant = grant_for(&browser, &owner, wall_clock() + 300_000, false);
+        let agents = AgentGrants::for_test(FakeMcp::new());
+
+        let waiting_agents = agents.clone();
+        let waiting_grant = grant.clone();
+        let waiting_browser = browser.clone();
+        let waiter = std::thread::spawn(move || {
+            waiting_agents.wait_for_approval(
+                &waiting_grant,
+                &waiting_browser,
+                Tool::MouseClick,
+                &approval_event(),
+            )
+        });
+        let item = pending_approval(&agents);
+        assert_eq!(item["tool"], "mouse_click");
+        let approval_id = item["approvalId"].as_str().unwrap().to_owned();
+        let decided = agents.decide_approval(&approval_id, true).unwrap();
+        assert_eq!(decided["status"], "approved");
+        match waiter.join().unwrap() {
+            Ok(()) => {}
+            Err(failure) => panic!("approved input was refused: {}", failure.code),
+        }
+        assert!(agents.list_approvals(Some("assistant-1")).is_empty());
+
+        let waiting_agents = agents.clone();
+        let waiting_grant = grant.clone();
+        let waiting_browser = browser.clone();
+        let waiter = std::thread::spawn(move || {
+            waiting_agents.wait_for_approval(
+                &waiting_grant,
+                &waiting_browser,
+                Tool::MouseClick,
+                &approval_event(),
+            )
+        });
+        let item = pending_approval(&agents);
+        let approval_id = item["approvalId"].as_str().unwrap().to_owned();
+        agents.decide_approval(&approval_id, false).unwrap();
+        match waiter.join().unwrap() {
+            Ok(()) => panic!("denied input was allowed"),
+            Err(failure) => assert_eq!(failure.code, "computer_agent_approval_denied"),
+        }
+
+        agents.set_mode("assistant-1", AgentControlMode::Full);
+        assert!(agents
+            .wait_for_approval(&grant, &browser, Tool::MouseClick, &approval_event())
+            .is_ok());
+        assert!(agents.list_approvals(Some("assistant-1")).is_empty());
+    }
+
     #[test]
     fn trusted_origins_are_literal_loopback_on_this_port() {
         assert_eq!(
@@ -2995,7 +3451,10 @@ mod tests {
             "computer_agent_target_unsupported"
         );
         // An unknown member shape (no adapter, no target) is never assumed local.
-        let info = assistant_from_member(&json!({"agentId": "a"}), Err("computer_agent_mcp_unavailable"));
+        let info = assistant_from_member(
+            &json!({"agentId": "a"}),
+            Err("computer_agent_mcp_unavailable"),
+        );
         assert_eq!(
             assistant_admissible(&info).unwrap_err(),
             "computer_agent_runtime_unsupported"
@@ -3101,7 +3560,9 @@ mod tests {
             "computer_agent_target_unsupported"
         );
         // A member whose target could not be read is never assumed local.
-        assert!(!assistant_from_member(&member, Err("computer_agent_mcp_unavailable")).target_local);
+        assert!(
+            !assistant_from_member(&member, Err("computer_agent_mcp_unavailable")).target_local
+        );
         // Removed members are refused even with a perfectly good runtime.
         let mut removed = member.clone();
         removed["removedAt"] = json!("2026-02-02T00:00:00Z");
@@ -3114,7 +3575,8 @@ mod tests {
         let name = "loom-computer-agent-0123abcd";
         let digest = format!("sha256:{}", "1a".repeat(32));
         let stale = format!("sha256:{}", "2b".repeat(32));
-        let definition = json!({"mcpServers": {name: {"command": "python", "args": []}}}).to_string();
+        let definition =
+            json!({"mcpServers": {name: {"command": "python", "args": []}}}).to_string();
         assert_eq!(definition_name(&definition).as_deref(), Some(name));
         let ok = json!({
             "status": "ok",
@@ -3130,7 +3592,10 @@ mod tests {
         // below are asserted through `ok()`/`err()` instead of `unwrap()`.
         let view = mutation(&ok).ok().expect("an ok reply must parse");
         assert_eq!(view.digest, digest);
-        assert_eq!(server_id_by_name(&view.servers, name).as_deref(), Some("srv-1"));
+        assert_eq!(
+            server_id_by_name(&view.servers, name).as_deref(),
+            Some("srv-1")
+        );
         assert!(server_id_by_name(&view.servers, "other").is_none());
         assert_eq!(
             mutation(&json!({"status": "conflict", "actualConfigDigest": stale.clone()}))
@@ -3147,17 +3612,25 @@ mod tests {
             json!({"status": "ok", "configDigest": "d1", "config": {"servers": []}}),
         ] {
             assert_eq!(
-                mutation(&refused).err().expect("a malformed reply must be refused"),
+                mutation(&refused)
+                    .err()
+                    .expect("a malformed reply must be refused"),
                 "computer_agent_mcp_unavailable"
             );
         }
         // A reply without the created server must not be guessed at.
-        let unauthored = json!({"status": "ok", "configDigest": digest.clone(), "config": {"servers": []}});
-        assert!(server_id_by_name(
-            &mutation(&unauthored).ok().expect("an ok reply must parse").servers,
-            name
-        )
-        .is_none());
+        let unauthored =
+            json!({"status": "ok", "configDigest": digest.clone(), "config": {"servers": []}});
+        assert!(
+            server_id_by_name(
+                &mutation(&unauthored)
+                    .ok()
+                    .expect("an ok reply must parse")
+                    .servers,
+                name
+            )
+            .is_none()
+        );
 
         // `mcp.config.get` returns the *flat* `McpConfigView` (`mcp.rs:213-225`). This value
         // is the real Core type serialized, not a hand-written guess: the digest and the
@@ -3223,7 +3696,11 @@ mod tests {
         let empty = json!({"servers": []});
         assert_eq!(public_servers(&empty).map(<[Value]>::len), Ok(0));
         assert!(
-            server_entry(public_servers(&empty).expect("a genuine empty list"), "srv-1").is_none()
+            server_entry(
+                public_servers(&empty).expect("a genuine empty list"),
+                "srv-1"
+            )
+            .is_none()
         );
 
         // `McpRevealResult` (`mcp.rs:255-272`), again the real Core type serialized: only an
@@ -3235,7 +3712,9 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            revealed_definition(&revealed, "srv-1", &digest).ok().as_deref(),
+            revealed_definition(&revealed, "srv-1", &digest)
+                .ok()
+                .as_deref(),
             Some(definition.as_str()),
             "the exact reveal must hand back the definition verbatim"
         );
@@ -3270,10 +3749,9 @@ mod tests {
             Some("computer_agent_digest_mismatch"),
             "a conflict must never fall back to another definition"
         );
-        let invalid = serde_json::to_value(rovai_core::mcp::McpRevealResult::Invalid {
-            issues: Vec::new(),
-        })
-        .unwrap();
+        let invalid =
+            serde_json::to_value(rovai_core::mcp::McpRevealResult::Invalid { issues: Vec::new() })
+                .unwrap();
         assert_eq!(
             revealed_definition(&invalid, "srv-1", &digest).err(),
             Some("computer_agent_mcp_unavailable")
@@ -3282,7 +3760,10 @@ mod tests {
         // a non-string definition and undecodable JSON.
         for (case, refused) in [
             ("empty", json!({})),
-            ("missing-status", json!({"serverId": "srv-1", "configDigest": digest.clone()})),
+            (
+                "missing-status",
+                json!({"serverId": "srv-1", "configDigest": digest.clone()}),
+            ),
             (
                 "missing-definition",
                 json!({"status": "ok", "serverId": "srv-1", "configDigest": digest.clone()}),
@@ -3310,10 +3791,19 @@ mod tests {
     fn closed_tool_set_and_argument_shapes() {
         assert_eq!(TOOLS.len(), 5);
         for (tool, arguments) in [
-            (Tool::MouseClick, json!({"x": 1, "y": 2, "button": "left", "command": "calc"})),
+            (
+                Tool::MouseClick,
+                json!({"x": 1, "y": 2, "button": "left", "command": "calc"}),
+            ),
             (Tool::Key, json!({"key": "enter", "path": "/etc/passwd"})),
-            (Tool::Text, json!({"text": "hi", "url": "http://example.com"})),
-            (Tool::Wheel, json!({"x": 1, "y": 2, "delta": 3, "tool": "shell"})),
+            (
+                Tool::Text,
+                json!({"text": "hi", "url": "http://example.com"}),
+            ),
+            (
+                Tool::Wheel,
+                json!({"x": 1, "y": 2, "delta": 3, "tool": "shell"}),
+            ),
             (Tool::Screenshot, json!({"path": "/tmp/x.png"})),
         ] {
             let failure = event_for(tool, arguments).err().expect("must refuse");
@@ -3423,10 +3913,12 @@ mod tests {
             .unwrap()
             .clone();
         let env = &server["env"];
-        assert!(env["LOOM_COMPUTER_AGENT_TOKEN_FILE"]
-            .as_str()
-            .unwrap()
-            .ends_with("grant-x"));
+        assert!(
+            env["LOOM_COMPUTER_AGENT_TOKEN_FILE"]
+                .as_str()
+                .unwrap()
+                .ends_with("grant-x")
+        );
         assert_eq!(env["LOOM_COMPUTER_AGENT_GRANT"], json!("0123456789abcdef"));
         // The non-secret authority identity reaches the Pi toolchain; the token never does.
         assert_eq!(env["LOOM_COMPUTER_AGENT_RUNTIME"], json!("pi"));
@@ -3502,7 +3994,10 @@ mod tests {
         grants.reserve(first.clone()).unwrap();
         let mut second = grant_for(&sessions, &owner, wall_clock() + 60_000, false);
         Arc::get_mut(&mut second).unwrap().digest = [9; 32];
-        assert_eq!(grants.reserve(second).unwrap_err(), "computer_agent_grant_conflict");
+        assert_eq!(
+            grants.reserve(second).unwrap_err(),
+            "computer_agent_grant_conflict"
+        );
         // An explicit revoke frees the slot. Model the state the real path leaves behind:
         // `retire` is what a user's revoke and every sweep run, and it closes the grant.
         // Marking only `revoked` would not free the slot, because a reservation is created
@@ -3650,6 +4145,7 @@ mod tests {
                 run_tool(
                     &computer,
                     &sessions,
+                    None,
                     &grant,
                     Tool::Key,
                     "req-queued",
@@ -3771,6 +4267,7 @@ mod tests {
                 run_tool(
                     &computer,
                     &sessions,
+                    None,
                     &grant,
                     Tool::Key,
                     "req-once",
@@ -3812,6 +4309,7 @@ mod tests {
         let replay = run_tool(
             &computer,
             &sessions,
+            None,
             &grant,
             Tool::Key,
             "req-once",
@@ -3851,6 +4349,7 @@ mod tests {
         let shot = run_tool(
             &computer,
             &sessions,
+            None,
             &view_grant,
             Tool::Screenshot,
             "pi-shot-1",
@@ -3858,10 +4357,15 @@ mod tests {
         )
         .ok()
         .expect("a view grant must capture");
-        assert!(shot["pngBase64"].as_str().is_some_and(|png| !png.is_empty()));
+        assert!(
+            shot["pngBase64"]
+                .as_str()
+                .is_some_and(|png| !png.is_empty())
+        );
         let refused = run_tool(
             &computer,
             &sessions,
+            None,
             &view_grant,
             Tool::Key,
             "pi-key-view",
@@ -3883,6 +4387,7 @@ mod tests {
         let first = run_tool(
             &computer,
             &sessions,
+            None,
             &grant,
             Tool::Key,
             "pi-key-1",
@@ -3895,6 +4400,7 @@ mod tests {
         let replay = run_tool(
             &computer,
             &sessions,
+            None,
             &grant,
             Tool::Key,
             "pi-key-1",
@@ -3910,6 +4416,7 @@ mod tests {
         let revoked = run_tool(
             &computer,
             &sessions,
+            None,
             &grant,
             Tool::Key,
             "pi-key-2",
@@ -3926,6 +4433,7 @@ mod tests {
         let late = run_tool(
             &computer,
             &sessions,
+            None,
             &expired,
             Tool::Key,
             "pi-key-3",
@@ -3980,7 +4488,15 @@ mod tests {
                 Tool::Screenshot => json!({}),
                 _ => json!({"key": "enter"}),
             };
-            run_tool(&computer, &sessions, &grant, tool, request_id, arguments)
+            run_tool(
+                &computer,
+                &sessions,
+                None,
+                &grant,
+                tool,
+                request_id,
+                arguments,
+            )
                 .map_err(|failure| failure.code)
         };
 
@@ -4100,17 +4616,23 @@ mod tests {
             fixture.node_id = Some("node-a".to_owned());
             fixture.authority.device_id = "sha256:node-screen".to_owned();
         }
-        assert_eq!(public_grant(&grant, wall_clock())["nodeId"], json!("node-a"));
+        assert_eq!(
+            public_grant(&grant, wall_clock())["nodeId"],
+            json!("node-a")
+        );
         // The grant's own device is the resolved computer, not a name a caller supplies.
         assert_eq!(
-            grant.target.status(&grant.sessions, &grant.session).unwrap()["device"]
-                ["deviceId"],
+            grant
+                .target
+                .status(&grant.sessions, &grant.session)
+                .unwrap()["device"]["deviceId"],
             json!("sha256:node-screen")
         );
 
         let shot = run_tool(
             &grant.target,
             &sessions,
+            None,
             &grant,
             Tool::Screenshot,
             "node-shot-1",
@@ -4118,11 +4640,12 @@ mod tests {
         )
         .ok()
         .expect("a node-bound grant must capture the node's screen");
-        assert!(shot["pngBase64"].as_str().is_some_and(|png| !png.is_empty()));
-        for (tool, request_id) in [
-            (Tool::Key, "node-key-1"),
-            (Tool::Text, "node-text-1"),
-        ] {
+        assert!(
+            shot["pngBase64"]
+                .as_str()
+                .is_some_and(|png| !png.is_empty())
+        );
+        for (tool, request_id) in [(Tool::Key, "node-key-1"), (Tool::Text, "node-text-1")] {
             let arguments = if tool == Tool::Key {
                 json!({"key": "enter"})
             } else {
@@ -4131,6 +4654,7 @@ mod tests {
             run_tool(
                 &grant.target,
                 &sessions,
+                None,
                 &grant,
                 tool,
                 request_id,
@@ -4168,6 +4692,7 @@ mod tests {
         let refused = run_tool(
             &grant.target,
             &sessions,
+            None,
             &grant,
             Tool::Key,
             "node-key-2",
@@ -4218,7 +4743,10 @@ mod tests {
         grants.reserve(expired.clone()).unwrap();
         let owned = grants.owned(&owner.client_id, wall_clock());
         assert_eq!(owned.len(), 1);
-        assert_eq!(public_grant(&owned[0], wall_clock())["state"], json!("expired"));
+        assert_eq!(
+            public_grant(&owned[0], wall_clock())["state"],
+            json!("expired")
+        );
         assert_eq!(owned[0].id, expired.id);
     }
 
@@ -4298,7 +4826,10 @@ mod tests {
 
         // Lease ended while the request was queued: expiry, not a busy answer.
         let lapsed = grant_for(&sessions, &owner, now + 120_000, false);
-        lapsed.session.expires_at.send_replace(now.saturating_sub(1));
+        lapsed
+            .session
+            .expires_at
+            .send_replace(now.saturating_sub(1));
         let _held = lapsed.run.lock().unwrap();
         assert_eq!(
             lapsed.gate().map(|_| ()),
@@ -4363,7 +4894,12 @@ mod tests {
                 .unwrap();
             let digest = grants
                 .mcp
-                .set_members(owner.clone(), digest, server_id.clone(), "assistant-1".to_owned())
+                .set_members(
+                    owner.clone(),
+                    digest,
+                    server_id.clone(),
+                    "assistant-1".to_owned(),
+                )
                 .await
                 .unwrap();
             grants
@@ -4388,7 +4924,10 @@ mod tests {
         let fake = FakeMcp::new();
         let grants = AgentGrants::for_test(fake.clone());
         let pending = grant_for(&sessions, &owner, wall_clock() + 60_000, true);
-        assert!(pending.revoked.load(Ordering::Acquire), "pending starts revoked");
+        assert!(
+            pending.revoked.load(Ordering::Acquire),
+            "pending starts revoked"
+        );
         assert!(!pending.closed.load(Ordering::Acquire));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4426,7 +4965,14 @@ mod tests {
             .build()
             .unwrap();
         let outcome = runtime.block_on(async {
-            run_creation(&grants, &sessions, &pending, &pending.authority.owner_id, "{}".to_owned()).await
+            run_creation(
+                &grants,
+                &sessions,
+                &pending,
+                &pending.authority.owner_id,
+                "{}".to_owned(),
+            )
+            .await
         });
         assert_eq!(outcome.err(), Some("computer_agent_grant_revoked"));
         assert!(fake.names().is_empty(), "no Core write may happen");
@@ -4555,7 +5101,8 @@ mod tests {
         let mut command_changed = expected.clone();
         command_changed["mcpServers"][name.as_str()]["command"] = json!("/opt/other-python");
         let mut args_changed = expected.clone();
-        args_changed["mcpServers"][name.as_str()]["args"] = json!(["/opt/mcp_bridge.py", "--extra"]);
+        args_changed["mcpServers"][name.as_str()]["args"] =
+            json!(["/opt/mcp_bridge.py", "--extra"]);
         let mut args_duplicated = expected.clone();
         args_duplicated["mcpServers"][name.as_str()]["args"] =
             json!(["/opt/mcp_bridge.py", "/opt/mcp_bridge.py"]);
@@ -4575,7 +5122,8 @@ mod tests {
             "env": {}
         });
         let mut extra_env = expected.clone();
-        extra_env["mcpServers"][name.as_str()]["env"]["LOOM_COMPUTER_AGENT_TIMEOUT_SECONDS"] = json!("60");
+        extra_env["mcpServers"][name.as_str()]["env"]["LOOM_COMPUTER_AGENT_TIMEOUT_SECONDS"] =
+            json!("60");
         // The authority is inside the definition, so a definition re-pointed at another
         // runtime, member or scope is not this grant either.
         let mut runtime_changed = expected.clone();
@@ -4635,7 +5183,11 @@ mod tests {
             );
         }
         let mut unrecorded = grant_for(&sessions, &owner, wall_clock() + 60_000, false);
-        *Arc::get_mut(&mut unrecorded).unwrap().expected_definition.lock().unwrap() = None;
+        *Arc::get_mut(&mut unrecorded)
+            .unwrap()
+            .expected_definition
+            .lock()
+            .unwrap() = None;
         assert_eq!(
             server_authorizes(&state(expected.to_string()), &unrecorded).err(),
             Some("computer_agent_grant_revoked"),
@@ -4824,7 +5376,10 @@ mod tests {
         // Physical input dies first, whatever the MCP outcome is.
         assert!(grant.revoked.load(Ordering::Acquire));
         assert_eq!(first.err(), Some("computer_agent_cleanup_unconfirmed"));
-        assert!(!grant.cleaned.load(Ordering::Acquire), "cleanup is not confirmed");
+        assert!(
+            !grant.cleaned.load(Ordering::Acquire),
+            "cleanup is not confirmed"
+        );
         // Still listed for its owner: the failure is visible, not hidden.
         assert_eq!(grants.owned(&owner.client_id, wall_clock()).len(), 1);
         let shown = public_grant(&grant, wall_clock());
