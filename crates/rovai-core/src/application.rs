@@ -10085,12 +10085,20 @@ impl Core {
                 // trusted from the payload.
                 input.executor_id = CURRENT_USER_ID.to_string();
                 let mut database = self.database.lock().await;
-                let result = rovai_core::loom::verification_record_with_archives(
-                    &mut database,
-                    &self.data_dir,
-                    input,
-                )?;
-                Ok(serde_json::to_value(result)?)
+                let (result, mismatch_receipt) =
+                    rovai_core::loom::verification_record_with_archives_and_receipt(
+                        &mut database,
+                        &self.data_dir,
+                        input,
+                    );
+                // The refusal is unchanged; when it also recorded a trusted repair fact, the
+                // scheduler and the Run launcher are woken only after the write lock is released.
+                drop(database);
+                if mismatch_receipt {
+                    self.delivery_batch_scheduler_notify.notify_one();
+                    self.execution_wake.runs.notify_one();
+                }
+                Ok(serde_json::to_value(result?)?)
             }
             "loom.review.record" => {
                 let mut input: rovai_core::loom::LoomReviewRecordInput =

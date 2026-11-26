@@ -16,8 +16,9 @@ use super::{
     LoomAcceptanceCriterionResult, LoomCandidateRecordInput, LoomClaimAcquireInput,
     LoomCommandError, LoomPlanImportCriterion, LoomPlanImportDependency, LoomPlanImportInput,
     LoomPlanImportTask, LoomReviewRecordInput, LoomReviewVerdict, LoomTaskReleaseInput,
-    candidate_record, claim_acquire, claim_acquire_reusing_own_lease, plan_import, review_record,
-    task_release,
+    LoomVerificationRecordInput, LoomVerificationResult, candidate_record, claim_acquire,
+    claim_acquire_reusing_own_lease, plan_import, review_record, task_release,
+    verification_record_with_archives,
 };
 use crate::agent_profile::AdapterKind;
 use crate::collaboration::ProjectBindingKind;
@@ -26,6 +27,7 @@ use crate::db::{Database, TestDatabaseOpenMode};
 use crate::mission::{CreateMissionCommand, MissionService};
 use crate::test_support::OwnedTestDatabase;
 use rusqlite::{OptionalExtension, params};
+use sha2::{Digest, Sha256};
 
 const OWNER: &str = "local_user";
 const PRODUCER_AGENT: &str = "agent_1";
@@ -3612,6 +3614,18 @@ fn loom_deliveries(database: &Database) -> i64 {
         database,
         "SELECT COUNT(*) FROM camp_message_delivery WHERE message_id IN
              (SELECT id FROM camp_message WHERE author_id='loom-control-scheduler')",
+    )
+}
+
+/// The LOOM Deliveries still waiting for an executor: the repair child exactly one of which a
+/// failed Attempt may launch. A second launch would mint a second one, so one claimable child is
+/// the fact the repair tests prove and one byte more is the failure.
+fn claimable_children(database: &OwnedTestDatabase) -> i64 {
+    count(
+        database,
+        "SELECT COUNT(*) FROM camp_message_delivery delivery
+         JOIN loom_control_dispatch dispatch ON dispatch.delivery_id = delivery.id
+         WHERE dispatch.task_id='task_a' AND delivery.status='waiting'",
     )
 }
 
@@ -7790,8 +7804,9 @@ fn the_dispatch_tick_runs_the_watchdog_against_the_real_clock() {
 // ---------------------------------------------------------------------------------------------
 // Completion hook boundary (M6-C): the Run-completion path folds only the dispatch the finished
 // Run actually claimed, then admits the same Task's next event. The global tick stays the retry
-// fallback; every fixture here commits real terminal states through
-// `ExecutionRuntimeService::succeed_agent_run` exactly as the ACP completion path does.
+// fallback; every fixture here commits real terminal states through the Runtime's own commands —
+// `succeed_agent_run`, `fail_agent_run` and `request_agent_run_cancellation` — exactly as the
+// ACP completion and stop paths do.
 // ---------------------------------------------------------------------------------------------
 
 /// The Candidate one LOOM execution Run delivers, recorded through the real write path under the
@@ -7801,6 +7816,18 @@ fn recorded_candidate(
     mission_id: &str,
     run_id: &str,
     command_id: &str,
+) -> (String, String) {
+    recorded_candidate_with_evidence(database, mission_id, run_id, command_id, Vec::new())
+}
+
+/// The same delivery with the registered artifacts it cites, so a trusted verification has real
+/// Candidate-owned evidence to re-read.
+fn recorded_candidate_with_evidence(
+    database: &mut OwnedTestDatabase,
+    mission_id: &str,
+    run_id: &str,
+    command_id: &str,
+    evidence_ids: Vec<String>,
 ) -> (String, String) {
     let claim = claim_acquire_reusing_own_lease(
         database,
@@ -7824,7 +7851,7 @@ fn recorded_candidate(
             fence_generation: claim.fence_generation,
             command_id: command_id.into(),
             content_hash: "sha256:delivery-one".into(),
-            evidence_ids: vec![],
+            evidence_ids,
             acceptance_criteria_version: "ac-v1".into(),
             previous_candidate_id: None,
         },
@@ -7880,6 +7907,108 @@ fn succeed_run_for_real(
         (crate::command::CommandResultStatus::Applied, false),
         "assertion the_fixture_commits_the_terminal_state_once: {:?}",
         completed.result
+    );
+}
+
+/// The real terminal commit the completion callback hands to the hook: the same
+/// `fail_agent_run` command the ACP failure callback writes for a non-success outcome, which
+/// settles the claimed Delivery from the same transaction. The public failure body carries the
+/// Runtime's own `retryable` verdict, and `manualRetryAllowed` is the failure callback's gate —
+/// the two facts the recovery path reads before it ever relaunches a Task.
+fn fail_run_for_real(
+    database: &mut OwnedTestDatabase,
+    camp_id: &str,
+    run_id: &str,
+    error_code: &str,
+) {
+    let (version, epoch, adapter_kind): (i64, i64, String) = database
+        .connection()
+        .query_row(
+            "SELECT version, execution_epoch, runtime_adapter_kind FROM agent_run WHERE id=?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let runtime_kind = adapter_kind
+        .parse::<AdapterKind>()
+        .expect("the fixture run freezes a known adapter kind");
+    let failed = crate::runtime::ExecutionRuntimeService::default()
+        .fail_agent_run(
+            database,
+            &CommandEnvelope {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                actor: ActorRef::System {
+                    component_id: format!("runtime-adapter:{adapter_kind}"),
+                },
+                camp_id: Some(camp_id.to_string()),
+                expected_versions: vec![],
+                execution_epoch: None,
+                payload: crate::runtime::FailAgentRunCommand {
+                    agent_run_id: run_id.to_string(),
+                    expected_version: version,
+                    execution_epoch: epoch,
+                    error_code: error_code.to_string(),
+                    error_detail: Some("the native turn ended with an error".into()),
+                    failure: Some(crate::runtime_failure::RuntimeFailureView::new(
+                        runtime_kind,
+                        crate::runtime_failure::RuntimeFailureOrigin::Runtime,
+                        crate::runtime_failure::RuntimeFailurePhase::Execution,
+                        error_code,
+                        "原生执行回合失败。",
+                        None,
+                        true,
+                    )),
+                    manual_retry_allowed: true,
+                    ending_git_observation: None,
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        (failed.result.status, failed.replayed),
+        (crate::command::CommandResultStatus::Applied, false),
+        "assertion the_fixture_commits_the_terminal_failure_once: {:?}",
+        failed.result
+    );
+}
+
+/// The real User stop the delivery lane's Run goes through: the same
+/// `request_agent_run_cancellation` command the stop action writes, which settles the Run *and*
+/// its claimed Delivery in one transaction.
+fn cancel_run_for_real(database: &mut OwnedTestDatabase, camp_id: &str, run_id: &str) {
+    let version: i64 = database
+        .connection()
+        .query_row("SELECT version FROM agent_run WHERE id=?1", [run_id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let cancelled = crate::runtime::ExecutionRuntimeService::default()
+        .request_agent_run_cancellation(
+            database,
+            &CommandEnvelope {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                actor: ActorRef::User {
+                    user_id: OWNER.into(),
+                },
+                camp_id: Some(camp_id.to_string()),
+                expected_versions: vec![],
+                execution_epoch: None,
+                payload: crate::runtime::CancelAgentRunCommand {
+                    camp_id: camp_id.to_string(),
+                    agent_run_id: run_id.to_string(),
+                    expected_version: version,
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        (cancelled.result.status, cancelled.result.code.as_str()),
+        (
+            crate::command::CommandResultStatus::Applied,
+            "agent_run.cancelled"
+        ),
+        "assertion the_fixture_stops_the_run_through_the_real_command: {:?}",
+        cancelled.result
     );
 }
 
@@ -8057,11 +8186,992 @@ fn loom_m6c_success_without_domain_fact_does_not_admit_next_stage() {
             candidates,
             task_status.as_str()
         ),
-        ("SETTLED", 1, 0, "READY"),
-        "assertion the_settled_delivery_folds_its_own_dispatch_and_nothing_else"
+        ("BLOCKED", 1, 0, "READY"),
+        "assertion transport_settlement_without_a_domain_fact_blocks_the_dispatch"
     );
     assert!(
         !crate::delivery_queue::has_pending_delivery_batch_work(&database).unwrap(),
         "assertion nothing_pending_remains_for_the_wake_predicate"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Trusted evidence-mismatch repair boundary (M6-B): only the Host verification path that re-reads
+// the Candidate's own evidence records a scoped repair fact, and only that fact may return the same
+// Candidate to its approved assignee as one REWORK. The original Candidate and the Owner's
+// acceptance axis are never rewritten, and unreadable, foreign or stale evidence never authorizes
+// a repair.
+// ---------------------------------------------------------------------------------------------
+
+struct MismatchCase {
+    mission_id: String,
+    camp_id: String,
+    candidate_id: String,
+    evidence_id: String,
+    workspace: std::path::PathBuf,
+    reviewer_run: String,
+}
+
+/// A real delivery handed to a real independent reviewer: the Candidate cites one local artifact
+/// whose bytes are on the Mission's own workspace, and the REVIEW delivery has been claimed by the
+/// Run the ledger names. The artifact predates archiving, so verification re-reads the workspace
+/// file exactly like the historical local-evidence path.
+fn mismatch_case(database: &mut OwnedTestDatabase, title: &str, prefix: &str) -> MismatchCase {
+    let (mission_id, _plan_id) = dispatchable_plan(
+        database,
+        title,
+        &format!("command_{prefix}_policy"),
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(database, &mission_id);
+    assert_eq!(
+        control::admit_due_dispatches(database).unwrap(),
+        1,
+        "assertion the_mismatch_fixture_reserves_the_execution_delivery"
+    );
+    let mut runs = claim_mission_lane(database, &camp_id, 1);
+    assert_eq!(runs.len(), 1, "assertion the_execution_produces_one_run");
+    let producer_run = runs.pop().unwrap();
+    claim_the_run(database, &camp_id, &producer_run);
+
+    let workspace: String = database
+        .connection()
+        .query_row(
+            "SELECT camp.project_path FROM mission JOIN camp ON camp.id=mission.camp_id
+             WHERE mission.id=?1",
+            [&mission_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let workspace = std::path::PathBuf::from(workspace);
+    let relative = "evidence_one.txt";
+    let registered_bytes = b"the delivery the reviewer checked";
+    std::fs::write(workspace.join(relative), registered_bytes).unwrap();
+    let sha256 = format!("{:x}", Sha256::digest(registered_bytes));
+    let evidence_id = format!("evidence_one@{mission_id}");
+    database
+        .connection()
+        .execute(
+            "INSERT INTO loom_artifact(artifact_id,plan_id,task_id,agent_run_id,relative_path,
+                                       sha256,size_bytes,content_type,creator_id,created_at)
+             SELECT ?1, plan_id, NULL, NULL, ?2, ?3, ?4, NULL, 'local_user', ?5
+             FROM loom_plan WHERE mission_id=?6",
+            params![
+                &evidence_id,
+                relative,
+                &sha256,
+                registered_bytes.len() as i64,
+                chrono::Utc::now().to_rfc3339(),
+                &mission_id
+            ],
+        )
+        .unwrap();
+
+    let (candidate_id, _manifest) = recorded_candidate_with_evidence(
+        database,
+        &mission_id,
+        &producer_run,
+        &format!("command_{prefix}_candidate"),
+        vec![evidence_id.clone()],
+    );
+    // The producer has delivered and ended; its claim was released by the Candidate record.
+    finish_run(database, &producer_run);
+
+    assert_eq!(
+        control::admit_due_dispatches(database).unwrap(),
+        1,
+        "assertion the_delivered_candidate_is_handed_to_its_reviewer"
+    );
+    let mut runs = claim_mission_lane(database, &camp_id, 1);
+    assert_eq!(runs.len(), 1, "assertion the_review_produces_one_run");
+    let reviewer_run = runs.pop().unwrap();
+    claim_the_run(database, &camp_id, &reviewer_run);
+    assert_eq!(
+        review_run_of(database, &candidate_id).as_deref(),
+        Some(reviewer_run.as_str()),
+        "assertion the_receipt_source_is_the_run_that_claimed_the_review"
+    );
+
+    MismatchCase {
+        mission_id,
+        camp_id,
+        candidate_id,
+        evidence_id,
+        workspace,
+        reviewer_run,
+    }
+}
+
+fn trusted_mismatch_input(
+    case: &MismatchCase,
+    command_id: &str,
+) -> LoomVerificationRecordInput {
+    LoomVerificationRecordInput {
+        mission_id: case.mission_id.clone(),
+        task_id: "task_a".into(),
+        candidate_id: case.candidate_id.clone(),
+        command_id: command_id.into(),
+        method: "re-read the Candidate's own evidence".into(),
+        executor_id: OWNER.into(),
+        result: LoomVerificationResult::Passed,
+        // Deliberately empty: the Candidate's own evidence is what the trusted Host re-reads.
+        evidence_ids: vec![],
+    }
+}
+
+/// The Host verification path, against Core's own data directory. A local artifact without a
+/// snapshot row is judged on the workspace file the registration recorded.
+fn record_trusted_mismatch(
+    database: &mut OwnedTestDatabase,
+    case: &MismatchCase,
+    command_id: &str,
+) -> anyhow::Error {
+    let data_dir = database.directory().to_path_buf();
+    verification_record_with_archives(
+        database,
+        &data_dir,
+        trusted_mismatch_input(case, command_id),
+    )
+    .unwrap_err()
+}
+
+fn mismatch_receipts(database: &Database) -> Vec<serde_json::Value> {
+    let mut statement = database
+        .connection()
+        .prepare(
+            "SELECT payload_json FROM event_log
+             WHERE event_type='loom.verification_mismatch' ORDER BY id",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| {
+            let payload: String = row.get(0)?;
+            Ok(serde_json::from_str(&payload).unwrap())
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+fn rework_dispatches(database: &Database, task_id: &str) -> Vec<(String, String, String)> {
+    let mut statement = database
+        .connection()
+        .prepare(
+            "SELECT dispatch_id, recipient_agent_id, status FROM loom_control_dispatch
+             WHERE task_id=?1 AND kind='REWORK' ORDER BY created_at, dispatch_id",
+        )
+        .unwrap();
+    statement
+        .query_map([task_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+#[test]
+fn loom_m6b_verification_mismatch_records_one_scoped_repair_fact() {
+    let mut database = fixture();
+    let case = mismatch_case(
+        &mut database,
+        "m6b mismatch fact",
+        "m6b_mismatch_fact",
+    );
+    std::fs::write(
+        case.workspace.join("evidence_one.txt"),
+        b"bytes nobody registered",
+    )
+    .unwrap();
+
+    let error = record_trusted_mismatch(&mut database, &case, "command_verify_mismatch_one");
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_EVIDENCE_HASH_MISMATCH",
+        "assertion the_trusted_path_keeps_its_original_typed_error: {error}"
+    );
+
+    let receipts = mismatch_receipts(&database);
+    assert_eq!(
+        receipts.len(),
+        1,
+        "assertion one_trusted_mismatch_records_exactly_one_repair_fact"
+    );
+    let receipt = &receipts[0];
+    let review_dispatch_id: String = database
+        .connection()
+        .query_row(
+            "SELECT dispatch_id FROM loom_control_dispatch
+             WHERE task_id='task_a' AND kind='REVIEW' AND candidate_id=?1",
+            [&case.candidate_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            receipt["candidateId"].as_str(),
+            receipt["reviewDispatchId"].as_str(),
+            receipt["reviewAgentRunId"].as_str(),
+            receipt["evidenceId"].as_str(),
+            receipt["policyRevision"].as_i64(),
+            receipt["reasonCode"].as_str(),
+        ),
+        (
+            Some(case.candidate_id.as_str()),
+            Some(review_dispatch_id.as_str()),
+            Some(case.reviewer_run.as_str()),
+            Some(case.evidence_id.as_str()),
+            Some(1),
+            Some("LOOM_EVIDENCE_HASH_MISMATCH"),
+        ),
+        "assertion the_fact_is_bound_to_the_candidate_its_review_dispatch_run_and_evidence"
+    );
+    assert_eq!(
+        count(&database, "SELECT COUNT(*) FROM loom_verification"),
+        0,
+        "assertion no_passing_verification_is_forged"
+    );
+    assert_eq!(
+        count(&database, "SELECT COUNT(*) FROM loom_stage_review"),
+        0,
+        "assertion no_stage_verdict_is_forged"
+    );
+    assert_eq!(
+        task_state(&database, &case.mission_id, "task_a"),
+        "IN_REVIEW",
+        "assertion recording_the_fact_does_not_move_the_task"
+    );
+    assert_eq!(
+        acceptance_status(&database, &case.candidate_id),
+        "PENDING",
+        "assertion the_old_candidate_stays_pending"
+    );
+    let verification_status: String = database
+        .connection()
+        .query_row(
+            "SELECT verification_status FROM loom_candidate WHERE candidate_id=?1",
+            [&case.candidate_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        verification_status, "UNVERIFIED",
+        "assertion the_refused_verification_rewrites_no_axis"
+    );
+
+    // The same trusted call again is the same fact, not a second repair claim. While the original
+    // review Run is still live, nothing may be returned to the assignee yet.
+    let duplicate = record_trusted_mismatch(&mut database, &case, "command_verify_mismatch_two");
+    assert_eq!(
+        rejection_code(&duplicate),
+        "LOOM_EVIDENCE_HASH_MISMATCH",
+        "assertion the_duplicate_call_keeps_the_same_typed_error"
+    );
+    assert_eq!(
+        mismatch_receipts(&database).len(),
+        1,
+        "assertion a_duplicate_call_adds_no_second_fact"
+    );
+    assert!(
+        rework_dispatches(&database, "task_a").is_empty(),
+        "assertion a_live_check_cannot_be_consumed_into_rework"
+    );
+}
+
+#[test]
+fn loom_m6b_unreadable_and_stale_evidence_do_not_authorize_rework() {
+    let mut database = fixture();
+    let case = mismatch_case(
+        &mut database,
+        "m6b unreadable stale",
+        "m6b_unreadable_stale",
+    );
+
+    // A vanished file is "something moved", not a confirmed bad artifact.
+    std::fs::remove_file(case.workspace.join("evidence_one.txt")).unwrap();
+    let unreadable = record_trusted_mismatch(&mut database, &case, "command_verify_unreadable");
+    assert_eq!(
+        rejection_code(&unreadable),
+        "LOOM_EVIDENCE_UNREADABLE",
+        "assertion a_missing_artifact_keeps_its_unreadable_code: {unreadable}"
+    );
+    assert!(
+        mismatch_receipts(&database).is_empty(),
+        "assertion unreadable_evidence_records_no_repair_fact"
+    );
+
+    // A payload evidence id that is not this plan's artifact is the caller's claim, never the
+    // Candidate's evidence.
+    let mut foreign = trusted_mismatch_input(&case, "command_verify_foreign");
+    foreign.evidence_ids = vec![format!("artifact_foreign@{}", case.mission_id)];
+    let data_dir = database.directory().to_path_buf();
+    let foreign_error =
+        verification_record_with_archives(&mut database, &data_dir, foreign).unwrap_err();
+    assert_eq!(
+        rejection_code(&foreign_error),
+        "LOOM_EVIDENCE_NOT_FOUND",
+        "assertion foreign_evidence_is_refused_before_any_repair_fact"
+    );
+    assert!(
+        mismatch_receipts(&database).is_empty(),
+        "assertion foreign_evidence_records_no_repair_fact"
+    );
+
+    // Now the bytes really differ, but the Candidate the mismatch names is no longer the chain
+    // head: a successor Candidate exists. That is stale evidence, not a repair fact.
+    std::fs::write(
+        case.workspace.join("evidence_one.txt"),
+        b"bytes nobody registered",
+    )
+    .unwrap();
+    let plan_id: String = database
+        .connection()
+        .query_row(
+            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+            [&case.mission_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    // Only the fixture forces READY and releases the delivered Run's old lease; a real successor is
+    // recorded through `candidate_record`. `stage_review_record` is the product path that releases
+    // it for a `REQUEST_CHANGES`, and this case deliberately has no verdict.
+    let stale_now = chrono::Utc::now().to_rfc3339();
+    database
+        .connection()
+        .execute(
+            "UPDATE loom_task SET status='READY' WHERE plan_id=?1 AND task_id='task_a'",
+            [&plan_id],
+        )
+        .unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE loom_claim SET released_at=?1
+             WHERE plan_id=?2 AND task_id='task_a' AND released_at IS NULL",
+            params![&stale_now, &plan_id],
+        )
+        .unwrap();
+    let successor_claim = claim_acquire(
+        &mut database,
+        LoomClaimAcquireInput {
+            mission_id: case.mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: "run_stale_successor".into(),
+            claimant_agent_id: Some(PRODUCER_AGENT.into()),
+            command_id: "command_stale_successor_claim".into(),
+            lease_seconds: None,
+        },
+    )
+    .unwrap();
+    let successor = candidate_record(
+        &mut database,
+        LoomCandidateRecordInput {
+            mission_id: case.mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: "run_stale_successor".into(),
+            claim_id: successor_claim.claim_id,
+            fence_generation: successor_claim.fence_generation,
+            command_id: "command_stale_successor_candidate".into(),
+            content_hash: "sha256:stale-successor".into(),
+            evidence_ids: vec![case.evidence_id.clone()],
+            acceptance_criteria_version: "ac-v1".into(),
+            previous_candidate_id: Some(case.candidate_id.clone()),
+        },
+    )
+    .unwrap();
+
+    let stale = record_trusted_mismatch(&mut database, &case, "command_verify_stale");
+    assert_eq!(
+        rejection_code(&stale),
+        "LOOM_EVIDENCE_HASH_MISMATCH",
+        "assertion stale_bytes_still_report_the_original_mismatch: {stale}"
+    );
+    assert!(
+        mismatch_receipts(&database).is_empty(),
+        "assertion a_superseded_candidate_records_no_repair_fact"
+    );
+
+    // The successor is the chain head, but no REVIEW dispatch was written for it, so it has no
+    // unique check source and cannot mint a fact either.
+    let mut successor_input = trusted_mismatch_input(&case, "command_verify_successor");
+    successor_input.candidate_id = successor.candidate_id.clone();
+    let successor_error =
+        verification_record_with_archives(&mut database, &data_dir, successor_input).unwrap_err();
+    assert_eq!(
+        rejection_code(&successor_error),
+        "LOOM_EVIDENCE_HASH_MISMATCH",
+        "assertion the_successor_mismatch_is_still_the_same_typed_error"
+    );
+    assert!(
+        mismatch_receipts(&database).is_empty(),
+        "assertion no_review_dispatch_means_no_repair_fact"
+    );
+
+    finish_run(&database, &case.reviewer_run);
+    control::admit_due_dispatches(&mut database).unwrap();
+    assert!(
+        rework_dispatches(&database, "task_a").is_empty(),
+        "assertion unreadable_and_stale_evidence_never_reserve_rework"
+    );
+    assert_eq!(
+        acceptance_status(&database, &case.candidate_id),
+        "PENDING",
+        "assertion the_superseded_candidate_is_not_accepted_or_overwritten"
+    );
+}
+
+#[test]
+fn loom_m6b_mismatch_rework_reserves_one_claimable_delivery() {
+    let mut database = fixture();
+    let case = mismatch_case(
+        &mut database,
+        "m6b mismatch rework",
+        "m6b_mismatch_rework",
+    );
+    std::fs::write(
+        case.workspace.join("evidence_one.txt"),
+        b"bytes nobody registered",
+    )
+    .unwrap();
+
+    let error = record_trusted_mismatch(&mut database, &case, "command_verify_rework");
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_EVIDENCE_HASH_MISMATCH",
+        "assertion the_repair_begins_with_the_original_typed_error: {error}"
+    );
+
+    // The original review Run is the check source: until it ends, the mismatch is not consumable.
+    control::admit_due_dispatches(&mut database).unwrap();
+    assert!(
+        rework_dispatches(&database, "task_a").is_empty(),
+        "assertion the_live_review_run_keeps_the_repair_closed"
+    );
+
+    finish_run(&database, &case.reviewer_run);
+    let outcome = control::admit_due_dispatches(&mut database).unwrap();
+    assert_eq!(
+        outcome, 1,
+        "assertion the_ended_check_turns_the_trusted_mismatch_into_one_rework"
+    );
+    let reworks = rework_dispatches(&database, "task_a");
+    assert_eq!(
+        reworks.len(),
+        1,
+        "assertion exactly_one_rework_dispatch_is_recorded"
+    );
+    let (dispatch_id, recipient, status) = &reworks[0];
+    assert_eq!(
+        (recipient.as_str(), status.as_str()),
+        (PRODUCER_AGENT, "DISPATCHED"),
+        "assertion the_rework_goes_to_the_approved_assignee_with_one_delivery"
+    );
+    assert_eq!(
+        task_state(&database, &case.mission_id, "task_a"),
+        "READY",
+        "assertion the_task_is_prepared_ready_in_the_same_savepoint"
+    );
+    assert_eq!(
+        acceptance_status(&database, &case.candidate_id),
+        "PENDING",
+        "assertion the_previous_candidate_stays_the_pending_chain_head"
+    );
+    let candidate_evidence: String = database
+        .connection()
+        .query_row(
+            "SELECT content_hash FROM loom_candidate WHERE candidate_id=?1",
+            [&case.candidate_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        candidate_evidence, "sha256:delivery-one",
+        "assertion the_old_candidate_row_is_not_rewritten"
+    );
+    let delivered: i64 = database
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM loom_control_dispatch dispatch
+             JOIN camp_message_delivery delivery ON delivery.id=dispatch.delivery_id
+             WHERE dispatch.dispatch_id=?1",
+            [dispatch_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        delivered, 1,
+        "assertion the_rework_reserves_exactly_one_delivery"
+    );
+
+    // The pre-execution recheck asks the same question again and must let the reservation start:
+    // its own queued Run is the work about to run, not an \"other\" live Run.
+    let now = chrono::Utc::now().to_rfc3339();
+    assert_eq!(
+        control::dispatch_block_reason(database.connection(), dispatch_id, &now).unwrap(),
+        None,
+        "assertion the_reserved_rework_passes_the_prerun_recheck"
+    );
+    let mut runs = claim_mission_lane(&mut database, &case.camp_id, 1);
+    assert_eq!(
+        runs.len(),
+        1,
+        "assertion the_rework_is_the_one_claimable_delivery"
+    );
+    let rework_run = runs.pop().unwrap();
+    claim_the_run(&mut database, &case.camp_id, &rework_run);
+    assert_eq!(
+        control::dispatch_block_reason(database.connection(), dispatch_id, &now).unwrap(),
+        None,
+        "assertion the_claimed_rework_still_passes_the_same_recheck"
+    );
+
+    // A second tick adds no dispatch and no Delivery: the receipt is one fact and the rework one
+    // reservation.
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion a_second_tick_does_not_mint_another_repair"
+    );
+    assert_eq!(
+        rework_dispatches(&database, "task_a").len(),
+        1,
+        "assertion the_repair_is_reserved_once"
+    );
+}
+
+/// Step 3, failure terminal: the Runtime commits its own failed terminal through
+/// `ExecutionRuntimeService::fail_agent_run` — never a fixture UPDATE — so the fold that the
+/// completion hook performs reads the same persisted facts production reads. The hook folds the
+/// Failed dispatch the Run actually claimed and starts nothing; the shared tick relaunches the
+/// Task inside the same epoch's budget, one claimable child per failed Attempt, and when the
+/// budget is spent no child waits and the failed Attempt parks with the Runtime's own reason.
+/// History is never rewritten: every superseded Attempt keeps its Dispatch, Delivery and Run.
+#[test]
+fn loom_m6c_failure_retries_then_stops_at_budget() {
+    let mut database = fixture();
+    let now = at(1_910_000_000);
+    let task = retry_test_task(&mut database, now);
+    let epoch = task.epoch(&database);
+    let (old_dispatch, old_run, _old_key) = latest_dispatch_and_run(&database, "task_a");
+    assert_eq!(old_run.as_deref(), Some(task.run_id.as_str()));
+    let (claimed_run, run_epoch, ledger_epoch) = {
+        let (claimed_run, run_epoch) = claimed_run_of(&database, "task_a");
+        (claimed_run, run_epoch, task.epoch(&database))
+    };
+    assert_eq!(
+        claimed_run, task.run_id,
+        "assertion the_claim_is_the_ledger_pinned_run"
+    );
+    let old_delivery_id: String = database
+        .connection()
+        .query_row(
+            "SELECT delivery_id FROM loom_control_dispatch WHERE dispatch_id=?1",
+            [&old_dispatch],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    // The Runtime's own failure command commits the terminal the completion hook is called
+    // about: `manualRetryAllowed` passes the gate and the public failure carries `retryable`.
+    fail_run_for_real(&mut database, &task.camp_id, &task.run_id, "runtime_turn_failed");
+    assert_eq!(
+        run_status(&database, &task.run_id),
+        "failed",
+        "assertion the_failed_run_is_the_persisted_terminal"
+    );
+
+    // The hook folds the Failed dispatch the Run actually claimed — the Runtime's own error code
+    // is the reason — and starts nothing: the repair belongs to the shared tick.
+    assert_eq!(
+        control::reconcile_completed_run_at(&mut database, &task.run_id, run_epoch, now).unwrap(),
+        0,
+        "assertion the_hook_folds_the_failure_without_minting_the_repair"
+    );
+    let (folded_status, folded_reason): (String, Option<String>) = database
+        .connection()
+        .query_row(
+            "SELECT status, reason FROM loom_control_dispatch WHERE dispatch_id=?1",
+            [&old_dispatch],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (folded_status.as_str(), folded_reason.as_deref()),
+        ("BLOCKED", Some("runtime_turn_failed")),
+        "assertion the_failure_reason_is_the_runtime_error_code"
+    );
+
+    // The epoch budget (three recoveries) buys exactly three same-epoch children, each one a
+    // claimable Run the executor's own lane then runs — and fails again through the same command.
+    let mut tick_instant = now;
+    for expected_ordinal in ["2", "3", "4"] {
+        tick_instant += chrono::Duration::seconds(5);
+        let before = loom_deliveries(&database);
+        assert_eq!(
+            tick_at(&mut database, tick_instant).admitted,
+            1,
+            "assertion the_{expected_ordinal}_repair_is_launched_within_the_budget"
+        );
+        assert_eq!(
+            loom_deliveries(&database),
+            before + 1,
+            "assertion the_{expected_ordinal}_repair_is_one_new_delivery"
+        );
+        let (retry_dispatch, retry_run, retry_key) = latest_dispatch_and_run(&database, "task_a");
+        assert_ne!(retry_dispatch, old_dispatch);
+        assert_eq!(
+            retry_run, None,
+            "assertion the_{expected_ordinal}_repair_child_is_unclaimed"
+        );
+        assert_eq!(
+            claimable_children(&database),
+            1,
+            "assertion at_most_one_claimable_child_exists"
+        );
+        assert_eq!(
+            control::request_epoch(&retry_key),
+            ledger_epoch,
+            "assertion the_{expected_ordinal}_repair_stays_in_the_failed_attempt_epoch"
+        );
+        let parts: Vec<String> = serde_json::from_str(&retry_key).unwrap();
+        assert_eq!(
+            (parts[parts.len() - 2].as_str(), parts[parts.len() - 1].as_str()),
+            ("watchdog_retry", expected_ordinal),
+            "assertion the_{expected_ordinal}_child_is_the_repair_of_the_same_event"
+        );
+        // The child claims its own Delivery as the lane does, then fails through the same real
+        // command — the next repair request the budget must answer.
+        let mut runs = claim_mission_lane(&mut database, &task.camp_id, 1);
+        assert_eq!(
+            runs.len(),
+            1,
+            "assertion the_{expected_ordinal}_repair_child_materialises_one_run"
+        );
+        let child_run_id = runs.pop().unwrap();
+        assert_eq!(
+            claim_the_run(&mut database, &task.camp_id, &child_run_id).result.status,
+            crate::command::CommandResultStatus::Accepted,
+            "assertion the_{expected_ordinal}_repair_child_starts"
+        );
+        fail_run_for_real(
+            &mut database,
+            &task.camp_id,
+            &child_run_id,
+            "runtime_turn_failed",
+        );
+    }
+
+    // The budget is spent: the failed Attempt that used the last slot gets no child, and the Task
+    // parks on the failed Attempt with the Runtime's own reason instead of a fourth launch.
+    tick_instant += chrono::Duration::seconds(5);
+    let before = loom_deliveries(&database);
+    assert_eq!(
+        tick_at(&mut database, tick_instant).admitted,
+        0,
+        "assertion the_exhausted_budget_launches_no_child"
+    );
+    assert_eq!(loom_deliveries(&database), before);
+    assert_eq!(
+        claimable_children(&database),
+        0,
+        "assertion no_child_waits_when_the_budget_is_spent"
+    );
+    let (last_status, last_reason): (String, Option<String>) = database
+        .connection()
+        .query_row(
+            "SELECT status, reason FROM loom_control_dispatch
+             WHERE dispatch_id=(SELECT dispatch_id FROM loom_control_dispatch
+                                WHERE task_id='task_a'
+                                ORDER BY created_at DESC, dispatch_id DESC LIMIT 1)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (last_status.as_str(), last_reason.as_deref()),
+        ("BLOCKED", Some("runtime_turn_failed")),
+        "assertion the_spent_budget_parks_the_failed_attempt_with_its_reason"
+    );
+    assert_eq!(
+        run_status(&database, &task.run_id),
+        "failed",
+        "assertion the_old_run_is_retained_as_the_record_it_is"
+    );
+    let (old_loading, old_delivery_status): (i64, String) = database
+        .connection()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM loom_control_dispatch WHERE dispatch_id=?1),
+                    (SELECT status FROM camp_message_delivery WHERE id=?2)",
+            params![&old_dispatch, &old_delivery_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (old_loading, old_delivery_status.as_str()),
+        (1, "failed"),
+        "assertion the_old_delivery_is_retained_as_the_record_it_is"
+    );
+}
+
+/// Step 3, cancellation terminal: the User's stop commits through the real command path, the
+/// completion hook folds the cancelled dispatch, and neither the hook nor the shared tick ever
+/// mints a repair child for it — a cancellation is a decision, not a failure to repair, and it
+/// spends none of the epoch's recovery budget.
+#[test]
+fn loom_m6c_cancelled_completion_never_mints_repair() {
+    let mut database = fixture();
+    let now = at(1_930_000_000);
+    let task = retry_test_task(&mut database, now);
+    let (old_dispatch, old_run, old_key) = latest_dispatch_and_run(&database, "task_a");
+    assert_eq!(old_run.as_deref(), Some(task.run_id.as_str()));
+    let (claimed_run, run_epoch) = claimed_run_of(&database, "task_a");
+    assert_eq!(
+        claimed_run, task.run_id,
+        "assertion the_claim_is_the_ledger_pinned_run"
+    );
+    let old_delivery_id: String = database
+        .connection()
+        .query_row(
+            "SELECT delivery_id FROM loom_control_dispatch WHERE dispatch_id=?1",
+            [&old_dispatch],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    // The User's stop goes through the real command path: the Run settles cancelled and its
+    // claimed Delivery settles with it, in one transaction.
+    cancel_run_for_real(&mut database, &task.camp_id, &task.run_id);
+    assert_eq!(
+        run_status(&database, &task.run_id),
+        "cancelled",
+        "assertion the_stop_settles_the_run_cancelled"
+    );
+    let (manual_retry, cancel_reason): (i64, String) = database
+        .connection()
+        .query_row(
+            "SELECT manual_retry_allowed, COALESCE(cancel_reason_code, '') FROM agent_run WHERE id=?1",
+            [&task.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (manual_retry, cancel_reason.as_str()),
+        (0, "user_requested_agent_run_stop"),
+        "assertion the_cancelled_run_fails_the_manual_retry_gate"
+    );
+    let old_delivery_status: String = database
+        .connection()
+        .query_row(
+            "SELECT status FROM camp_message_delivery WHERE id=?1",
+            [&old_delivery_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        old_delivery_status, "cancelled",
+        "assertion the_claimed_delivery_settles_with_its_run"
+    );
+
+    // The completion hook folds the stop — the dispatch CANCELLED — and admits nothing.
+    assert_eq!(
+        control::reconcile_completed_run_at(&mut database, &task.run_id, run_epoch, now).unwrap(),
+        0,
+        "assertion the_hook_folds_the_stop_without_starting_anything"
+    );
+    let (folded_status, folded_reason, folded_key): (String, Option<String>, String) = database
+        .connection()
+        .query_row(
+            "SELECT status, reason, dedupe_key FROM loom_control_dispatch WHERE dispatch_id=?1",
+            [&old_dispatch],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (folded_status.as_str(), folded_reason.as_deref()),
+        ("CANCELLED", None),
+        "assertion the_hook_folds_the_cancelled_dispatch"
+    );
+    assert_eq!(
+        folded_key, old_key,
+        "assertion the_folded_dispatch_is_still_the_attempt_the_stop_cancelled"
+    );
+
+    // The shared tick neither repairs a User's stop nor spends the recovery budget on it: no
+    // child, no receipt, and the ledger keeps the one Attempt the stop actually cancelled.
+    let before = loom_deliveries(&database);
+    assert_eq!(
+        tick_at(&mut database, now + chrono::Duration::seconds(5)).admitted,
+        0,
+        "assertion the_shared_tick_launches_no_repair_for_a_cancelled_run"
+    );
+    assert_eq!(loom_deliveries(&database), before);
+    assert_eq!(
+        claimable_children(&database),
+        0,
+        "assertion no_child_waits_for_a_cancelled_run"
+    );
+    assert_eq!(
+        count(
+            &database,
+            "SELECT COUNT(*) FROM loom_control_dispatch WHERE task_id='task_a'"
+        ),
+        1,
+        "assertion the_cancellation_mints_no_repair_dispatch"
+    );
+    assert_eq!(
+        count(
+            &database,
+            "SELECT COALESCE(SUM(recovery_tries),0) FROM loom_task_recovery
+             WHERE task_id='task_a'"
+        ),
+        0,
+        "assertion the_cancellation_spends_no_recovery_budget"
+    );
+    assert_eq!(
+        run_status(&database, &task.run_id),
+        "cancelled",
+        "assertion the_cancelled_run_is_retained_as_the_record_it_is"
+    );
+}
+
+/// Step 3, dedupe: once the shared tick has launched the failed Attempt's recovery successor in
+/// the same epoch, the next tick launches nothing — the existing child is the fact that answers
+/// the repair request, and the failed Attempt never gets a second claimable child. The same
+/// suppression holds for the successor's own repair: an existing continuation Run of the failed
+/// successor suppresses the launch that would have replaced it.
+#[test]
+fn loom_m6c_existing_recovery_successor_suppresses_second_launch() {
+    let mut database = fixture();
+    let now = at(1_940_000_000);
+    let task = retry_test_task(&mut database, now);
+    let (old_dispatch, old_run, _old_key) = latest_dispatch_and_run(&database, "task_a");
+    assert_eq!(old_run.as_deref(), Some(task.run_id.as_str()));
+    let (claimed_run, run_epoch, ledger_epoch) = {
+        let (claimed_run, run_epoch) = claimed_run_of(&database, "task_a");
+        (claimed_run, run_epoch, task.epoch(&database))
+    };
+    assert_eq!(
+        claimed_run, task.run_id,
+        "assertion the_claim_is_the_ledger_pinned_run"
+    );
+    let old_delivery_id: String = database
+        .connection()
+        .query_row(
+            "SELECT delivery_id FROM loom_control_dispatch WHERE dispatch_id=?1",
+            [&old_dispatch],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    fail_run_for_real(&mut database, &task.camp_id, &task.run_id, "runtime_turn_failed");
+
+    // The shared tick launches exactly one recovery successor of the failed Attempt, in the same
+    // epoch, and shows the old Attempt's history: superseded Dispatch, failed Delivery and Run.
+    assert_eq!(
+        tick_at(&mut database, now + chrono::Duration::seconds(5)).admitted,
+        1,
+        "assertion the_failed_attempt_recovers_into_one_child"
+    );
+    let (child_dispatch, child_run, child_key) = latest_dispatch_and_run(&database, "task_a");
+    assert_eq!(
+        child_run, None,
+        "assertion the_recovery_successor_starts_unclaimed"
+    );
+    assert_eq!(
+        control::request_epoch(&child_key),
+        ledger_epoch,
+        "assertion the_recovery_successor_is_a_same_epoch_child"
+    );
+    let parts: Vec<String> = serde_json::from_str(&child_key).unwrap();
+    assert_eq!(
+        (parts[parts.len() - 2].as_str(), parts[parts.len() - 1].as_str()),
+        ("watchdog_retry", "2"),
+        "assertion the_child_is_the_first_repair_of_the_same_event"
+    );
+    assert_eq!(
+        claimable_children(&database),
+        1,
+        "assertion exactly_one_claimable_child_exists"
+    );
+    let superseded: (i64, String) = database
+        .connection()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM loom_control_dispatch WHERE dispatch_id=?1),
+                    (SELECT status FROM camp_message_delivery WHERE id=?2)",
+            params![&old_dispatch, &old_delivery_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        superseded,
+        (1, "failed".to_string()),
+        "assertion the_superseded_attempt_keeps_its_failed_delivery_as_history"
+    );
+    assert_eq!(
+        run_status(&database, &task.run_id),
+        "failed",
+        "assertion the_failed_attempt_run_remains_retained"
+    );
+
+    // The very next tick launches nothing: this failed Attempt already has its successor, so the
+    // ledger never holds a second claimable child for one failure.
+    let before = loom_deliveries(&database);
+    assert_eq!(
+        tick_at(&mut database, now + chrono::Duration::seconds(10)).admitted,
+        0,
+        "assertion the_existing_recovery_successor_suppresses_the_second_launch"
+    );
+    assert_eq!(loom_deliveries(&database), before);
+    assert_eq!(
+        claimable_children(&database),
+        1,
+        "assertion the_one_claimable_child_survives_the_suppressed_tick"
+    );
+
+    // The recovery successor claims its Delivery and runs; when it too fails, an existing
+    // continuation Run of the failed successor suppresses its repair all the same — the ledger
+    // never launches a second child for the same failure, on the epoch's own successor either.
+    let mut runs = claim_mission_lane(&mut database, &task.camp_id, 1);
+    assert_eq!(
+        runs.len(),
+        1,
+        "assertion the_recovery_successor_materialises_one_run"
+    );
+    let child_run_id = runs.pop().unwrap();
+    assert_eq!(
+        claim_the_run(&mut database, &task.camp_id, &child_run_id).result.status,
+        crate::command::CommandResultStatus::Accepted,
+        "assertion the_recovery_successor_starts"
+    );
+    seed_run(&database, &task.camp_id, REVIEWER_AGENT, "m6c_recovery_successor");
+    set_predecessor(&database, "m6c_recovery_successor", Some(&child_run_id));
+    finish_run(&database, "m6c_recovery_successor");
+    fail_run_for_real(&mut database, &task.camp_id, &child_run_id, "runtime_turn_failed_2");
+    let before = loom_deliveries(&database);
+    assert_eq!(
+        tick_at(&mut database, now + chrono::Duration::seconds(15)).admitted,
+        0,
+        "assertion the_existing_successor_suppresses_the_children_repair_too"
+    );
+    assert_eq!(loom_deliveries(&database), before);
+    let (child_status, child_reason, dispatch_rows): (String, Option<String>, i64) = database
+        .connection()
+        .query_row(
+            "SELECT status, reason,
+                    (SELECT COUNT(*) FROM loom_control_dispatch WHERE task_id='task_a')
+             FROM loom_control_dispatch WHERE dispatch_id=?1",
+            [&child_dispatch],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            child_status.as_str(),
+            child_reason.as_deref(),
+            dispatch_rows
+        ),
+        ("BLOCKED", Some("runtime_turn_failed_2"), 2),
+        "assertion the_suppressed_child_parks_with_its_own_reason_and_the_ledger_grows_no_third_row"
     );
 }

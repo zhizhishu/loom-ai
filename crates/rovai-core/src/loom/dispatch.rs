@@ -134,6 +134,15 @@ const REVIEW: &str = "REVIEW";
 const REWORK: &str = "REWORK";
 const HANDOFF: &str = "HANDOFF";
 
+/// The one evidence fact that may turn a delivery back to its approved assignee without an
+/// explicit `REQUEST_CHANGES`: the trusted Host verification path re-read the Candidate's own
+/// evidence and the bytes no longer matched the digest recorded at registration. The receipt is
+/// durable and scoped to the standing grant and the exact REVIEW dispatch whose Run performed the
+/// check; nothing here trusts an evidence id from the verification payload.
+const VERIFICATION_MISMATCH_EVENT: &str = "loom.verification_mismatch";
+const VERIFICATION_MISMATCH_REASON: &str = "LOOM_EVIDENCE_HASH_MISMATCH";
+const VERIFICATION_MISMATCH_REWORK: &str = "verification_mismatch";
+
 /// The four `blocked_reason` values the watchdog owns. They are the LOOM spelling of the
 /// upstream `attempt.output.watchdog.reasonCode` (`task_stalled`, `external_effect_uncertain`,
 /// `stop_unacknowledged`, `recovery_exhausted`): the receipt keeps the upstream literal, this
@@ -192,6 +201,10 @@ struct DispatchEvent {
     /// True when the Task must move `DRAFT` → `READY` in the same transaction that admits the
     /// dispatch; the release is only worth writing if its execution is actually being handed out.
     release_task: bool,
+    /// True for the one trusted evidence-mismatch REWORK: the Task moves `IN_REVIEW` → `READY` in
+    /// the same transaction that reserves the repair, while the delivered Candidate stays the chain
+    /// head with its `PENDING` acceptance untouched.
+    prepare_ready: bool,
 }
 
 /// How an earlier dispatch of the same event class ended, judged only by facts.
@@ -754,6 +767,22 @@ fn admit_plan(
                         params![now, plan_id, &event.task_id],
                     )?;
                 }
+                if event.prepare_ready {
+                    // The trusted mismatch repair keeps the delivered Candidate exactly as it was —
+                    // still the chain head, still `PENDING` — and only returns the Task to READY so
+                    // the approved assignee may chain a new Candidate onto it.
+                    transaction.execute(
+                        "UPDATE loom_task SET status='READY', blocked_reason=NULL,
+                                             updated_at=?1, revision=revision+1
+                         WHERE plan_id=?2 AND task_id=?3 AND status='IN_REVIEW'",
+                        params![now, plan_id, &event.task_id],
+                    )?;
+                    transaction.execute(
+                        "UPDATE loom_claim SET released_at=?1
+                         WHERE plan_id=?2 AND task_id=?3 AND released_at IS NULL",
+                        params![now, plan_id, &event.task_id],
+                    )?;
+                }
                 match recipient_failure {
                     // Reserved, but the device still cannot start it: the queued work is now the
                     // durable pending item the scheduler and the recovery timer find, and the
@@ -785,6 +814,318 @@ fn admit_plan(
         }
     }
     Ok(admitted)
+}
+
+/// The single REVIEW dispatch the standing grant wrote for one Candidate, and the Run that actually
+/// claimed its Delivery. This is the only source a verification mismatch may be bound to; the
+/// evidence ids in a verification payload are never consulted for it.
+struct ReviewCheckSource {
+    dispatch_id: String,
+    agent_run_id: String,
+    execution_epoch: i64,
+    run_status: String,
+}
+
+fn review_check_source(
+    connection: &Connection,
+    plan_id: &str,
+    task_id: &str,
+    candidate_id: &str,
+    policy_revision: i64,
+) -> Result<Option<ReviewCheckSource>> {
+    let mut rows: Vec<ReviewCheckSource> = Vec::new();
+    {
+        let mut statement = connection.prepare(
+            "SELECT dispatch.dispatch_id, run.id, run.execution_epoch, run.status
+             FROM loom_control_dispatch dispatch
+             JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+             JOIN agent_run run ON run.id = delivery.claimed_agent_run_id
+             WHERE dispatch.plan_id=?1 AND dispatch.task_id=?2 AND dispatch.kind='REVIEW'
+               AND dispatch.candidate_id=?3 AND dispatch.policy_revision=?4
+               AND dispatch.status <> 'CANCELLED'
+             ORDER BY dispatch.created_at, dispatch.dispatch_id",
+        )?;
+        let mapped = statement.query_map(
+            params![plan_id, task_id, candidate_id, policy_revision],
+            |row| {
+                Ok(ReviewCheckSource {
+                    dispatch_id: row.get(0)?,
+                    agent_run_id: row.get(1)?,
+                    execution_epoch: row.get(2)?,
+                    run_status: row.get(3)?,
+                })
+            },
+        )?;
+        for row in mapped {
+            rows.push(row?);
+        }
+    }
+    // No check source, or more than one competing source, is not a fact this module may act on.
+    if rows.len() != 1 {
+        return Ok(None);
+    }
+    Ok(rows.pop())
+}
+
+/// The stable receipt identity of one trusted evidence mismatch: the Plan, Task, Candidate, standing
+/// authorization, the REVIEW dispatch that asked for the check and the execution epoch of the Run
+/// that performed it. A second verification call over the same fact can only replay this id.
+fn verification_mismatch_event_id(
+    plan_id: &str,
+    task_id: &str,
+    candidate_id: &str,
+    policy_revision: i64,
+    dispatch_id: &str,
+    execution_epoch: i64,
+) -> Result<String> {
+    let revision = policy_revision.to_string();
+    let epoch = execution_epoch.to_string();
+    let identity = dedupe_key(&[
+        VERIFICATION_MISMATCH_EVENT,
+        plan_id,
+        task_id,
+        candidate_id,
+        revision.as_str(),
+        dispatch_id,
+        epoch.as_str(),
+    ])?;
+    Ok(format!(
+        "{VERIFICATION_MISMATCH_EVENT}:{:x}",
+        Sha256::digest(identity.as_bytes())
+    ))
+}
+
+/// Record the trusted evidence-mismatch receipt, once per scoped fact.
+///
+/// The caller is the Host verification path that has already re-read the Candidate's own evidence
+/// and produced `LOOM_EVIDENCE_HASH_MISMATCH`. Everything else is re-proved here: the standing
+/// authorization, the Task's `IN_REVIEW` state, the Candidate as the chain head with `PENDING`
+/// acceptance, and the unique REVIEW dispatch whose claimed Run is the check source. A missing or
+/// ambiguous source writes nothing and returns `None`; the verification error is still returned by
+/// the caller.
+pub(crate) fn record_verification_mismatch(
+    connection: &Connection,
+    mission_id: &str,
+    plan_id: &str,
+    task_id: &str,
+    candidate_id: &str,
+    evidence_id: &str,
+    now: &str,
+) -> Result<Option<String>> {
+    let Some(policy) = read_policy(connection, plan_id)? else {
+        return Ok(None);
+    };
+    if !policy.enabled || policy.paused || policy.mission_id != mission_id {
+        return Ok(None);
+    }
+    let Some(expires_at) = policy.expires_at.as_deref() else {
+        return Ok(None);
+    };
+    if !expiry_is_future(expires_at, now) {
+        return Ok(None);
+    }
+    if !policy.task_ids.iter().any(|scoped| scoped == task_id) {
+        return Ok(None);
+    }
+
+    let task_status: Option<String> = connection
+        .query_row(
+            "SELECT status FROM loom_task WHERE plan_id=?1 AND task_id=?2",
+            params![plan_id, task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if task_status.as_deref() != Some("IN_REVIEW") {
+        return Ok(None);
+    }
+    let latest: Option<(String, String)> = connection
+        .query_row(
+            "SELECT candidate_id, acceptance_status FROM loom_candidate
+             WHERE plan_id=?1 AND task_id=?2 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![plan_id, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if !matches!(
+        latest,
+        Some((ref latest_id, ref acceptance))
+            if latest_id == candidate_id && acceptance == "PENDING"
+    ) {
+        return Ok(None);
+    }
+    let Some(source) = review_check_source(
+        connection,
+        plan_id,
+        task_id,
+        candidate_id,
+        policy.authorization_revision,
+    )? else {
+        return Ok(None);
+    };
+
+    let event_id = verification_mismatch_event_id(
+        plan_id,
+        task_id,
+        candidate_id,
+        policy.authorization_revision,
+        &source.dispatch_id,
+        source.execution_epoch,
+    )?;
+    let camp_id: Option<String> = connection
+        .query_row("SELECT camp_id FROM mission WHERE id=?1", [mission_id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    let payload = serde_json::json!({
+        "missionId": mission_id,
+        "planId": plan_id,
+        "taskId": task_id,
+        "candidateId": candidate_id,
+        "policyRevision": policy.authorization_revision,
+        "reviewDispatchId": source.dispatch_id,
+        "reviewAgentRunId": source.agent_run_id,
+        "executionEpoch": source.execution_epoch,
+        "evidenceId": evidence_id,
+        "reasonCode": VERIFICATION_MISMATCH_REASON,
+    });
+    connection.execute(
+        "INSERT INTO event_log(event_id,event_type,payload_json,camp_id,entity_type,entity_id,
+                               actor_type,actor_id,created_at)
+         VALUES(?1,?2,?3,?4,'loom_task',?5,'system','loom.verification',?6)
+         ON CONFLICT(event_id) DO NOTHING",
+        params![
+            &event_id,
+            VERIFICATION_MISMATCH_EVENT,
+            serde_json::to_string(&payload)
+                .context("a LOOM verification mismatch fact must serialise as JSON")?,
+            camp_id,
+            task_id,
+            now
+        ],
+    )?;
+    Ok(Some(event_id))
+}
+
+/// The repair fact the scheduler may consume: the same receipt identity, re-proved against the
+/// ledger. The original check must have ended, the Candidate must still be the chain head with
+/// `PENDING` acceptance, no successor may exist, and no other Run may still hold the Task. The
+/// optional `excluding_dispatch_id` is the REWORK reservation being rechecked: its own queued Run
+/// is the work about to start, not an "other" live Run.
+struct VerificationMismatchFact {
+    event_id: String,
+}
+
+fn trusted_verification_mismatch(
+    connection: &Connection,
+    plan_id: &str,
+    task_id: &str,
+    candidate_id: &str,
+    policy_revision: i64,
+    excluding_dispatch_id: Option<&str>,
+) -> Result<Option<VerificationMismatchFact>> {
+    let Some(source) = review_check_source(
+        connection,
+        plan_id,
+        task_id,
+        candidate_id,
+        policy_revision,
+    )? else {
+        return Ok(None);
+    };
+    if !matches!(
+        source.run_status.as_str(),
+        "succeeded" | "failed" | "cancelled"
+    ) {
+        return Ok(None);
+    }
+    let latest: Option<(String, String)> = connection
+        .query_row(
+            "SELECT candidate_id, acceptance_status FROM loom_candidate
+             WHERE plan_id=?1 AND task_id=?2 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![plan_id, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if !matches!(
+        latest,
+        Some((ref latest_id, ref acceptance))
+            if latest_id == candidate_id && acceptance == "PENDING"
+    ) {
+        return Ok(None);
+    }
+    let successor: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM loom_candidate
+                       WHERE plan_id=?1 AND previous_candidate_id=?2 AND candidate_id<>?2)",
+        params![plan_id, candidate_id],
+        |row| row.get(0),
+    )?;
+    if successor {
+        return Ok(None);
+    }
+    let live_run: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM agent_run run
+             WHERE run.status IN ('queued','running','waiting')
+               AND run.id <> COALESCE(
+                   (SELECT delivery.claimed_agent_run_id
+                    FROM loom_control_dispatch dispatch
+                    JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+                    WHERE dispatch.dispatch_id = ?3), '')
+               AND (run.id IN (SELECT claim.agent_run_id FROM loom_claim claim
+                               WHERE claim.plan_id=?1 AND claim.task_id=?2
+                                 AND claim.released_at IS NULL)
+                    OR run.id IN (SELECT delivery.claimed_agent_run_id
+                                  FROM loom_control_dispatch dispatch
+                                  JOIN camp_message_delivery delivery
+                                    ON delivery.id = dispatch.delivery_id
+                                  WHERE dispatch.plan_id=?1 AND dispatch.task_id=?2))
+         )",
+        params![plan_id, task_id, excluding_dispatch_id],
+        |row| row.get(0),
+    )?;
+    if live_run {
+        return Ok(None);
+    }
+
+    let event_id = verification_mismatch_event_id(
+        plan_id,
+        task_id,
+        candidate_id,
+        policy_revision,
+        &source.dispatch_id,
+        source.execution_epoch,
+    )?;
+    let payload: Option<String> = connection
+        .query_row(
+            "SELECT payload_json FROM event_log
+             WHERE event_id=?1 AND event_type=?2 AND entity_type='loom_task' AND entity_id=?3",
+            params![&event_id, VERIFICATION_MISMATCH_EVENT, task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let payload: serde_json::Value = serde_json::from_str(&payload)
+        .context("a recorded LOOM verification mismatch fact must be JSON")?;
+    let same_fact = payload.get("planId").and_then(serde_json::Value::as_str)
+        == Some(plan_id)
+        && payload.get("taskId").and_then(serde_json::Value::as_str) == Some(task_id)
+        && payload.get("candidateId").and_then(serde_json::Value::as_str)
+            == Some(candidate_id)
+        && payload.get("policyRevision").and_then(serde_json::Value::as_i64)
+            == Some(policy_revision)
+        && payload.get("reviewDispatchId").and_then(serde_json::Value::as_str)
+            == Some(source.dispatch_id.as_str())
+        && payload.get("reviewAgentRunId").and_then(serde_json::Value::as_str)
+            == Some(source.agent_run_id.as_str())
+        && payload
+            .get("executionEpoch")
+            .and_then(serde_json::Value::as_i64)
+            == Some(source.execution_epoch)
+        && payload.get("reasonCode").and_then(serde_json::Value::as_str)
+            == Some(VERIFICATION_MISMATCH_REASON);
+    Ok(same_fact.then_some(VerificationMismatchFact { event_id }))
 }
 
 /// Every event the standing policy authorizes right now, in Task order. One Task contributes at
@@ -858,6 +1199,7 @@ fn due_events(
                     recipient_agent_id: assignee,
                     dedupe_key: dedupe_key(&[EXECUTE, plan_id, task_id.as_str()])?,
                     release_task: status == "DRAFT",
+                    prepare_ready: false,
                 }
             }
             Some((candidate_id, acceptance)) => {
@@ -872,32 +1214,69 @@ fn due_events(
                         if status != "IN_REVIEW" {
                             continue;
                         }
-                        let Some(assignment) = policy
-                            .reviewers
-                            .iter()
-                            .find(|assignment| assignment.task_id == *task_id)
-                        else {
-                            continue;
-                        };
-                        if assignee.as_deref() == Some(assignment.reviewer_agent_id.as_str()) {
-                            continue;
-                        }
-                        DispatchEvent {
-                            task_id: task_id.clone(),
-                            kind: REVIEW,
-                            candidate_id: Some(candidate_id.clone()),
-                            recipient_agent_id: assignment.reviewer_agent_id.clone(),
-                            dedupe_key: {
-                                let authorization = policy.authorization_revision.to_string();
-                                dedupe_key(&[
-                                    REVIEW,
+                        // A trusted verification mismatch is the one repair fact that may return
+                        // this very Candidate to its approved assignee: the Host re-read the
+                        // Candidate's own evidence, the check came from the REVIEW dispatch this
+                        // grant actually wrote, that Run has ended, and no successor exists. The
+                        // original Candidate and the Owner's acceptance axis stay untouched.
+                        if let Some(receipt) = trusted_verification_mismatch(
+                            transaction,
+                            plan_id,
+                            task_id,
+                            &candidate_id,
+                            policy.authorization_revision,
+                            None,
+                        )? {
+                            let Some(assignee) =
+                                assignee.clone().filter(|assignee| !assignee.is_empty())
+                            else {
+                                continue;
+                            };
+                            DispatchEvent {
+                                task_id: task_id.clone(),
+                                kind: REWORK,
+                                candidate_id: Some(candidate_id.clone()),
+                                recipient_agent_id: assignee,
+                                dedupe_key: dedupe_key(&[
+                                    REWORK,
                                     plan_id,
-                                    task_id,
+                                    task_id.as_str(),
                                     candidate_id.as_str(),
-                                    authorization.as_str(),
-                                ])?
-                            },
-                            release_task: false,
+                                    VERIFICATION_MISMATCH_REWORK,
+                                    receipt.event_id.as_str(),
+                                ])?,
+                                release_task: false,
+                                prepare_ready: true,
+                            }
+                        } else {
+                            let Some(assignment) = policy
+                                .reviewers
+                                .iter()
+                                .find(|assignment| assignment.task_id == *task_id)
+                            else {
+                                continue;
+                            };
+                            if assignee.as_deref() == Some(assignment.reviewer_agent_id.as_str()) {
+                                continue;
+                            }
+                            DispatchEvent {
+                                task_id: task_id.clone(),
+                                kind: REVIEW,
+                                candidate_id: Some(candidate_id.clone()),
+                                recipient_agent_id: assignment.reviewer_agent_id.clone(),
+                                dedupe_key: {
+                                    let authorization = policy.authorization_revision.to_string();
+                                    dedupe_key(&[
+                                        REVIEW,
+                                        plan_id,
+                                        task_id,
+                                        candidate_id.as_str(),
+                                        authorization.as_str(),
+                                    ])?
+                                },
+                                release_task: false,
+                                prepare_ready: false,
+                            }
                         }
                     }
                     Some("REQUEST_CHANGES") => {
@@ -928,6 +1307,7 @@ fn due_events(
                                 stage_review_id.as_str(),
                             ])?,
                             release_task: false,
+                            prepare_ready: false,
                         }
                     }
                     Some("PASS") => {
@@ -958,6 +1338,7 @@ fn due_events(
                                 stage_review_id.as_str(),
                             ])?,
                             release_task: false,
+                            prepare_ready: false,
                         }
                     }
                     // A blocked verdict stops the Task for a User decision: no dispatch at all.
@@ -1193,17 +1574,44 @@ fn event_problem(
             }
         }
         REWORK => {
-            let Some((latest_id, _, _)) = latest_candidate else {
+            let Some((latest_id, acceptance, _)) = latest_candidate else {
                 return Ok(Some("loom.dispatch_candidate_missing"));
             };
             if candidate_id != Some(latest_id.as_str()) {
                 return Ok(Some("loom.dispatch_candidate_stale"));
             }
-            if task_status != "READY" {
-                return Ok(Some("loom.dispatch_task_not_ready"));
-            }
-            if current_stage.as_deref() != Some("REQUEST_CHANGES") {
-                return Ok(Some("loom.dispatch_rework_not_requested"));
+            // Normally only an explicit `REQUEST_CHANGES` verdict returns a delivery to its
+            // assignee. The one exception is the trusted evidence-mismatch receipt: the Host
+            // re-read this very Candidate's evidence, the check came from the standing grant's
+            // REVIEW dispatch, and that Run has ended without a successor. A written verdict of
+            // any kind still owns the outcome, so the exception only applies while the stage holds
+            // no verdict at all.
+            let verification_mismatch = if current_stage.is_none() {
+                trusted_verification_mismatch(
+                    transaction,
+                    plan_id,
+                    task_id,
+                    &latest_id,
+                    authorization_revision,
+                    excluding_dispatch_id,
+                )?
+            } else {
+                None
+            };
+            if verification_mismatch.is_some() {
+                if task_status != "READY" && task_status != "IN_REVIEW" {
+                    return Ok(Some("loom.dispatch_task_not_ready"));
+                }
+                if acceptance != "PENDING" {
+                    return Ok(Some("loom.dispatch_already_settled_by_owner"));
+                }
+            } else {
+                if task_status != "READY" {
+                    return Ok(Some("loom.dispatch_task_not_ready"));
+                }
+                if current_stage.as_deref() != Some("REQUEST_CHANGES") {
+                    return Ok(Some("loom.dispatch_rework_not_requested"));
+                }
             }
             if assignee.as_deref() != Some(recipient) {
                 return Ok(Some("loom.dispatch_recipient_not_assignee"));
@@ -1453,7 +1861,16 @@ fn fold_dispatch_outcome(
     now: &str,
 ) -> Result<()> {
     let settled = match (delivery_status, run_status) {
-        ("settled", _) => Some(("SETTLED", None)),
+        // Transport settlement is not a domain fact for EXECUTE/REVIEW/REWORK. The same
+        // successor-fact test used for a succeeded Run decides whether this dispatch truly
+        // finished; HANDOFF is the exception encoded inside `prior_dispatch_outcome` itself.
+        ("settled", _) => match prior_dispatch_outcome(transaction, dispatch_id)? {
+            PriorOutcome::Completed => Some(("SETTLED", None)),
+            _ => Some((
+                "BLOCKED",
+                Some("loom.dispatch_previous_outcome_unknown"),
+            )),
+        },
         ("failed", _) => Some((
             "BLOCKED",
             Some(failure_code.unwrap_or("loom.dispatch_failed")),
@@ -1467,7 +1884,7 @@ fn fold_dispatch_outcome(
         // produced by this Run, the stage verdict written by this reviewer Run under this
         // Candidate and policy revision, the rework chained onto this Candidate, or a settled
         // handoff.
-        (_, Some("succeeded")) => match prior_dispatch_outcome(transaction, &dispatch_id)? {
+        (_, Some("succeeded")) => match prior_dispatch_outcome(transaction, dispatch_id)? {
             PriorOutcome::Completed => Some(("SETTLED", None)),
             _ => None,
         },
@@ -2027,7 +2444,6 @@ fn retry_terminal_failure(
     now: DateTime<Utc>,
 ) -> Result<bool> {
     if subject.run_status.as_deref() != Some("failed")
-        || subject.task_status == "blocked"
         || subject.active_run
         || subject.uncertain_effect
     {
@@ -2043,7 +2459,7 @@ fn retry_terminal_failure(
                AND dispatch.kind IN ('EXECUTE','REVIEW','REWORK')
                AND delivery.status='failed' AND run.status='failed'
                AND run.ended_at IS NOT NULL AND run.terminal_resolution_source='runtime_terminal'
-               AND run.terminal_reason_code IS NULL
+               AND run.terminal_reason_code IS NULL AND run.manual_retry_allowed=1
                AND run.cancel_requested_at IS NULL AND run.retry_declined_at IS NULL
                AND CASE WHEN json_valid(run.public_runtime_failure_json)
                         THEN json_type(run.public_runtime_failure_json, '$.retryable')='true'
@@ -2547,6 +2963,12 @@ fn write_watchdog_retry(
     if policy_revision != policy.authorization_revision {
         return Ok(None);
     }
+    let now_text = now.to_rfc3339();
+    // A retry is only considered once the old executor is demonstrably gone, so its claim fence and
+    // this module's hold are released before any event re-check. The savepoint rolls both back if
+    // admission is not possible.
+    release_watchdog_claim(transaction, &subject.plan_id, &subject.task_id, &now_text)?;
+    clear_watchdog_hold(transaction, &subject.plan_id, &subject.task_id, &now_text)?;
     if check_event
         && event_problem(
             transaction,
@@ -2598,7 +3020,6 @@ fn write_watchdog_retry(
     let epoch = request_epoch(&base);
     let attempts = attempts_in_epoch(transaction, subject)?;
     let retry_key = retry_dedupe_key(&base, attempts + 1)?;
-    let now_text = now.to_rfc3339();
 
     // The Attempt that ended is closed as superseded: a `CANCELLED` dispatch never executed, so the
     // class-level "previous outcome unknown" rule no longer reads its failed Run as an unresolved
@@ -2611,11 +3032,6 @@ fn write_watchdog_retry(
     if superseded != 1 {
         return Ok(None);
     }
-    // Release the fence the dead Run still holds, and this module's own hold, before the successor
-    // is admitted: the very same tick must be able to start it.
-    release_watchdog_claim(transaction, &subject.plan_id, &subject.task_id, &now_text)?;
-    clear_watchdog_hold(transaction, &subject.plan_id, &subject.task_id, &now_text)?;
-
     let dispatch_id = format!("dispatch_{}", uuid::Uuid::new_v4().simple());
     let admission = LoomDispatchAdmission {
         mission_id: &subject.mission_id,

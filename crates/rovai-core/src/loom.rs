@@ -3159,6 +3159,12 @@ fn ensure_evidence_artifacts(
     Ok(())
 }
 
+/// One artifact whose re-read bytes no longer match the digest recorded at registration.
+struct EvidenceMismatch {
+    evidence_id: String,
+    relative_path: String,
+}
+
 /// Re-read the bytes behind every referenced artifact and compare them with the digest recorded
 /// at registration. A passing verification cannot be recorded over changed or missing bytes.
 ///
@@ -3171,7 +3177,7 @@ fn ensure_evidence_bytes_match(
     snapshot_root: Option<&std::path::Path>,
     plan_id: &str,
     evidence_ids: &[String],
-) -> Result<()> {
+) -> Result<Option<EvidenceMismatch>> {
     use sha2::Digest;
     let mut local_workspace = None;
     for evidence_id in evidence_ids {
@@ -3264,15 +3270,13 @@ fn ensure_evidence_bytes_match(
             format!("{:x}", sha2::Sha256::digest(&bytes))
         };
         if actual != expected {
-            return Err(LoomCommandError::rejection(
-                LOOM_EVIDENCE_HASH_MISMATCH,
-                format!(
-                    "evidence {evidence_id} at {relative_path} no longer matches its recorded sha256"
-                ),
-            ));
+            return Ok(Some(EvidenceMismatch {
+                evidence_id: evidence_id.clone(),
+                relative_path,
+            }));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Project the leases of one Mission, released ones included.
@@ -4277,7 +4281,8 @@ pub fn verification_record(
     database: &mut Database,
     input: LoomVerificationRecordInput,
 ) -> Result<LoomVerificationRecordResult> {
-    verification_record_internal(database, None, input)
+    let mut mismatch_receipt = false;
+    verification_record_internal(database, None, input, &mut mismatch_receipt)
 }
 
 /// The application supplies its trusted data directory; no request field can
@@ -4287,13 +4292,28 @@ pub fn verification_record_with_archives(
     data_dir: &std::path::Path,
     input: LoomVerificationRecordInput,
 ) -> Result<LoomVerificationRecordResult> {
-    verification_record_internal(database, Some(data_dir), input)
+    let mut mismatch_receipt = false;
+    verification_record_internal(database, Some(data_dir), input, &mut mismatch_receipt)
+}
+
+/// The Host entry point, which also reports whether the trusted mismatch receipt was persisted.
+/// The verification call still fails with its original typed error; the flag only lets the caller
+/// wake the dispatch lanes after the write lock is released.
+pub fn verification_record_with_archives_and_receipt(
+    database: &mut Database,
+    data_dir: &std::path::Path,
+    input: LoomVerificationRecordInput,
+) -> (Result<LoomVerificationRecordResult>, bool) {
+    let mut mismatch_receipt = false;
+    let result = verification_record_internal(database, Some(data_dir), input, &mut mismatch_receipt);
+    (result, mismatch_receipt)
 }
 
 fn verification_record_internal(
     database: &mut Database,
     archive_root: Option<&std::path::Path>,
     input: LoomVerificationRecordInput,
+    mismatch_receipt: &mut bool,
 ) -> Result<LoomVerificationRecordResult> {
     let mission_id = required_field("verification record", "missionId", &input.mission_id)?;
     let task_id = required_field("verification record", "taskId", &input.task_id)?;
@@ -4439,7 +4459,7 @@ fn verification_record_internal(
     // reject the delivery, and recording a failure is still allowed.
     let candidate_evidence: Vec<String> = serde_json::from_str(&candidate_evidence_json)
         .with_context(|| format!("LOOM candidate {candidate_id} has unreadable evidence ids"))?;
-    let mut checked_evidence = candidate_evidence;
+    let mut checked_evidence = candidate_evidence.clone();
     for evidence_id in &input.evidence_ids {
         if !checked_evidence.contains(evidence_id) {
             checked_evidence.push(evidence_id.clone());
@@ -4454,14 +4474,69 @@ fn verification_record_internal(
             )
             .into());
         }
-        ensure_evidence_bytes_match(
+        // The Candidate's own evidence is the part the Host may turn into a repair fact. It is
+        // always checked first, and only a mismatch here — never one on an evidence id the caller
+        // merely added — can record the scoped receipt.
+        if let Some(mismatch) = ensure_evidence_bytes_match(
             &transaction,
             &mission_id,
             archive_root,
             snapshot_root.as_deref(),
             &plan_id,
-            &checked_evidence,
-        )?;
+            &candidate_evidence,
+        )? {
+            let error = LoomCommandError::rejection(
+                LOOM_EVIDENCE_HASH_MISMATCH,
+                format!(
+                    "evidence {} at {} no longer matches its recorded sha256",
+                    mismatch.evidence_id, mismatch.relative_path
+                ),
+            );
+            // Only the Host path that supplied Core's own data directory and the Host-injected
+            // Owner identity may leave this fact behind. The receipt is committed before the
+            // original typed error is returned, and it is the only evidence of a repair the
+            // scheduler may consume later.
+            if archive_root.is_some()
+                && executor_id == crate::current_user::CURRENT_USER_ID
+                && control::record_verification_mismatch(
+                    &transaction,
+                    &mission_id,
+                    &plan_id,
+                    &task_id,
+                    &candidate_id,
+                    &mismatch.evidence_id,
+                    &verified_at,
+                )?
+                .is_some()
+            {
+                transaction.commit()?;
+                *mismatch_receipt = true;
+            }
+            return Err(error);
+        }
+        let extra_evidence: Vec<String> = input
+            .evidence_ids
+            .iter()
+            .filter(|evidence_id| !candidate_evidence.contains(evidence_id))
+            .cloned()
+            .collect();
+        if let Some(mismatch) = ensure_evidence_bytes_match(
+            &transaction,
+            &mission_id,
+            archive_root,
+            snapshot_root.as_deref(),
+            &plan_id,
+            &extra_evidence,
+        )? {
+            return Err(LoomCommandError::rejection(
+                LOOM_EVIDENCE_HASH_MISMATCH,
+                format!(
+                    "evidence {} at {} no longer matches its recorded sha256",
+                    mismatch.evidence_id, mismatch.relative_path
+                ),
+            )
+            .into());
+        }
     }
 
     let verification_id = format!("verification_{}", uuid::Uuid::new_v4().simple());
