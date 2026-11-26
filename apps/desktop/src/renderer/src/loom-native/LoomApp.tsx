@@ -299,7 +299,7 @@ export function LoomApp({ environment, onLogout, initialSettingsSection = null, 
   })
   const shortcutKey = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl'
   return <div className={`ln-app ${expanded && inspectorOpen ? 'ln-inspector-expanded' : ''}`} data-theme={theme} data-loom-frontend="native-v2">
-    <BotBoard open={boardOpen} agents={data.agents} conversations={data.conversations} missions={data.missions} bundles={data.bundles} error={data.error} refresh={data.refresh} theme={theme} onClose={()=>setBoardOpen(false)} onCreate={()=>{setBoardOpen(false);manageAssistant(undefined,true)}} onOpen={row=>{
+    <BotBoard open={boardOpen} agents={data.agents} conversations={data.conversations} missions={data.missions} bundles={data.bundles} error={data.error} refresh={data.refresh} theme={theme} onClose={()=>setBoardOpen(false)} onCreate={()=>{setBoardOpen(false);manageAssistant(undefined,true)}} onDetails={row=>manageAssistant(row.key,false)} onOpen={row=>{
       setBoardOpen(false)
       if(row.threadId){setDockSelection({threadId:row.threadId,taskId:row.taskId});void data.openConversation(row.threadId).catch(report)}
     }}/>

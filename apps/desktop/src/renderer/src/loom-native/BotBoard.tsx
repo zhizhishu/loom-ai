@@ -5,9 +5,9 @@ import { botBoardBucket, botBoardTargets, type BoardBucket, type BoardTarget } f
 import { markViewed, readSeen } from './bot-board-seen'
 import { SurfaceDialog } from './Controls'
 import './bot-board.css'
-export function BotBoard({ open, agents, conversations, missions, bundles, error, refresh, onOpen, onClose, onCreate, theme='day' }: {
+export function BotBoard({ open, agents, conversations, missions, bundles, error, refresh, onOpen, onDetails, onClose, onCreate, theme='day' }: {
   open:boolean; agents:AgentProfile[]; conversations:ConversationItem[]; missions:MissionRecord[]; bundles:WorkBundle[];
-  error:string|null; refresh():Promise<void>; onOpen(row:BoardTarget):void; onClose():void; onCreate():void; theme?:'day'|'night'
+  error:string|null; refresh():Promise<void>; onOpen(row:BoardTarget):void; onDetails?(row:BoardTarget):void; onClose():void; onCreate():void; theme?:'day'|'night'
 }) {
   const [query,setQuery]=useState('')
   const [filter,setFilter]=useState('all')
@@ -41,8 +41,9 @@ export function BotBoard({ open, agents, conversations, missions, bundles, error
   const rows=useMemo(()=>botBoardTargets(agents,conversations,missions,bundles),[agents,conversations,missions,bundles])
   const filtered=rows.filter(row=>(filter==='all'||botBoardBucket(row,seen[row.key])===filter) &&
     (row.name+' '+row.title).toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()))
-  const card=(row:BoardTarget)=><article key={row.key} className="ln-board-card"><strong>{row.name}</strong><p>{row.title||'没有正在处理的工作'}</p><small>{row.status} · {row.runtimeLabel??'未配置'}</small>
-    <button type="button" disabled={!row.threadId||!!error} onClick={()=>{
+  const card=(row:BoardTarget)=><article key={row.key} className="ln-board-card" onClick={()=>onDetails?.(row)}><strong>{row.name}</strong><p>{row.title||'没有正在处理的工作'}</p><small>{row.status} · {row.runtimeLabel??'未配置'}</small>
+    <button type="button" disabled={!row.threadId||!!error} onClick={event=>{
+      event.stopPropagation()
       if(row.resultId)try{markViewed(row.key,row.resultId);setSeen(s=>({...s,[row.key]:row.resultId!}))}
       catch{setStorageError('查看标记未能保存；稍后可能再次显示待查看。')}
       onOpen(row)

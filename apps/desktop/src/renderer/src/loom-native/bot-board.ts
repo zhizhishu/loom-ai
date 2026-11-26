@@ -18,7 +18,7 @@ export function botBoardBucket(item: BoardTarget, seenId?: string): BoardBucket 
 // Pending acceptance alone never means a user action: workStatus checks control facts.
 export function botBoardTargets(agents: readonly AgentProfile[], conversations: readonly ConversationItem[],
   missions: readonly MissionRecord[], bundles: WorkBundle[]): BoardTarget[] {
-  const work = flattenWork(bundles.filter(b=>b.control?.status === 'observed' && b.control.snapshot.policy?.planId === b.plan?.planId))
+  const work = flattenWork(bundles)
   return agents.map(agent => {
     const tasks = work.filter(row => row.task.assigneeAgentId === agent.agentId)
     const related = missions.filter(m => m.memberAgentIds.includes(agent.agentId))
@@ -27,7 +27,7 @@ export function botBoardTargets(agents: readonly AgentProfile[], conversations: 
     const result = tasks.filter(row => row.candidate && row.task.status === 'done')
       .sort((a,b) => (b.candidate?.createdAt??'').localeCompare(a.candidate?.createdAt??''))[0]
     const mission = related.find(m=>m.status==='needs_you') ?? related.find(m=>m.runningAgentIds.includes(agent.agentId))
-    const active = attention ?? working ?? result
+    const active = attention ?? working ?? result ?? tasks[0]
     return { key:agent.agentId, name:agent.displayName, attention:!!attention||mission?.status==='needs_you',
       working:!!working||related.some(m=>m.runningAgentIds.includes(agent.agentId)),
       resultId:result?.candidate?.candidateId,
