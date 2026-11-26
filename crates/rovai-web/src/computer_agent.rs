@@ -4067,6 +4067,12 @@ mod tests {
                 "input actions require one bounded human-readable step"
             );
         }
+        let (_event, step) = event_and_step(
+            Tool::MouseClick,
+            json!({"x": 1, "y": 2, "button": "left", "step": "  点击\n登录   按钮  "}),
+        )
+        .expect("a bounded human-readable step must parse");
+        assert_eq!(step.as_deref(), Some("点击 登录 按钮"));
         let click = event_for(
             Tool::MouseClick,
             json!({"x": -5, "y": 5, "button": "left", "step": "点击按钮"}),
