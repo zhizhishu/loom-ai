@@ -137,7 +137,8 @@ export function ComputerAgentAccess({ port, client, agent, device, theme }: {
     setBusy(true); setError('')
     try {
       const result = await port.decideApproval(item.approvalId, decision)
-      if (result.approvalId !== item.approvalId) throw new Error('审批结果尚未确认，请刷新检查。')
+      const expected = decision === 'approve' ? 'approved' : 'denied'
+      if (result.approvalId !== item.approvalId || result.status !== expected) throw new Error('审批结果尚未确认，请刷新检查。')
       setApprovals(current => current.filter(value => value.approvalId !== item.approvalId))
     } catch (cause) { setError(hostFeatureError(cause)); void reloadApprovals() }
     finally { setBusy(false) }
