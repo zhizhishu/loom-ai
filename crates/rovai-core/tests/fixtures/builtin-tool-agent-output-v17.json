@@ -788,7 +788,10 @@
       "tasks": [],
       "dependencies": [],
       "claims": [],
-      "evaluatedAt": "2026-10-31T00:00:00Z"
+      "evaluatedAt": "2026-10-31T00:00:00Z",
+      "missionTitle": "fixture title",
+      "missionGoal": "fixture goal",
+      "missionStatus": "not_started"
     },
     "agentOutput": {
       "missionId": "rvm_example",
@@ -796,7 +799,10 @@
       "tasks": [],
       "dependencies": [],
       "claims": [],
-      "evaluatedAt": "2026-10-31T00:00:00Z"
+      "evaluatedAt": "2026-10-31T00:00:00Z",
+      "missionTitle": "fixture title",
+      "missionGoal": "fixture goal",
+      "missionStatus": "not_started"
     }
   },
   "loom.plan": {
