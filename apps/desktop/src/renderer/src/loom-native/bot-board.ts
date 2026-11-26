@@ -3,7 +3,7 @@ import type { AgentProfile, ConversationItem, MissionRecord, WorkBundle } from '
 import { flattenWork, workStatus } from './Inspector'
 export type BoardBucket = 'attention' | 'working' | 'review' | 'idle' | 'offline'
 export type BoardTarget = { key: string; name: string; threadId: string | null; taskId: string | null;
-  attention: boolean; working: boolean; phase?: string; resultId?: string; title: string; status: string; online: boolean; runtimeLabel?: string }
+  attention: boolean; working: boolean; phase?: string; resultId?: string; title: string; status: string; online: boolean; runtimeLabel?: string; progress?: { completed: number; total: number; current: string | null } | null }
 const RUNTIME_LABELS: Record<string, string> = { 'claude-code-cli': 'Claude Code', 'codex-cli': 'Codex', 'deepseek-harness': 'DSH', pi: 'Pi' }
 export function botBoardBucket(item: BoardTarget, seenId?: string): BoardBucket {
   if (!item.online) return 'offline'
@@ -35,6 +35,11 @@ export function botBoardTargets(agents: readonly AgentProfile[], conversations: 
     const running = related.some(m=>m.runningAgentIds.includes(agent.agentId))
     const busy = !!working || running
     const needsUser = !!attention || mission?.status==='needs_you' || runtimeNeedsAttention
+    const liveTasks = tasks.filter(row => row.task.status !== 'canceled')
+    const completed = liveTasks.filter(row => row.task.status === 'done').length
+    const currentTask = working ?? liveTasks.find(row => row.task.status !== 'done')
+    const current = currentTask ? `「${currentTask.mission.title ?? ''}」 · ${currentTask.task.title ?? ''}`.slice(0, 200) : null
+    const progress = liveTasks.length === 0 ? null : { completed, total: liveTasks.length, current }
     return { key:agent.agentId, name:agent.displayName, attention:needsUser,
       working:busy,
       resultId:result?.candidate?.candidateId,
@@ -43,6 +48,7 @@ export function botBoardTargets(agents: readonly AgentProfile[], conversations: 
       title:active?.task.title ?? mission?.title ?? (runtimeNeedsAttention?'运行配置需要处理':''),
       status:!online?(agent.presence==='away'?'离开':'已移除'):active?workStatus(active).label:runtimeNeedsAttention?'运行需处理':mission?.status==='needs_you'?'需要你':mission?'进行中':'空闲',
       online,
+      progress,
       runtimeLabel:agent.runtimeConfiguration?.adapterKind?RUNTIME_LABELS[agent.runtimeConfiguration.adapterKind]??agent.runtimeConfiguration.adapterKind:'未配置' }
   })
 }

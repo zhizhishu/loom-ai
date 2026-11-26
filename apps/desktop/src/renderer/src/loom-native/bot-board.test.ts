@@ -90,3 +90,18 @@ it('uses existing presence and runtime-readiness facts for each bot live state',
  expect(brokenRow.status).toBe('运行需处理')
  expect(botBoardBucket(brokenRow)).toBe('attention')
 })
+
+it('projects completed total and current task onto board cards',()=>{
+ const agent={agentId:'a',displayName:'A',presence:'present',removedAt:null} as unknown as AgentProfile
+ const mission={missionId:'m',threadId:'t',memberAgentIds:['a'],runningAgentIds:['a'],title:'Mission'} as unknown as MissionRecord
+ const bundle={mission,plan:null,tasks:[
+  {taskId:'done',title:'Done task',assigneeAgentId:'a',status:'done'},
+  {taskId:'current',title:'Current task',assigneeAgentId:'a',status:'open'},
+  {taskId:'cancelled',title:'Cancelled task',assigneeAgentId:'a',status:'canceled'}
+ ],candidates:[],artifacts:[],reviews:[],verifications:[]} as never
+ const [target]=botBoardTargets([agent],[],[mission],[bundle])
+ expect(target.progress).toEqual({completed:1,total:2,current:'「Mission」 · Current task'})
+ const html=renderToStaticMarkup(createElement(BotBoard,{open:true,agents:[agent],conversations:[],missions:[mission],bundles:[bundle],error:null,refresh:async()=>{},onOpen:()=>{},onClose:()=>{},onCreate:()=>{}}))
+ expect(html).toContain('已完成 1 / 2 项')
+ expect(html).toContain('「Mission」 · Current task')
+})

@@ -44,6 +44,7 @@ export function BotBoard({ open, agents, conversations, missions, bundles, error
   const filtered=rows.filter(row=>(filter==='all'||botBoardBucket(row,seen[row.key])===filter) &&
     (row.name+' '+row.title).toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()))
   const card=(row:BoardTarget)=><article key={row.key} className="ln-board-card" onClick={()=>onDetails?.(row)}><strong>{row.name}</strong><p>{row.title||'没有正在处理的工作'}</p><small>{row.status} · {row.runtimeLabel??'未配置'}</small>
+    {row.progress&&<span><small>已完成 {row.progress.completed} / {row.progress.total} 项</small>{row.progress.current&&<p>{row.progress.current}</p>}</span>}
     <button type="button" disabled={!row.threadId||!!error} onClick={event=>{
       event.stopPropagation()
       if(row.resultId)try{markViewed(row.key,row.resultId);setSeen(s=>({...s,[row.key]:row.resultId!}))}
