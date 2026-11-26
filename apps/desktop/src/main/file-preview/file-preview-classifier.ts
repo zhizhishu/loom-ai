@@ -17,6 +17,11 @@ const IMAGE_MIME = new Map([
   ['.bmp', 'image/bmp'],
   ['.ico', 'image/x-icon']
 ])
+const VIDEO_MIME = new Map([
+  ['.mp4', 'video/mp4'],
+  ['.mov', 'video/quicktime'],
+  ['.webm', 'video/webm']
+])
 const TEXT_MIME = new Map([
   ['.txt', 'text/plain'],
   ['.log', 'text/plain'],
@@ -48,8 +53,8 @@ const CODE_EXTENSIONS = new Set([
 const SYSTEM_ONLY_EXTENSIONS = new Set([
   '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
   '.zip', '.tar', '.gz', '.tgz', '.7z', '.rar', '.bz2', '.xz',
-  '.mp3', '.m4a', '.wav', '.flac', '.aac', '.ogg', '.mp4', '.mov',
-  '.mkv', '.avi', '.webm', '.sqlite', '.sqlite3', '.db', '.dmg', '.pkg',
+  '.mp3', '.m4a', '.wav', '.flac', '.aac', '.ogg',
+  '.mkv', '.avi', '.sqlite', '.sqlite3', '.db', '.dmg', '.pkg',
   '.exe', '.msi', '.app', '.deb', '.rpm', '.iso'
 ])
 const RISKY_EXTENSIONS = new Set([
@@ -80,6 +85,8 @@ export function classifyFilePreview(
   if (SYSTEM_ONLY_EXTENSIONS.has(extension)) {
     return { extension, mime: 'application/octet-stream', kind: 'system', openRisk }
   }
+  const videoMime = VIDEO_MIME.get(extension)
+  if (videoMime) return { extension, mime: videoMime, kind: 'video', openRisk }
   const imageMime = IMAGE_MIME.get(extension)
   if (imageMime) return { extension, mime: imageMime, kind: 'image', openRisk }
   if (extension === '.svg') return { extension, mime: 'image/svg+xml', kind: textKind('svg', size), openRisk }

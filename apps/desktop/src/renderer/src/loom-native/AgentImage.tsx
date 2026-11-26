@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { imageCredit, imageSourceInMessage, plainText, type AgentImageResult } from './agent-images'
+import { ImageGeneration } from './ImageGeneration'
 
 /**
  * Counterpart of Mikka `components/workspace/agent-image.tsx`.
@@ -29,6 +30,7 @@ export type AgentImageProps = AgentImageResult & {
 
 export function AgentImage({ src, alt, caption, title, source, author, license, compact = false }: AgentImageProps) {
   const [failedSrc, setFailedSrc] = useState<string | null>(null)
+  const [loadedSrc, setLoadedSrc] = useState<string | null>(null)
   const imageSrc = imageSourceInMessage(src)
   const credit = imageCredit({ title, author, license })
   const creditHref = imageSourceInMessage(source)
@@ -38,7 +40,10 @@ export function AgentImage({ src, alt, caption, title, source, author, license, 
     <button type="button" className="ln-agent-image-retry" onClick={() => setFailedSrc(null)}>{'重试配图'}</button>
   </span>
   return <span className="ln-agent-image" data-compact={compact ? 'true' : undefined}>
-    <img className="ln-agent-image-media" src={imageSrc} alt={alt} loading="lazy" onError={() => setFailedSrc(imageSrc)} />
+    <ImageGeneration status={loadedSrc === imageSrc ? 'complete' : 'generating'} statusText="正在加载图片…">
+      <img className="ln-agent-image-media" src={imageSrc} alt={alt} loading="lazy"
+        onLoad={() => setLoadedSrc(imageSrc)} onError={() => setFailedSrc(imageSrc)} />
+    </ImageGeneration>
     {(caption || credit) && <span className="ln-agent-image-caption">
       {caption && <span>{plainText(caption)}</span>}
       {credit && (creditHref

@@ -20,6 +20,10 @@ const attachment = (id: string, image = true): ThreadMessageAttachmentView => ({
   byteSize: 12, previewKind: image ? 'image' : 'none', availability: 'unknown'
 })
 
+const videoAttachment = (id: string): ThreadMessageAttachmentView => ({
+  ...attachment(id), mediaType: 'video/mp4', previewKind: 'video'
+})
+
 const attachmentSource = (id: string): GalleryImage => ({
   kind: 'attachment',
   threadId: 'camp',
@@ -34,9 +38,9 @@ afterEach(() => {
 
 describe('shared image presentation', () => {
   it('partitions images and files while preserving order inside each display region', () => {
-    const items = [attachment('A'), attachment('B'), attachment('report', false), attachment('C')]
+    const items = [attachment('A'), attachment('B'), attachment('report', false), videoAttachment('movie.mp4'), attachment('C')]
     expect(partitionMessageAttachments(items)).toEqual({
-      images: [items[0], items[1], items[3]],
+      images: [items[0], items[1], items[3], items[4]],
       files: [items[2]]
     })
   })

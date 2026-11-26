@@ -9,7 +9,7 @@ export type FilePreviewContent =
   | { kind: 'markdown'; text: string; tabToken: string; assetBasePath: string }
   | { kind: 'code' | 'text' | 'patch'; text: string }
   | { kind: 'html'; preview: FilePreviewHtmlSite }
-  | { kind: 'image'; url: string; bytes: number }
+  | { kind: 'image' | 'video'; url: string; bytes: number }
   | { kind: 'page'; page: FilePreviewPageContent }
 
 export interface FilePreviewTabModel {
@@ -300,13 +300,13 @@ export function createFilePreviewSession(api: FilePreviewApi, threadId: string, 
   > => {
     const request = { handleId: file.handleId, expectedGeneration: file.contentGeneration }
     try {
-      if (file.kind === 'image') {
+      if (file.kind === 'image' || file.kind === 'video') {
         const result = await api.readBinary(request)
         if (!result.ok) return result
         const bytes = Uint8Array.from(result.value.bytes)
         const url = URL.createObjectURL(new Blob([bytes.buffer], { type: result.value.mime }))
         objectUrls.current.add(url)
-        return { ok: true, content: { kind: 'image', url, bytes: result.value.bytes.byteLength }, pageOffsets: [], pageIndex: 0 }
+        return { ok: true, content: { kind: file.kind === 'video' ? 'video' : 'image', url, bytes: result.value.bytes.byteLength }, pageOffsets: [], pageIndex: 0 }
       }
       if (file.kind === 'html') {
         const result = await prepareHtmlPreviewSite(api, request)

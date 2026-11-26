@@ -73,7 +73,7 @@ function isAttachment(value: unknown): value is ThreadMessageAttachmentView {
     && (value.fileCount === null || (Number.isInteger(value.fileCount) && Number(value.fileCount) >= 0))
     && nullableString(value.mediaType, 512)
     && (value.byteSize === null || (Number.isInteger(value.byteSize) && Number(value.byteSize) >= 0))
-    && (value.previewKind === 'image' || value.previewKind === 'none')
+    && (value.previewKind === 'image' || value.previewKind === 'video' || value.previewKind === 'none')
     && ['unknown', 'available', 'missing', 'unreadable', 'kind_changed'].includes(String(value.availability))
     && (value.sourcePath === undefined || string(value.sourcePath, 16_384))
     && (value.pastedTextPreview === undefined || (typeof value.pastedTextPreview === 'string'

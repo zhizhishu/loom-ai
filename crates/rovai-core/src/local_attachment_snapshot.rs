@@ -957,6 +957,12 @@ pub(crate) fn inspect_prefix(prefix: &[u8], byte_size: u64) -> PrefixInspection 
             .to_string(),
         };
     }
+    if byte_size <= MAX_PREVIEW_BYTES && ((prefix.len() >= 12 && &prefix[4..8] == b"ftyp") || prefix.starts_with(&[0x1a, 0x45, 0xdf, 0xa3])) {
+        return PrefixInspection {
+            media_type: if prefix.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) { "video/webm" } else { "video/mp4" }.to_string(),
+            preview_kind: "video".to_string(),
+        };
+    }
     let media_type = if prefix.starts_with(b"%PDF-") {
         "application/pdf"
     } else if prefix.starts_with(b"PK\x03\x04") {

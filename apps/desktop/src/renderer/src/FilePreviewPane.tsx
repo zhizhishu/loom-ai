@@ -187,6 +187,38 @@ function ImageViewer({ tab }: { tab: FilePreviewTabModel }): React.JSX.Element {
   )
 }
 
+function VideoViewer({ tab }: { tab: FilePreviewTabModel }): React.JSX.Element {
+  const content = tab.content?.kind === 'video' ? tab.content : null
+  const [videoError, setVideoError] = useState(false)
+
+  useEffect(() => {
+    setVideoError(false)
+  }, [content?.url])
+
+  if (!content) return <div className="file-preview-empty-content" />
+  if (videoError) {
+    return (
+      <div className="file-preview-error" role="alert">
+        <strong><UiText zh={"无法播放视频"} /></strong>
+        <span><UiText zh={"可以从文件标签页菜单使用系统默认应用打开。"} /></span>
+      </div>
+    )
+  }
+  return (
+    <div className="file-preview-video-stage">
+      <video
+        src={content.url}
+        controls
+        preload="metadata"
+        playsInline
+        aria-label={tab.presentation.fileName}
+        onError={() => setVideoError(true)}
+      />
+      <div className="file-preview-image-info">{tab.file ? fileSizeLabel(tab.file.size) : ''}</div>
+    </div>
+  )
+}
+
 function OpeningIndicator(): React.JSX.Element | null {
   const [visible, setVisible] = useState(false)
   useEffect(() => {
@@ -336,6 +368,9 @@ function Viewer({ tab }: { tab: FilePreviewTabModel }): React.JSX.Element {
   }
   if (tab.content.kind === 'image') {
     return <ImageViewer tab={tab} />
+  }
+  if (tab.content.kind === 'video') {
+    return <VideoViewer tab={tab} />
   }
   if (tab.content.kind === 'patch') {
     return <PatchViewer tab={tab} />

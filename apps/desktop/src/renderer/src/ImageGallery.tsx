@@ -118,7 +118,7 @@ export function partitionMessageAttachments(
 ): MessageAttachmentGroups {
   const groups: MessageAttachmentGroups = { images: [], files: [] }
   for (const attachment of attachments) {
-    if (attachment.kind === 'file' && attachment.previewKind === 'image') {
+    if (attachment.kind === 'file' && (attachment.previewKind === 'image' || attachment.previewKind === 'video')) {
       groups.images.push(attachment)
     } else groups.files.push(attachment)
   }
@@ -251,6 +251,9 @@ function ImageTile({ source }: { source: GalleryImage }): JSX.Element {
   const hadCachedPayload = useRef(false)
   const committedUrl = useRef<string | null>(null)
   const ownedUrls = useRef(new Set<string>())
+  const isVideo = source.kind === 'attachment'
+    ? source.image.previewKind === 'video' || (source.image.mediaType ?? '').startsWith('video/')
+    : (source.image.mediaType ?? '').startsWith('video/')
   const canDownload = source.kind === 'attachment' && client.attachments.kind === 'download'
   const downloadAvailable = canDownload && ['available', 'unknown'].includes(availability)
 
@@ -290,7 +293,8 @@ function ImageTile({ source }: { source: GalleryImage }): JSX.Element {
         const link = document.createElement('a')
         link.href = url
         const extension = ({ 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp',
-          'image/gif': 'gif', 'image/svg+xml': 'svg', 'image/avif': 'avif', 'image/bmp': 'bmp' } as Record<string, string>)[source.image.mediaType ?? '']
+          'image/gif': 'gif', 'image/svg+xml': 'svg', 'image/avif': 'avif', 'image/bmp': 'bmp',
+          'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/webm': 'webm' } as Record<string, string>)[source.image.mediaType ?? '']
         const name = source.image.displayName.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').trim() || 'image'
         link.download = extension && !/\.[a-z0-9]+$/i.test(name) ? `${name}.${extension}` : name
         document.body.appendChild(link)
@@ -386,7 +390,7 @@ function ImageTile({ source }: { source: GalleryImage }): JSX.Element {
     const install = async (payload: ImagePayload): Promise<boolean> => {
       const candidateUrl = createOwnedUrl(payload.blob)
       try {
-        await decodeObjectUrl(candidateUrl)
+        if (!isVideo) await decodeObjectUrl(candidateUrl)
       } catch {
         releaseOwnedUrl(candidateUrl)
         if (active) markUnavailable()
@@ -428,7 +432,7 @@ function ImageTile({ source }: { source: GalleryImage }): JSX.Element {
     if (observer && tile.current) observer.observe(tile.current)
     else load(hadCachedPayload.current)
     return () => { active = false; observer?.disconnect() }
-  }, [cacheKey, createOwnedUrl, releaseOwnedUrl, source.kind, client, imagePayloadCache, refreshRevision])
+  }, [cacheKey, createOwnedUrl, releaseOwnedUrl, source.kind, client, imagePayloadCache, refreshRevision, isVideo])
 
   useEffect(() => {
     if (source.kind !== 'attachment') return
@@ -460,7 +464,9 @@ function ImageTile({ source }: { source: GalleryImage }): JSX.Element {
         aria-label={uiAttribute("查看大图 {0}", String(source.image.displayName))}
         aria-busy={loading}
         onClick={() => { if (canOpen) showPreview() }}>
-        {url ? <img src={url} alt={source.image.displayName} />
+        {url ? (isVideo
+          ? <video src={url} preload="metadata" muted playsInline aria-label={source.image.displayName} />
+          : <img src={url} alt={source.image.displayName} />)
           : <span className="image-tile-placeholder">
               {failed ? unavailableLabel : uiAttribute("正在读取图片…")}
             </span>}
@@ -475,14 +481,16 @@ function ImageTile({ source }: { source: GalleryImage }): JSX.Element {
               onContextMenu={showMenu} onKeyDown={showMenu}
               onCloseAutoFocus={event => { event.preventDefault(); tile.current?.querySelector<HTMLButtonElement>('.image-tile-preview')?.focus({ preventScroll: true }) }}>
               <Dialog.Title className="sr-only"><UiText zh={"图片预览"} /></Dialog.Title>
-              {url ? <img src={url} alt={source.image.displayName} /> : <div className="image-lightbox-unavailable">
+              {url ? (isVideo
+                ? <video src={url} controls autoPlay playsInline preload="metadata" aria-label={source.image.displayName} />
+                : <img src={url} alt={source.image.displayName} />) : <div className="image-lightbox-unavailable">
                 <p>{availability === 'available' ? uiAttribute('此图片暂不支持在线预览，可下载到本机查看。') : unavailableLabel}</p>
               </div>}
               <div className="image-lightbox-actions">
-                <button type="button" className="file-action-button" title={uiAttribute('复制图片')} aria-label={uiAttribute('复制图片')}
+                {!isVideo && <button type="button" className="file-action-button" title={uiAttribute('复制图片')} aria-label={uiAttribute('复制图片')}
                   disabled={action !== null || !url} onClick={() => void runImageAction('copy')}>
                   <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M12 7V3H3v9h4"/></svg>
-                </button>
+                </button>}
                 {(canDownload ? downloadAvailable : Boolean(url)) && <button type="button" className="file-action-button"
                   title={action === 'save' ? uiAttribute('准备下载…') : canDownload ? uiAttribute('下载原图') : uiAttribute('保存图片')}
                   aria-label={canDownload ? uiAttribute('下载原图') : uiAttribute('保存图片')} aria-busy={action === 'save'} disabled={action !== null}

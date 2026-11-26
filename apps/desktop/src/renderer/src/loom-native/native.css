@@ -178,6 +178,21 @@
 .ln-agent-image-missing,.ln-agent-image-error{display:flex;align-items:center;flex-wrap:wrap;gap:8px;font-size:12px;color:var(--ln-muted);margin:8px 0}
 .ln-agent-image-retry{border:1px solid var(--ln-line);border-radius:8px;padding:3px 9px;font-size:12px;background:var(--ln-card);color:var(--ln-text);cursor:pointer}
 .ln-markdown-image-note{color:var(--ln-muted)}
+/* ImageGeneration (Mikka components/agents/image-generation.tsx:22-33): reserve the target aspect ratio,
+   expose the queued/generating/refining/complete/error state, and keep retry inside the failure card. */
+.ln-image-generation{display:flex;min-width:0;max-width:100%;flex-direction:column;gap:8px}
+.ln-image-generation-media{position:relative;display:block;width:min(100%,640px);overflow:hidden;border-radius:14px;background:var(--ln-card)}
+.ln-image-generation-media .ln-agent-image-media{width:100%}
+.ln-image-generation[data-status=generating] .ln-agent-image-media,.ln-image-generation[data-status=queued] .ln-agent-image-media{opacity:0}
+.ln-image-generation[data-status=refining] .ln-agent-image-media{opacity:.62;filter:blur(1.5px)}
+.ln-image-generation-overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:8px;padding:16px;color:var(--ln-muted);font-size:12px;text-align:center}
+.ln-image-generation-mark{width:8px;height:8px;border-radius:50%;background:currentColor;animation:ln-image-generation-pulse 1.2s ease-in-out infinite}
+.ln-image-generation[data-status=error] .ln-image-generation-mark{animation:none}
+.ln-image-generation-detail{color:var(--ln-muted)}
+.ln-image-generation-retry{border:1px solid var(--ln-line);border-radius:8px;padding:3px 9px;font-size:12px;background:var(--ln-card);color:var(--ln-text);cursor:pointer}
+.ln-image-generation-prompt{font-size:12px;line-height:1.5;color:var(--ln-muted)}
+@keyframes ln-image-generation-pulse{0%,100%{opacity:.35;transform:scale(.8)}50%{opacity:1;transform:scale(1.2)}}
+
 .ln-agent-image-card{display:flex;min-width:0;flex-direction:column;gap:8px;padding:12px;border-radius:16px;background:var(--ln-card);margin:12px 0}
 .ln-agent-image-card>h3{font-size:14px;font-weight:600;margin:2px 0 0}
 .ln-agent-image-card>p{font-size:13px;line-height:1.55;margin:0;color:var(--ln-muted)}

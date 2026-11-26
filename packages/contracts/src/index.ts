@@ -1424,7 +1424,7 @@ export interface ThreadMessageAttachmentView {
   fileCount: number | null
   mediaType: string | null
   byteSize: number | null
-  previewKind: 'image' | 'none'
+  previewKind: 'image' | 'video' | 'none'
   availability: LocalAttachmentAvailability
   /** Optional, display-only prefix (at most 160 Unicode code points) of generated pasted text. */
   pastedTextPreview?: string
@@ -1724,6 +1724,7 @@ export type FilePreviewKind =
   | 'text'
   | 'paged_text'
   | 'image'
+  | 'video'
   | 'svg'
   | 'patch'
 
@@ -4855,7 +4856,7 @@ export interface MissionAttachmentsApi {
 }
 export interface MissionActivity { id: number; kind: string; actorType: string; actorId: string; changes: Record<string, unknown>; createdAt: string }
 export interface MissionWorkspace { id: string; missionId: string; threadId: string; executionHostId: string; sourceDirectory: string; repositoryRoot: string; gitCommonDir: string; worktreePath: string; workingDirectory: string; baseBranch: string | null; managedBranch: string; baseSha: string; state: 'preparing' | 'ready' | 'cleaned' | 'cleanup_pending' | 'cleanup_failed'; cleanupWorktreeRemoved: boolean; cleanupBranchRemoved: boolean; diagnostic: string | null }
-export interface MissionDelivery { threadId: string; workingDirectory: string; git: boolean; workspace: MissionWorkspace | null; pullRequests: { id: string; url: string; title: string; createdAt: string }[]; files: { attachmentId: string; displayName: string; kind: 'file' | 'directory'; fileCount: number; mediaType: string; byteSize: number; previewKind: 'image' | 'none'; messageId: string; agentId: string; createdAt: string }[] }
+export interface MissionDelivery { threadId: string; workingDirectory: string; git: boolean; workspace: MissionWorkspace | null; pullRequests: { id: string; url: string; title: string; createdAt: string }[]; files: { attachmentId: string; displayName: string; kind: 'file' | 'directory'; fileCount: number; mediaType: string; byteSize: number; previewKind: 'image' | 'video' | 'none'; messageId: string; agentId: string; createdAt: string }[] }
 export interface MissionChangedFile { id: string; path: string; oldPath: string | null; kind: 'added' | 'deleted' | 'renamed' | 'copied' | 'type_changed' | 'unmerged' | 'modified'; additions: number | null; deletions: number | null; binary: boolean; oldMode: string; newMode: string }
 export type CheckoutState = { kind: 'branch'; branch: string; head: string } | { kind: 'detached'; head: string } | { kind: 'unavailable' }
 export interface MissionWorkspaceChangesView { checkoutState: CheckoutState; viewId: string | null; files: MissionChangedFile[] | null; diffError: string | null }

@@ -368,7 +368,7 @@ pub fn preview_source_attachment(
         || !source_ref
             .media_type
             .as_deref()
-            .is_some_and(|media_type| media_type.starts_with("image/"))
+            .is_some_and(|media_type| media_type.starts_with("image/") || media_type.starts_with("video/"))
     {
         return Ok(None);
     }
@@ -1812,7 +1812,7 @@ impl ThreadAttachmentStore {
         else {
             return Ok(None);
         };
-        if preview_kind != "image" || byte_size < 0 || byte_size as u64 > MAX_PREVIEW_BYTES {
+        if (preview_kind != "image" && preview_kind != "video") || byte_size < 0 || byte_size as u64 > MAX_PREVIEW_BYTES {
             return Ok(None);
         }
         let storage_model = match storage_model.as_str() {

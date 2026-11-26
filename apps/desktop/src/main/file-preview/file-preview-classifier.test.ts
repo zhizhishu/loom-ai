@@ -12,6 +12,15 @@ describe('classifyFilePreview', () => {
     expect(classifyFilePreview('/repo/logo.png', 10, Buffer.from([0x89, 0x50]))).toMatchObject({
       kind: 'image', mime: 'image/png'
     })
+    expect(classifyFilePreview('/repo/demo.mp4', 10, Buffer.alloc(10))).toMatchObject({
+      kind: 'video', mime: 'video/mp4'
+    })
+    expect(classifyFilePreview('/repo/demo.mov', 10, Buffer.alloc(10))).toMatchObject({
+      kind: 'video', mime: 'video/quicktime'
+    })
+    expect(classifyFilePreview('/repo/demo.webm', 10, Buffer.alloc(10))).toMatchObject({
+      kind: 'video', mime: 'video/webm'
+    })
   })
 
   it('falls back to paged text and the system application', () => {

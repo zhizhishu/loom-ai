@@ -94,6 +94,12 @@ impl LocalAttachmentSourceRef {
                 .is_some_and(|media_type| media_type.starts_with("image/"))
             {
                 "image"
+            } else if self
+                .media_type
+                .as_deref()
+                .is_some_and(|media_type| media_type.starts_with("video/"))
+            {
+                "video"
             } else {
                 "none"
             }

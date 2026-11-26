@@ -67,7 +67,7 @@ export function missionLocalAttachmentView(
     fileCount: directory ? null : 1,
     mediaType: directory ? 'inode/directory' : attachment.file.type || null,
     byteSize: directory ? null : attachment.file.size,
-    previewKind: !directory && attachment.file.type.startsWith('image/') ? 'image' : 'none',
+    previewKind: !directory && attachment.file.type.startsWith('image/') ? 'image' : !directory && attachment.file.type.startsWith('video/') ? 'video' : 'none',
     availability: 'unknown'
   }
 }

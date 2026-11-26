@@ -2343,7 +2343,7 @@ ipcMain.handle(
           && (typeof attachment.mediaType !== 'string' || attachment.mediaType.length > 512))
         || (attachment.byteSize !== null
           && (!Number.isSafeInteger(attachment.byteSize) || Number(attachment.byteSize) < 0))
-        || (attachment.previewKind !== 'image' && attachment.previewKind !== 'none')
+        || (attachment.previewKind !== 'image' && attachment.previewKind !== 'video' && attachment.previewKind !== 'none')
         || !['unknown', 'available', 'missing', 'unreadable', 'kind_changed']
           .includes(String(attachment.availability))) {
         throw new Error('Composer 附件无效。')

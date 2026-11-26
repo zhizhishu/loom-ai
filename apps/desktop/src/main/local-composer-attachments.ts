@@ -209,7 +209,7 @@ export class LocalComposerAttachmentRegistry {
     if (!entry) return { preview: null, availability: 'missing' }
     const inspected = await this.#inspect(entry, false)
     if (inspected.view.availability !== 'available'
-      || inspected.view.previewKind !== 'image'
+      || (inspected.view.previewKind !== 'image' && inspected.view.previewKind !== 'video')
       || inspected.view.byteSize === null
       || inspected.view.byteSize > MAX_PREVIEW_BYTES) {
       return { preview: null, availability: inspected.view.availability }
@@ -287,7 +287,7 @@ export class LocalComposerAttachmentRegistry {
         observedByteSize: kind === 'file' ? info.size : null,
         updatedAt: new Date().toISOString()
       }
-      return { entry: next, view: this.#view(next, 'available', classification?.kind === 'image') }
+      return { entry: next, view: this.#view(next, 'available', classification?.kind === 'image' ? 'image' : classification?.kind === 'video' ? 'video' : 'none') }
     } catch (error) {
       if (preparing) throw error
       return { entry, view: this.#view(entry, availabilityFromError(error)) }
@@ -297,7 +297,7 @@ export class LocalComposerAttachmentRegistry {
   #view(
     entry: RegistryEntry,
     availability: LocalAttachmentAvailability,
-    image = false
+    previewKind: 'image' | 'video' | 'none' = 'none'
   ): LocalAttachmentSourceView {
     return {
       id: entry.attachmentId,
@@ -306,7 +306,7 @@ export class LocalComposerAttachmentRegistry {
       fileCount: entry.kind === 'file' ? 1 : null,
       mediaType: entry.mediaType,
       byteSize: entry.observedByteSize,
-      previewKind: image ? 'image' : 'none',
+      previewKind,
       availability,
       ...(entry.generatedBy === 'long_text_paste' ? { generatedBy: entry.generatedBy } : {}),
       ...(entry.pastedTextPreview !== undefined ? { pastedTextPreview: entry.pastedTextPreview } : {}),

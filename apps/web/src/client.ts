@@ -813,7 +813,7 @@ export class ConsoleClient {
       id: source.id, sourcePath: source.sourcePath, displayName: source.displayName, kind: source.kind,
       mediaType: source.mediaType, byteSize: source.observedByteSize,
       fileCount: source.kind === 'file' ? 1 : null,
-      previewKind: source.mediaType?.startsWith('image/') ? 'image' : 'none',
+      previewKind: source.mediaType?.startsWith('image/') ? 'image' : source.mediaType?.startsWith('video/') ? 'video' : 'none',
       availability: 'available',
       ...(source.generatedBy ? { generatedBy: source.generatedBy } : {}),
       ...(source.pastedTextPreview !== undefined ? { pastedTextPreview: source.pastedTextPreview } : {})

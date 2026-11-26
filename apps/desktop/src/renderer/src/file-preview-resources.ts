@@ -5,7 +5,7 @@ import { filePreviewSessionStore, restorableFilePreviewRequest } from './file-pr
 
 function bytes(content: FilePreviewContent | null): number {
   if (!content) return 0
-  if (content.kind === 'image') return content.bytes
+  if (content.kind === 'image' || content.kind === 'video') return content.bytes
   if (content.kind === 'page') return content.page.text.length * 2
   return 'text' in content ? content.text.length * 2 : 0
 }

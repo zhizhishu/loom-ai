@@ -813,6 +813,8 @@ impl MissionService {
                        CASE
                            WHEN CAST(json_extract(source.value, '$.mediaType') AS TEXT) LIKE 'image/%'
                                THEN 'image'
+                           WHEN CAST(json_extract(source.value, '$.mediaType') AS TEXT) LIKE 'video/%'
+                               THEN 'video'
                            ELSE 'none'
                        END AS preview_kind,
                        m.id AS message_id,

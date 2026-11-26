@@ -1,7 +1,7 @@
 import type { JSX } from 'react'
 
 export type AttachmentKind = 'file' | 'directory'
-export type AttachmentPreviewKind = 'image' | 'none'
+export type AttachmentPreviewKind = 'image' | 'video' | 'none'
 export type UserAttachmentDisplayType = 'document' | 'code' | 'folder' | 'image'
 export type AgentAttachmentDisplayType =
   | 'web'

@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import { AgentImage } from './AgentImage'
 import { AgentImageCard } from './AgentImageCard'
+import { ImageGeneration } from './ImageGeneration'
 import { AgentMarkdown } from './AgentMarkdown'
 import { imageCredit, imageSourceInMessage, plainText } from './agent-images'
 
@@ -63,6 +64,27 @@ describe('agent images in the native conversation', () => {
   it('sizes the compact figure for a card instead of a reply', () => {
     const html = render(createElement(AgentImage, { src: picture, alt: '海港', compact: true }))
     expect(html).toContain('data-compact="true"')
+  })
+})
+
+
+
+describe('image generation state card', () => {
+  it('reserves space and exposes queued/generating/refining states', () => {
+    for (const [status, text] of [['queued', '等待生成'], ['generating', '正在生成图片'], ['refining', '正在细化细节']] as const) {
+      const html = render(createElement(ImageGeneration, { status, prompt: '海港夜景' }))
+      expect(html).toContain(`data-status="${status}"`)
+      expect(html).toContain('aspect-ratio')
+      expect(html).toContain(text)
+      expect(html).toContain('海港夜景')
+    }
+  })
+
+  it('keeps retry inside the error card', () => {
+    const html = render(createElement(ImageGeneration, { status: 'error', onRetry: () => undefined }))
+    expect(html).toContain('role="alert"')
+    expect(html).toContain('生成失败')
+    expect(html).toContain('ln-image-generation-retry')
   })
 })
 
