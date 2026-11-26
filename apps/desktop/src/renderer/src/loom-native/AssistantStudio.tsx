@@ -23,8 +23,8 @@ export function AssistantLearnedTab({ environment, agent }: { environment: Busin
 }
 const purposeTemplates = ASSISTANT_PRESETS.map(preset => ({ value:preset.id, label:`${preset.name} · ${preset.role}`, role:preset.role, purpose:preset.purpose }))
 
-export function AssistantStudio({ open, environment, agents, initialAgentId, threadId, theme = 'day', onClose, onRefresh, onLibrary, catalogEpoch = 0, onCreatedConversation, onOpenConnections }: {
-  open: boolean; environment: BusinessEnvironment; agents: AgentProfile[]; initialAgentId?: string; threadId?: string
+export function AssistantStudio({ open, environment, agents, initialAgentId, initialCreate = false, threadId, theme = 'day', onClose, onRefresh, onLibrary, catalogEpoch = 0, onCreatedConversation, onOpenConnections }: {
+  open: boolean; environment: BusinessEnvironment; agents: AgentProfile[]; initialAgentId?: string; initialCreate?: boolean; threadId?: string
   theme?: 'day' | 'night'; onClose(): void; onRefresh(): Promise<void>; onLibrary?(): void; catalogEpoch?: number; onCreatedConversation?(threadId: string): Promise<void> | void; onOpenConnections?(): void
 }) {
   const [selected, setSelected] = useState<string | null>(null)
@@ -58,8 +58,8 @@ export function AssistantStudio({ open, environment, agents, initialAgentId, thr
     setCapDirty(false); setLocationDirty(false); setError(''); setMessage(''); setDangerConfirm(false)
   }
   useEffect(() => {
-    if (open) choose(agents.find(agent => agent.agentId === initialAgentId) ?? roster[0] ?? null)
-  }, [open, initialAgentId])
+    if (open) choose(initialCreate ? null : agents.find(agent => agent.agentId === initialAgentId) ?? roster[0] ?? null)
+  }, [open, initialAgentId, initialCreate])
   useEffect(() => {
     if (!open) return
     let active = true

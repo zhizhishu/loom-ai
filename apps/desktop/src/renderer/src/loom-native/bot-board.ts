@@ -3,7 +3,8 @@ import type { AgentProfile, ConversationItem, MissionRecord, WorkBundle } from '
 import { flattenWork, workStatus } from './Inspector'
 export type BoardBucket = 'attention' | 'working' | 'review' | 'idle' | 'offline'
 export type BoardTarget = { key: string; name: string; threadId: string | null; taskId: string | null;
-  attention: boolean; working: boolean; phase?: string; resultId?: string; title: string; status: string; online: boolean }
+  attention: boolean; working: boolean; phase?: string; resultId?: string; title: string; status: string; online: boolean; runtimeLabel?: string }
+const RUNTIME_LABELS: Record<string, string> = { 'claude-code-cli': 'Claude Code', 'codex-cli': 'Codex', 'deepseek-harness': 'DSH', pi: 'Pi' }
 export function botBoardBucket(item: BoardTarget, seenId?: string): BoardBucket {
   if (!item.online) return 'offline'
   if (item.phase === 'stopping' || item.phase === 'interrupting') return 'working'
@@ -32,7 +33,8 @@ export function botBoardTargets(agents: readonly AgentProfile[], conversations: 
       resultId:result?.candidate?.candidateId,
       threadId:active?.mission.threadId ?? mission?.threadId ?? conversations.find(c=>c.agentId===agent.agentId)?.threadId ?? null,
       taskId:active?.task.taskId ?? null, title:active?.task.title ?? mission?.title ?? '',
-      status:active?workStatus(active).label:mission?.status==='needs_you'?'需要你':mission?'进行中':'空闲', online:true }
+      status:active?workStatus(active).label:mission?.status==='needs_you'?'需要你':mission?'进行中':'空闲', online:true,
+      runtimeLabel:agent.runtimeConfiguration?.adapterKind?RUNTIME_LABELS[agent.runtimeConfiguration.adapterKind]??agent.runtimeConfiguration.adapterKind:'未配置' }
   })
 }
 

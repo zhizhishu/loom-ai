@@ -5,9 +5,9 @@ import { botBoardBucket, botBoardTargets, type BoardBucket, type BoardTarget } f
 import { markViewed, readSeen } from './bot-board-seen'
 import { SurfaceDialog } from './Controls'
 import './bot-board.css'
-export function BotBoard({ open, agents, conversations, missions, bundles, error, refresh, onOpen, onClose, theme='day' }: {
+export function BotBoard({ open, agents, conversations, missions, bundles, error, refresh, onOpen, onClose, onCreate, theme='day' }: {
   open:boolean; agents:AgentProfile[]; conversations:ConversationItem[]; missions:MissionRecord[]; bundles:WorkBundle[];
-  error:string|null; refresh():Promise<void>; onOpen(row:BoardTarget):void; onClose():void; theme?:'day'|'night'
+  error:string|null; refresh():Promise<void>; onOpen(row:BoardTarget):void; onClose():void; onCreate():void; theme?:'day'|'night'
 }) {
   const [query,setQuery]=useState('')
   const [filter,setFilter]=useState('all')
@@ -41,7 +41,7 @@ export function BotBoard({ open, agents, conversations, missions, bundles, error
   const rows=useMemo(()=>botBoardTargets(agents,conversations,missions,bundles),[agents,conversations,missions,bundles])
   const filtered=rows.filter(row=>(filter==='all'||botBoardBucket(row,seen[row.key])===filter) &&
     (row.name+' '+row.title).toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()))
-  const card=(row:BoardTarget)=><article key={row.key} className="ln-board-card"><strong>{row.name}</strong><p>{row.title||'没有正在处理的工作'}</p><small>{row.status}</small>
+  const card=(row:BoardTarget)=><article key={row.key} className="ln-board-card"><strong>{row.name}</strong><p>{row.title||'没有正在处理的工作'}</p><small>{row.status} · {row.runtimeLabel??'未配置'}</small>
     <button type="button" disabled={!row.threadId||!!error} onClick={()=>{
       if(row.resultId)try{markViewed(row.key,row.resultId);setSeen(s=>({...s,[row.key]:row.resultId!}))}
       catch{setStorageError('查看标记未能保存；稍后可能再次显示待查看。')}
@@ -49,7 +49,7 @@ export function BotBoard({ open, agents, conversations, missions, bundles, error
     }}>{row.attention?'回答问题':botBoardBucket(row,seen[row.key])==='review'?'查看结果':'进入聊天'}</button></article>
   const columns:[BoardBucket,string][]=[['attention','需要你'],['working','进行中'],['review','待查看']]
   return <SurfaceDialog open={open} onClose={onClose} theme={theme} title="助手看板" description="可见时每 5 秒刷新 · 只读摘要">
-    <section className="ln-bot-board"><button type="button" onClick={()=>void reload().catch(()=>{})}>刷新看板</button>
+    <section className="ln-bot-board"><button type="button" onClick={()=>void reload().catch(()=>{})}>刷新看板</button><button type="button" onClick={onCreate}>新建助手</button>
       <input aria-label="搜索助手看板" value={query} onChange={e=>setQuery(e.target.value)} placeholder="搜索助手或工作"/>
       <select aria-label="看板状态" value={filter} onChange={e=>setFilter(e.target.value)}><option value="all">全部状态</option>{columns.map(([key,label])=><option key={key} value={key}>{label}</option>)}</select>
       {storageError&&<p role="alert">{storageError}</p>}

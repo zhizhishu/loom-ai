@@ -17,9 +17,9 @@ it('renders inbox, badge and profile in one bottom rail',()=>{
 })
 vi.mock('./Controls',async original=>({...await original<typeof import('./Controls')>(),SurfaceDialog:({children}:{children:ReactNode})=>children}))
 it('renders exactly three main columns, collapsed idle rows, and an honest read failure',()=>{
- const html=renderToStaticMarkup(createElement(BotBoard,{open:true,agents:[],conversations:[],missions:[],bundles:[],error:'offline',refresh:async()=>{},onOpen:()=>{},onClose:()=>{}}))
+ const html=renderToStaticMarkup(createElement(BotBoard,{open:true,agents:[],conversations:[],missions:[],bundles:[],error:'offline',refresh:async()=>{},onOpen:()=>{},onClose:()=>{},onCreate:()=>{}}))
  expect(html.match(/<h3>/g)).toHaveLength(3)
- for(const label of ['需要你','进行中','待查看','空闲 0 · 离线 0','没有符合条件的助手','上次更新'])expect(html).toContain(label)
+ for(const label of ['需要你','进行中','待查看','空闲 0 · 离线 0','没有符合条件的助手','上次更新','新建助手'])expect(html).toContain(label)
  expect(html).toContain('<details>');expect(html).not.toContain('<details open')
 })
 it('derives running agents from mission facts instead of inventing per-bot runtime activity',()=>{
@@ -27,6 +27,9 @@ it('derives running agents from mission facts instead of inventing per-bot runti
  const mission={missionId:'m',threadId:'t',memberAgentIds:['a'],runningAgentIds:['a'],title:'Real work'} as MissionRecord
  const [target]=botBoardTargets([agent],[],[mission],[])
  expect(target?.working).toBe(true);expect(botBoardBucket(target!)).toBe('working')
+ expect(target?.runtimeLabel).toBe('未配置')
+ const [piTarget]=botBoardTargets([{...agent,runtimeConfiguration:{adapterKind:'pi'}} as AgentProfile],[],[mission],[])
+ expect(piTarget?.runtimeLabel).toBe('Pi')
 })
 const base:BoardTarget={key:'bot',name:'Helper',threadId:'t',taskId:null,attention:false,working:false,title:'',status:'',online:true}
 it('keeps the upstream attention, busy, unseen, idle and offline precedence',()=>{

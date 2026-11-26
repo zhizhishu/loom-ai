@@ -114,6 +114,7 @@ export function LoomApp({ environment, onLogout, initialSettingsSection = null, 
   const [membersOpen, setMembersOpen] = useState(false)
   const [studioOpen, setStudioOpen] = useState(false)
   const [studioAgent, setStudioAgent] = useState<string | undefined>()
+  const [studioCreate, setStudioCreate] = useState(false)
   const [libraryOpen, setLibraryOpen] = useState(false)
   const [visitedPanels,setVisitedPanels]=useState({studio:false,room:false,members:false,library:false})
   useEffect(()=>{
@@ -130,7 +131,7 @@ export function LoomApp({ environment, onLogout, initialSettingsSection = null, 
   const [pendingInspectorAction, setPendingInspectorAction] = useState<(() => void) | null>(null)
   const safeInspectorAction = (action: () => void) => { if (capabilityDirty) setPendingInspectorAction(() => action); else action() }
   const openCreatedConversation: typeof data.openConversation = (...args) => { setSettingsSection(null); return data.openConversation(...args) }
-  const manageAssistant = (agentId?: string) => { setStudioAgent(agentId); setStudioOpen(true) }
+  const manageAssistant = (agentId?: string, create = false) => { setStudioAgent(agentId); setStudioCreate(create); setStudioOpen(true) }
   const [query, setQuery] = useState('')
   const [artifact, setArtifact] = useState<ArtifactSelection | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
@@ -298,7 +299,7 @@ export function LoomApp({ environment, onLogout, initialSettingsSection = null, 
   })
   const shortcutKey = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl'
   return <div className={`ln-app ${expanded && inspectorOpen ? 'ln-inspector-expanded' : ''}`} data-theme={theme} data-loom-frontend="native-v2">
-    <BotBoard open={boardOpen} agents={data.agents} conversations={data.conversations} missions={data.missions} bundles={data.bundles} error={data.error} refresh={data.refresh} theme={theme} onClose={()=>setBoardOpen(false)} onOpen={row=>{
+    <BotBoard open={boardOpen} agents={data.agents} conversations={data.conversations} missions={data.missions} bundles={data.bundles} error={data.error} refresh={data.refresh} theme={theme} onClose={()=>setBoardOpen(false)} onCreate={()=>{setBoardOpen(false);manageAssistant(undefined,true)}} onOpen={row=>{
       setBoardOpen(false)
       if(row.threadId){setDockSelection({threadId:row.threadId,taskId:row.taskId});void data.openConversation(row.threadId).catch(report)}
     }}/>
@@ -334,7 +335,7 @@ export function LoomApp({ environment, onLogout, initialSettingsSection = null, 
         {inspectorOpen && <Inspector key={capabilityEpoch} questions={piQuestions.questions} selectedTaskId={dockSelection?.threadId === (active?.threadId ?? null) ? dockSelection?.taskId ?? null : null} onTaskSelect={taskId => setDockSelection({ threadId: active?.threadId ?? null, taskId })} threadId={active?.threadId} conversationTitle={active?.title} onCreateWork={beginWork} onConnectDevice={() => openSettings('devices')} workbench={environment.workbench} client={environment.client} theme={theme} onManageAssistant={manageAssistant} onCapabilityDirty={setCapabilityDirty} onLibrary={() => safeInspectorAction(() => { setCapabilityDirty(false); setLibraryOpen(true) })} agents={data.agents} bundles={data.bundles} agent={activeAgent} mode={inspectorMode} tab={tab} onTab={value => safeInspectorAction(() => { setTab(value); setCapabilityDirty(false) })} onMode={value => safeInspectorAction(() => { setInspectorMode(value); setCapabilityDirty(false) })} onClose={() => safeInspectorAction(() => { setInspectorOpen(false); setExpanded(false); setCapabilityDirty(false) })} onExpand={() => setExpanded(value => !value)} expanded={expanded} onArtifact={setArtifact} loading={data.loading} onOpenConversation={threadId => { const item = data.conversations.find(item => item.threadId === threadId); if (item) void select(item) }}/>}</>}</section>
     </div>
     {(notice || data.error) && <div className="ln-notice" role="alert"><span>{notice || data.error}</span><IconButton icon="refresh" label="重试读取" onClick={() => { setNotice(null); void data.refresh().catch(report) }}/><IconButton icon="close" label="关闭提示" onClick={() => setNotice(null)}/></div>}
-    {visitedPanels.studio&&<Suspense fallback={<span role="status" className="ln-loading">正在打开助手编辑…</span>}><AssistantStudio threadId={active?.threadId ?? undefined} onCreatedConversation={openCreatedConversation} onOpenConnections={() => openSettings('runtime')} catalogEpoch={capabilityEpoch} open={studioOpen} environment={environment} agents={data.agents} initialAgentId={studioAgent} theme={theme} onClose={() => setStudioOpen(false)} onRefresh={data.refresh} onLibrary={() => setLibraryOpen(true)}/></Suspense>}
+    {visitedPanels.studio&&<Suspense fallback={<span role="status" className="ln-loading">正在打开助手编辑…</span>}><AssistantStudio threadId={active?.threadId ?? undefined} onCreatedConversation={openCreatedConversation} onOpenConnections={() => openSettings('runtime')} catalogEpoch={capabilityEpoch} open={studioOpen} environment={environment} agents={data.agents} initialAgentId={studioAgent} initialCreate={studioCreate} theme={theme} onClose={() => setStudioOpen(false)} onRefresh={data.refresh} onLibrary={() => setLibraryOpen(true)}/></Suspense>}
     {visitedPanels.room&&<Suspense fallback={<span role="status" className="ln-loading">正在打开新工作…</span>}><RoomDialog open={newRoom} initialMode={roomMode} initialWorkspace={roomInitialWorkspace} environment={environment} agents={data.agents} initialAgentId={activeAgent?.agentId} theme={theme} onClose={() => setNewRoom(false)} onCreated={openCreatedConversation} onNewAssistant={() => manageAssistant()}/></Suspense>}
     {visitedPanels.members&&<Suspense fallback={null}><RoomMembersDialog open={membersOpen} environment={environment} agents={data.agents} snapshot={data.snapshot} theme={theme} onClose={() => setMembersOpen(false)} onRefresh={data.refresh}/></Suspense>}
     {visitedPanels.library&&<Suspense fallback={<span role="status" className="ln-loading">正在打开能力库…</span>}><CapabilityLibrary open={libraryOpen} environment={environment} theme={theme} onClose={() => setLibraryOpen(false)} onChanged={() => { setCapabilityEpoch(value => value + 1); void data.refresh() }}/></Suspense>}
