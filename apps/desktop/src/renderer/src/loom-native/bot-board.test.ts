@@ -73,3 +73,20 @@ it('shows assigned task ownership even before control facts are observed',()=>{
  expect(target?.title).toBe('Owned task')
  expect(target?.taskId).toBe('task-a')
 })
+
+it('uses existing presence and runtime-readiness facts for each bot live state',()=>{
+ const present={agentId:'a',displayName:'A',presence:'present',removedAt:null,runtimeReadiness:{status:'ready',blockers:[]}} as AgentProfile
+ const away={...present,agentId:'away',presence:'away'} as AgentProfile
+ const removed={...present,agentId:'removed',removedAt:'2026-11-26T00:00:00Z'} as AgentProfile
+ const broken={...present,agentId:'broken',runtimeReadiness:{status:'needs_attention',blockers:[{code:'runtime_configuration_invalid',detail:null}]}} as AgentProfile
+ const rows=botBoardTargets([present,away,removed,broken],[],[],[])
+ expect(rows.find(row=>row.key==='a')?.online).toBe(true)
+ expect(rows.find(row=>row.key==='away')?.online).toBe(false)
+ expect(rows.find(row=>row.key==='away')?.status).toBe('离开')
+ expect(rows.find(row=>row.key==='removed')?.online).toBe(false)
+ expect(rows.find(row=>row.key==='removed')?.status).toBe('已移除')
+ const brokenRow=rows.find(row=>row.key==='broken')!
+ expect(brokenRow.attention).toBe(true)
+ expect(brokenRow.status).toBe('运行需处理')
+ expect(botBoardBucket(brokenRow)).toBe('attention')
+})
