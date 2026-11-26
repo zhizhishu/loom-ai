@@ -8550,50 +8550,11 @@ impl Database {
             "#,
             [&now],
         )?;
-        let intercepted_actions_failed_closed = transaction.execute(
-            r#"
-            UPDATE action_execution
-            SET status = 'not_executed',
-                not_executed_reason = 'runtime_request_lost',
-                effect_disposition = 'none', ended_at = ?1,
-                execution_lease_owner = NULL,
-                execution_lease_expires_at = NULL,
-                version = version + 1, updated_at = ?1
-            WHERE status = 'prepared' AND control_mode = 'intercepted'
-              AND (
-                  EXISTS (
-                      SELECT 1 FROM approval
-                      WHERE approval.action_id = action_execution.id
-                        AND approval.status = 'pending'
-                  )
-                  OR EXISTS (
-                      SELECT 1 FROM runtime_delivery_checkpoint
-                      WHERE runtime_delivery_checkpoint.action_id = action_execution.id
-                        AND runtime_delivery_checkpoint.delivery_kind = 'authorization_resolution'
-                        AND runtime_delivery_checkpoint.status IN ('pending', 'delivering', 'failed')
-                  )
-              )
-            "#,
-            [&now],
-        )? as i64;
-        let action_approvals_cancelled = transaction.execute(
-            r#"
-            UPDATE approval
-            SET status = 'cancelled',
-                decision_json = '{"reason":"runtime_request_lost"}',
-                resolved_by_type = 'system',
-                resolved_by_id = 'runtime-recovery-coordinator',
-                resolution_code = 'runtime_request_lost',
-                version = version + 1,
-                resolved_at = ?1, updated_at = ?1
-            WHERE status = 'pending'
-              AND action_id IN (
-                  SELECT id FROM action_execution
-                  WHERE control_mode = 'intercepted'
-              )
-            "#,
-            [&now],
-        )? as i64;
+        // Pending intercepted approvals are durable across a Core restart. Recovery must
+        // not fail-close the request or its authorization delivery; runtime reconciliation
+        // decides whether the owning Run is still live, and terminal settlement closes them.
+        let intercepted_actions_failed_closed = 0;
+        let action_approvals_cancelled = 0;
         let actions_marked_unknown = transaction.execute(
             r#"
             UPDATE action_execution
@@ -8725,22 +8686,7 @@ impl Database {
             "#,
             [&now],
         )? as i64;
-        let authorization_deliveries_failed_closed = transaction.execute(
-            r#"
-            UPDATE runtime_delivery_checkpoint
-            SET status = 'safely_closed', safely_closed_at = ?1,
-                lease_owner = NULL, lease_expires_at = NULL,
-                last_error = 'authorization_delivery_outcome_unknown',
-                version = version + 1, updated_at = ?1
-            WHERE status IN ('pending', 'delivering', 'failed')
-              AND delivery_kind = 'authorization_resolution'
-              AND action_id IN (
-                  SELECT id FROM action_execution
-                  WHERE control_mode = 'intercepted'
-              )
-            "#,
-            [&now],
-        )? as i64;
+        let authorization_deliveries_failed_closed = 0;
         transaction.execute(
             r#"
             UPDATE agent_run

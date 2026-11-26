@@ -1278,7 +1278,8 @@ impl ActionSafetyService {
                            COALESCE(agent_run.camp_id, camp_turn.camp_id),
                            action_execution.source_agent_run_execution_epoch,
                            agent_run.execution_epoch, agent_run.permission_semantics,
-                           agent_run.status, agent_run.cancel_requested_at
+                           agent_run.status, agent_run.cancel_requested_at,
+                           approval.decision_json
                     FROM approval
                     JOIN action_execution ON action_execution.id = approval.action_id
                     JOIN agent_run ON agent_run.id = action_execution.agent_run_id
@@ -1306,6 +1307,7 @@ impl ActionSafetyService {
                             row.get::<_, String>(15)?,
                             row.get::<_, String>(16)?,
                             row.get::<_, Option<String>>(17)?,
+                            row.get::<_, Option<String>>(18)?,
                         ))
                     },
                 )
@@ -1329,6 +1331,7 @@ impl ActionSafetyService {
                 permission_semantics,
                 run_status,
                 run_cancel_requested_at,
+                decision_json,
             )) = row
             else {
                 return Ok(rejected("approval.not_found", "Action Approval does not exist"));
@@ -1343,6 +1346,28 @@ impl ActionSafetyService {
                 ));
             }
             if approval_status != "pending" {
+                let settled_option = decision_json
+                    .as_deref()
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                    .and_then(|decision| {
+                        decision
+                            .get("optionId")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    });
+                if settled_option.as_deref() == Some(envelope.payload.option_id.as_str()) {
+                    return Ok(CommandHandlerResult::applied(
+                        "approval.resolved",
+                        json!({
+                            "approvalId": envelope.payload.approval_id,
+                            "actionId": action_id,
+                            "decision": approval_status,
+                            "optionId": envelope.payload.option_id,
+                            "replayed": true,
+                        }),
+                        Some(entity_ref("approval", &envelope.payload.approval_id)),
+                    ));
+                }
                 return Ok(rejected(
                     "approval.not_pending",
                     "Approval is no longer pending",
@@ -5284,7 +5309,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_fails_closed_intercepted_approvals_and_authorization_deliveries() {
+    fn restart_preserves_intercepted_approvals_and_authorization_deliveries() {
         let mut fixture = fixture("ask");
         let service = ActionSafetyService::default();
         for (action_id, item_id) in [
@@ -5315,7 +5340,7 @@ mod tests {
                     "approve-before-restart",
                     Some(&fixture.camp_id),
                     ResolveActionApprovalCommand {
-                        approval_id,
+                        approval_id: approval_id.clone(),
                         option_id: "accept".to_string(),
                         expected_version: approval_version,
                         reason: None,
@@ -5328,16 +5353,16 @@ mod tests {
 
         let mut reopened = Database::open(&directory).unwrap();
         let recovery = reopened.prepare_v2_recovery().unwrap();
-        assert_eq!(recovery.intercepted_actions_failed_closed, 2);
-        assert_eq!(recovery.action_approvals_cancelled, 1);
-        assert_eq!(recovery.authorization_deliveries_failed_closed, 1);
+        assert_eq!(recovery.intercepted_actions_failed_closed, 0);
+        assert_eq!(recovery.action_approvals_cancelled, 0);
+        assert_eq!(recovery.authorization_deliveries_failed_closed, 0);
         let states = {
             let mut statement = reopened
                 .connection()
                 .prepare(
                     r#"
                     SELECT action_execution.id, action_execution.status,
-                           action_execution.not_executed_reason, approval.status
+                           COALESCE(action_execution.not_executed_reason, ''), approval.status
                     FROM action_execution
                     JOIN approval ON approval.action_id = action_execution.id
                     WHERE action_execution.id IN (
@@ -5365,18 +5390,53 @@ mod tests {
             vec![
                 (
                     "action-awaiting-runtime".to_string(),
-                    "not_executed".to_string(),
-                    "runtime_request_lost".to_string(),
+                    "prepared".to_string(),
+                    "".to_string(),
                     "approved".to_string(),
                 ),
                 (
                     "action-awaiting-user".to_string(),
-                    "not_executed".to_string(),
-                    "runtime_request_lost".to_string(),
-                    "cancelled".to_string(),
+                    "prepared".to_string(),
+                    "".to_string(),
+                    "pending".to_string(),
                 ),
             ]
         );
+        let checkpoint_status: String = reopened
+            .connection()
+            .query_row(
+                "SELECT status FROM runtime_delivery_checkpoint WHERE action_id = 'action-awaiting-runtime'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkpoint_status, "pending");
+        let replayed = service
+            .resolve_approval(
+                &mut reopened,
+                &user_envelope(
+                    "approve-before-restart-retry",
+                    Some(&fixture.camp_id),
+                    ResolveActionApprovalCommand {
+                        approval_id,
+                        option_id: "accept".to_string(),
+                        expected_version: approval_version,
+                        reason: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(replayed.result.status, CommandResultStatus::Applied);
+        assert_eq!(replayed.result.payload["replayed"], true);
+        let checkpoint_count: i64 = reopened
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_delivery_checkpoint WHERE action_id = 'action-awaiting-runtime'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkpoint_count, 1);
         let second = reopened.prepare_v2_recovery().unwrap();
         assert_eq!(second.intercepted_actions_failed_closed, 0);
         assert_eq!(second.action_approvals_cancelled, 0);
