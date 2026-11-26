@@ -545,14 +545,11 @@ pub fn configure_host(
         {"id":"acp","inject":["acpAppStartup","rovaiDshReady"]},
         {"insert":[{"id":"rovai-bootstrap","name":plugin_path,"config":{"bindingRoot":binding_root,"observationRoot":observation_root,"mcpServerNames":mcp_server_names}}]}
     ]);
-    if let Some(config) = native_acp_default_model()
-        && let Some(row) = patch
+    if let Some(config) = native_acp_default_model() {
+        patch
             .as_array_mut()
             .unwrap()
-            .iter_mut()
-            .find(|row| row["id"] == "acp")
-    {
-        row["config"] = config;
+            .push(json!({"id":"acp","config":config}));
     }
     // Model overrides are applied only in memory after native initialization.
     // A CLI llm-pi-ai override here can be absorbed into DSH's Profile import.
