@@ -204,6 +204,24 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise BridgeError("redirect_refused")
 
 
+def endpoint_opener(endpoint):
+    """build_opener's handlers minus the schemes the endpoint never uses."""
+    handlers = [
+        urllib.request.ProxyHandler({}),
+        urllib.request.UnknownHandler(),
+        urllib.request.HTTPHandler(),
+        urllib.request.HTTPDefaultErrorHandler(),
+        NoRedirect(),
+        urllib.request.HTTPErrorProcessor(),
+    ]
+    if endpoint.startswith("https://"):
+        handlers.append(urllib.request.HTTPSHandler())
+    opener = urllib.request.OpenerDirector()
+    for handler in handlers:
+        opener.add_handler(handler)
+    return opener
+
+
 def call_body(request_id, tool, arguments, digest):
     """The exact wire body. No token, no path, no url, no prefix juggling."""
     if tool not in TOOL_NAMES:
@@ -271,9 +289,7 @@ class Bridge:
         # so a missing scope can never widen the surface.
         self.scope = scope
         self.fatal = False
-        self.opener = opener or urllib.request.build_opener(
-            NoRedirect(), urllib.request.ProxyHandler({})
-        )
+        self.opener = opener or endpoint_opener(endpoint)
 
     def tools(self):
         """Exactly the tools this grant's scope exposes, in declaration order."""
