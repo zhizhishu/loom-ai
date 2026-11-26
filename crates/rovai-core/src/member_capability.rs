@@ -538,6 +538,18 @@ pub(crate) fn set_member_capability_catalog(
     )?;
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     for piece in &next {
+        // Mikka resolves a personal Skill through its owner. LOOM's existing rows predate
+        // ownership, so the first assistant that actually selects an unowned Library Skill
+        // claims the existing owner field here; later choosers never overwrite it.
+        if piece.selected {
+            if let Some(skill_id) = piece.id.strip_prefix(skill_source::ID_PREFIX) {
+                transaction.execute(
+                    "UPDATE member_skill_source SET owner_agent_id=?1
+                     WHERE skill_id=?2 AND owner_agent_id IS NULL",
+                    params![profile.agent_id, skill_id],
+                )?;
+            }
+        }
         if was_selected(&current_pieces, piece) == piece.selected {
             continue;
         }
@@ -1413,7 +1425,7 @@ fn user_envelope<P>(payload: P) -> CommandEnvelope<P> {
 mod tests {
     use super::*;
     use crate::context::{self, render_session_bootstrap};
-    use crate::skill::{CommitSkillImportCommand, SetSkillEnabledCommand};
+    use crate::skill::{CommitSkillImportCommand, SetSkillEnabledCommand, SetSkillMetadataCommand, SkillMetadataPatch};
     use std::path::{Path, PathBuf};
 
     fn write_skill_folder(root: &Path, name: &str, body: &str) -> PathBuf {
@@ -2004,6 +2016,34 @@ mod tests {
                 .items
                 .iter()
                 .any(|item| item.id == registered.id && item.selected)
+        );
+        let owner: Option<String> = database
+            .connection()
+            .query_row(
+                "SELECT owner_agent_id FROM member_skill_source WHERE skill_id=?1",
+                [&imported.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner.as_deref(), Some(agent_id.as_str()));
+        let share = user_envelope(SetSkillMetadataCommand {
+            skill_id: imported.id.clone(),
+            expected_version: imported.version,
+            patch: SkillMetadataPatch {
+                visibility_scope: Some("assigned".to_string()),
+                learned_state: None,
+                pinned: None,
+                locked: None,
+            },
+        });
+        assert_eq!(
+            library
+                .set_metadata(&mut database, &share)
+                .unwrap()
+                .result
+                .status,
+            CommandResultStatus::Applied,
+            "the first chooser owns the skill, so sharing metadata is no longer refused as unowned"
         );
         let persisted = get_member_capability_catalog(&database, &store, &agent_id).unwrap();
         assert!(persisted.items.iter().any(|item| item.id == registered.id
