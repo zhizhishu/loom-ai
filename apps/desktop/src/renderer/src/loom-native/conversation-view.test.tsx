@@ -84,7 +84,7 @@ describe('composer address names the group, not the lead assistant', () => {
 
 // 验收 C2：timeline 的群成员事件投影成聊天流系统行（不写库、不进「会话记录」），
 // 按 eventId 去重、eventId 空用 globalSequence 兜底，与消息按 createdAt 并入同一条流。
-const memberEvent = (eventId: string, agentId: string, eventType: 'camp.member_added' | 'camp.member_removed'): DomainEventView =>
+const memberEvent = (eventId: string, agentId: string, eventType: 'camp.member_added' | 'camp.member_removed' | 'thread.member_added' | 'thread.member_removed'): DomainEventView =>
   ({
     globalSequence: 1, eventId, eventType, threadId: 'th-1', entityType: null, entityId: null,
     actorType: null, actorId: null, sourceAgentRunId: null, executionEpoch: null,

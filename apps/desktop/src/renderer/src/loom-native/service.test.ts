@@ -315,11 +315,13 @@ describe('native work bundle review facts',()=>{
 })
 
 describe('native sender preservation and replay',()=>{
-  it('does not overwrite unseen existing user input',()=>{
-    const old={...emptyLocalThreadComposerDraft('t'),body:'old',content:{version:2 as const,segments:[{kind:'text' as const,text:'old'}]}}
+  it('treats the visible edited body as confirmed while preserving the draft revision',()=>{
+    const old={...emptyLocalThreadComposerDraft('t'),revision:7,body:'old',content:{version:2 as const,segments:[{kind:'text' as const,text:'old'}]}}
     saveLocalThreadComposerDraft(old)
-    expect(()=>prepareSendDraft('t','different')).toThrow('草稿')
-    expect(loadLocalThreadComposerDraft('t')?.body).toBe('old')
+    const prepared=prepareSendDraft('t','different')
+    expect(prepared.revision).toBe(7)
+    expect(prepared.body).toBe('different')
+    expect(prepared.content.segments).toEqual([{kind:'text',text:'different'}])
   })
   it('keeps text after a rejected command and never declares success',async()=>{
     const request=vi.fn().mockResolvedValue({commandResult:{...applied,status:'rejected',code:'denied'}})

@@ -433,7 +433,9 @@ function composerDocument(text: string, recipientAgentId?: string): ComposerDocu
 
 /**
  * The revisioned draft protocol: an existing local draft keeps its revision, quotes,
- * attachments and reply/continuation routing. A different body is never merged into it.
+ * attachments and reply/continuation routing. The body passed to an explicit send is
+ * the visible composer's confirmed content, so it replaces the preserved body instead
+ * of trapping the user in a draft-conflict loop.
  */
 export function prepareSendDraft(
   threadId: string,
@@ -441,15 +443,7 @@ export function prepareSendDraft(
   recipientAgentId?: string
 ): ThreadComposerDraftView {
   const stored = loadLocalThreadComposerDraft(threadId)
-  if (stored) {
-    if (stored.body === text) return stored
-    const ownsUserInput = stored.body.trim() !== ''
-      || stored.quotes.length > 0
-      || stored.attachments.length > 0
-      || stored.replyIntent !== null
-      || stored.continuationIntent !== null
-    if (ownsUserInput) throw new LoomDraftConflict(stored.body)
-  }
+  if (stored && stored.body === text) return stored
   const base = stored ?? emptyLocalThreadComposerDraft(threadId)
   return { ...base, body: text, content: composerDocument(text, recipientAgentId) }
 }
