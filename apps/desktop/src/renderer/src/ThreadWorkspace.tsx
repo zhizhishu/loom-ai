@@ -68,6 +68,7 @@ import {
   ToolActivityGroup, ToolCallRow, selectCompletePresentableExecutionEvidence, type ToolCallStep
 } from './ExecutionToolGroup'
 import { executionPhaseFeedback, executionRunSummary } from './execution-run-summary'
+import { RunCompletionCard, useRunCompletionLedger } from './RunCompletionCard'
 import { ComposerDeliveryAction, deliveryPlans, deliveryActionLabel } from './ComposerDeliveryAction'
 import { ThreadMemberFastToggle } from './ThreadMemberFastToggle'
 import { useThreadMemberFast, type ThreadMemberFastControls } from './useThreadMemberFast'
@@ -2653,6 +2654,24 @@ export function ThreadWorkspace({
     }
     return null
   }, [conversationTimeline])
+  // 完工总结卡的数据：已登记成果与候选验收投影按 Mission 读一次，按 Run 分桶。
+  const completionRunIds = useMemo(
+    () => snapshot.agentRuns.filter((run) => !NON_TERMINAL_RUNS.has(run.status)).map((run) => run.id),
+    [snapshot.agentRuns]
+  )
+  const completionLedger = useRunCompletionLedger(snapshot.thread.missionId ?? null, completionRunIds)
+  const fileChangesByRunId = useMemo(() => {
+    const byRun = new Map<string, AgentRunFileChangesView[]>()
+    for (const changes of snapshot.agentRunFileChanges) {
+      const owned = byRun.get(changes.agentRunId)
+      if (owned) owned.push(changes)
+      else byRun.set(changes.agentRunId, [changes])
+    }
+    return byRun
+  }, [snapshot.agentRunFileChanges])
+  const openCompletionArtifacts = useCallback(() => {
+    if (snapshot.thread.missionId) filePreview?.openMissionActivity(snapshot.thread.missionId)
+  }, [filePreview, snapshot.thread.missionId])
   const userAnchors = anchorNavigation.anchors
   const groupingFollowsLatest = useCallback(() => !conversationFind.open
     && (timelineReadingPosition.current?.threadId !== snapshot.thread.id
@@ -5575,6 +5594,10 @@ export function ThreadWorkspace({
                             )}
                           </div>
                         </div>
+                        <RunCompletionCard run={run} fileChanges={fileChanges}
+                          artifacts={completionLedger.artifactsByRunId.get(run.id)}
+                          candidates={completionLedger.candidatesByRunId.get(run.id)}
+                          onOpenArtifacts={snapshot.thread.missionId ? openCompletionArtifacts : undefined} />
                         {(memberCreations.length > 0 || fileChanges.length > 0) && (
                           <div className="run-result-stack">
                             {memberCreations.map((receipt) => (

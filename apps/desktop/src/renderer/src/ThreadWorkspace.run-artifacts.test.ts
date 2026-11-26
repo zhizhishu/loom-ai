@@ -273,6 +273,8 @@ describe('Member creation results belong to the creating Run', () => {
           expect(markup.match(/class="message-actions /g)).toHaveLength(1)
         } else {
           expect(markup).toContain('data-run-artifact-output-id="run-1"')
+          expect(markup).toContain('run-completion-card')
+          expect(markup).toContain('完工总结')
           expect(markup).not.toContain('data-message-id=')
           expect(markup).not.toContain('class="message-actions')
         }

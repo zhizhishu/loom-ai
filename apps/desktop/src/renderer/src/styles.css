@@ -2947,6 +2947,7 @@ button.camp-world-map-live-caption { cursor: pointer; font: inherit; }
   margin: 14px 0;
 }
 .agent-message-output > .timeline-node { margin-top: 0; margin-bottom: 0; }
+.agent-message-output > .run-completion-card { margin-top: 12px; margin-bottom: 0; }
 .run-result-stack { display: grid; gap: 12px; margin-top: 14px; }
 .run-result-stack > :is(.member-joined-card, .run-file-changes-card) { width: 100%; min-width: 0; margin: 0; }
 .agent-message-output.same-author { margin-top: 8px; }
@@ -3874,10 +3875,33 @@ button.task-event-card:focus-visible .task-card-chevron { color: var(--brand-ink
 .task-event-card,
 .run-file-changes-card,
 .member-joined-card,
-.run-result-stack {
+.run-result-stack,
+.run-completion-card {
   width: min(620px, calc(100% - 42px));
   margin-left: 42px;
 }
+/* 完工总结卡：终态摘要 + 改动数 + 成果链接 + 验收徽标；同一批卡片式呈现。 */
+.run-completion-card {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--ink);
+  background: var(--surface-raised);
+}
+.run-completion-headline { display: flex; min-width: 0; align-items: center; gap: 8px; }
+.run-completion-title { min-width: 0; font-size: 12px; font-weight: 550; color: var(--ink); }
+.run-completion-acceptance { flex: 0 0 auto; padding: 1px 7px; border: 1px solid var(--line-strong); border-radius: 999px; color: var(--muted); background: var(--neutral-soft); font-size: 10.5px; font-weight: 600; white-space: nowrap; }
+.run-completion-acceptance[data-acceptance='accepted'] { border-color: color-mix(in srgb, var(--success) 28%, var(--line)); color: var(--success); background: var(--success-soft); }
+.run-completion-acceptance[data-acceptance='rejected'] { border-color: color-mix(in srgb, var(--danger) 28%, var(--line)); color: var(--danger); background: var(--danger-soft); }
+.run-completion-acceptance[data-acceptance='pending'] { border-color: color-mix(in srgb, var(--attention) 28%, var(--line)); color: var(--attention); background: var(--attention-soft); }
+.run-completion-changes { display: flex; align-items: baseline; gap: 7px; margin: 0; color: var(--muted); font-size: 11px; }
+.run-completion-changes .run-file-change-stat { font-style: normal; font-variant-numeric: tabular-nums; }
+.run-completion-artifacts-link { justify-self: start; display: inline-flex; align-items: center; gap: 5px; min-height: 26px; padding: 1px 4px; border: 0; border-radius: 6px; color: var(--conversation-action, var(--brand-ink)); background: transparent; font-size: 11px; cursor: pointer; }
+.run-completion-artifacts-link svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.5; }
+.run-completion-artifacts-link:hover { background: var(--surface-hover); }
+p.run-completion-artifacts-count { margin: 0; color: var(--muted); font-size: 11px; }
 .run-file-changes-card {
   overflow: hidden;
   border: 1px solid var(--line);
@@ -8314,7 +8338,7 @@ html[lang="en"] .runtime-parameter-picker-menu:has(.permission-menu-guidance) { 
   .conversation-bubble.system { max-width: 100%; margin-left: 0; }
   .timeline-scroll { padding-right: 12px; padding-left: 12px; }
   .task-event-card,
-  .run-file-changes-card, .member-joined-card, .run-result-stack, .run-interruption-marker { width: 100%; margin-left: 0; }
+  .run-file-changes-card, .member-joined-card, .run-result-stack, .run-interruption-marker, .run-completion-card { width: 100%; margin-left: 0; }
   .agent-message-output > .agent-message-output-actions { margin-left: -5px; }
   .task-event-card { grid-template-columns: 26px minmax(0, 1fr); gap: 8px; padding: 10px; }
   .task-card-glyph { width: 26px; height: 26px; border-radius: 7px; }
