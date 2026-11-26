@@ -106,10 +106,19 @@ jobs:
           if-no-files-found: error
           retention-days: 7
       - name: Download byte-for-byte artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: loom-personal-preview-linux-${{ env.LOOM_SOURCE_COMMIT }}
-          path: out/linux-personal-download
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          rm -rf out/linux-personal-download
+          mkdir -p out/linux-personal-download
+          for attempt in 1 2 3 4 5 6; do
+            if gh run download "$GITHUB_RUN_ID" --name "loom-personal-preview-linux-${LOOM_SOURCE_COMMIT}" --dir out/linux-personal-download; then
+              break
+            fi
+            test "$attempt" -lt 6
+            sleep 5
+          done
+          test -f out/linux-personal-download/loom-personal-linux-x64.tar.gz
       - name: Verify delivered Linux package closure
         shell: bash
         run: |
