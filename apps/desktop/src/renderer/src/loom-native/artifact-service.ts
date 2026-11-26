@@ -51,16 +51,17 @@ export type ArtifactMediaType =
   | 'image/webp'
   | 'image/gif'
   | 'application/pdf'
+  | 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
 /** 媒体预览：图片走 Blob 灯箱，PDF 走 pdf.js 画布；字节是 Core 归档字节的解码结果。 */
 export type ArtifactMedia = {
   mediaType: ArtifactMediaType
-  kind: 'image' | 'pdf'
+  kind: 'image' | 'pdf' | 'spreadsheet'
   bytes: Uint8Array
 }
 
 const ARTIFACT_MEDIA_TYPES: readonly ArtifactMediaType[] = [
-  'image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf'
+  'image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 ]
 
 /**
@@ -73,8 +74,9 @@ export function normalizeArtifactMediaType(value: unknown): ArtifactMediaType | 
 }
 
 /** 图片与 PDF 在界面上是两种完全不同的渲染路径，判定只在这里做一次。 */
-export function artifactMediaKind(mediaType: ArtifactMediaType): 'image' | 'pdf' {
-  return mediaType === 'application/pdf' ? 'pdf' : 'image'
+export function artifactMediaKind(mediaType: ArtifactMediaType): 'image' | 'pdf' | 'spreadsheet' {
+  if (mediaType === 'application/pdf') return 'pdf'
+  return mediaType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ? 'spreadsheet' : 'image'
 }
 
 /**

@@ -1139,6 +1139,7 @@ fn artifact_preview_media_type(relative_path: &str) -> Option<&'static str> {
         "webp" => Some("image/webp"),
         "gif" => Some("image/gif"),
         "pdf" => Some("application/pdf"),
+        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         _ => None,
     }
 }

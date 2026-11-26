@@ -25,6 +25,7 @@ import type {
 import { THREAD_SNAPSHOT_SCHEMA_VERSION } from '@contracts'
 import { newCommandId } from '../../../shared/command-id'
 import { readErrorMessage } from '../error-message'
+import { extractOfficeDocumentText } from './office-text'
 import { uiAttribute } from '../interface-language'
 import {
   clearLocalThreadComposerDraft,
@@ -466,7 +467,9 @@ export async function stageDraftAttachments(
     const previous = preparedFiles.get(file)?.get(draft.threadId)
     if (previous && next.attachments.some(item => item.id === previous.id)) continue
     if (next.attachments.length >= MAX_LOCAL_COMPOSER_ATTACHMENTS) throw new Error(`一次最多添加 ${MAX_LOCAL_COMPOSER_ATTACHMENTS} 个附件。`)
-    const attachment = previous ?? await composer.prepare(draft.threadId, next.revision, file)
+    const extractedText = previous ? undefined : await extractOfficeDocumentText(file)
+    const prepared = previous ?? await composer.prepare(draft.threadId, next.revision, file)
+    const attachment = extractedText ? { ...prepared, extractedText } : prepared
     const entries = preparedFiles.get(file) ?? new Map<string, LocalAttachmentSourceView>()
     entries.set(draft.threadId, attachment); preparedFiles.set(file, entries)
     next = { ...next, attachments: [...next.attachments, attachment] }
@@ -506,7 +509,8 @@ export function threadMessageSendParams(commandId: string, draft: ThreadComposer
       kind: attachment.kind,
       mediaType: attachment.mediaType,
       observedByteSize: attachment.byteSize,
-      ...(attachment.pastedTextPreview !== undefined ? { pastedTextPreview: attachment.pastedTextPreview } : {})
+      ...(attachment.pastedTextPreview !== undefined ? { pastedTextPreview: attachment.pastedTextPreview } : {}),
+      ...(attachment.extractedText !== undefined ? { extractedText: attachment.extractedText } : {})
     }
   })
   return {

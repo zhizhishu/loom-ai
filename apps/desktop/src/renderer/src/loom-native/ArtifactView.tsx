@@ -7,6 +7,7 @@ import { useThreadClient } from '../camp-client'
 import { readErrorMessage } from '../error-message'
 import { ArtifactPdfPreview } from './ArtifactPdfPreview'
 import { Icon } from './icons'
+import { ArtifactXlsxPreview } from './ArtifactXlsxPreview'
 import './artifact-ux.css'
 import type { ArtifactSelection } from './types'
 import {
@@ -271,7 +272,9 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
         : preview.status === 'media'
           ? preview.media.kind === 'pdf'
             ? <ArtifactPdfPreview bytes={preview.media.bytes} fileName={fileName}/>
-            : imageUrl === null
+            : preview.media.kind === 'spreadsheet'
+              ? <ArtifactXlsxPreview bytes={preview.media.bytes} fileName={fileName}/>
+              : imageUrl === null
               // 字节已经解码，但 object URL 还没就绪：这是短暂的过渡态，不是「没有图」。
               ? <div className="ln-artifact-state" data-state="reading" role="status">正在准备图片…</div>
               : <div className="ln-artifact-media" data-media={preview.media.mediaType}>
