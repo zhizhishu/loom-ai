@@ -23196,8 +23196,8 @@ async fn persist_pi_prompt_completion(
     } else {
         None
     };
-    let manual_retry_allowed = outcome == RuntimeTerminalOutcome::Failed
-        && delivery_status.as_deref() == Some("not_accepted");
+    let manual_retry_allowed =
+        pi_prompt_manual_retry_allowed(outcome, delivery_status.as_deref());
     let base_error_code = if stop_reason == "stop" {
         "runtime_missing_final_output".to_string()
     } else {
@@ -26400,6 +26400,14 @@ fn acp_prompt_terminal_outcome(
     } else {
         RuntimeTerminalOutcome::Failed
     }
+}
+
+fn pi_prompt_manual_retry_allowed(
+    outcome: RuntimeTerminalOutcome,
+    delivery_status: Option<&str>,
+) -> bool {
+    outcome == RuntimeTerminalOutcome::Failed
+        && matches!(delivery_status, Some("not_accepted") | Some("accepted"))
 }
 
 fn acp_prompt_manual_retry_allowed(
@@ -29640,6 +29648,26 @@ mod tests {
             failure.detail.as_deref(),
             Some("mission.workspace_branch_mismatch")
         );
+    }
+
+    #[test]
+    fn pi_prompt_failure_is_retryable_after_not_accepted_or_accepted_input() {
+        for delivery_status in [Some("not_accepted"), Some("accepted")] {
+            assert!(pi_prompt_manual_retry_allowed(
+                RuntimeTerminalOutcome::Failed,
+                delivery_status,
+            ));
+        }
+        for delivery_status in [Some("delivery_unknown"), None] {
+            assert!(!pi_prompt_manual_retry_allowed(
+                RuntimeTerminalOutcome::Failed,
+                delivery_status,
+            ));
+        }
+        assert!(!pi_prompt_manual_retry_allowed(
+            RuntimeTerminalOutcome::Cancelled,
+            Some("accepted")
+        ));
     }
 
     #[test]

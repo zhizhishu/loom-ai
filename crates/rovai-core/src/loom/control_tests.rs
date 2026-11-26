@@ -6922,6 +6922,46 @@ fn retryable_failure_redispatches_once() {
 }
 
 #[test]
+fn pi_accepted_input_failure_redispatches_once() {
+    let mut database = fixture();
+    let now = chrono::Utc::now();
+    let task = retry_test_task(&mut database, now);
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_run SET runtime_adapter_kind='pi' WHERE id=?1",
+            [&task.run_id],
+        )
+        .unwrap();
+    let epoch: i64 = database
+        .connection()
+        .query_row(
+            "SELECT execution_epoch FROM agent_run WHERE id=?1",
+            [&task.run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    crate::test_support::insert_test_runtime_input(&database, &task.run_id, epoch, "accepted");
+    persist_retry_fixture_terminal(&database, &task.run_id, "failed");
+
+    let before = loom_deliveries(&database);
+    assert_eq!(
+        tick_at(&mut database, now + chrono::Duration::seconds(5)).admitted,
+        1
+    );
+    assert_eq!(loom_deliveries(&database), before + 1);
+    let input_status: String = database
+        .connection()
+        .query_row(
+            "SELECT status FROM runtime_input_delivery WHERE agent_run_id=?1",
+            [&task.run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(input_status, "accepted");
+}
+
+#[test]
 fn retry_stops_at_epoch_cap() {
     let mut database = fixture();
     let now = chrono::Utc::now();

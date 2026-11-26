@@ -2468,7 +2468,8 @@ fn retry_terminal_failure(
                    SELECT 1 FROM agent_run successor WHERE successor.predecessor_agent_run_id=run.id)
                AND NOT EXISTS (
                    SELECT 1 FROM runtime_input_delivery input WHERE input.agent_run_id=run.id
-                   AND (input.status IN ('accepted','delivery_unknown')
+                   AND (input.status='delivery_unknown'
+                        OR (input.status='accepted' AND run.runtime_adapter_kind<>'pi')
                         OR (input.status='prepared' AND input.dispatch_started_at IS NOT NULL)))
                AND NOT EXISTS (
                    SELECT 1 FROM loom_claim claim
