@@ -259,6 +259,39 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      - name: Package the standalone Windows Node kit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zipName = "loom-node-windows-$env:LOOM_SOURCE_COMMIT"
+          $staging = Join-Path $env:RUNNER_TEMP 'loom-node-kit'
+          if (Test-Path -LiteralPath $staging) { throw 'Refusing to replace an existing Node kit staging directory' }
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          $inputs = [ordered]@{
+            'loom-node.exe' = 'target/debug/loom-node.exe'
+            'Connect-LoomNode.ps1' = 'scripts/node/Connect-LoomNode.ps1'
+            'README.md' = 'scripts/node/README.md'
+          }
+          foreach ($name in $inputs.Keys) {
+            $source = $inputs[$name]
+            if (!(Test-Path -LiteralPath $source -PathType Leaf)) { throw "Node kit input missing: $source" }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $staging $name)
+          }
+          if (@(Get-ChildItem -LiteralPath $staging -Force).Count -ne 3) { throw 'Node kit must contain exactly three root files' }
+          $zipPath = Join-Path $env:RUNNER_TEMP ($zipName + '.zip')
+          if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
+          Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $zipPath -CompressionLevel Optimal
+          if (!(Test-Path -LiteralPath $zipPath -PathType Leaf)) { throw 'Node kit archive was not created' }
+
+      - name: Upload the standalone Windows Node kit
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: loom-node-windows-${{ env.LOOM_SOURCE_COMMIT }}
+          path: ${{ runner.temp }}/loom-node-windows-${{ env.LOOM_SOURCE_COMMIT }}.zip
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Test exact public brand routes over real Host HTTP
         shell: pwsh
         run: |
