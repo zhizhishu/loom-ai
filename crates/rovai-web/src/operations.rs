@@ -893,6 +893,7 @@ fn project_loom_control(value: serde_json::Value) -> serde_json::Value {
                         "policyRevision",
                         "recipientAgentId",
                         "deliveryId",
+                        "agentRunId",
                         "status",
                         "reason",
                         "createdAt",
@@ -1159,7 +1160,8 @@ mod tests {
                 "reviewedAt":"2026-01-01T00:00:00Z","reviewerId":"payload-forged"}],
             "dispatches":[{"dispatchId":"dispatch_fixture","taskId":"task_fixture",
                 "kind":"execute","candidateId":null,"policyRevision":2,
-                "recipientAgentId":"agent_fixture","deliveryId":null,"status":"waiting",
+                "recipientAgentId":"agent_fixture","deliveryId":null,"agentRunId":"run_fixture",
+                "status":"waiting",
                 "reason":null,"createdAt":"2026-01-01T00:00:00Z",
                 "futureCredentialField":"dispatch-secret"}],
             "evaluatedAt":"2026-01-01T00:00:00Z",
@@ -1182,6 +1184,7 @@ mod tests {
             "a nested per-criterion verdict keeps only criterionId, satisfied, evidenceIds and note"
         );
         assert_eq!(projected["dispatches"][0]["status"], json!("waiting"));
+        assert_eq!(projected["dispatches"][0]["agentRunId"], json!("run_fixture"));
         assert_eq!(projected["evaluatedAt"], json!("2026-01-01T00:00:00Z"));
         assert!(!projected.to_string().contains("secret"));
         assert!(
