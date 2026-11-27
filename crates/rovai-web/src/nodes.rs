@@ -1,11 +1,13 @@
 //! Execution nodes for milestones B2, B3, and B4.
 //!
 //! Node tokens are stored as digests in SQLite, so they survive a server
-//! restart. Pairing codes stay in memory. A remote node is only used when
-//! `node-exec` targets it; it is not the mission execution host. A CLI the
-//! connected node did not report is refused before a process is started.
-//! Each dispatched run gets a separate shim credential, scoped to that run
-//! and member, which dies when the run ends or the node is revoked.
+//! restart. A pairing code is shown once when it is issued, and only its keyed
+//! digest stays in memory, so no later read can show that code again. A remote
+//! node is only used when `node-exec` targets it; it is not the mission
+//! execution host. A CLI the connected node did not report is refused before a
+//! process is started. Each dispatched run gets a separate shim credential,
+//! scoped to that run and member, which dies when the run ends or the node is
+//! revoked.
 
 use crate::auth::{Session, Sessions};
 use crate::{WebState, error};
@@ -249,16 +251,11 @@ impl PairingLimiter {
     }
 }
 
-struct OpenPairing {
-    code: String,
-    digest: [u8; 32],
-}
-
 struct Inner {
+    /// Keyed digest of each outstanding code and its expiry. The plaintext is
+    /// only ever the value returned by `issue_pairing`; redeeming or expiry
+    /// drops the digest, so nothing here can reproduce the code for display.
     pairings: HashMap<[u8; 32], Instant>,
-    /// Plaintext of the code an administrator may open again. Redeeming or
-    /// expiry drops it from `pairings`; the next issue replaces it.
-    open_pairing: Option<OpenPairing>,
     pairing_failures: PairingLimiter,
     nodes: HashMap<String, Node>,
     runs: HashMap<String, Run>,
@@ -326,7 +323,6 @@ impl Hub {
             builtin_jobs: Arc::new(tokio::sync::Semaphore::new(16)),
             inner: Mutex::new(Inner {
                 pairings: HashMap::new(),
-                open_pairing: None,
                 pairing_failures: PairingLimiter {
                     by_address: HashMap::new(),
                     global: VecDeque::new(),
@@ -342,28 +338,16 @@ impl Hub {
         }
     }
 
-    /// The same unused, unexpired code is returned until it is redeemed or
-    /// expires. A used or expired code is replaced and is not shown again.
+    /// Every call mints a fresh code and returns its plaintext exactly once.
+    /// Only the keyed digest and the expiry are kept, so a later call cannot
+    /// repeat an earlier code, and each code stays redeemable for its own full
+    /// [`PAIRING_TTL`] until it is used or expires.
     async fn issue_pairing(&self) -> (String, u64) {
         let mut inner = self.inner.lock().await;
         let now = Instant::now();
         inner.pairings.retain(|_, expiry| *expiry > now);
-        if let Some(open) = &inner.open_pairing {
-            if let Some(expiry) = inner.pairings.get(&open.digest).copied() {
-                if expiry > now {
-                    let remaining = expiry.saturating_duration_since(now).as_secs().max(1);
-                    return (open.code.clone(), remaining);
-                }
-            }
-        }
         let code = random_hex(8);
-        let digest = keyed_digest(PAIRING_KIND, &code);
-        let expiry = now + PAIRING_TTL;
-        inner.pairings.insert(digest, expiry);
-        inner.open_pairing = Some(OpenPairing {
-            code: code.clone(),
-            digest,
-        });
+        inner.pairings.insert(keyed_digest(PAIRING_KIND, &code), now + PAIRING_TTL);
         (code, PAIRING_TTL.as_secs())
     }
 
@@ -2065,6 +2049,9 @@ pub(crate) async fn pair(
     if !state.network.listen.ip().is_loopback() {
         return error(StatusCode::FORBIDDEN, "node_channel_requires_loopback");
     }
+    // This response is the only place the plaintext code exists. The hub keeps
+    // its keyed digest, so a later request mints a new code instead of
+    // returning this one again.
     let (code, expires_in_seconds) = state.nodes.issue_pairing().await;
     let (connect_url, reachability_warning) =
         connect_target(state.network.listen, state.network.public_origin());
@@ -3982,19 +3969,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unused_pairing_code_is_shown_again_until_it_is_redeemed() {
+    async fn pairing_code_is_shown_once_and_kept_only_as_its_keyed_digest() {
         let hub = test_hub();
         let (first, first_ttl) = hub.issue_pairing().await;
-        assert_eq!(first_ttl, PAIRING_TTL.as_secs());
         let (second, second_ttl) = hub.issue_pairing().await;
-        assert_eq!(first, second);
-        assert!(second_ttl <= first_ttl);
+        // Only issuance hands out plaintext, so a second issue cannot repeat an
+        // earlier code, and neither code loses the lifetime it was issued with.
+        assert_ne!(first, second, "an issued code must not be shown again");
+        assert_eq!(first_ttl, PAIRING_TTL.as_secs());
+        assert_eq!(second_ttl, PAIRING_TTL.as_secs());
+        {
+            let inner = hub.inner.lock().await;
+            assert_eq!(inner.pairings.len(), 2, "one digest per issued code");
+            for code in [first.as_str(), second.as_str()] {
+                let expiry = inner
+                    .pairings
+                    .get(&keyed_digest(PAIRING_KIND, code))
+                    .copied()
+                    .expect("the keyed digest is the only stored form of a code");
+                assert!(expiry > Instant::now(), "issued code is still inside its TTL");
+                assert!(
+                    expiry <= Instant::now() + PAIRING_TTL,
+                    "no issued code outlives the 10 minute TTL"
+                );
+            }
+        }
+        // The caller holds the plaintext; the hub only holds digests, so both
+        // codes redeem inside their TTL and using one drops even its digest.
         let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
         hub.redeem(&first, peer).await.expect("pairing code");
-        let (third, _) = hub.issue_pairing().await;
-        assert_ne!(third, first);
-        assert!(hub.redeem(&first, peer).await.is_err());
-        assert!(hub.redeem(&third, peer).await.is_ok());
+        assert_eq!(hub.inner.lock().await.pairings.len(), 1);
+        hub.redeem(&second, peer).await.expect("pairing code");
+        assert!(
+            hub.inner.lock().await.pairings.is_empty(),
+            "a redeemed code leaves no digest behind"
+        );
+        assert!(matches!(hub.redeem(&first, peer).await, Err("pairing_invalid")));
+    }
+
+    #[tokio::test]
+    async fn expired_pairing_code_is_rejected_and_its_digest_is_dropped() {
+        let hub = test_hub();
+        let (code, _) = hub.issue_pairing().await;
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        // Past its expiry the entry is unredeemable and the same sweep the
+        // background ticker runs removes it. The clock is written directly so
+        // the boundary is proven without sleeping out the 10 minute TTL.
+        {
+            let mut inner = hub.inner.lock().await;
+            inner.pairings.insert(
+                keyed_digest(PAIRING_KIND, &code),
+                Instant::now() - Duration::from_millis(1),
+            );
+        }
+        hub.expire().await;
+        assert!(hub.inner.lock().await.pairings.is_empty());
+        assert!(matches!(hub.redeem(&code, peer).await, Err("pairing_invalid")));
     }
 
     #[test]
