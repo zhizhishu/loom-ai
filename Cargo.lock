@@ -1657,6 +1657,7 @@ dependencies = [
  "croner",
  "dirs",
  "dunce",
+ "flate2",
  "getrandom 0.3.4",
  "gif",
  "image",

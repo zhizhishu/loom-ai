@@ -2,6 +2,7 @@ import type {
   LoomAcceptanceCriterion,
   LoomAcceptanceCriterionResult,
   LoomArtifactPreviewResult,
+  LoomArtifactPptxPreview,
   LoomDispatch,
   LoomReviewRecordInput,
   LoomReviewRecordReceipt,
@@ -41,6 +42,7 @@ export type ArtifactPreviewState =
   | { status: 'reading' }
   | { status: 'ready'; text: string }
   | { status: 'media'; media: ArtifactMedia }
+  | { status: 'pptx'; pptx: LoomArtifactPptxPreview }
   | { status: 'unavailable'; reason: 'too_large' | 'binary' | 'not_archived' }
   | { status: 'error'; message: string }
 
@@ -135,6 +137,9 @@ export function previewStateFromResult(result: LoomArtifactPreviewResult): Artif
   const reason = result.unavailableReason
   if (reason === 'too_large' || reason === 'binary' || reason === 'not_archived') {
     return { status: 'unavailable', reason }
+  }
+  if (result.pptxPreview && typeof result.pptxPreview === 'object') {
+    return { status: 'pptx', pptx: result.pptxPreview }
   }
   const mediaType = normalizeArtifactMediaType(result.mediaType)
   if (mediaType !== null) {
