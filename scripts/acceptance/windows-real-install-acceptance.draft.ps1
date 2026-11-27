@@ -800,7 +800,11 @@ function Get-PiModelParts([string]$Value) {
 
 function Test-PiModelId([string]$Value) {
     if (-not $Value) { return $false }
-    return ((Get-PiModelParts $Value).Id -eq $ModelId)
+    # PowerShell variable names and -eq are case-insensitive; compare the parsed id as one
+    # trimmed scalar with -ceq so an array-valued part can never turn this into a mismatch.
+    $actual = [string](@((Get-PiModelParts $Value).Id)[0])
+    $expected = [string](@($ModelId)[0])
+    return ($actual.Trim() -ceq $expected.Trim())
 }
 
 function Resolve-PiModelId($Installation) {
@@ -901,7 +905,10 @@ function Select-MemberAndModel {
     if (-not $permissions) {
         throw "runtime $adapterKind reports no member runtime defaults; its permissions are unknown."
     }
-    $modelId = Resolve-PiModelId $installation
+    # Not $modelId: PowerShell variable names are case-insensitive, so that name would
+    # overwrite the script-level $ModelId parameter and Test-PiModelId would compare the
+    # bare model id against the full pi:// identity.
+    $piExplicitModelId = Resolve-PiModelId $installation
 
     $profile = $null
     $configured = $null
@@ -913,14 +920,14 @@ function Select-MemberAndModel {
                     agentId = $agentId
                     expectedVersion = (Get-Value $profile 'version')
                     adapterKind = $adapterKind
-                    model = [ordered]@{ mode = 'explicit'; modelId = $modelId; options = [ordered]@{} }
+                    model = [ordered]@{ mode = 'explicit'; modelId = $piExplicitModelId; options = [ordered]@{} }
                     permissions = $permissions
                 }
             })
         if ([string](Get-Value $configured 'status') -eq 'applied') { break }
         $code = [string](Get-Value $configured 'code')
         if ($code -ne 'version_conflict' -or $attempt -eq 3) {
-            throw "members.runtime.set for $modelId was not applied: $code"
+            throw "members.runtime.set for $piExplicitModelId was not applied: $code"
         }
         # A concurrent writer bumped the profile version; re-read and retry.
         Start-Sleep -Milliseconds 500
@@ -1003,7 +1010,9 @@ function Invoke-RealModelTurn([string]$ThreadId, [string]$AgentId) {
     $observedModel = Get-Value $run 'runtimeModel'
     if (-not $observedModel) { $observedModel = Get-Value $reply 'runtimeModel' }
     $observedModelId = [string](Get-Value $observedModel 'modelId')
-    if ($observedModelId -and $observedModelId -ne $ModelId) {
+    # The Run reports the explicit pi:// identity (crates/rovai-core/src/pi/host.rs:2198-2205),
+    # so compare through Test-PiModelId instead of the bare id.
+    if ($observedModelId -and -not (Test-PiModelId $observedModelId)) {
         throw "the run reported model $observedModelId, not $ModelId."
     }
     if (-not $observedModelId) {
