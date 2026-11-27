@@ -20,6 +20,7 @@ import {
   artifactFileName,
   artifactPreviewKind,
   artifactReviewLabel,
+  artifactReviewRejectionMessage,
   artifactSizeLabel,
   artifactVersionLabel,
   newReviewDraft,
@@ -78,6 +79,23 @@ export function ArtifactReviewStatus({ kind }: { kind: ArtifactReviewKind }): Re
     {kind === 'fixing' && <p className="ln-artifact-fact-note">助手正在按审查意见返工。</p>}
     {kind === 'ready' && <p className="ln-artifact-fact-note">这份归档没有可验收的候选。</p>}
   </>
+}
+
+/**
+ * 受阻说明：任务被阻塞（或 Core 只写了阻塞原因）时，把真实原因和唯一安全的
+ * 下一步（刷新）摆出来。原因键是 task.blockedReason（阶段审查为 `stage review: <reason>`）。
+ * 不造 Core 没有的「继续/重新审查」按钮。
+ */
+export function ArtifactReviewBlockedNotice({ reason, onRefresh }: {
+  reason: string | null
+  onRefresh(): void
+}): React.JSX.Element {
+  const detail = (reason ?? '').trim()
+  return <div className="ln-artifact-state" role="status" data-state="blocked">
+    <strong>受阻</strong>
+    <p className="ln-artifact-fact-note">{detail === '' ? '任务已被阻塞，但没有记录阻塞原因。' : detail}</p>
+    <button type="button" className="ln-artifact-retry" onClick={onRefresh}>刷新记录</button>
+  </div>
 }
 
 /**
@@ -287,7 +305,7 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
         discardUnconfirmedReviewAttempt(client, intent, 'confirmed_rejection')
         if (!current()) return
         setAttempt(null)
-        setFailure('无法保存：'+outcome.message)
+        setFailure(artifactReviewRejectionMessage(outcome.code, outcome.message))
       } else if (current()) {
         setFailure(outcome.message+'。请核对上次提交。')
       }
@@ -432,6 +450,10 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
               </div>
 
               <ArtifactReviewStatus kind={facts.reviewKind}/>
+              {facts.reviewKind === 'blocked' && <ArtifactReviewBlockedNotice
+                reason={facts.task?.blockedReason ?? null}
+                onRefresh={() => { void onRefresh().catch(error => setFailure(readErrorMessage(error, '刷新失败'))) }}
+              />}
 
               <details className="ln-artifact-metadata"><summary>文件信息</summary>              <div className="ln-artifact-fact" data-fact="artifact">
                 <span className="ln-artifact-fact-label">档案</span>
@@ -494,7 +516,7 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
                   ? <p className="ln-artifact-fact-note">这是历史版本，请查看最新版本后再验收。</p>
                   : null}
 
-              {contextAvailable && candidate !== null && facts.latest && facts.review === null && receipt === null && attempt === null && draft === null
+              {contextAvailable && candidate !== null && facts.latest && facts.reviewable && facts.review === null && receipt === null && attempt === null && draft === null
                 && <div className="ln-artifact-review-composer">
                   <textarea aria-label="审阅意见草稿" placeholder="写下审阅意见…" value={reviewNote} onChange={event => {
                     const note=event.target.value; setReviewNote(note)
@@ -515,7 +537,7 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
                 </div>}
 
               {attempt !== null && <p className="ln-artifact-fact-note" role="status">请先核对上次提交，再修改验收意见。</p>}
-              {draft !== null && candidate !== null && <form
+              {draft !== null && candidate !== null && (facts.reviewable || attempt !== null) && <form
                 className="ln-artifact-review-form"
                 data-verdict={draft.verdict}
                 onSubmit={event => { event.preventDefault(); void record() }}
