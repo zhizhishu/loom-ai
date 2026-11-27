@@ -820,14 +820,23 @@ function Resolve-PiModelId($Installation) {
 }
 
 function Find-PiAssistantId {
-    $members = @(Invoke-CoreRequest 'members.list' ([ordered]@{}))
-    foreach ($member in $members) {
-        if (-not $member) { continue }
-        $configuration = Get-Value $member 'runtimeConfiguration'
-        if ([string](Get-Value $configuration 'adapterKind') -ne 'pi') { continue }
-        return [string](Get-Value $member 'agentId')
+    # Startup seeds the Pi 主助手 and binds it to Pi in the background task that runs after
+    # runtime discovery, i.e. after the Host already answers requests
+    # (crates/rovai-core/src/application.rs:21905-21913, :3717-3789). members.list only
+    # reports already bound members (:3797-3808), so one read is a race: poll until the
+    # binding lands, and only then fall back to creating a member.
+    $found = Wait-Until -TimeoutSeconds 90 -IntervalMilliseconds 1500 -Probe {
+        try { $members = @(Invoke-CoreRequest 'members.list' ([ordered]@{})) }
+        catch { $members = @() }
+        foreach ($member in $members) {
+            if (-not $member) { continue }
+            $configuration = Get-Value $member 'runtimeConfiguration'
+            if ([string](Get-Value $configuration 'adapterKind') -ne 'pi') { continue }
+            return [string](Get-Value $member 'agentId')
+        }
+        return $null
     }
-    return $null
+    return $found
 }
 
 function New-PiAssistant {
@@ -856,9 +865,20 @@ function New-PiAssistant {
     return $agentId
 }
 
+function Find-RuntimeInstallation([string]$AdapterKind, [switch]$ReadyOnly) {
+    foreach ($item in @(Invoke-CoreRequest 'runtime.installations.list' ([ordered]@{}))) {
+        if ([string](Get-Value $item 'adapterKind') -ne $AdapterKind) { continue }
+        if ($ReadyOnly -and [string](Get-Value (Get-Value $item 'snapshot') 'probeStatus') -ne 'ready') { continue }
+        return $item
+    }
+    return $null
+}
+
 function Select-MemberAndModel {
     # Fail fast on the credential and write the oct-chat provider catalog before any Pi
-    # probe runs, so the runtime snapshot can report the model this acceptance needs.
+    # probe runs, so the runtime snapshot can report the model this acceptance needs. The
+    # catalog is written after start: <data> only exists once the Host created it with its
+    # protected DACL.
     [void](Set-PiOctChatGateway)
     $agentId = Find-PiAssistantId
     if (-not $agentId) {
@@ -866,25 +886,27 @@ function Select-MemberAndModel {
         Add-Result 'MEMBER_CREATE' 'PASS' "members.create created the Pi assistant $agentId"
     }
     $adapterKind = 'pi'
-    $profile = Invoke-CoreRequest 'members.get' ([ordered]@{ agentId = $agentId })
-    $runtimeConfiguration = Get-Value $profile 'runtimeConfiguration'
-    $currentModel = [string](Get-Value (Get-Value $runtimeConfiguration 'model') 'modelId')
 
-    [void](Invoke-CoreRequest 'runtime.product.check' ([ordered]@{ runtimeKind = $adapterKind }))
-    $installation = Wait-Until -TimeoutSeconds $ReadyTimeoutSeconds -IntervalMilliseconds 1000 -Probe {
-        $list = @(Invoke-CoreRequest 'runtime.installations.list' ([ordered]@{}))
-        foreach ($item in $list) {
-            if ([string](Get-Value $item 'adapterKind') -ne $adapterKind) { continue }
-            if ([string](Get-Value (Get-Value $item 'snapshot') 'probeStatus') -ne 'ready') { continue }
-            return $item
-        }
-        return $null
+    # Freeze the member runtime BEFORE waiting for a probe. The startup binding and every
+    # members.runtime.set are configuration changes, and a runtime check that finishes
+    # afterwards is reported as Superseded: it publishes no ready installation snapshot
+    # (crates/rovai-core/src/application.rs:2324-2342, :28570-28582). A wait that starts
+    # before the set therefore never observes ready. The explicit model also replaces the
+    # startup binding's runtime_default, so the conversation runs on oct-chat.
+    $installation = Find-RuntimeInstallation $adapterKind
+    if (-not $installation) {
+        throw "runtime $adapterKind is not installed; the member runtime cannot be configured."
     }
-    if (-not $installation) { throw "runtime $adapterKind did not become ready." }
+    $permissions = Get-Value (Get-Value $installation 'memberRuntimeDefaults') 'permissions'
+    if (-not $permissions) {
+        throw "runtime $adapterKind reports no member runtime defaults; its permissions are unknown."
+    }
     $modelId = Resolve-PiModelId $installation
 
-    if (-not (Test-PiModelId $currentModel)) {
-        $permissions = Get-Value (Get-Value $installation 'memberRuntimeDefaults') 'permissions'
+    $profile = $null
+    $configured = $null
+    foreach ($attempt in 1..3) {
+        $profile = Invoke-CoreRequest 'members.get' ([ordered]@{ agentId = $agentId })
         $configured = Invoke-CoreRequest 'members.runtime.set' ([ordered]@{
                 commandId = (New-CommandId)
                 command = [ordered]@{
@@ -895,23 +917,61 @@ function Select-MemberAndModel {
                     permissions = $permissions
                 }
             })
-        if ([string](Get-Value $configured 'status') -ne 'applied') {
-            $code = [string](Get-Value $configured 'code')
+        if ([string](Get-Value $configured 'status') -eq 'applied') { break }
+        $code = [string](Get-Value $configured 'code')
+        if ($code -ne 'version_conflict' -or $attempt -eq 3) {
             throw "members.runtime.set for $modelId was not applied: $code"
         }
-        $profile = Invoke-CoreRequest 'members.get' ([ordered]@{ agentId = $agentId })
-        $runtimeConfiguration = Get-Value $profile 'runtimeConfiguration'
+        # A concurrent writer bumped the profile version; re-read and retry.
+        Start-Sleep -Milliseconds 500
     }
 
+    # runtime.product.check blocks until this round's probe finishes
+    # (crates/rovai-core/src/application.rs:4821-4868), but its reply is not evidence: a
+    # superseded or deferred attempt completes the operation without publishing a ready
+    # snapshot, so only runtime.installations.list decides and every round is retried.
+    $deadline = (Get-Date).AddSeconds($ReadyTimeoutSeconds)
+    $probeFailure = $null
+    $installation = Find-RuntimeInstallation $adapterKind -ReadyOnly
+    while (-not $installation -and (Get-Date) -lt $deadline) {
+        try {
+            [void](Invoke-CoreRequest 'runtime.product.check' ([ordered]@{ runtimeKind = $adapterKind }))
+            $probeFailure = $null
+        } catch {
+            $probeFailure = $_.Exception.Message
+        }
+        $installation = Find-RuntimeInstallation $adapterKind -ReadyOnly
+        if ($installation) { break }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $installation) {
+        $detail = if ($probeFailure) { ": $probeFailure" } else { '.' }
+        throw "runtime $adapterKind did not become ready $ReadyTimeoutSeconds s after members.runtime.set$detail"
+    }
+
+    $profile = Invoke-CoreRequest 'members.get' ([ordered]@{ agentId = $agentId })
+    $runtimeConfiguration = Get-Value $profile 'runtimeConfiguration'
     $resolvedModel = [string](Get-Value (Get-Value $runtimeConfiguration 'model') 'modelId')
     $readiness = [string](Get-Value (Get-Value $profile 'runtimeReadiness') 'status')
+    if ([string](Get-Value $runtimeConfiguration 'adapterKind') -ne $adapterKind) {
+        throw "the member runtime adapter is not $adapterKind after members.runtime.set."
+    }
     if (-not (Test-PiModelId $resolvedModel)) { throw "the member frozen model is $resolvedModel, not $ModelId." }
-    if ($readiness -ne 'ready') { throw "member runtime readiness is $readiness, not ready." }
+    # A configured member profile stops at installed_unverified
+    # (crates/rovai-core/src/agent_profile.rs:5650-5701); ready, light_ready and
+    # installed_unverified are the launch-eligible states
+    # (crates/rovai-core/src/member_execution_availability.rs:38-46). The ready Pi snapshot
+    # above is the proof that the runtime itself is verified.
+    if (@('ready', 'light_ready', 'installed_unverified') -notcontains $readiness) {
+        throw "member runtime readiness is $readiness, not launch-eligible."
+    }
     $script:Evidence['member'] = [ordered]@{
         agentId = $agentId
         adapterKind = $adapterKind
         modelId = $resolvedModel
         readiness = $readiness
+        installationId = [string](Get-Value $installation 'id')
+        probeStatus = [string](Get-Value (Get-Value $installation 'snapshot') 'probeStatus')
     }
     Add-Result 'MEMBER_MODEL' 'PASS' "$agentId uses $adapterKind / $resolvedModel"
     return $agentId
