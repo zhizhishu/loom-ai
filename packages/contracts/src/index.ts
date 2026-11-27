@@ -235,12 +235,28 @@ export interface AdapterPermissionConfig {
   values: Record<string, unknown>
 }
 
+export interface PiPurgePersonaSource {
+  fileName: string
+  sha256: string
+  name?: string
+  origin?: string
+  version?: string
+  license?: string
+  importedAt: string
+}
+
+export interface PiPurgeSelection {
+  mode: 'off' | 'append'
+  persona: string
+  source?: PiPurgePersonaSource
+}
+
 export interface MemberRuntimeConfiguration {
   adapterKind: AdapterKind
   model: ModelSelection
   permissions: AdapterPermissionConfig
   /** Pi-only; never a tool/OS permission. */
-  piPurge?: { mode: 'off' | 'append'; persona: string } | null
+  piPurge?: PiPurgeSelection | null
 }
 
 export type RuntimeReadinessStatus =
@@ -323,7 +339,7 @@ export interface SetMemberRuntimeConfigurationCommand {
   adapterKind: AdapterKind
   model: ModelSelection
   permissions: AdapterPermissionConfig
-  piPurge?: { mode: 'off' | 'append'; persona: string } | null
+  piPurge?: PiPurgeSelection | null
 }
 
 export interface ClearMemberRuntimeConfigurationCommand {

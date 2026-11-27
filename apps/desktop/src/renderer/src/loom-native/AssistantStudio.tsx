@@ -2,13 +2,14 @@ import { LearnedSkillsPanel } from './LearnedSkillsPanel'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { AssistantCreateWizard } from './AssistantCreateWizard'
 import { ASSISTANT_PRESETS } from './assistant-presets'
-import type { MemberRuntimeConfiguration, PermissionOptionDescriptor } from '@contracts'
+import type { MemberRuntimeConfiguration, PermissionOptionDescriptor, PiPurgeSelection } from '@contracts'
 import type { BusinessEnvironment } from '../business-environment'
 import type { AgentProfile } from './types'
 import { Avatar } from './Avatar'
 import { Icon } from './icons'
 import { ChoiceMenu, FormMessage, SurfaceDialog, UnsavedNotice } from './Controls'
 import { AssistantCapabilityEditor } from './AssistantCapabilityEditor'
+import { importPersonaMarkdownFile } from './persona-markdown'
 import { ExecutionPanel } from './ExecutionPanel'
 import {
   ASSISTANT_RUNTIME_REGISTRY, assistantIdentityOf, assistantRuntimeChoice,
@@ -101,8 +102,18 @@ export function AssistantStudio({ open, environment, agents, initialAgentId, ini
   const updatePermission = (key: string, value: unknown) => setRuntime(current => current ? {
     ...current, permissions: { ...current.permissions, values: { ...current.permissions.values, [key]: value } }
   } : current)
-  const updatePiPurge = (patch: Partial<{ mode: 'off' | 'append'; persona: string }>) => setRuntime(current =>
+  const updatePiPurge = (patch: Partial<PiPurgeSelection>) => setRuntime(current =>
     current?.adapterKind === 'pi' ? { ...current, piPurge: { mode: 'off', persona: '', ...current.piPurge, ...patch } } : current)
+  const importPersona = async (file: File) => {
+    setError(''); setMessage('')
+    try {
+      const imported = await importPersonaMarkdownFile(file)
+      updatePiPurge({ mode: 'append', persona: imported.persona, source: imported.source })
+      setMessage(`已导入 ${imported.source.fileName}，保存后自下次运行开始生效。`)
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '人格 Markdown 导入失败。')
+    }
+  }
   const changedDangerous = useMemo(() => {
     if (!runtime || !option) return []
     const before = local?.runtimeConfiguration?.adapterKind === runtime.adapterKind ? local.runtimeConfiguration.permissions.values : {}
@@ -201,7 +212,9 @@ export function AssistantStudio({ open, environment, agents, initialAgentId, ini
           <p className="ln-native-help">追加（Append）把下面的设定放在 Pi 原始系统提示词前面，不改写宿主提示词，也不扩大工具与文件授权。</p>
           <section className="ln-review-card" aria-label="Pi Purge 人格扩展">
             <label className="ln-field"><span>启用方式</span><ChoiceMenu label="Pi Purge 模式" theme={theme} value={runtime.piPurge?.mode ?? 'off'} disabled={busy} onChange={value => updatePiPurge({mode: value as 'off' | 'append'})} choices={[{ value:'off', label:'关闭', description:'Off' }, { value:'append', label:'追加助手设定', description:'Append' }]}/></label>
+            <label className="ln-field"><span>导入 Markdown 人格</span><input aria-label="导入 Markdown 人格" type="file" accept=".md,text/markdown" disabled={busy} onChange={event => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ''; if (file) void importPersona(file) }}/><small>读取 frontmatter 的 name/version/license，正文进入 Append；hash 是原始 Markdown 文件的内容摘要。</small></label>
             <label className="ln-field"><span>角色与偏好</span><textarea aria-label="Pi Purge 人格提示词" rows={6} maxLength={16 * 1024} disabled={busy} value={runtime.piPurge?.persona ?? ''} placeholder="写清这个助手的角色、表达风格和任务偏好" onChange={event => updatePiPurge({persona:event.target.value})}/><small>{purgeStatus}{purgeDirty ? ' · 有未保存修改，保存后自下次运行开始生效。' : ''}</small></label>
+            {runtime.piPurge?.source && <div className="ln-review-card" aria-label="人格来源"><h3>导入来源</h3><p>{runtime.piPurge.source.name ? `${runtime.piPurge.source.name} · ` : ''}{runtime.piPurge.source.fileName}{runtime.piPurge.source.origin ? ` · ${runtime.piPurge.source.origin}` : ''}{runtime.piPurge.source.version ? ` · v${runtime.piPurge.source.version}` : ''}{runtime.piPurge.source.license ? ` · ${runtime.piPurge.source.license}` : ''}</p><p><small>SHA-256 {runtime.piPurge.source.sha256} · 导入于 {runtime.piPurge.source.importedAt}</small></p></div>}
           </section>
           {purgeGrantWarning}
           {error && <FormMessage error>{error}</FormMessage>}{message && <FormMessage>{message}</FormMessage>}

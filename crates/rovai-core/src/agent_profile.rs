@@ -464,12 +464,47 @@ pub enum PiPurgeMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PiPurgePersonaSource {
+    pub file_name: String,
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    pub imported_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PiPurgeSelection {
     pub mode: PiPurgeMode,
     pub persona: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PiPurgePersonaSource>,
 }
 
 const PI_PURGE_PERSONA_MAX_BYTES: usize = 16 * 1024;
+
+fn valid_pi_purge_persona_source(source: &PiPurgePersonaSource) -> bool {
+    fn short_text(value: &str, max_bytes: usize) -> bool {
+        !value.is_empty()
+            && value.len() <= max_bytes
+            && !value.contains('\0')
+            && !value.chars().any(char::is_control)
+    }
+    source.sha256.len() == 64
+        && source.sha256.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        && short_text(&source.file_name, 255)
+        && source.name.as_deref().is_none_or(|value| short_text(value, 120))
+        && source.origin.as_deref().is_none_or(|value| short_text(value, 500))
+        && source.version.as_deref().is_none_or(|value| short_text(value, 120))
+        && source.license.as_deref().is_none_or(|value| short_text(value, 120))
+        && chrono::DateTime::parse_from_rfc3339(&source.imported_at).is_ok()
+}
 
 // Legacy JSON column stores the Pi-only prompt extension alongside (not inside)
 // the permission value map. Core strips it before checking native permissions;
@@ -3082,6 +3117,7 @@ impl AgentProfileService {
                     || selection.persona.len() > PI_PURGE_PERSONA_MAX_BYTES
                     || selection.persona.contains('\0')
                     || (selection.mode == PiPurgeMode::Append && selection.persona.trim().is_empty())
+                    || selection.source.as_ref().is_some_and(|source| !valid_pi_purge_persona_source(source))
                 {
                     return Ok(CommandHandlerResult::rejected(
                         "pi_purge_configuration_invalid",
@@ -6488,6 +6524,7 @@ fn pi_purge_selection_roundtrips_without_entering_runtime_permissions() {
     let selection = PiPurgeSelection {
         mode: PiPurgeMode::Append,
         persona: "Use concise responses".to_owned(),
+        source: None,
     };
     let saved = permissions_with_pi_purge(&permissions, Some(&selection)).unwrap();
     let native: AdapterPermissionConfig = serde_json::from_str(&saved).unwrap();
@@ -6503,15 +6540,38 @@ fn pi_purge_selection_roundtrips_without_entering_runtime_permissions() {
         + ",\"piPurge\":{\"mode\":\"unknown\",\"persona\":\"x\"}}";
     assert!(saved_pi_purge(&malformed).is_err());
 
+    let source = PiPurgePersonaSource {
+        file_name: "reviewer.md".to_owned(),
+        sha256: "a".repeat(64),
+        name: Some("Reviewer".to_owned()),
+        origin: Some("https://example.invalid/persona".to_owned()),
+        version: Some("1.0.0".to_owned()),
+        license: Some("MIT".to_owned()),
+        imported_at: "2026-11-27T00:00:00Z".to_owned(),
+    };
+    assert!(valid_pi_purge_persona_source(&source));
+    let mut bad_source = source.clone();
+    bad_source.sha256 = "A".repeat(64);
+    assert!(!valid_pi_purge_persona_source(&bad_source));
+    let sourced = PiPurgeSelection {
+        mode: PiPurgeMode::Append,
+        persona: "Use concise responses".to_owned(),
+        source: Some(source),
+    };
+    let saved = permissions_with_pi_purge(&permissions, Some(&sourced)).unwrap();
+    assert_eq!(saved_pi_purge(&saved).unwrap(), Some(sourced));
+
     // Append only runs with a Core-issued workspace file grant. Both guarded spellings satisfy it,
     // while native, missing and malformed policies do not; nothing is upgraded to satisfy the purge.
     let append = PiPurgeSelection {
         mode: PiPurgeMode::Append,
         persona: "Use concise responses".to_owned(),
+        source: None,
     };
     let off = PiPurgeSelection {
         mode: PiPurgeMode::Off,
         persona: "Use concise responses".to_owned(),
+        source: None,
     };
     for (values, expected) in [
         (json!({ "loom_file_access": "workspace_read_only" }), false),
