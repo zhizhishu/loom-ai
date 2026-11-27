@@ -7003,6 +7003,242 @@ fn retryable_failure_redispatches_once() {
     }
 }
 
+fn retry_test_handoff_run(database: &mut OwnedTestDatabase, task: &DispatchedTask) -> String {
+    let (claim_id, fence_generation) =
+        open_claim_of(database, &task.plan_id, "task_a", &task.run_id);
+    let candidate = candidate_record(
+        database,
+        LoomCandidateRecordInput {
+            mission_id: task.mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: task.run_id.clone(),
+            claim_id,
+            fence_generation,
+            command_id: "handoff_original_candidate".into(),
+            content_hash: "sha256:handoff-candidate".into(),
+            evidence_ids: vec![],
+            acceptance_criteria_version: "ac-v1".into(),
+            previous_candidate_id: None,
+        },
+    )
+    .unwrap();
+    persist_retry_fixture_terminal(database, &task.run_id, "succeeded");
+    let review_run = dispatched_review_run(database, &task.camp_id, &candidate.candidate_id);
+    let manifest =
+        control::candidate_manifest_hash(database.connection(), &candidate.candidate_id).unwrap();
+    control::stage_review_record(
+        database,
+        &task.mission_id,
+        REVIEWER_AGENT,
+        &review_run,
+        "handoff_review_pass",
+        stage_input(&candidate.candidate_id, 1, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap();
+    persist_retry_fixture_terminal(database, &review_run, "succeeded");
+    assert_eq!(control::admit_due_dispatches(database).unwrap(), 1);
+    let mut runs = claim_mission_lane(database, &task.camp_id, 1);
+    assert_eq!(runs.len(), 1);
+    let run_id = runs.pop().unwrap();
+    assert_eq!(
+        claim_the_run(database, &task.camp_id, &run_id).result.status,
+        crate::command::CommandResultStatus::Accepted,
+    );
+    let kind: String = database.connection().query_row(
+        "SELECT dispatch.kind FROM loom_control_dispatch dispatch
+         JOIN camp_message_delivery delivery ON delivery.id=dispatch.delivery_id
+         WHERE delivery.claimed_agent_run_id=?1",
+        [&run_id], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(kind, "HANDOFF");
+    run_id
+}
+
+fn persist_accepted_input_handoff_loss(
+    database: &OwnedTestDatabase,
+    run_id: &str,
+    user_closed: bool,
+) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let details = user_closed.then_some(
+        r#"{"reason":"core_restarted_after_runtime_input_accepted","resolution":"user_closed_unknown_outcome"}"#,
+    );
+    assert_eq!(database.connection().execute(
+        "UPDATE agent_run SET status='failed', ended_at=?2, updated_at=?2,
+         terminal_resolution_source=NULL, terminal_reason_code=NULL,
+         last_error_code='accepted_input_outcome_unknown', last_error_details_ref=?3,
+         public_runtime_failure_json=NULL, manual_retry_allowed=0,
+         execution_lease_owner=NULL, execution_lease_expires_at=NULL WHERE id=?1",
+        params![run_id, &now, details],
+    ).unwrap(), 1);
+    assert_eq!(database.connection().execute(
+        "UPDATE camp_message_delivery SET status='failed',
+         failure_code='accepted_input_outcome_unknown', ended_at=?2, updated_at=?2
+         WHERE claimed_agent_run_id=?1 AND status='claimed'",
+        params![run_id, &now],
+    ).unwrap(), 1);
+}
+
+#[test]
+fn handoff_accepted_input_loss_reconciles_only_after_successor_fact() {
+    let mut database = fixture();
+    let now = chrono::Utc::now();
+    let task = retry_test_task(&mut database, now);
+    let handoff_run = retry_test_handoff_run(&mut database, &task);
+    let (old_dispatch, old_run, old_key) = latest_dispatch_and_run(&database, "task_a");
+    assert_eq!(old_run.as_deref(), Some(handoff_run.as_str()));
+    persist_accepted_input_handoff_loss(&database, &handoff_run, false);
+    let before = loom_deliveries(&database);
+    let judged = now + chrono::Duration::seconds(5);
+
+    assert_eq!(tick_at(&mut database, judged).admitted, 0);
+    assert_eq!(loom_deliveries(&database), before);
+    let (latest_dispatch, _, latest_key) = latest_dispatch_and_run(&database, "task_a");
+    assert_eq!(latest_dispatch, old_dispatch);
+    assert_eq!(latest_key, old_key);
+    let blocked: (String, String) = database.connection().query_row(
+        "SELECT status, reason FROM loom_control_dispatch WHERE dispatch_id=?1",
+        [&old_dispatch], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(blocked, ("BLOCKED".into(), "accepted_input_outcome_unknown".into()));
+
+    database.connection().execute(
+        "UPDATE loom_candidate SET acceptance_status='ACCEPTED'
+         WHERE plan_id=?1 AND task_id='task_a'",
+        [&task.plan_id],
+    ).unwrap();
+    database.connection().execute(
+        "UPDATE loom_task SET status='DONE'
+         WHERE plan_id=?1 AND task_id='task_a'",
+        [&task.plan_id],
+    ).unwrap();
+    assert_eq!(tick_at(&mut database, judged).admitted, 0);
+    assert_eq!(loom_deliveries(&database), before);
+    let reconciled: (String, String) = database.connection().query_row(
+        "SELECT status, reason FROM loom_control_dispatch WHERE dispatch_id=?1",
+        [old_dispatch], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(reconciled, ("SETTLED".into(), "loom.dispatch_handoff_reconciled".into()));
+}
+
+#[test]
+fn handoff_user_closed_unknown_outcome_does_not_redispatch() {
+    let mut database = fixture();
+    let now = chrono::Utc::now();
+    let task = retry_test_task(&mut database, now);
+    let handoff_run = retry_test_handoff_run(&mut database, &task);
+    persist_accepted_input_handoff_loss(&database, &handoff_run, true);
+    let before = loom_deliveries(&database);
+    assert_eq!(tick_at(&mut database, now + chrono::Duration::seconds(5)).admitted, 0);
+    assert_eq!(loom_deliveries(&database), before);
+}
+
+
+fn settle_controlled_shutdown(
+    database: &mut OwnedTestDatabase,
+    generation: &str,
+) -> crate::runtime::ControlledShutdownCycleSettlement {
+    let runtime = crate::runtime::ExecutionRuntimeService::default();
+    runtime
+        .record_controlled_shutdown_cycle(database, generation, 3)
+        .unwrap();
+    runtime
+        .settle_controlled_shutdown_runs(database, generation, true, (0, 0))
+        .unwrap()
+}
+
+#[test]
+fn controlled_shutdown_cancellation_redispatches_interrupted_work_once() {
+    let mut database = fixture();
+    let now = chrono::Utc::now();
+    let task = retry_test_task(&mut database, now);
+    let (old_dispatch, old_run, old_key) = latest_dispatch_and_run(&database, "task_a");
+    assert_eq!(old_run.as_deref(), Some(task.run_id.as_str()));
+    let before = loom_deliveries(&database);
+
+    let settlement = settle_controlled_shutdown(&mut database, "shutdown-loom-retry");
+    assert!(settlement
+        .fenced_agent_runs
+        .iter()
+        .any(|run| run.agent_run_id == task.run_id));
+    let run_facts: (String, String) = database
+        .connection()
+        .query_row(
+            "SELECT status, cancel_reason_code FROM agent_run WHERE id=?1",
+            [&task.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(run_facts.0, "cancelled");
+    assert!(matches!(
+        run_facts.1.as_str(),
+        "planned_shutdown_cancelled" | "app_shutdown_cancel_all"
+    ));
+    // Accepted input is interruption evidence, not an uncertain external effect. The durable
+    // shutdown receipt may therefore say the input survived while still allowing one handoff-shaped
+    // retry whose body tells the next executor to inspect existing work first.
+    assert_eq!(
+        database.connection().execute(
+            r#"UPDATE event_log
+             SET payload_json=json_set(
+                 payload_json,
+                 '$.acceptedInputPreserved', json('true'),
+                 '$.externalEffectEvidencePreserved', json('true'))
+             WHERE event_type='agent_run.cancelled' AND entity_type='agent_run' AND entity_id=?1"#,
+            [&task.run_id],
+        ).unwrap(),
+        1
+    );
+
+    assert_eq!(tick_at(&mut database, now + chrono::Duration::seconds(5)).admitted, 1);
+    assert_eq!(loom_deliveries(&database), before + 1);
+    let (retry_dispatch, retry_run, retry_key) = latest_dispatch_and_run(&database, "task_a");
+    assert_ne!(old_dispatch, retry_dispatch);
+    assert_eq!(retry_run, None);
+    assert_eq!(control::request_epoch(&retry_key), control::request_epoch(&old_key));
+    let retry_parts: Vec<String> = serde_json::from_str(&retry_key).unwrap();
+    assert_eq!(retry_parts[retry_parts.len() - 2], "watchdog_retry");
+    assert_eq!(retry_parts[retry_parts.len() - 1], "2");
+    let retry_body: String = database
+        .connection()
+        .query_row(
+            "SELECT message.body
+             FROM loom_control_dispatch dispatch
+             JOIN camp_message_delivery delivery ON delivery.id=dispatch.delivery_id
+             JOIN camp_message message ON message.id=delivery.message_id
+             WHERE dispatch.dispatch_id=?1",
+            [&retry_dispatch],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(retry_body.contains("先检查已有成果，不重复外部操作。"));
+
+    let before_second = loom_deliveries(&database);
+    assert_eq!(tick_at(&mut database, now + chrono::Duration::seconds(10)).admitted, 0);
+    assert_eq!(loom_deliveries(&database), before_second);
+}
+
+#[test]
+fn controlled_shutdown_with_unsettled_effect_does_not_redispatch() {
+    let mut database = fixture();
+    let now = chrono::Utc::now();
+    let task = retry_test_task(&mut database, now);
+    settle_controlled_shutdown(&mut database, "shutdown-loom-uncertain");
+    let rewritten = database
+        .connection()
+        .execute(
+            r#"UPDATE event_log
+             SET payload_json=json_set(payload_json, '$.externalEffectEvidencePreserved', json('true'), '$.deliveriesClosed', 1)
+             WHERE event_type='agent_run.cancelled' AND entity_type='agent_run' AND entity_id=?1"#,
+            [&task.run_id],
+        )
+        .unwrap();
+    assert_eq!(rewritten, 1);
+    let before = loom_deliveries(&database);
+    assert_eq!(tick_at(&mut database, now + chrono::Duration::seconds(5)).admitted, 0);
+    assert_eq!(loom_deliveries(&database), before);
+}
+
 #[test]
 fn pi_accepted_input_failure_redispatches_once() {
     let mut database = fixture();
