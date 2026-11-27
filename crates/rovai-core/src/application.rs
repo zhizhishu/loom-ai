@@ -1010,6 +1010,8 @@ fn request_runs_outside_main_queue(method: &str) -> bool {
             | "host.upload.removePastedText"
             | "camp.messages.withdraw"
             | "userAutomation.camp.send"
+            | "webhooks.submit"
+            | "webhooks.get"
             | "automations.schedulerControl"
             | "automations.run"
             | "missions.createWithAttachments"
@@ -1314,6 +1316,7 @@ fn request_invalidates_navigation(method: &str) -> bool {
             | "camp.messages.send"
             | "camp.messages.withdraw"
             | "userAutomation.camp.send"
+            | "webhooks.submit"
             | "agentRuns.cancel"
             | "agentRuns.continue"
             | "channels.executionConsole.agentRun.cancel"
@@ -12947,6 +12950,61 @@ impl Core {
                 let params: SendUserAutomationThreadMessageParams =
                     serde_json::from_value(request.params.clone())?;
                 self.send_user_automation_camp_message_request(params).await
+            }
+            "webhooks.submit" => {
+                let params: rovai_core::webhook::WebhookSubmitParams =
+                    serde_json::from_value(request.params.clone())?;
+                rovai_core::webhook::validate_webhook_submit(&params)?;
+                let body = rovai_core::webhook::webhook_body(
+                    &params.route_name,
+                    &params.instruction,
+                    &params.payload,
+                )?;
+                let result = self
+                    .send_user_automation_camp_message_request(
+                        SendUserAutomationThreadMessageParams {
+                            command_id: rovai_core::webhook::webhook_command_id(
+                                &params.agent_id,
+                                &params.request_id,
+                            ),
+                            camp_id: params.camp_id.clone(),
+                            agent_id: params.agent_id.clone(),
+                            body,
+                            execution: Some(ExecutionRequest {
+                                task_id: None,
+                                purpose: format!("Webhook · {}", params.route_name),
+                                completion_role: "required".to_string(),
+                                budget: None,
+                            }),
+                        },
+                    )
+                    .await?;
+                Ok(rovai_core::webhook::initial_receipt(
+                    &params.agent_id,
+                    &params.request_id,
+                    &result["commandResult"],
+                    result["replayed"].as_bool().unwrap_or(false),
+                ))
+            }
+            "webhooks.get" => {
+                let params: rovai_core::webhook::WebhookStatusParams =
+                    serde_json::from_value(request.params.clone())?;
+                rovai_core::webhook::validate_webhook_status(&params)?;
+                let database = self.database.lock().await;
+                Ok(
+                    rovai_core::webhook::load_receipt(
+                        &database,
+                        &params.agent_id,
+                        &params.request_id,
+                    )?
+                    .unwrap_or_else(|| {
+                        json!({
+                            "status": "not_found",
+                            "requestId": params.request_id,
+                            "botId": params.agent_id,
+                        })
+                    }),
+                )
             }
             "runtime.pendingExecution.cancel" => {
                 let params: CancelPendingExecutionParams =

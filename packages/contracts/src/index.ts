@@ -4615,6 +4615,8 @@ export type CoreMethod =
   | 'thread.messages.send'
   | 'thread.messages.withdraw'
   | 'userAutomation.thread.send'
+  | 'webhooks.submit'
+  | 'webhooks.get'
   | 'action.approvals.resolve'
   | 'pi.extensionUi.pending'
   | 'pi.extensionUi.respond'

@@ -115,6 +115,27 @@ function stringField(value: RecordValue, key: string): string {
   return field
 }
 
+function isWellFormedUtf16(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      index += 1
+      if (index >= value.length || value.charCodeAt(index) < 0xdc00 || value.charCodeAt(index) > 0xdfff) return false
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false
+    }
+  }
+  return true
+}
+
+function webhookIdField(value: RecordValue, key: string): string {
+  const field = stringField(value, key)
+  if (!isWellFormedUtf16(field) || Buffer.byteLength(field, 'utf8') > 256) {
+    throw new UserAutomationError('automation_invalid_input', `${key} must be a well-formed webhook id of at most 256 UTF-8 bytes`)
+  }
+  return field
+}
+
 function optionalBoolean(value: RecordValue, key: string): boolean {
   const field = value[key]
   if (field === undefined) return false
@@ -408,6 +429,46 @@ export async function dispatchUserAutomation(
       return dependencies.core.request<AgentRunDiagnosticView>('agentRuns.diagnostic.get', {
         agentRunId: stringField(input, 'agentRunId')
       })
+    case 'webhook.submit': {
+      const allowed = ['requestId', 'threadId', 'campId', 'botId', 'agentId', 'memberId', 'routeName', 'instruction', 'payload']
+      if (Object.keys(input).some((key) => !allowed.includes(key))) {
+        throw new UserAutomationError('automation_invalid_input', 'Unsupported webhook submit option')
+      }
+      if (input.campId !== undefined && input.threadId !== undefined) {
+        throw new UserAutomationError('automation_invalid_input', 'campId and threadId cannot be supplied together')
+      }
+      const botKeys = ['botId', 'agentId', 'memberId'].filter((key) => input[key] !== undefined)
+      if (botKeys.length !== 1) {
+        throw new UserAutomationError('automation_invalid_input', 'Exactly one botId/agentId/memberId is required')
+      }
+      const routeName = stringField(input, 'routeName')
+      const instruction = stringField(input, 'instruction')
+      if (routeName.length > 80) throw new UserAutomationError('automation_invalid_input', 'routeName must be at most 80 characters')
+      if (instruction.length > 8000) throw new UserAutomationError('automation_invalid_input', 'instruction must be at most 8000 characters')
+      const payload = record(input.payload, 'payload')
+      return dependencies.core.request('webhooks.submit', {
+        requestId: webhookIdField(input, 'requestId'),
+        threadId: stringField(input, input.threadId === undefined ? 'campId' : 'threadId'),
+        botId: webhookIdField(input, botKeys[0]),
+        routeName,
+        instruction,
+        payload
+      })
+    }
+    case 'webhook.status': {
+      const allowed = ['requestId', 'botId', 'agentId', 'memberId']
+      if (Object.keys(input).some((key) => !allowed.includes(key))) {
+        throw new UserAutomationError('automation_invalid_input', 'Unsupported webhook status option')
+      }
+      const botKeys = ['botId', 'agentId', 'memberId'].filter((key) => input[key] !== undefined)
+      if (botKeys.length !== 1) {
+        throw new UserAutomationError('automation_invalid_input', 'Exactly one botId/agentId/memberId is required')
+      }
+      return dependencies.core.request('webhooks.get', {
+        requestId: webhookIdField(input, 'requestId'),
+        botId: webhookIdField(input, botKeys[0])
+      })
+    }
     case 'trace.export': {
       const allowed = ['since', 'until', 'threadIds', 'excludeThreadIds', 'excludeAutomationIds']
       if (Object.keys(input).some((key) => !allowed.includes(key))) {

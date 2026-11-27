@@ -143,6 +143,59 @@ describe('User Automation transport', () => {
     })
   })
 
+  it('submits Webhook tasks through the closed Core operation with field whitelists', async () => {
+    const calls: Array<{ method: CoreMethod; params: unknown }> = []
+    const core = {
+      async request<T>(method: CoreMethod, params?: unknown): Promise<T> {
+        calls.push({ method, params })
+        return { status: 'queued', requestId: 'request-1', botId: 'agent_1', replayed: false } as T
+      }
+    }
+    const dependencies = {
+      core,
+      openThread: async (threadId: string) => ({ threadId, opened: true as const }),
+      appVersion: 'test'
+    }
+
+    const result = await dispatchUserAutomation('webhook.submit', {
+      requestId: 'request-1',
+      threadId: 'rvcamp_test',
+      botId: 'agent_1',
+      routeName: 'deploy',
+      instruction: 'handle the deploy payload',
+      payload: { deploymentId: 'dep-1' }
+    }, dependencies)
+
+    expect(result).toMatchObject({ status: 'queued', requestId: 'request-1' })
+    expect(calls).toEqual([{ method: 'webhooks.submit', params: {
+      requestId: 'request-1',
+      threadId: 'rvcamp_test',
+      botId: 'agent_1',
+      routeName: 'deploy',
+      instruction: 'handle the deploy payload',
+      payload: { deploymentId: 'dep-1' }
+    } }])
+
+    await expect(dispatchUserAutomation('webhook.submit', {
+      requestId: 'request-1',
+      threadId: 'rvcamp_test',
+      botId: 'agent_1',
+      routeName: 'deploy',
+      instruction: 'handle the deploy payload',
+      payload: { deploymentId: 'dep-1' },
+      rawSql: 'SELECT 1'
+    }, dependencies)).rejects.toMatchObject({ code: 'automation_invalid_input' })
+    await expect(dispatchUserAutomation('webhook.submit', {
+      requestId: 'request-1',
+      threadId: 'rvcamp_test',
+      botId: 'agent_1',
+      routeName: 'deploy',
+      instruction: 'handle the deploy payload',
+      payload: []
+    }, dependencies)).rejects.toMatchObject({ code: 'automation_invalid_input' })
+    expect(calls).toHaveLength(1)
+  })
+
   it('fails closed when Core ever returns Pending Execution', async () => {
     const core = {
       async request<T>(method: CoreMethod): Promise<T> {

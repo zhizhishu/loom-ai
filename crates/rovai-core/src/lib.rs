@@ -96,6 +96,7 @@ pub mod member_tool;
 pub mod memory;
 pub mod memory_retrieval;
 pub mod memory_secret;
+pub mod webhook;
 pub mod memory_tool;
 mod message_changes;
 pub mod message_delivery;
