@@ -1790,9 +1790,8 @@ mod legacy_stage_tests {
             "loom-node: legacy spawn detail phase=child_create io=permission_denied os=13");
         // A boundary error whose chain carries a token and a path keeps only the
         // closed fields: no inner text may reach the diagnostic.
-        let boundary = Err::<(), anyhow::Error>(anyhow::anyhow!(
-            "adopt failed token={} path={}", SECRET_TOKEN, ACCOUNT_PATH))
-            .context(std::io::Error::from_raw_os_error(1))
+        let boundary = Err::<(), std::io::Error>(std::io::Error::from_raw_os_error(1))
+            .context(format!("adopt failed token={} path={}", SECRET_TOKEN, ACCOUNT_PATH))
             .expect_err("boundary failure");
         let io = boundary.chain().find_map(|cause| cause.downcast_ref::<std::io::Error>());
         let line = legacy_spawn_detail(LEGACY_SPAWN_BOUNDARY_ADOPT, io);
