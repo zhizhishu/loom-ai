@@ -2217,6 +2217,41 @@ pub(crate) struct PrepareWorkspaceRequest {
     source: String,
 }
 
+/// The individually admitted `missions.workspace.prepareRemote` params.
+///
+/// A browser names the Mission, the node and that node's own source root. It
+/// never names `campId`: the Host reads the Thread Core already stored for the
+/// Mission, so the row this prepares is the one the remote catalog offers back.
+/// `campId` and `source` are therefore unknown fields here, not aliases.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PrepareRemoteWorkspaceRequest {
+    mission_id: String,
+    node_id: String,
+    source_root: String,
+}
+
+/// One prepare request, whichever admission produced it. The HTTP route and the
+/// Web operation both end in [`prepare_workspace_record`]; there is one prepare
+/// implementation and this is only its input.
+pub(crate) struct PrepareWorkspace {
+    mission_id: String,
+    camp_id: String,
+    node_id: String,
+    source: String,
+}
+
+impl From<PrepareWorkspaceRequest> for PrepareWorkspace {
+    fn from(request: PrepareWorkspaceRequest) -> Self {
+        Self {
+            mission_id: request.mission_id,
+            camp_id: request.camp_id,
+            node_id: request.node_id,
+            source: request.source,
+        }
+    }
+}
+
 // A remote source is an executor-local path. Only that executor can apply its
 // platform's absolute-path rules; prepare_git_worktree rechecks it before Git I/O.
 fn valid_workspace_source(source: &str, local: bool) -> bool {
@@ -2224,6 +2259,74 @@ fn valid_workspace_source(source: &str, local: bool) -> bool {
         && source.len() <= 4096
         && !source.contains('\0')
         && (!local || std::path::Path::new(source).is_absolute())
+}
+
+/// Admit one prepare against this Host's node registry. `role` is what the
+/// registry says about `node_id`; `None` means this Host never paired that node,
+/// which is a refusal before any socket or Git work, never a local fallback.
+fn admit_workspace_prepare(
+    request: &PrepareWorkspace,
+    role: Option<&str>,
+) -> Result<String, (StatusCode, &'static str)> {
+    if !valid_scope_id(&request.mission_id, 80)
+        || !valid_scope_id(&request.camp_id, 80)
+        || !valid_scope_id(&request.node_id, 80)
+    {
+        return Err((StatusCode::BAD_REQUEST, "invalid_workspace"));
+    }
+    let role = role.ok_or((StatusCode::NOT_FOUND, "node_not_found"))?;
+    // Only the node's own role decides whether this Host can read the path.
+    if !valid_workspace_source(&request.source, role == "local") {
+        return Err((StatusCode::BAD_REQUEST, "invalid_workspace"));
+    }
+    Ok(role.to_owned())
+}
+
+/// The operation's params are its own shape: an omitted, extra or renamed field
+/// is refused, never folded into the HTTP route's `campId`/`source` body.
+fn prepare_remote_params(
+    params: Value,
+) -> Result<PrepareRemoteWorkspaceRequest, (StatusCode, &'static str)> {
+    // serde also reads a JSON sequence as positional struct input, so the shape is
+    // checked before any field is read: these params are exactly one object.
+    if !params.is_object() {
+        return Err((StatusCode::BAD_REQUEST, "invalid_workspace"));
+    }
+    let request = serde_json::from_value::<PrepareRemoteWorkspaceRequest>(params)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid_workspace"))?;
+    if !valid_scope_id(&request.mission_id, 80) || !valid_scope_id(&request.node_id, 80) {
+        return Err((StatusCode::BAD_REQUEST, "invalid_workspace"));
+    }
+    // The source root is judged by the node's role inside the shared prepare.
+    Ok(request)
+}
+
+/// The Thread a Mission owns, read from the projection Core already keeps. The
+/// Web Host does not invent a `campId` for a Mission it was only given the id of.
+async fn mission_thread(
+    state: &WebState,
+    mission_id: &str,
+) -> Result<String, (StatusCode, &'static str)> {
+    let reply = match tokio::time::timeout(
+        Duration::from_secs(30),
+        state.core.request("missions.get", json!({ "missionId": mission_id })),
+    )
+    .await
+    {
+        Ok(Ok(reply)) => reply,
+        _ => return Err((StatusCode::SERVICE_UNAVAILABLE, "core_unavailable")),
+    };
+    if reply.error.is_some() {
+        return Err((StatusCode::NOT_FOUND, "mission_not_found"));
+    }
+    reply
+        .result
+        .as_ref()
+        .and_then(|mission| mission.get("threadId"))
+        .and_then(Value::as_str)
+        .filter(|thread_id| valid_scope_id(thread_id, 80))
+        .map(str::to_owned)
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "core_unavailable"))
 }
 
 pub(crate) async fn prepare_workspace(
@@ -2234,56 +2337,88 @@ pub(crate) async fn prepare_workspace(
     let Ok(Json(body)) = body else {
         return workspace_error(StatusCode::BAD_REQUEST, "invalid_workspace");
     };
-    if !valid_scope_id(&body.mission_id, 80)
-        || !valid_scope_id(&body.camp_id, 80)
-        || !valid_scope_id(&body.node_id, 80)
-    {
-        return workspace_error(StatusCode::BAD_REQUEST, "invalid_workspace");
+    match prepare_workspace_record(&state, body.into()).await {
+        Ok(workspace) => Json(workspace).into_response(),
+        Err((status, code)) => workspace_error(status, code),
     }
-    let role = match state.nodes.store.node_role(&body.node_id) {
-        Ok(Some(role)) => role,
-        Ok(None) => return workspace_error(StatusCode::NOT_FOUND, "node_not_found"),
-        Err(_) => {
-            return workspace_error(StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable");
-        }
+}
+
+/// `missions.workspace.prepareRemote`: the same prepare, reached through the
+/// individually admitted operation surface. It answers in the `/request`
+/// envelope with the identical workspace projection, so a browser sees exactly
+/// the fields `POST /api/v1/nodes/workspaces` returns.
+pub(crate) async fn prepare_remote_workspace(state: &WebState, params: Value) -> Response {
+    let prepared = async {
+        let request = prepare_remote_params(params)?;
+        let camp_id = mission_thread(state, &request.mission_id).await?;
+        prepare_workspace_record(
+            state,
+            PrepareWorkspace {
+                mission_id: request.mission_id,
+                camp_id,
+                node_id: request.node_id,
+                source: request.source_root,
+            },
+        )
+        .await
+    }
+    .await;
+    match prepared {
+        Ok(workspace) => Json(json!({ "result": workspace, "error": null })).into_response(),
+        Err((status, code)) => (
+            status,
+            Json(json!({
+                "result": null,
+                "error": { "code": code, "message": workspace_message(code) }
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn prepare_workspace_record(
+    state: &WebState,
+    request: PrepareWorkspace,
+) -> Result<Value, (StatusCode, &'static str)> {
+    let role = match state.nodes.store.node_role(&request.node_id) {
+        Ok(role) => role,
+        Err(_) => return Err((StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable")),
     };
-    if !valid_workspace_source(&body.source, role == "local") {
-        return workspace_error(StatusCode::BAD_REQUEST, "invalid_workspace");
+    let role = admit_workspace_prepare(&request, role.as_deref())?;
+    if let Ok(Some(existing)) = state.nodes.store.workspace_by_mission(&request.mission_id) {
+        return Ok(workspace_json(&existing));
     }
-    if let Ok(Some(existing)) = state.nodes.store.workspace_by_mission(&body.mission_id) {
-        return Json(workspace_json(&existing)).into_response();
-    }
-    let branch = match loom_protocol::safe_branch(&body.mission_id) {
+    let branch = match loom_protocol::safe_branch(&request.mission_id) {
         Ok(branch) => branch,
-        Err(code) => return workspace_error(StatusCode::BAD_REQUEST, code),
+        Err(code) => return Err((StatusCode::BAD_REQUEST, code)),
     };
     let workspace_id = format!("ws_{}", uuid::Uuid::new_v4().simple());
     let prepared = if role == "local" {
         let directory = match state.nodes.store.sqlite_directory() {
             Ok(directory) => directory,
             Err(_) => {
-                return workspace_error(StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable");
+                return Err((StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable"));
             }
         };
         let worktree = directory.join("worktrees").join(branch.replace('/', "_"));
         match loom_protocol::prepare_git_worktree(
-            std::path::Path::new(&body.source),
+            std::path::Path::new(&request.source),
             &worktree,
             &branch,
         ) {
             Ok(prepared) => prepared,
-            Err(code) => return workspace_error(StatusCode::CONFLICT, code),
+            Err(code) => return Err((StatusCode::CONFLICT, code)),
         }
     } else {
         let request_id = workspace_id.clone();
         let message = match state
             .nodes
             .call_fs(
-                &body.node_id,
+                &request.node_id,
                 &request_id,
                 ServerMessage::PrepareWorktree {
                     request_id: request_id.clone(),
-                    source: body.source.clone(),
+                    source: request.source.clone(),
                     worktree: String::new(),
                     branch: branch.clone(),
                 },
@@ -2291,7 +2426,7 @@ pub(crate) async fn prepare_workspace(
             .await
         {
             Ok(message) => message,
-            Err(code) => return workspace_error(StatusCode::CONFLICT, code),
+            Err(code) => return Err((StatusCode::CONFLICT, code)),
         };
         let ClientMessage::FsResult {
             code,
@@ -2303,10 +2438,10 @@ pub(crate) async fn prepare_workspace(
             ..
         } = message
         else {
-            return workspace_error(StatusCode::CONFLICT, "node_offline");
+            return Err((StatusCode::CONFLICT, "node_offline"));
         };
         if !code.is_empty() {
-            return workspace_error(StatusCode::CONFLICT, leak_code(&code));
+            return Err((StatusCode::CONFLICT, leak_code(&code)));
         }
         loom_protocol::PreparedWorktree {
             worktree,
@@ -2318,9 +2453,9 @@ pub(crate) async fn prepare_workspace(
     };
     let record = WorkspaceRecord {
         id: workspace_id,
-        mission_id: body.mission_id,
-        camp_id: body.camp_id,
-        execution_host_id: body.node_id,
+        mission_id: request.mission_id,
+        camp_id: request.camp_id,
+        execution_host_id: request.node_id,
         source_directory: prepared.source.clone(),
         repository_root: prepared.source,
         git_common_dir: prepared.common_dir,
@@ -2332,7 +2467,7 @@ pub(crate) async fn prepare_workspace(
         last_heartbeat: None,
     };
     if state.nodes.store.save_workspace(&record).is_err() {
-        return workspace_error(StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable");
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable"));
     }
     let Some(saved) = state
         .nodes
@@ -2341,9 +2476,9 @@ pub(crate) async fn prepare_workspace(
         .ok()
         .flatten()
     else {
-        return workspace_error(StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable");
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable"));
     };
-    Json(workspace_json(&saved)).into_response()
+    Ok(workspace_json(&saved))
 }
 
 #[derive(Deserialize)]
@@ -2531,13 +2666,7 @@ fn workspace_failure(
     code: &'static str,
     record: Option<&WorkspaceRecord>,
 ) -> Response {
-    let message = match code {
-        "node_offline" => "这台机器不在线",
-        "path_rejected" => "路径超出工作区",
-        "not_found" | "not_file" => "文件读取失败",
-        _ => "",
-    };
-    let mut body = json!({"error":{"code":code,"message":message}});
+    let mut body = json!({"error":{"code":code,"message":workspace_message(code)}});
     if let Some(record) = record {
         body["error"]["ownerName"] = json!(record.owner_name);
         if let Some(heartbeat) = &record.last_heartbeat {
@@ -2545,6 +2674,17 @@ fn workspace_failure(
         }
     }
     (status, Json(body)).into_response()
+}
+
+/// One message table for both surfaces, so the operation envelope and the HTTP
+/// route explain the same refusal the same way.
+fn workspace_message(code: &str) -> &'static str {
+    match code {
+        "node_offline" => "这台机器不在线",
+        "path_rejected" => "路径超出工作区",
+        "not_found" | "not_file" => "文件读取失败",
+        _ => "",
+    }
 }
 
 fn leak_code(code: &str) -> &'static str {
@@ -4065,6 +4205,57 @@ mod tests {
         assert!(!valid_workspace_source("/home/loom/fixture/source", true));
         #[cfg(unix)]
         assert!(!valid_workspace_source(r"C:\fixture\source", true));
+    }
+
+    #[test]
+    fn prepare_remote_operation_takes_only_mission_node_and_source_root() {
+        let admitted = prepare_remote_params(json!({
+            "missionId":"mission_a", "nodeId":"node_b", "sourceRoot": r"C:\fixture\source"
+        }))
+        .expect("admitted params");
+        assert_eq!(admitted.mission_id, "mission_a");
+        assert_eq!(admitted.node_id, "node_b");
+        assert_eq!(admitted.source_root, r"C:\fixture\source");
+        for refused in [
+            // The HTTP route's own body is not this operation's params.
+            json!({"missionId":"mission_a","nodeId":"node_b","source":r"C:\fixture\source"}),
+            json!({"missionId":"mission_a","campId":"thread_c","nodeId":"node_b","sourceRoot":"/srv/source"}),
+            json!({"missionId":"mission_a","nodeId":"node_b"}),
+            json!({"missionId":"","nodeId":"node_b","sourceRoot":"/srv/source"}),
+            json!({"missionId":"mission_a","nodeId":"node\u{0}b","sourceRoot":"/srv/source"}),
+            json!(["mission_a","node_b","/srv/source"]),
+        ] {
+            assert!(prepare_remote_params(refused.clone()).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_node_is_refused_before_any_prepare_work() {
+        let store = NodeStore::open_ephemeral().unwrap();
+        // A relative root is the interesting case here: it is whatever the remote
+        // executor's own platform accepts, and only a local role refuses it.
+        let mut request = PrepareWorkspace {
+            mission_id: "mission_a".into(),
+            camp_id: "thread_c".into(),
+            node_id: "node_missing".into(),
+            source: "relative/source".into(),
+        };
+        // The registry answers `None` for a node this Host never paired, and that is
+        // exactly the answer the operation refuses instead of preparing anywhere.
+        assert_eq!(store.node_role("node_missing").unwrap(), None);
+        assert_eq!(
+            admit_workspace_prepare(&request, store.node_role(&request.node_id).unwrap().as_deref()),
+            Err((StatusCode::NOT_FOUND, "node_not_found"))
+        );
+        // A known remote node judges the source root with the executor's own rules.
+        assert_eq!(admit_workspace_prepare(&request, Some("remote")), Ok("remote".into()));
+        // The same request on this Host would have to name an absolute path.
+        assert_eq!(
+            admit_workspace_prepare(&request, Some("local")),
+            Err((StatusCode::BAD_REQUEST, "invalid_workspace"))
+        );
+        request.source = std::env::temp_dir().to_string_lossy().into_owned();
+        assert_eq!(admit_workspace_prepare(&request, Some("local")), Ok("local".into()));
     }
 
     #[test]
