@@ -138,12 +138,14 @@ fn plan_input(mission_id: &str) -> LoomPlanImportInput {
                 title: "Task A".into(),
                 description: String::new(),
                 assignee_agent_id: None,
+                acceptance_criteria: None,
             },
             LoomPlanImportTask {
                 task_id: "task_b".into(),
                 title: "Task B".into(),
                 description: String::new(),
                 assignee_agent_id: None,
+                acceptance_criteria: None,
             },
         ],
         dependencies: vec![LoomPlanImportDependency {
@@ -7369,6 +7371,7 @@ fn watchdog_records_a_long_review_epoch_inside_the_ledger_bound() {
                 title: "Long identity review".into(),
                 description: String::new(),
                 assignee_agent_id: Some(PRODUCER_AGENT.into()),
+                acceptance_criteria: None,
             }],
         ),
     )
@@ -7620,6 +7623,7 @@ fn watchdog_scans_past_a_page_of_unapproved_tasks() {
                     title: format!("Backlog {index:02}"),
                     description: String::new(),
                     assignee_agent_id: Some(PRODUCER_AGENT.into()),
+                    acceptance_criteria: None,
                 })
                 .collect(),
         ),
