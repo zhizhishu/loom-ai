@@ -789,13 +789,41 @@ pub fn load_agent_run_source_attachments(
             |row| row.get::<_, String>(0),
         )
         .optional()?;
-    json.map(|value| parse_source_attachments(&value))
-        .transpose()
-        .map(Option::unwrap_or_default)
+    if let Some(json) = json {
+        return parse_source_attachments(&json);
+    }
+    // Camp batches do not always freeze `trigger_camp_message_id`; the durable
+    // input rows are the batch boundary and carry the same user message ids.
+    let mut statement = database.connection().prepare(
+        r#"
+        SELECT message.source_attachments_json
+        FROM agent_run_input AS input
+        JOIN camp_message AS message ON message.id = input.message_id
+        WHERE input.agent_run_id = ?1
+        ORDER BY input.ordinal
+        "#,
+    )?;
+    let rows = statement.query_map([agent_run_id], |row| row.get::<_, String>(0))?;
+    let mut attachments = Vec::new();
+    for json in rows {
+        attachments.extend(parse_source_attachments(&json?)?);
+    }
+    Ok(attachments)
 }
 
 pub fn resolve_source_attachments_for_run(
     source_refs: &[LocalAttachmentSourceRef],
+) -> Result<Vec<String>> {
+    resolve_source_attachments_for_run_with_extract_root(source_refs, None)
+}
+
+/// Resolve user-owned source paths plus browser-extracted Office text. When the
+/// run workspace is supplied, extracted text is written inside it because the
+/// guarded Pi file tools are intentionally limited to that workspace; the source
+/// upload cache outside the workspace is never widened.
+pub fn resolve_source_attachments_for_run_with_extract_root(
+    source_refs: &[LocalAttachmentSourceRef],
+    workspace_root: Option<&Path>,
 ) -> Result<Vec<String>> {
     let mut resolved = Vec::with_capacity(source_refs.len());
     for source_ref in source_refs {
@@ -803,7 +831,11 @@ pub fn resolve_source_attachments_for_run(
         resolved.push(source_ref.source_path.clone());
         if let Some(text) = source_ref.extracted_text.as_deref().filter(|text| !text.trim().is_empty()) {
             let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
-            let path = std::env::temp_dir().join(format!("loom-office-text-{digest}.txt"));
+            let root = workspace_root
+                .map(|root| root.join(".loom-attachment-text"))
+                .unwrap_or_else(std::env::temp_dir);
+            fs::create_dir_all(&root).context("office_attachment_extract_write_failed")?;
+            let path = root.join(format!("loom-office-text-{digest}.txt"));
             if !path.exists() {
                 fs::write(&path, text).context("office_attachment_extract_write_failed")?;
             }
@@ -976,6 +1008,30 @@ mod tests {
         );
         assert_eq!(resolve_agent_local_path(&missing, &directory), missing);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolver_writes_extracted_office_text_inside_the_run_workspace() {
+        let root = std::env::temp_dir().join(format!("rovai-office-extract-root-{}", Uuid::new_v4()));
+        let source_root = std::env::temp_dir().join(format!("rovai-office-source-{}", Uuid::new_v4()));
+        fs::create_dir_all(&source_root).unwrap();
+        let source = source_root.join("sample.docx");
+        fs::write(&source, b"ooxml bytes").unwrap();
+        let mut source_ref = observe_source_attachment(&source, "sample.docx", None).unwrap();
+        source_ref.extracted_text = Some("DOCX_MARKER_4677".to_string());
+
+        let resolved = resolve_source_attachments_for_run_with_extract_root(
+            &[source_ref],
+            Some(&root),
+        )
+        .unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0], source.to_string_lossy());
+        let extracted = Path::new(&resolved[1]);
+        assert_eq!(extracted.parent(), Some(root.join(".loom-attachment-text").as_path()));
+        assert_eq!(fs::read_to_string(extracted).unwrap(), "DOCX_MARKER_4677");
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(source_root).unwrap();
     }
 
     #[cfg(unix)]

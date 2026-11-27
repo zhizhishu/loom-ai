@@ -193,7 +193,7 @@ use rovai_core::{
     git,
     local_attachment_source::{
         LocalAttachmentFailure, LocalAttachmentOwnerLocator, load_agent_run_source_attachments,
-        observe_source_attachment, resolve_source_attachments_for_run,
+        observe_source_attachment, resolve_source_attachments_for_run_with_extract_root,
     },
     managed_attachment::ManagedAttachmentStore,
     managed_blob::ManagedBlobStore,
@@ -16303,9 +16303,15 @@ impl Core {
                 .is_none(),
             "remote_attachment_transfer_required"
         );
-        tokio::task::spawn_blocking(move || resolve_source_attachments_for_run(&source_refs))
-            .await
-            .context("Source Attachment Run resolver task failed")?
+        let workspace_root = execution.workspace.execution_root.clone();
+        tokio::task::spawn_blocking(move || {
+            resolve_source_attachments_for_run_with_extract_root(
+                &source_refs,
+                Some(std::path::Path::new(&workspace_root)),
+            )
+        })
+        .await
+        .context("Source Attachment Run resolver task failed")?
     }
 
     async fn prepare_agent_run_skill_exposure(

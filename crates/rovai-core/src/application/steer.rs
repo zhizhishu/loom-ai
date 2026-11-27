@@ -133,10 +133,15 @@ impl Core {
                 [&pending.delivery_id], |r|r.get(0))?;
             rovai_core::local_attachment_source::parse_source_attachments(&json)?
         };
-        let paths =
-            tokio::task::spawn_blocking(move || resolve_source_attachments_for_run(&sources))
-                .await
-                .context("Source Attachment input resolver task failed")??;
+        let workspace_root = execution.workspace.execution_root.clone();
+        let paths = tokio::task::spawn_blocking(move || {
+            resolve_source_attachments_for_run_with_extract_root(
+                &sources,
+                Some(std::path::Path::new(&workspace_root)),
+            )
+        })
+        .await
+        .context("Source Attachment input resolver task failed")??;
         let (context, input) = {
             let mut database = self.database.lock().await;
             if !rovai_core::steer::active_input_availability(

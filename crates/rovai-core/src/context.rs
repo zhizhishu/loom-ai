@@ -4505,6 +4505,7 @@ struct SharedMessageAttachment {
     path: String,
     content_digest: Option<String>,
     legacy_view_backed: bool,
+    extracted_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -4712,6 +4713,7 @@ fn model_batch_message(message: &SharedMessage) -> Value {
                         "name": attachment.name,
                         "mediaType": attachment.media_type,
                         "path": attachment.path,
+                        "extractedText": attachment.extracted_text,
                     })
                 })
                 .collect(),
@@ -5852,6 +5854,7 @@ fn project_shared_message<R: ContextReadConnection>(
             media_type,
             content_digest: Some(content_digest),
             legacy_view_backed,
+            extracted_text: None,
         });
     }
     for source in load_message_source_refs(database.context_connection(), Some(&message_id))? {
@@ -5864,6 +5867,7 @@ fn project_shared_message<R: ContextReadConnection>(
             path: source.source_path,
             content_digest: None,
             legacy_view_backed: false,
+            extracted_text: source.extracted_text,
         });
     }
     let quotes = match claimed_quote_source_message_ids {
