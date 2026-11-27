@@ -2,6 +2,7 @@
 //! Mission; every query is scoped by `missionId`. The write paths are [`plan_import`],
 //! [`task_release`], [`claim_acquire`] and [`candidate_record`], each one Mission, one
 //! transaction.
+pub(crate) mod pptx_preview;
 pub(crate) mod remote_artifact;
 /// The bytes of a registered local artifact, archived so a later verification re-reads what was
 /// registered instead of whatever the workspace file holds now.
@@ -1233,6 +1234,8 @@ pub enum LoomArtifactPreviewUnavailableReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoomArtifactPreviewResult {
+    /// PPTX page preview rendered on demand through system LibreOffice + pdftoppm; absent for every other file kind.
+    pub pptx_preview: Option<pptx_preview::LoomArtifactPptxPreview>,
     pub artifact_id: String,
     pub relative_path: String,
     pub content_type: Option<String>,
@@ -1257,6 +1260,15 @@ const MAX_ARTIFACT_MEDIA_PREVIEW_BYTES: i64 = 8 * 1024 * 1024;
 ///
 /// The immutable `relative_path` extension is the only input: extension whitelisting keeps SVG and
 /// HTML out (both can execute), and a missing or wrong recorded `content_type` never decides.
+fn artifact_preview_is_pptx(relative_path: &str) -> bool {
+    relative_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(relative_path)
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("pptx"))
+}
+
 fn artifact_preview_media_type(relative_path: &str) -> Option<&'static str> {
     // Judge the last segment only, so a directory named `shot.png/` cannot whitelist a text file,
     // and accept both separators because a relative path is recorded verbatim.
@@ -3613,6 +3625,7 @@ pub fn artifact_preview(
                         size_bytes: row.get(5)?,
                         sha256: row.get(6)?,
                         text: None,
+                        pptx_preview: None,
                         bytes_base64: None,
                         media_type: None,
                         unavailable_reason: None,
@@ -3639,7 +3652,7 @@ pub fn artifact_preview(
     // The judged type is a pure function of the immutable path, so it is reported even when the
     // bytes turn out to be missing or oversized: the client still learns what the file is.
     preview.media_type = media_type.map(str::to_string);
-    let size_limit = if media_type.is_some() {
+    let size_limit = if media_type.is_some() || artifact_preview_is_pptx(&preview.relative_path) {
         MAX_ARTIFACT_MEDIA_PREVIEW_BYTES
     } else {
         MAX_ARTIFACT_PREVIEW_BYTES
@@ -3672,6 +3685,15 @@ pub fn artifact_preview(
     match bytes {
         None => {
             preview.unavailable_reason = Some(LoomArtifactPreviewUnavailableReason::NotArchived);
+        }
+        Some(bytes) if artifact_preview_is_pptx(&preview.relative_path) => {
+            if bytes.len() as i64 != preview.size_bytes {
+                return Err(LoomCommandError::rejection(
+                    LOOM_EVIDENCE_UNREADABLE,
+                    format!("evidence {artifact_id} archived bytes do not match the registered size"),
+                ));
+            }
+            preview.pptx_preview = Some(pptx_preview::render_pptx_preview(&bytes));
         }
         Some(bytes) => match media_type {
             // The verified channel already checked the digest; the length is checked again against
@@ -9775,6 +9797,7 @@ mod tests {
             size_bytes: first.size_bytes,
             sha256: first.sha256.clone(),
             text: Some("archived bytes".into()),
+            pptx_preview: None,
             bytes_base64: None,
             media_type: None,
             unavailable_reason: None,

@@ -55,3 +55,9 @@
 .ln-artifact-download[data-active="true"] { font-weight: 600; }
 
 .ln-artifact-video{display:block;width:100%;max-height:62vh;border-radius:12px;background:#000}
+
+.ln-artifact-pptx { display:grid; gap:14px; }
+.ln-artifact-pptx-slide { margin:0; display:grid; gap:6px; }
+.ln-artifact-pptx-slide img, .ln-artifact-pptx-hidden { width:100%; aspect-ratio:16/9; display:block; border:1px solid var(--ln-border); border-radius:10px; background:#f0f0f0; object-fit:contain; }
+.ln-artifact-pptx-hidden { background-image:linear-gradient(45deg,transparent 48%,#c8c8c8 49%,#c8c8c8 51%,transparent 52%),linear-gradient(-45deg,transparent 48%,#c8c8c8 49%,#c8c8c8 51%,transparent 52%); }
+.ln-artifact-pptx-slide figcaption { font-size:12px; color:var(--ln-muted); }

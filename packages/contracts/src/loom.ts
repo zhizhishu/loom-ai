@@ -244,6 +244,20 @@ export interface LoomArtifactPreviewInput {
   artifactId: string
 }
 
+
+export interface LoomArtifactPptxSlide {
+  label: string
+  hidden: boolean
+  jpegBase64: string | null
+}
+
+export interface LoomArtifactPptxPreview {
+  status: 'ready' | 'missing_dependency' | 'conversion_failed'
+  missingDependency: string | null
+  error: string | null
+  slides: LoomArtifactPptxSlide[]
+}
+
 /** 只读已归档的文本（最多 256 KiB）或媒体字节（最多 8 MiB）；不会记录核验或验收状态。 */
 export interface LoomArtifactPreviewResult {
   artifactId: string
@@ -252,6 +266,7 @@ export interface LoomArtifactPreviewResult {
   sizeBytes: number
   sha256: string
   text: string | null
+  pptxPreview?: LoomArtifactPptxPreview | null
   /**
    * 媒体命中时的归档字节（标准 base64）；非媒体文件为 null。
    *

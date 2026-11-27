@@ -6,6 +6,7 @@ import type { LoomReviewRecordReceipt } from '@contracts'
 import { useThreadClient } from '../camp-client'
 import { readErrorMessage } from '../error-message'
 import { ArtifactPdfPreview } from './ArtifactPdfPreview'
+import { ArtifactPptxPreview } from './ArtifactPptxPreview'
 import { ArtifactSelectionActions } from './ArtifactSelectionActions'
 import type { ArtifactQuote } from './artifact-quote'
 import { markdownDiff, remarkDiff } from './artifact-diff'
@@ -313,6 +314,8 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
             <span>内容读取失败：{preview.message}</span>
             <button type="button" className="ln-artifact-retry" onClick={() => setRetry(value => value + 1)}>重试</button>
           </div>
+        : preview.status === 'pptx'
+          ? <ArtifactPptxPreview preview={preview.pptx} fileName={fileName}/>
         : preview.status === 'media'
           ? preview.media.kind === 'pdf'
             ? <ArtifactPdfPreview bytes={preview.media.bytes} fileName={fileName}/>
