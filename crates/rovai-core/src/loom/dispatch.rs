@@ -1846,6 +1846,36 @@ fn reconcile_dispatches(transaction: &Transaction<'_>, now: &str) -> Result<()> 
             now,
         )?;
     }
+    reconcile_superseded_handoffs(transaction, now)?;
+    Ok(())
+}
+
+/// Close a lost verification handoff only when its durable successor fact already exists. This is
+/// reconciliation, not replay: the unknown Run is not restarted or treated as successful, but once
+/// the current Candidate is no longer awaiting the Owner (or the Task is already done), keeping the
+/// handoff blocked would misrepresent a chain whose verification lane has been superseded by the
+/// Owner-visible outcome itself.
+fn reconcile_superseded_handoffs(transaction: &Transaction<'_>, now: &str) -> Result<()> {
+    transaction.execute(
+        "UPDATE loom_control_dispatch
+         SET status='SETTLED', reason='loom.dispatch_handoff_reconciled', updated_at=?1
+         WHERE status='BLOCKED' AND kind='HANDOFF'
+           AND reason='accepted_input_outcome_unknown'
+           AND candidate_id = (
+               SELECT candidate_id FROM loom_candidate latest
+               WHERE latest.plan_id=loom_control_dispatch.plan_id
+                 AND latest.task_id=loom_control_dispatch.task_id
+               ORDER BY latest.created_at DESC, latest.rowid DESC LIMIT 1)
+           AND EXISTS(
+               SELECT 1 FROM loom_task task
+               JOIN loom_candidate candidate ON candidate.plan_id=task.plan_id
+                    AND candidate.task_id=task.task_id
+                    AND candidate.candidate_id=loom_control_dispatch.candidate_id
+               WHERE task.plan_id=loom_control_dispatch.plan_id
+                 AND task.task_id=loom_control_dispatch.task_id
+                 AND (task.status='DONE' OR candidate.acceptance_status<>'PENDING'))",
+        [now],
+    )?;
     Ok(())
 }
 
@@ -1999,6 +2029,12 @@ fn sweep_watchdog(transaction: &Transaction<'_>, now: DateTime<Utc>) -> Result<L
     let mut outcome = LoomTickOutcome::default();
     for subject in watchdog_subjects(transaction, now)? {
         outcome.scanned += 1;
+        if outcome.admitted < MAX_DISPATCHES_PER_TICK
+            && retry_controlled_shutdown_cancellation(transaction, &subject, now)?
+        {
+            outcome.admitted += 1;
+            continue;
+        }
         if outcome.admitted < MAX_DISPATCHES_PER_TICK
             && retry_terminal_failure(transaction, &subject, now)?
         {
@@ -2494,7 +2530,89 @@ fn retry_terminal_failure(
     {
         return Ok(false);
     }
-    Ok(retry_watchdog_attempt(transaction, subject, now, true)?.is_some())
+    Ok(retry_watchdog_attempt(transaction, subject, now, true, false)?.is_some())
+}
+
+/// The controlled-shutdown counterpart of Mikka's `pending + no active run => dispatchNext`
+/// reconciliation. The shutdown transaction itself has already proved two things the watchdog
+/// otherwise cannot know: the executor was deliberately cancelled (not lost in an unknown state),
+/// and its terminal `agent_run.cancelled` fact records whether any action or output effect was
+/// still unsettled. Accepted input may be handed back because the retry itself carries Mikka's
+/// inspect-existing-work handoff; an uncertain external effect stays closed instead of replaying.
+fn retry_controlled_shutdown_cancellation(
+    transaction: &Transaction<'_>,
+    subject: &WatchdogSubject,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    if subject.run_status.as_deref() != Some("cancelled")
+        || subject.active_run
+        || subject.uncertain_effect
+    {
+        return Ok(false);
+    }
+    let attempt: Option<(String, String, String, String)> = transaction
+        .query_row(
+            "SELECT run.id, run.cancel_reason_code, delivery.status, dispatch.status
+             FROM loom_control_dispatch dispatch
+             JOIN camp_message_delivery delivery ON delivery.id=dispatch.delivery_id
+             JOIN agent_run run ON run.id=delivery.claimed_agent_run_id
+             WHERE dispatch.dispatch_id=?1",
+            [&subject.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((run_id, cancel_reason, delivery_status, dispatch_status)) = attempt else {
+        return Ok(false);
+    };
+    if dispatch_status != "CANCELLED"
+        || delivery_status != "cancelled"
+        || !matches!(
+            cancel_reason.as_str(),
+            "planned_shutdown_cancelled" | "app_shutdown_cancel_all"
+        )
+    {
+        return Ok(false);
+    }
+    // The terminal fact is the durable receipt the shutdown transaction wrote before closing any
+    // prepared or in-flight effect. Accepted input alone is not a replay blocker: the retry body is
+    // the Mikka handoff shape and tells the next executor to inspect existing work before acting.
+    // An action whose effect is unknown, or a Runtime output checkpoint the shutdown had to close,
+    // is an uncertain external effect and fails closed instead.
+    let receipt: Option<String> = transaction
+        .query_row(
+            "SELECT payload_json FROM event_log
+             WHERE event_type='agent_run.cancelled' AND entity_type='agent_run' AND entity_id=?1
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(receipt) = receipt else {
+        return Ok(false);
+    };
+    let Ok(receipt) = serde_json::from_str::<serde_json::Value>(&receipt) else {
+        return Ok(false);
+    };
+    let number = |key: &str| receipt.get(key).and_then(serde_json::Value::as_i64).unwrap_or(0);
+    let uncertain_action: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM action_execution
+             WHERE agent_run_id=?1 AND status='unknown' AND unknown_disposition='active')",
+        [&run_id],
+        |row| row.get(0),
+    )?;
+    let external_effect_uncertain = receipt
+        .get("externalEffectEvidencePreserved")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if uncertain_action
+        || (external_effect_uncertain
+            && (number("actionsMarkedUnknown") > 0 || number("deliveriesClosed") > 0))
+        || shared_recovery_budget(transaction, subject)? >= WATCHDOG_MAX_RECOVERIES
+    {
+        return Ok(false);
+    }
+    Ok(retry_watchdog_attempt(transaction, subject, now, true, true)?.is_some())
 }
 
 fn attempts_in_epoch(connection: &Connection, subject: &WatchdogSubject) -> Result<i64> {
@@ -2620,7 +2738,7 @@ fn observe_watchdog(
         // mint the next Attempt of the *same* epoch — the retried delivery then starts through the
         // ordinary Delivery/Run path, exactly like the first one did.
         let Some((retry_dispatch_id, _)) =
-            retry_watchdog_attempt(transaction, subject, now, false)?
+            retry_watchdog_attempt(transaction, subject, now, false, false)?
         else {
             // No room for another Attempt — the plan's dispatch budget or the Task's rework budget
             // is spent, or the recipient can no longer be addressed. That is upstream's deferred
@@ -2888,9 +3006,10 @@ fn retry_watchdog_attempt(
     subject: &WatchdogSubject,
     now: DateTime<Utc>,
     check_event: bool,
+    allow_cancelled_attempt: bool,
 ) -> Result<Option<(String, String)>> {
     transaction.execute_batch("SAVEPOINT watchdog_retry")?;
-    match write_watchdog_retry(transaction, subject, now, check_event) {
+    match write_watchdog_retry(transaction, subject, now, check_event, allow_cancelled_attempt) {
         Ok(Some(retry)) => {
             transaction.execute_batch("RELEASE SAVEPOINT watchdog_retry")?;
             Ok(Some(retry))
@@ -2922,6 +3041,7 @@ fn write_watchdog_retry(
     subject: &WatchdogSubject,
     now: DateTime<Utc>,
     check_event: bool,
+    allow_cancelled_attempt: bool,
 ) -> Result<Option<(String, String)>> {
     let Some(policy) = read_policy(transaction, &subject.plan_id)? else {
         return Ok(None);
@@ -3031,7 +3151,21 @@ fn write_watchdog_retry(
         params![WATCHDOG_SUPERSEDED_REASON, &now_text, &old_dispatch_id],
     )?;
     if superseded != 1 {
-        return Ok(None);
+        // Controlled shutdown already folded the old Attempt to `CANCELLED`; that terminal row is
+        // closed enough when the caller has separately proved the cancellation was effect-free.
+        // Other retry owners still require the row they personally supersede, so a user stop or an
+        // ambiguous cancellation cannot become an automatic replay through this shared write path.
+        if !allow_cancelled_attempt {
+            return Ok(None);
+        }
+        let already_cancelled: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM loom_control_dispatch WHERE dispatch_id=?1 AND status='CANCELLED')",
+            [&old_dispatch_id],
+            |row| row.get(0),
+        )?;
+        if !already_cancelled {
+            return Ok(None);
+        }
     }
     let dispatch_id = format!("dispatch_{}", uuid::Uuid::new_v4().simple());
     let admission = LoomDispatchAdmission {
