@@ -11,7 +11,8 @@
 
 | 编号 | 结论 / 执行位置 / 模型真伪 / 证据路径+sha256 / 已知限制 |
 |---|---|
-| §5 个人版主链 | **实质 PASS** / Devin VM / 真 / SWE-1 原始回执待回填 / kill -9 后单条 HANDOFF 停 `accepted_input_outcome_unknown` 属已接受已知限制；重启恢复修复中 |
+| §5 个人版主链 | **实质 PASS** / Devin VM / 真 / `/home/ubuntu/final-acc-taskscope/report.json` sha256 `05a61efaa9fba74439908b9adf261656f7082677dca12dae2aac75f8ec74402a` / 任务级验收条件后全链完成；恢复修复另见下行 |
+| T28 重启恢复 / handoff recovery | **PASS_WITH_CAVEATS** / Devin VM / 真 / `/home/ubuntu/final-acc-handoff-recovery/report.json` sha256 `a895b2ae1b8b5e119ff75dd1e6473627ee65443f1f16fb5502c3bf3e86c5d6e0` / server-only SIGTERM 自动同 epoch retryo��kill -9 HANDOFF 不重放且 Owner 完成后对账；worker-a REVIEW unknown 未自动补，正向 fail-closed 真包未自然复现 |
 | T19 群聊 @ 路由 | PASS / Devin VM / 真 / `/home/ubuntu/final-regress/artifacts/t19-memory.json` sha256 `395c83b6bce5f195d1a821ce2fbff4d408ff88f0eaf50735f2b45d14339a32b1` / 快速回归证据 |
 | T20 Assignment DAG | PASS / Devin VM / 真 / SWE-2 原始回执待回填 / 未回传 sha |
 | T21 迟到回复 | PASS / Devin VM / 真 / SWE-2 原始回执待回填 / 未回传 sha |
