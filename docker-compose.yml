@@ -1,0 +1,43 @@
+# LOOM Host + Web — run a PREBUILT server image locally.
+#
+#   LOOM_IMAGE=ghcr.io/<owner>/<repo>-server-candidate:sha-<40-hex> \
+#     docker compose up -d
+#
+# There is intentionally no `build:` section. docker/Dockerfile requires the
+# allowlisted staging context produced only by
+# .github/workflows/loom-v2-container.yml (the packaged `package/` tree plus
+# entrypoint.sh and healthcheck.sh) — this checkout is not that context. The
+# image is built and published by that workflow; here it is only run, by an
+# immutable `sha-<commit>` tag.
+#
+# Read the Owner token (created on first start and stored only in
+# /data/web-auth.json; the image never accepts or prints a token, so there is
+# no token or password in this file):
+#   docker compose exec loom /opt/rovai/rovai-server --data-dir /data token
+# Treat that stdout as a secret: do not paste it into logs, issues, URLs or chat.
+services:
+  loom:
+    # Required: no default tag, because candidate tags are immutable and
+    # commit-specific (there is deliberately no `latest`).
+    image: ${LOOM_IMAGE:?set LOOM_IMAGE to the prebuilt LOOM server image tag}
+    restart: unless-stopped
+    # Loopback only. The Server speaks plain HTTP on 8767, so it must not be
+    # reachable from the network unless TLS or a private network (Tailscale,
+    # VPN) sits in front of it. The host port defaults to 8767 and can be
+    # overridden with LOOM_PORT. The container side stays 8767, which is what
+    # the image listens on by default (LISTEN=0.0.0.0:8767), so LISTEN is not
+    # set here.
+    ports:
+      - "127.0.0.1:${LOOM_PORT:-8767}:8767"
+    # The whole data root, not just the database: rovai.sqlite, mcp.json,
+    # skills/, instances/, logs/ and web-auth.json. Back it up while stopped.
+    volumes:
+      - "loom-data:/data"
+    environment:
+      # Both optional; an empty value is still passed to the container and the
+      # entrypoint treats it as unset (no reverse-proxy origin, VERBOSE off).
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-}
+      VERBOSE: ${VERBOSE:-}
+
+volumes:
+  loom-data:
