@@ -1,8 +1,9 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -34,14 +35,14 @@ fn which(name: &str) -> bool {
     })
 }
 
-fn read_zip_entry(bytes: &[u8], wanted: &str) -> Option<Vec<u8>> {
-    let eocd = bytes.windows(22).rev().find_map(|w| {
-        if w[..4] == [0x50, 0x4b, 0x05, 0x06] { Some((w[10] as usize) | ((w[11] as usize) << 8)) } else { None }
-    })?;
-    let mut pos = bytes.windows(22).rev().position(|w| w[..4] == [0x50, 0x4b, 0x05, 0x06])
+fn zip_entries(bytes: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
+    let eocd_pos = bytes.windows(22).rev().position(|w| w[..4] == [0x50, 0x4b, 0x05, 0x06])
         .map(|back| bytes.len() - back - 22)?;
-    pos = u32::from_le_bytes(bytes.get(pos + 16..pos + 20)?.try_into().ok()?) as usize;
-    for _ in 0..eocd {
+    let eocd = bytes.get(eocd_pos..eocd_pos + 22)?;
+    let count = (eocd[10] as usize) | ((eocd[11] as usize) << 8);
+    let mut pos = u32::from_le_bytes(eocd[16..20].try_into().ok()?) as usize;
+    let mut entries = Vec::new();
+    for _ in 0..count {
         if bytes.get(pos..pos + 46)?[..4] != [0x50, 0x4b, 0x01, 0x02] { return None }
         let method = u16::from_le_bytes(bytes[pos + 10..pos + 12].try_into().ok()?);
         let compressed = u32::from_le_bytes(bytes[pos + 20..pos + 24].try_into().ok()?) as usize;
@@ -49,25 +50,65 @@ fn read_zip_entry(bytes: &[u8], wanted: &str) -> Option<Vec<u8>> {
         let extra_len = u16::from_le_bytes(bytes[pos + 30..pos + 32].try_into().ok()?) as usize;
         let comment_len = u16::from_le_bytes(bytes[pos + 32..pos + 34].try_into().ok()?) as usize;
         let local = u32::from_le_bytes(bytes[pos + 42..pos + 46].try_into().ok()?) as usize;
-        let name = std::str::from_utf8(bytes.get(pos + 46..pos + 46 + name_len)?).ok()?;
-        if name == wanted {
-            let local_name = u16::from_le_bytes(bytes.get(local + 26..local + 28)?.try_into().ok()?) as usize;
-            let local_extra = u16::from_le_bytes(bytes.get(local + 28..local + 30)?.try_into().ok()?) as usize;
-            let start = local + 30 + local_name + local_extra;
-            let data = bytes.get(start..start + compressed)?;
-            return match method {
-                0 => Some(data.to_vec()),
-                8 => {
-                    let mut out = Vec::new();
-                    flate2::read::DeflateDecoder::new(data).read_to_end(&mut out).ok()?;
-                    Some(out)
-                }
-                _ => None,
-            };
-        }
+        let name = std::str::from_utf8(bytes.get(pos + 46..pos + 46 + name_len)?).ok()?.to_string();
+        let local_name = u16::from_le_bytes(bytes.get(local + 26..local + 28)?.try_into().ok()?) as usize;
+        let local_extra = u16::from_le_bytes(bytes.get(local + 28..local + 30)?.try_into().ok()?) as usize;
+        let start = local + 30 + local_name + local_extra;
+        let data = bytes.get(start..start + compressed)?;
+        let data = match method {
+            0 => data.to_vec(),
+            8 => {
+                let mut out = Vec::new();
+                flate2::read::DeflateDecoder::new(data).read_to_end(&mut out).ok()?;
+                out
+            }
+            _ => return None,
+        };
+        entries.push((name, data));
         pos += 46 + name_len + extra_len + comment_len;
     }
-    None
+    Some(entries)
+}
+
+fn read_zip_entry(bytes: &[u8], wanted: &str) -> Option<Vec<u8>> {
+    zip_entries(bytes)?.into_iter().find(|(name, _)| name == wanted).map(|(_, data)| data)
+}
+
+fn u16le(out: &mut Vec<u8>, value: u16) { out.extend_from_slice(&value.to_le_bytes()) }
+fn u32le(out: &mut Vec<u8>, value: u32) { out.extend_from_slice(&value.to_le_bytes()) }
+
+fn write_zip_entries(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, data) in entries {
+        if name.len() > u16::MAX as usize || data.len() > u32::MAX as usize { return Err("pptx zip entry too large".into()) }
+        let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).map_err(|e| e.to_string())?;
+        let compressed = encoder.finish().map_err(|e| e.to_string())?;
+        if compressed.len() > u32::MAX as usize { return Err("pptx zip entry too large".into()) }
+        let mut crc = flate2::Crc::new();
+        crc.update(data);
+        let offset = out.len() as u32;
+        u32le(&mut out, 0x04034b50); u16le(&mut out, 20); u16le(&mut out, 0); u16le(&mut out, 8);
+        u16le(&mut out, 0); u16le(&mut out, 0); u32le(&mut out, crc.sum());
+        u32le(&mut out, compressed.len() as u32); u32le(&mut out, data.len() as u32);
+        u16le(&mut out, name.len() as u16); u16le(&mut out, 0);
+        out.extend_from_slice(name.as_bytes()); out.extend_from_slice(&compressed);
+        u32le(&mut central, 0x02014b50); u16le(&mut central, 20); u16le(&mut central, 20);
+        u16le(&mut central, 0); u16le(&mut central, 8); u16le(&mut central, 0); u16le(&mut central, 0);
+        u32le(&mut central, crc.sum()); u32le(&mut central, compressed.len() as u32); u32le(&mut central, data.len() as u32);
+        u16le(&mut central, name.len() as u16); u16le(&mut central, 0); u16le(&mut central, 0);
+        u16le(&mut central, 0); u16le(&mut central, 0); u32le(&mut central, 0); u32le(&mut central, offset);
+        central.extend_from_slice(name.as_bytes());
+    }
+    if entries.len() > u16::MAX as usize { return Err("too many pptx zip entries".into()) }
+    let central_offset = out.len() as u32;
+    let central_len = central.len() as u32;
+    out.extend_from_slice(&central);
+    u32le(&mut out, 0x06054b50); u16le(&mut out, 0); u16le(&mut out, 0);
+    u16le(&mut out, entries.len() as u16); u16le(&mut out, entries.len() as u16);
+    u32le(&mut out, central_len); u32le(&mut out, central_offset); u16le(&mut out, 0);
+    Ok(out)
 }
 
 fn attr(tag: &str, name: &str) -> Option<String> {
@@ -79,6 +120,62 @@ fn attr(tag: &str, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn replace_xml_attr(tag: &str, name: &str, value: &str) -> String {
+    for quote in ['"', '\''] {
+        let needle = format!("{name}={quote}");
+        if let Some(start) = tag.find(&needle) {
+            let value_start = start + needle.len();
+            if let Some(end) = tag[value_start..].find(quote) {
+                return format!("{}{}{quote}{}{}{}", &tag[..value_start], "", value, "", &tag[value_start + end + 1..]);
+            }
+        }
+    }
+    tag.to_string()
+}
+
+fn cut_outside_links(rels: &str) -> Option<Vec<u8>> {
+    let mut out = String::new();
+    let mut rest = rels;
+    let mut cut = false;
+    while let Some(pos) = rest.find("<Relationship") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        let Some(end) = after.find('>') else { return Some(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#.to_vec()) };
+        let tag = &after[..=end];
+        let external = attr(tag, "TargetMode").is_some_and(|v| v.eq_ignore_ascii_case("external"));
+        let target = attr(tag, "Target").unwrap_or_default();
+        let lower = target.to_ascii_lowercase();
+        let web_or_mail = lower.starts_with("http:") || lower.starts_with("https:") || lower.starts_with("mailto:");
+        if external && !web_or_mail {
+            out.push_str(&replace_xml_attr(tag, "Target", "about:blank"));
+            cut = true;
+        } else {
+            out.push_str(tag);
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    cut.then(|| out.into_bytes())
+}
+
+fn without_outside_links(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let entries = zip_entries(bytes).ok_or("pptx zip cannot be parsed")?;
+    let mut changed = false;
+    let mut rewritten = Vec::with_capacity(entries.len());
+    for (name, data) in entries {
+        if name.to_ascii_lowercase().ends_with(".rels") && data.len() <= 32 * 1024 * 1024 {
+            let text = String::from_utf8_lossy(&data);
+            if let Some(cut) = cut_outside_links(&text) {
+                changed = true;
+                rewritten.push((name, cut));
+                continue;
+            }
+        }
+        rewritten.push((name, data));
+    }
+    if changed { write_zip_entries(&rewritten) } else { Ok(bytes.to_vec()) }
 }
 
 fn opc_target(target: &str, external: bool) -> Option<String> {
@@ -166,6 +263,7 @@ fn render_pptx_preview_inner(bytes: &[u8]) -> Result<Vec<LoomArtifactPptxSlide>,
 
 fn render_with_soffice(bytes: &[u8], root: &Path, info: &[SlideInfo]) -> Result<Vec<LoomArtifactPptxSlide>, String> {
     let input = root.join("input.pptx");
+    let bytes = without_outside_links(bytes)?;
     fs::write(&input, bytes).map_err(|e| e.to_string())?;
     let profile = root.join("lo-profile");
     fs::create_dir_all(&profile).map_err(|e| e.to_string())?;
@@ -212,5 +310,16 @@ mod tests {
     fn attr_reads_both_quote_forms() {
         assert_eq!(attr("<x r:id=\"rId2\"/>", "r:id").as_deref(), Some("rId2"));
         assert_eq!(attr("<x r:id='rId3'/>", "r:id").as_deref(), Some("rId3"));
+    }
+
+    #[test]
+    fn outside_links_are_cut_after_zip_rewrite() {
+        let rels = br#"<Relationships xmlns="x"><Relationship Id="rId1" Type="t" Target="file:///etc/passwd" TargetMode="External"/><Relationship Id="rId2" Type="t" Target="https://example.test" TargetMode="External"/></Relationships>"#.to_vec();
+        let zipped = super::write_zip_entries(&[("ppt/slides/_rels/slide1.xml.rels".into(), rels)]).unwrap();
+        let sanitized = super::without_outside_links(&zipped).unwrap();
+        let rels = String::from_utf8(super::read_zip_entry(&sanitized, "ppt/slides/_rels/slide1.xml.rels").unwrap()).unwrap();
+        assert!(rels.contains("about:blank"));
+        assert!(rels.contains("https://example.test"));
+        assert!(!rels.contains("file:///etc/passwd"));
     }
 }
