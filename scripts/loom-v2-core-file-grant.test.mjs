@@ -345,8 +345,10 @@ test('workflow policy: the managed loom tool reaches the eight operations only, 
       assert.equal(workflow(toolEvent(toolName, id, { path: 'notes.md' }), ctx), undefined, `${toolName} must stay granted`)
     }
 
-    // Every operation without a path argument is allowed.
-    for (const operation of ['loom.status', 'loom.skill_suggest', 'loom.plan', 'loom.release', 'loom.claim', 'loom.submit', 'loom.inspect', 'loom.stage-review']) {
+    // Every managed operation without a local path argument is allowed. `loom.workspace.read/write`
+    // name a workspace-relative path that Core's RPC validates, and `thread.message.send` names local
+    // attachment sources that Core's `camp_attachment` resolves (workspace or ROVAI_RUN_TMP only).
+    for (const operation of ['loom.status', 'loom.skill_suggest', 'loom.plan', 'loom.release', 'loom.claim', 'loom.submit', 'loom.inspect', 'loom.stage-review', 'loom.workspace.list', 'loom.workspace.read', 'loom.workspace.write', 'thread.message.send']) {
       assert.equal(
         workflow(toolEvent('rovai_loom', `op_${operation}`, { operation, input: {} }), ctx),
         undefined,
@@ -354,8 +356,9 @@ test('workflow policy: the managed loom tool reaches the eight operations only, 
       )
     }
 
-    // Nothing outside the ten operations is reachable, even with a plausible looking name.
-    for (const operation of ['loom.workspace.run', 'loom.accept', 'thread.message.send', 'bash', 'memory.write', '']) {
+    // `run`, the poll/cancel controls and every operation outside the bridge stay unreachable, even
+    // with a plausible looking name.
+    for (const operation of ['loom.workspace.run', 'loom.workspace.poll', 'loom.workspace.cancel', 'loom.accept', 'thread.list', 'bash', 'memory.write', '']) {
       const outcome = workflow(toolEvent('rovai_loom', `op_bad_${operation}`, { operation, input: {} }), ctx)
       assert.equal(outcome?.block, true, `${operation} must be refused`)
       assert.match(String(outcome.reason), /loom_operation_not_allowed/)

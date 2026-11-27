@@ -45,14 +45,19 @@ const GUARD_SCHEMA = 'loom.runtime.file-guard.v1'
 const GUARD_TOOLS = Object.freeze(['read', 'write', 'edit'])
 
 // The one managed Core business tool the explicitly chosen `workspace_workflow` policy adds. It is a
-// typed bridge to the ten `loom.*` operations Core already ships — never `bash`, never an arbitrary
-// command. This guard stays authoritative for it: the operation must be one of the ten,
-// and a `loom.evidence` path goes through the SAME `read` path policy as the native tool.
+// typed bridge to the LOOM operations and, for a managed delivery, the workspace RPC operations plus
+// one ordinary group send — never `bash`, never an arbitrary command. This guard stays authoritative
+// for it: the operation must be one of these, the bridge's argv stays fixed, and a `loom.evidence`
+// path goes through the SAME `read` path policy as the native tool. The bridged `thread.message.send`
+// names local attachment sources, which Core resolves again in `camp_attachment` (workspace or
+// ROVAI_RUN_TMP only, symlinks refused), so this guard does not need to re-implement that policy.
 const LOOM_TOOL_NAME = 'rovai_loom'
 const LOOM_OPERATIONS = Object.freeze([
   'loom.status', 'loom.skill_suggest', 'loom.plan', 'loom.release', 'loom.claim',
   'loom.claim_heartbeat',
   'loom.evidence', 'loom.submit', 'loom.inspect', 'loom.stage-review',
+  'loom.workspace.list', 'loom.workspace.read', 'loom.workspace.write',
+  'thread.message.send',
 ])
 // P0 step 3: the tools that MUTATE the workspace. When the grant says `requiresClaim`, every one of
 // them must present a live LOOM claim first — including the creation of a brand-new file, which is

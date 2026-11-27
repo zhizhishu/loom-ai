@@ -713,6 +713,15 @@ async fn request(
     let Ok(_permit) = state.requests.clone().try_acquire_owned() else {
         return error(StatusCode::TOO_MANY_REQUESTS, "request_capacity");
     };
+    // This admitted operation is owned by the Host, not by Core: it runs the same
+    // remote workspace prepare as `POST /api/v1/nodes/workspaces` and answers with
+    // that workspace projection. Core has no such method, so it never sees it.
+    if matches!(
+        body.operation,
+        operations::Operation::MissionWorkspacePrepareRemote
+    ) {
+        return nodes::prepare_remote_workspace(&state, body.params).await;
+    }
     let preview_release_camp_id = matches!(
         body.operation,
         operations::Operation::CampDelete | operations::Operation::CampDiscardPending

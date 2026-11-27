@@ -769,8 +769,11 @@ pub type BatchWorkspaces =
     std::collections::BTreeMap<String, Result<PreparedBatchWorkspace, String>>;
 
 fn batch_workspace_fence(connection: &rusqlite::Connection, camp_id: &str) -> Result<Value> {
+    // The fence guards this Host's own execution directory. A remote row is another
+    // machine's worktree: it is not what a waiting batch executes in, and letting it
+    // become the fence would abort a correctly prepared local batch.
     let row: Option<(String, i64, String, String, String)> = connection.query_row(
-        "SELECT id,generation,preparation_token,working_directory,state FROM mission_workspace WHERE camp_id=?1 ORDER BY created_at,id LIMIT 1",
+        "SELECT id,generation,preparation_token,working_directory,state FROM mission_workspace WHERE camp_id=?1 AND execution_host_id=(SELECT id FROM mission_execution_host WHERE singleton=1) ORDER BY created_at,id LIMIT 1",
         [camp_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
     ).optional()?;
     Ok(serde_json::to_value(row)?)
@@ -9860,6 +9863,56 @@ mod tests {
             pass.next_due_at_ms
                 .is_some_and(|next| (now..=now + 61_000).contains(&next)),
             "the queued Run it just started is the next due work, at the recheck cadence: {pass:?}"
+        );
+    }
+
+    /// The batch fence guards this Host's own execution directory. A remote row is
+    /// another machine's worktree: it must not become the fence, or a correctly
+    /// prepared local batch would be aborted for a workspace it never executes in.
+    #[test]
+    fn batch_workspace_fence_reads_the_local_row_even_when_a_remote_row_sorts_first() {
+        let fixture = Fixture::new();
+        let connection = fixture.database.connection();
+        let local_host: String = connection
+            .query_row(
+                "SELECT id FROM mission_execution_host WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO mission(id,number,camp_id,title,description,status,created_at,updated_at)
+                 VALUES('mission_delivery_fence',1,?1,'Fence','','in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                [&fixture.camp_id],
+            )
+            .unwrap();
+        let insert = |id: &str, host: &str, created_at: &str| {
+            connection
+                .execute(
+                    "INSERT INTO mission_workspace(
+                        id,mission_id,camp_id,execution_host_id,source_directory,repository_root,
+                        git_common_dir,worktree_path,working_directory,base_branch,branch,base_sha,
+                        preparation_token,preparation_kind,generation,state,created_at,updated_at
+                     ) VALUES(?1,'mission_delivery_fence',?2,?3,'/source','/source','/source/.git',
+                        ?4,?4,'main','rovai/mission/delivery_fence','base','token','create',1,
+                        'ready',?5,?5)",
+                    rusqlite::params![id, fixture.camp_id, host, format!("/srv/{id}"), created_at],
+                )
+                .unwrap();
+        };
+        insert("ws_remote", "node_b", "2026-01-01T00:00:01Z");
+        insert("ws_local", &local_host, "2026-01-01T00:00:02Z");
+        let fence = batch_workspace_fence(connection, &fixture.camp_id).unwrap();
+        assert_eq!(fence[0], json!("ws_local"));
+        assert_eq!(fence[3], json!("/srv/ws_local"));
+        // A remote-only Mission has no local fence at all, never a foreign one.
+        connection
+            .execute("DELETE FROM mission_workspace WHERE id='ws_local'", [])
+            .unwrap();
+        assert_eq!(
+            batch_workspace_fence(connection, &fixture.camp_id).unwrap(),
+            json!(null)
         );
     }
 }

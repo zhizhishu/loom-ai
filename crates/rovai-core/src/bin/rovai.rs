@@ -1621,7 +1621,7 @@ fn print_root_help() {
 }
 
 fn root_help_text(managed_runtime: bool, tasks_enabled: bool) -> String {
-    let mut text = "Rovai CLI\n\nAgent operations:\n  rovai send\n  rovai member list|get|create|update\n  rovai task create|get|list|update\n  rovai thread list|search|read|runs\n  rovai history search\n  rovai memory view|search|read|write\n  rovai automation list|get|create|run|close|update|delete\n  rovai mission list|get|update|status\n  rovai loom status|skill-suggest|plan|release|claim|evidence|submit|inspect|stage-review\n  rovai workspace list|read|run|poll|cancel\n\nRun an Agent operation's exact `--help` for its closed inputs.\n".to_string();
+    let mut text = "Rovai CLI\n\nAgent operations:\n  rovai send\n  rovai member list|get|create|update\n  rovai task create|get|list|update\n  rovai thread list|search|read|runs\n  rovai history search\n  rovai memory view|search|read|write\n  rovai automation list|get|create|run|close|update|delete\n  rovai mission list|get|update|status\n  rovai loom status|skill-suggest|plan|release|claim|evidence|submit|inspect|stage-review\n  rovai workspace list|read|write|run|poll|cancel\n\nRun an Agent operation's exact `--help` for its closed inputs.\n".to_string();
     if !tasks_enabled {
         text = text.replace("  rovai task create|get|list|update\n", "");
     }
@@ -2196,7 +2196,7 @@ fn invocation_request_id(operation: &str, input: &Value) -> Result<String> {
     }
     if matches!(
         operation,
-        "loom.workspace.list" | "loom.workspace.read" | "loom.workspace.run"
+        "loom.workspace.list" | "loom.workspace.read" | "loom.workspace.write" | "loom.workspace.run"
     ) {
         if let Some(value) = input.get("requestId") {
             return Ok(Uuid::parse_str(
@@ -2254,6 +2254,9 @@ fn operation_help_examples(operation: &str) -> &'static [&'static str] {
         "loom.workspace.read" => {
             &["rovai workspace read --workspace-id workspace-id --path r2-fixture.txt"]
         }
+        "loom.workspace.write" => &[
+            "rovai workspace write --workspace-id workspace-id --path out/report.md --data PGgxPmhpPC9oMT4=",
+        ],
         "loom.workspace.run" => {
             &["rovai workspace run --workspace-id workspace-id --tool-id git.status"]
         }
@@ -2663,7 +2666,7 @@ mod tests {
             "rovai loom\n\nUse LOOM when a Mission needs a plan whose tasks, claims, deliveries and User acceptance stay on record.\nThe target is always the current Thread's Mission. Only the User accepts or rejects a delivery, in the Mission's Delivery tab.\n\n  status    Read the current Mission's plan, tasks and claims.\n  skill-suggest  Record a reusable procedure as a pending-review Skill.\n  plan      Import the Mission's one plan (Default Lead only).\n  release   Make planned tasks claimable (Default Lead only).\n  claim     Claim a released task for this Run.\n  evidence  Register a file you produced as delivery evidence.\n  submit    Submit a claimed task's delivery for User acceptance.\n  inspect       Read a task's latest candidate and review authorization.\n  stage-review  Record an authorized internal review; never User acceptance.\n\nUse rovai loom <command> --help for arguments.\n"
         );
         assert!(root_help_text(true, true).contains(
-            "  rovai mission list|get|update|status\n  rovai loom status|skill-suggest|plan|release|claim|evidence|submit|inspect|stage-review\n  rovai workspace list|read|run|poll|cancel\n\n"
+            "  rovai mission list|get|update|status\n  rovai loom status|skill-suggest|plan|release|claim|evidence|submit|inspect|stage-review\n  rovai workspace list|read|write|run|poll|cancel\n\n"
         ));
         assert_eq!(
             task_family_help_text(),
@@ -2673,7 +2676,7 @@ mod tests {
 
     #[test]
     fn exact_help_surface_covers_the_current_catalog_and_no_family_aliases() {
-        assert!(root_help_text(true, true).contains("rovai workspace list|read|run|poll|cancel"));
+        assert!(root_help_text(true, true).contains("rovai workspace list|read|write|run|poll|cancel"));
         let exact_paths: &[&[&str]] = &[
             &["send", "--help"],
             &["member", "list", "--help"],
@@ -2715,11 +2718,12 @@ mod tests {
             &["loom", "stage-review", "--help"],
             &["workspace", "list", "--help"],
             &["workspace", "read", "--help"],
+            &["workspace", "write", "--help"],
             &["workspace", "run", "--help"],
             &["workspace", "poll", "--help"],
             &["workspace", "cancel", "--help"],
         ];
-        assert_eq!(exact_paths.len(), 43);
+        assert_eq!(exact_paths.len(), 44);
         for path in exact_paths {
             let args = path
                 .iter()
@@ -3602,7 +3606,7 @@ mod managed_workflow_request_id_tests {
     const ID: &str = "6e71a1b4-6b19-4f86-8c18-988552586a37";
 
     #[test]
-    fn managed_workflow_request_id_is_accepted_for_the_ten_loom_operations_only() {
+    fn managed_workflow_request_id_is_accepted_for_the_managed_operations_only() {
         for operation in [
             "loom.status",
             "loom.skill_suggest",
@@ -3614,6 +3618,10 @@ mod managed_workflow_request_id_tests {
             "loom.submit",
             "loom.inspect",
             "loom.stage-review",
+            "loom.workspace.list",
+            "loom.workspace.read",
+            "loom.workspace.write",
+            "thread.message.send",
         ] {
             assert_eq!(
                 managed_workflow_request_id(operation, Some(ID)).unwrap(),
@@ -3624,14 +3632,13 @@ mod managed_workflow_request_id_tests {
         // Every other operation keeps its previous request-id behaviour, so an inherited environment
         // value can never change how another tool names its command.
         for operation in [
-            "loom.workspace.list",
-            "loom.workspace.read",
             "loom.workspace.run",
             "loom.workspace.poll",
             "loom.workspace.cancel",
             "thread.list",
-            "thread.message.send",
+            "thread.read",
             "memory.write",
+            "mission.update",
             "bash",
             "",
         ] {
@@ -3715,6 +3722,10 @@ mod workspace_rpc_cli_tests {
             id
         );
         assert_eq!(
+            invocation_request_id("loom.workspace.write", &input).unwrap(),
+            id
+        );
+        assert_eq!(
             invocation_request_id("loom.workspace.run", &input).unwrap(),
             id
         );
@@ -3726,6 +3737,7 @@ mod workspace_rpc_cli_tests {
         for operation in [
             "loom.workspace.list",
             "loom.workspace.read",
+            "loom.workspace.write",
             "loom.workspace.run",
             "loom.workspace.poll",
             "loom.workspace.cancel",

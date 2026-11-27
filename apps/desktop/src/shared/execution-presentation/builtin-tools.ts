@@ -44,6 +44,7 @@ export const BUILTIN_CLI_NAMES: Readonly<Record<string, string>> = Object.freeze
   'loom.stage-review': 'rovai loom stage-review',
   'loom.workspace.list': 'rovai workspace list',
   'loom.workspace.read': 'rovai workspace read',
+  'loom.workspace.write': 'rovai workspace write',
   'loom.workspace.run': 'rovai workspace run',
   'loom.workspace.poll': 'rovai workspace poll',
   'loom.workspace.cancel': 'rovai workspace cancel'

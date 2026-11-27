@@ -77,6 +77,7 @@ pub struct WorkspaceGrant {
     pub policy_revision: u64,
     pub allow_list: bool,
     pub allow_read: bool,
+    pub allow_write: bool,
     pub allowed_tools: BTreeSet<String>,
     pub online_generation: Option<u64>,
 }
@@ -87,6 +88,7 @@ impl WorkspaceGrant {
         match operation {
             WorkspaceOperation::List { .. } => self.allow_list,
             WorkspaceOperation::Read { .. } => self.allow_read,
+            WorkspaceOperation::Write { .. } => self.allow_write,
             WorkspaceOperation::Run { tool_id, .. } => self.allowed_tools.contains(tool_id),
         }
     }
@@ -1509,6 +1511,7 @@ mod tests {
             policy_revision: 7,
             allow_list: true,
             allow_read: true,
+            allow_write: false,
             allowed_tools,
             online_generation,
         }

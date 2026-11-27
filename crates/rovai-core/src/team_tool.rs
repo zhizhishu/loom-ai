@@ -51,7 +51,7 @@ pub const TEAM_CREATE_TASK_TOOL_NAME: &str = "team.create_task";
 pub const TEAM_GET_TASK_TOOL_NAME: &str = "team.get_task";
 pub const TEAM_UPDATE_TASK_TOOL_NAME: &str = "team.update_task";
 pub const TEAM_LIST_TASKS_TOOL_NAME: &str = "team.list_tasks";
-pub const TEAM_TOOL_NAMES: [&str; 45] = [
+pub const TEAM_TOOL_NAMES: [&str; 46] = [
     "mission.list",
     "mission.get",
     "mission.update",
@@ -68,6 +68,7 @@ pub const TEAM_TOOL_NAMES: [&str; 45] = [
     "loom.stage-review",
     "loom.workspace.list",
     "loom.workspace.read",
+    "loom.workspace.write",
     "loom.workspace.run",
     "loom.workspace.poll",
     "loom.workspace.cancel",

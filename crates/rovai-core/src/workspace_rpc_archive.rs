@@ -222,7 +222,10 @@ fn expected_material(
             ])
         }
         WorkspaceEventBody::Completed {
-            result: WorkspaceResult::Read { .. } | WorkspaceResult::List { .. },
+            result:
+                WorkspaceResult::Read { .. }
+                | WorkspaceResult::List { .. }
+                | WorkspaceResult::Write { .. },
         } => Ok(Vec::new()),
         _ => Err(RpcErrorCode::StorageUnavailable),
     }
@@ -362,6 +365,7 @@ mod tests {
             policy_revision: 1,
             allow_list: true,
             allow_read: true,
+            allow_write: false,
             allowed_tools: BTreeSet::from(["git.status".into()]),
             online_generation: Some(1),
         };

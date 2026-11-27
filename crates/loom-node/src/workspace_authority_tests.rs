@@ -77,7 +77,7 @@ async fn new_prepares_register_without_restart_and_policy_revisions_do_not_silen
     let authority=WorkspaceAuthority::open(&root.join("data"),"node-b".into()).unwrap();
     let engine=WorkspaceRpcExecutor::open("node-b".into(),root.join("rpc"),vec![]).unwrap();
     let handle=authority.record_prepared("workspace-1",&prepared).unwrap();
-    let make_policy=|revision,read|WorkspacePolicy::from_prepared(handle.clone(),"mission-1".into(),revision,true,read,BTreeMap::new()).unwrap();
+    let make_policy=|revision,read|WorkspacePolicy::from_prepared(handle.clone(),"mission-1".into(),revision,true,read,false,BTreeMap::new()).unwrap();
     engine.register_trusted_workspace(make_policy(1,true)).unwrap();
     engine.register_trusted_workspace(make_policy(1,true)).unwrap();
     assert_eq!(engine.register_trusted_workspace(make_policy(1,false)),Err(RpcErrorCode::PolicyMismatch));

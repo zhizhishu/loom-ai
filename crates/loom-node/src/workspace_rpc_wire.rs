@@ -42,7 +42,7 @@ impl WorkspaceRpcWire {
             git.fixed_prefix.splice(0..0,["-C".into(),root.clone(),format!("--work-tree={root}")]);
         }
         let policy=WorkspacePolicy::from_prepared(prepared,dispatch.scope.mission_id.clone(),
-            dispatch.policy_revision,true,true,tools)?;
+            dispatch.policy_revision,true,true,true,tools)?;
         self.executor.register_trusted_workspace(policy)
     }
     /// Caller must be the authenticated Core connection. Identity and policy

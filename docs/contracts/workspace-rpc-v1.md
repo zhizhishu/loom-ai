@@ -5,7 +5,7 @@ authority: workspace-rpc
 status: accepted
 version: 1
 source_version: v1.72
-last_updated: 2026-11-05
+last_updated: 2026-11-27
 ---
 
 # Workspace RPC v1
@@ -25,6 +25,11 @@ last_updated: 2026-11-05
 | workspaceId | 非空受限标识，最多 128 |
 | timeoutMs | u64，1..300000 |
 | operation | 闭集 List / Read / Run；不允许任意 RPC 方法 |
+
+Wire 的 workspaceId 始终必填：本服务端在构造 WorkspaceRequest 之前完成解析，发出去的请求一定带具体 id。Built-in Tool 输入层的 workspaceId 可省略，两侧共用同一授权：
+
+- 显式给出时走既有 authority，行为不变。
+- 省略时只由已认证 AgentRun 及其 camp/mission 决定：在该 mission 的 ready mission_workspace 中 JOIN execution_node 且只取 `role='remote'` 的行。0 行为 `not_found`，1 行直接使用，≥2 行为 `invalid_request`（必须显式指定，不新增错误 variant）。本机的 local 执行行不是远端目标，永不被此路径选中。
 
 CallerScope 只能由已认证 Built-in lease 对应的实际 AgentRun 和当前 Core 数据构造。它包含 runId、attempt、sessionId、memberId、missionId，其中：
 
