@@ -8,7 +8,7 @@ export function browserLanguages(): string[] {
 }
 
 /** A null scope is the unauthenticated, memory-only login preview. */
-export function browserGeneralPreferences(scope: string | null): Omit<GeneralPreferencesApi, 'setNewConversationTeam'> {
+export function browserGeneralPreferences(scope: string | null): Omit<GeneralPreferencesApi, 'setNewConversationTeam' | 'setOwnerPermission'> {
   const key = scope === null ? null : `rovai.presentation:${scope}:general`
   let stored = structuredClone(DEFAULT_STORED_GENERAL_PREFERENCES)
   let error: StructuredError | null = null

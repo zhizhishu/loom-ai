@@ -18,7 +18,7 @@ it('uses the Host team and one-click flag across browser sessions', async () => 
   const entries = new Map<string, string>()
   vi.stubGlobal('localStorage', { getItem: (key: string) => entries.get(key) ?? null, setItem: (key: string, value: string) => entries.set(key, value) })
   vi.stubGlobal('matchMedia', () => ({ matches: false, addEventListener() {}, removeEventListener() {} }))
-  const saved = { newConversationTeamId: null as string | null, newConversationDefaults: { memberAgentIds: ['agent-a', 'agent-b'], defaultLeadAgentId: 'agent-b' }, newConversationDefaultsRequireConfirmation: false, oneClickNewConversationEnabled: true }
+  const saved = { newConversationTeamId: null as string | null, newConversationDefaults: { memberAgentIds: ['agent-a', 'agent-b'], defaultLeadAgentId: 'agent-b' }, newConversationDefaultsRequireConfirmation: false, oneClickNewConversationEnabled: true, ownerPermissions: {} }
   const fetcher = vi.fn<typeof fetch>().mockImplementation(async (url, options) => {
     if (String(url).endsWith('/login')) return Response.json({ protocolVersion: 5, token: 'a'.repeat(64), clientId: 'd'.repeat(64), editorProof: 'e'.repeat(64), ownerId: 'local_user' })
     const input = JSON.parse(String(options?.body))

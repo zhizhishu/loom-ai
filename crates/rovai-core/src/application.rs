@@ -10275,6 +10275,8 @@ impl Core {
                 Ok(serde_json::to_value(execution.result)?)
             }
             "preferences.newConversation.get"
+            | "preferences.ownerPermissions.get"
+            | "preferences.ownerPermissions.set"
             | "preferences.newConversation.initialize"
             | "preferences.newConversation.setDefaults"
             | "preferences.newConversation.setTeam"

@@ -3458,7 +3458,13 @@ export interface InterfaceLanguageSnapshot {
   readError: StructuredError | null
 }
 
-export interface GeneralPreferencesSnapshot extends GeneralPreferencesStorage, InterfaceLanguageSnapshot {}
+export type OwnerPermissionKey = 'computerUse' | 'commandExecution' | 'installDependency' | 'hostFileWrite' | 'networkAccess' | 'gitPush'
+export type OwnerPermissionValue = 'allow' | 'ask' | 'deny'
+
+export interface GeneralPreferencesSnapshot extends GeneralPreferencesStorage, InterfaceLanguageSnapshot {
+  /** Host-owned administrator operation permissions; absent until the Host snapshot is loaded. */
+  ownerPermissions?: Partial<Record<OwnerPermissionKey, OwnerPermissionValue>>
+}
 
 export interface InterfaceLanguageApi {
   /** Local-only read and retry; never waits for the business service. */
@@ -3522,6 +3528,7 @@ export interface GeneralPreferencesApi extends InterfaceLanguageApi {
   setNewConversationTeam(teamId: string | null, enableOneClick?: boolean): Promise<GeneralPreferencesSnapshot>
   setNewConversationDefaults(defaults: NewConversationDefaults, enableOneClick?: boolean): Promise<GeneralPreferencesSnapshot>
   setOneClickNewConversationEnabled(enabled: boolean): Promise<GeneralPreferencesSnapshot>
+  setOwnerPermission(key: OwnerPermissionKey, value: OwnerPermissionValue): Promise<GeneralPreferencesSnapshot>
   setWorldMapEnabled(enabled: boolean): Promise<GeneralPreferencesSnapshot>
   /** Both fields must come from the snapshot that was judged invalid. */
   invalidateNewConversationDefaults(expected: { expectedTeamId: string | null; expectedDefaults: NewConversationDefaults | null }): Promise<GeneralPreferencesSnapshot>
@@ -4328,6 +4335,8 @@ export type CoreMethod =
   | 'preferences.newConversation.setOneClick'
   | 'preferences.newConversation.invalidate'
   | 'preferences.newConversation.initialize'
+  | 'preferences.ownerPermissions.get'
+  | 'preferences.ownerPermissions.set'
 
   | 'health.check'
   | 'diagnostics.check'

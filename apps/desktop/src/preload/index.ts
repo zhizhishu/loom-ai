@@ -248,6 +248,9 @@ const api: RovaiApi = {
     setOneClickNewConversationEnabled(enabled: boolean) {
       return ipcRenderer.invoke('rovai:general-preferences-set-one-click-new-conversation', enabled)
     },
+    setOwnerPermission(key: string, value: string) {
+      return ipcRenderer.invoke('rovai:general-preferences-set-owner-permission', key, value)
+    },
     setWorldMapEnabled(enabled: boolean) {
       return ipcRenderer.invoke('rovai:general-preferences-set-world-map', enabled)
     },

@@ -249,6 +249,8 @@ export const WEB_OPERATIONS = [
   'preferences.newConversation.setDefaults',
   'preferences.newConversation.setOneClick',
   'preferences.newConversation.invalidate',
+  'preferences.ownerPermissions.get',
+  'preferences.ownerPermissions.set',
   'members.update',
   'members.avatar.set',
   'members.runtime.set',

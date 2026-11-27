@@ -783,10 +783,38 @@ impl ActionSafetyService {
                 ));
             }
 
+            let ActorRef::Agent {
+                agent_id: actor_agent_id,
+                ..
+            } = &envelope.actor
+            else {
+                unreachable!("agent_action_context rejects non-agent Actors")
+            };
+            let bot_full = envelope.payload.control_mode != ActionControlMode::Observed
+                && bot_full_permission(transaction, actor_agent_id)?;
+            let owner_decision = if envelope.payload.control_mode == ActionControlMode::Observed {
+                None
+            } else if bot_full {
+                Some("ask")
+            } else if runtime_managed_request {
+                owner_permission_decision(transaction, &envelope.payload.input, actor_agent_id)?
+            } else {
+                None
+            };
             let policy = if envelope.payload.control_mode == ActionControlMode::Observed {
                 PolicyEvaluation {
                     decision: "observed",
                     version: "observed-v1".to_string(),
+                    matched_rule_ids: Vec::new(),
+                }
+            } else if let Some(decision) = owner_decision {
+                PolicyEvaluation {
+                    decision,
+                    version: if bot_full {
+                        "bot-full-permission-v1".to_string()
+                    } else {
+                        "owner-permissions-v1".to_string()
+                    },
                     matched_rule_ids: Vec::new(),
                 }
             } else if runtime_managed_request {
@@ -900,6 +928,7 @@ impl ActionSafetyService {
             )?;
 
             let mut approval_id = None;
+            let mut approval_auto_approved = false;
             if policy.decision == "ask" {
                 let id = Uuid::new_v4().to_string();
                 let approval_options = match runtime_request {
@@ -963,10 +992,78 @@ impl ActionSafetyService {
                         serde_json::to_string(&approval_options)?,
                     ],
                 )?;
+                if bot_full
+                    && let Some(selected_option) = approval_options
+                        .iter()
+                        .find(|option| option.allows_action && option.kind == "allow_once")
+                        .or_else(|| approval_options.iter().find(|option| option.allows_action))
+                {
+                    transaction.execute(
+                        r#"
+                        UPDATE approval
+                        SET status = 'approved', decision_json = ?2,
+                            resolved_by_type = 'system', resolved_by_id = 'bot-full-permission',
+                            resolution_code = 'bot_full_permission', resolution_reason = '当前助手已开启全权限运行',
+                            version = version + 1, resolved_at = ?3, updated_at = ?3
+                        WHERE id = ?1 AND status = 'pending'
+                        "#,
+                        params![
+                            id,
+                            serde_json::to_string(&json!({
+                                "decision": "approved",
+                                "optionId": selected_option.option_id,
+                                "kind": selected_option.kind,
+                                "label": selected_option.label,
+                                "consequence": selected_option.consequence,
+                                "nativeResponseDigest": selected_option.native_response_digest,
+                            }))?,
+                            now,
+                        ],
+                    )?;
+                    if envelope.payload.control_mode == ActionControlMode::Intercepted {
+                        create_runtime_delivery(
+                            transaction,
+                            source_agent_run_id,
+                            &envelope.payload.action_id,
+                            "authorization_resolution",
+                            envelope.execution_epoch.expect("Agent command requires epoch"),
+                            &json!({
+                                "actionId": envelope.payload.action_id,
+                                "actionKind": envelope.payload.input.action_kind(),
+                                "actionDigest": action_digest,
+                                "decision": "approved",
+                                "optionId": selected_option.option_id,
+                                "optionKind": selected_option.kind,
+                                "allowsAction": true,
+                                "nativeResponseDigest": selected_option.native_response_digest,
+                                "nativeResponse": (context.permission_semantics == PermissionSemantics::RuntimeManagedV2).then_some(&selected_option.native_response),
+                            }),
+                        )?;
+                    }
+                    append_domain_event(
+                        transaction,
+                        "approval.resolved",
+                        Some(camp_id),
+                        Some(("approval", &id)),
+                        &ActorRef::System { component_id: "bot-full-permission".to_string() },
+                        None,
+                        &json!({
+                            "actionId": envelope.payload.action_id,
+                            "decision": "approved",
+                            "optionId": selected_option.option_id,
+                            "actionStatus": "prepared",
+                            "automatic": true,
+                            "label": "全权限",
+                        }),
+                    )?;
+                    approval_auto_approved = true;
+                }
                 approval_id = Some(id);
             }
 
             let wait_reason = match policy.decision {
+                "ask" if approval_auto_approved && envelope.payload.control_mode == ActionControlMode::Intercepted => Some("runtime_delivery"),
+                "ask" if approval_auto_approved => Some("action_execution"),
                 "ask" => Some("approval"),
                 "deny" => Some("runtime_delivery"),
                 "observed" => Some("unknown_action_outcome"),
@@ -3442,6 +3539,110 @@ fn evaluate_policy(effective_config: &Value, action_kind: &str) -> Result<Policy
     })
 }
 
+fn bot_full_permission(transaction: &rusqlite::Transaction<'_>, agent_id: &str) -> Result<bool> {
+    let state: Option<String> = transaction
+        .query_row(
+            "SELECT state_json FROM creation_preferences WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(state
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|value| {
+            value["botControlModes"][agent_id]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("full"))
+}
+
+fn owner_permission_key(input: &CanonicalActionInput) -> Option<&'static str> {
+    match input {
+        CanonicalActionInput::ShellCommand { argv, .. } => {
+            let command = argv.join(" ").to_lowercase();
+            if [
+                "pnpm install",
+                "pnpm add",
+                "npm install",
+                "npm i ",
+                "yarn add",
+                "cargo add",
+                "pip install",
+                "apt install",
+                "brew install",
+            ]
+            .iter()
+            .any(|needle| command.contains(needle))
+            {
+                Some("installDependency")
+            } else {
+                Some("commandExecution")
+            }
+        }
+        CanonicalActionInput::FileWrite { .. } | CanonicalActionInput::FileDelete { .. } => {
+            Some("hostFileWrite")
+        }
+        CanonicalActionInput::GitMutation { operation, .. } => {
+            if operation == "push" {
+                Some("gitPush")
+            } else {
+                Some("hostFileWrite")
+            }
+        }
+        CanonicalActionInput::NetworkWrite { .. } | CanonicalActionInput::NetworkAccess { .. } => {
+            Some("networkAccess")
+        }
+        CanonicalActionInput::RuntimePermissionGrant { permissions, .. } => {
+            if permissions["network"]["enabled"].as_bool() == Some(true) {
+                Some("networkAccess")
+            } else {
+                Some("hostFileWrite")
+            }
+        }
+        _ => None,
+    }
+}
+
+fn owner_permission_decision(
+    transaction: &rusqlite::Transaction<'_>,
+    input: &CanonicalActionInput,
+    _agent_id: &str,
+) -> Result<Option<&'static str>> {
+    let state: Option<String> = transaction
+        .query_row(
+            "SELECT state_json FROM creation_preferences WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let parsed = state
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let Some(key) = owner_permission_key(input) else {
+        return Ok(None);
+    };
+    let stored =
+        parsed.and_then(|value| value["ownerPermissions"][key].as_str().map(str::to_owned));
+    let decision = match stored.as_deref() {
+        Some(value) if crate::creation_preferences::valid_owner_permission(key, value) => {
+            match value {
+                "allow" => "allow",
+                "deny" => "deny",
+                _ => "ask",
+            }
+        }
+        _ => match key {
+            "hostFileWrite" => "ask",
+            "gitPush" => "deny",
+            _ => "allow",
+        },
+    };
+    Ok(Some(decision))
+}
+
 fn validate_workspace_scope(
     input: &CanonicalActionInput,
     workspace: Option<&Value>,
@@ -4679,6 +4880,133 @@ mod tests {
     }
 
     #[test]
+    fn owner_command_permission_controls_runtime_managed_shell_approval() {
+        let mut fixture = fixture("allow");
+        let service = ActionSafetyService::default();
+        crate::creation_preferences::execute(
+            &fixture.directory,
+            &mut fixture.database,
+            "preferences.ownerPermissions.set",
+            json!({"key": "commandExecution", "value": "ask"}),
+        )
+        .unwrap();
+        let ask_prepare =
+            intercepted_prepare_envelope(&fixture, "action-owner-ask", "item-owner-ask");
+        let asked = service
+            .prepare_action(&mut fixture.database, &ask_prepare)
+            .unwrap();
+        assert_eq!(asked.result.payload["policyDecision"], "ask");
+        let status: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT status FROM approval WHERE action_id = 'action-owner-ask'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
+
+        crate::creation_preferences::execute(
+            &fixture.directory,
+            &mut fixture.database,
+            "preferences.ownerPermissions.set",
+            json!({"key": "commandExecution", "value": "deny"}),
+        )
+        .unwrap();
+        let deny_prepare =
+            intercepted_prepare_envelope(&fixture, "action-owner-deny", "item-owner-deny");
+        let denied = service
+            .prepare_action(&mut fixture.database, &deny_prepare)
+            .unwrap();
+        assert_eq!(denied.result.payload["policyDecision"], "deny");
+        assert_eq!(denied.result.payload["status"], "not_executed");
+        let delivery_payload: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT payload_json FROM runtime_delivery_checkpoint WHERE action_id = 'action-owner-deny'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(delivery_payload.contains("denied_by_policy"));
+
+        drop(fixture.database);
+        std::fs::remove_dir_all(fixture.directory).unwrap();
+    }
+
+    #[test]
+    fn bot_full_permission_auto_approves_an_intercepted_action_with_a_ledger_entry() {
+        let mut fixture = fixture("ask");
+        crate::creation_preferences::set_bot_control_mode(&fixture.directory, "agent_2", "full")
+            .unwrap();
+        let service = ActionSafetyService::default();
+        let prepare = intercepted_prepare_envelope(&fixture, "action-bot-full", "item-full");
+
+        let prepared = service
+            .prepare_action(&mut fixture.database, &prepare)
+            .unwrap();
+
+        assert_eq!(prepared.result.status, CommandResultStatus::Applied);
+        assert_eq!(prepared.result.payload["policyDecision"], "ask");
+        assert!(prepared.result.payload["approvalId"].is_string());
+        let approval = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT status, resolution_code, resolved_by_id FROM approval WHERE action_id = 'action-bot-full'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            approval,
+            (
+                "approved".to_string(),
+                "bot_full_permission".to_string(),
+                "bot-full-permission".to_string()
+            )
+        );
+        let delivery_payload: String = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT payload_json FROM runtime_delivery_checkpoint
+                WHERE action_id = 'action-bot-full' AND delivery_kind = 'authorization_resolution'
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let delivery_payload: Value = serde_json::from_str(&delivery_payload).unwrap();
+        assert_eq!(delivery_payload["decision"], "approved");
+        assert_eq!(
+            delivery_payload["nativeResponse"],
+            json!({"decision": "accept"})
+        );
+        let event_payload: String = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT payload_json FROM event_log
+                WHERE event_type = 'approval.resolved'
+                  AND entity_id IN (SELECT id FROM approval WHERE action_id = 'action-bot-full')
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event_payload: Value = serde_json::from_str(&event_payload).unwrap();
+        assert_eq!(event_payload["label"], "全权限");
+
+        drop(fixture.database);
+        std::fs::remove_dir_all(fixture.directory).unwrap();
+    }
+
+    #[test]
     fn intercepted_action_is_claimed_only_with_the_leased_authorization_delivery() {
         let mut fixture = fixture("ask");
         let service = ActionSafetyService::default();
@@ -5473,7 +5801,10 @@ mod tests {
             answered_after_restart.result.status,
             CommandResultStatus::Applied
         );
-        assert_eq!(answered_after_restart.result.payload["replayed"], Value::Null);
+        assert_eq!(
+            answered_after_restart.result.payload["replayed"],
+            Value::Null
+        );
         let pending_checkpoint_count: i64 = reopened
             .connection()
             .query_row(
