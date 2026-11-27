@@ -72,6 +72,15 @@ struct ReadInput {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WriteInput {
+    workspace_id: String,
+    path: String,
+    data: String,
+    #[serde(default = "timeout")]
+    timeout_ms: u64,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RunInput {
     workspace_id: String,
     tool_id: String,
@@ -150,6 +159,17 @@ fn build_request(
                     path: v.path,
                     offset: v.offset,
                     max_bytes: v.max_bytes,
+                },
+            )
+        }
+        "loom.workspace.write" => {
+            let v: WriteInput = decode(input)?;
+            (
+                v.workspace_id,
+                v.timeout_ms,
+                WorkspaceOperation::Write {
+                    path: v.path,
+                    data: v.data,
                 },
             )
         }
@@ -356,7 +376,8 @@ impl Core {
                 }
                 Ok(result)
             }
-            "loom.workspace.list" | "loom.workspace.read" | "loom.workspace.run" => {
+            "loom.workspace.list" | "loom.workspace.read" | "loom.workspace.write"
+            | "loom.workspace.run" => {
                 let request = build_request(authenticated, operation, input, call_id)?;
                 let owner = {
                     let database = self.database.lock().await;

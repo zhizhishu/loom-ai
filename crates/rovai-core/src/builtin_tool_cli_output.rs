@@ -134,6 +134,7 @@ pub fn agent_output_schema(operation: &str) -> Result<Value> {
         | "loom.stage-review"
         | "loom.workspace.list"
         | "loom.workspace.read"
+        | "loom.workspace.write"
         | "loom.workspace.run"
         | "loom.workspace.poll"
         | "loom.workspace.cancel"
@@ -282,6 +283,7 @@ fn project_success(operation: &str, result: Value) -> Result<Value> {
         | "loom.stage-review"
         | "loom.workspace.list"
         | "loom.workspace.read"
+        | "loom.workspace.write"
         | "loom.workspace.run"
         | "loom.workspace.poll"
         | "loom.workspace.cancel"
@@ -1008,10 +1010,10 @@ mod tests {
 
     #[test]
     fn every_operation_has_a_schema_valid_golden_projection() {
-        // v17 preserves v16 and adds the two LOOM control tools (`loom.inspect`,
-        // `loom.stage-review`). Prior fixture files remain available as historical contracts.
+        // v18 preserves v17 and adds the workspace write result. Prior fixture files
+        // remain available as historical contracts.
         let golden: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/builtin-tool-agent-output-v17.json"
+            "../tests/fixtures/builtin-tool-agent-output-v18.json"
         ))
         .unwrap();
         // Old results are projected to current names without content receipts.

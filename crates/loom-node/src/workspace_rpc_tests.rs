@@ -154,6 +154,8 @@ async fn write_replaces_only_a_contained_regular_file_and_refuses_escape_and_ove
     if linked.is_ok() {
         let escaped=complete(engine.submit_trusted(write("write-symlink","escape.txt",b"ESCAPED")).unwrap()).await;
         assert!(matches!(escaped.last().unwrap().body,WorkspaceEventBody::Failed{code:RpcErrorCode::PathRejected}));
+        // Regression for open-then-truncate: the owner must not truncate the file a swapped
+        // symlink names. A pre-verification truncate would leave this target empty or partial.
         assert_eq!(fs::read(root.join("outside.txt")).unwrap(),b"OUTSIDE_SECRET");
     } else {eprintln!("SYMLINK_PROBE_UNAVAILABLE: OS did not permit fixture link creation");}
     #[cfg(unix)]

@@ -9,6 +9,7 @@ import {
   CLI_ENV,
   LOOM_TOOL_NAME,
   WORKFLOW_CONTRACT_FILE,
+  applyReadbackForCall,
   loomToolDescription,
   loomToolParameters,
   piToolResult,
@@ -343,7 +344,7 @@ function loomRegistration(pi: any): void {
     name: LOOM_TOOL_NAME,
     label: "LOOM workflow",
     description: loomToolDescription(contracts),
-    promptSnippet: "rovai_loom — record delivery evidence and submit a claimed task (10 LOOM operations only)",
+    promptSnippet: "rovai_loom — record delivery evidence, submit a claimed task, move real workspace bytes and attach them (14 managed operations only)",
     parameters: loomToolParameters(contracts),
     async execute(toolCallId: string, params: any, signal?: AbortSignal) {
       let binding: any;
@@ -379,9 +380,18 @@ function loomRegistration(pi: any): void {
         plan: planned.plan,
         signal,
       });
+      // A whole-file read is the one result whose bytes must become a local file: Pi's own `write`
+      // is text-only, so only this bridge can hand the model a real `.docx` to attach. The step is
+      // inert for every other operation and for any truncated/unknown outcome.
+      const delivered = applyReadbackForCall({
+        operation: planned.plan.operation,
+        result,
+        params,
+        env: process.env,
+      });
       // Pi marks a fulfilled handler successful. Preserve Core rejection/unknown state by throwing;
       // this conversion never retries the child or changes its request identity.
-      return piToolResult(result);
+      return piToolResult(delivered);
     },
   });
 }

@@ -3,8 +3,9 @@
 // Run (Root, from loom/): node --test --test-force-exit --test-timeout=120000 scripts/loom-v2-workflow-tool.test.mjs
 //
 // What this proves (no network, no model, no real CLI process, no user data):
-//   1  the operation table is exactly the ten LOOM business operations, and argv is two fixed words
-//      taken from that table — never model text, never a shell, never `--input-file`;
+//   1  the operation table is exactly the managed operation set (ten LOOM business operations, the
+//      three workspace RPC operations and one group send), and argv is fixed words taken from that
+//      table — never model text, never a shell, never `--input-file`;
 //   2  the tool parameters are closed: `operation` plus an `input` object whose keys follow the existing
 //      Core schemas; Run/bot/Mission/creator/command identity is refused before any child starts;
 //   3  a call only plans when the live grant is bound to this Run, still grants the tool, and has not
@@ -22,15 +23,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import managedHost from '../crates/rovai-core/src/pi/managed-host.ts'
 
 import {
   CLI_ENV,
+  applyReadbackForCall,
   ENVELOPE_VERSION,
   EXIT_CODES,
   FILE_GRANT_SCHEMA,
@@ -38,20 +40,31 @@ import {
   LOOM_OPERATIONS,
   LOOM_OPERATION_ARGV,
   LOOM_TOOL_NAME,
+  MATERIALIZED_PREFIX,
+  MATERIALIZE_OPERATION,
+  MAX_MATERIALIZED_BYTES,
   MAX_STDIN_BYTES,
+  MAX_WRITE_BYTES,
   REQUEST_ID_ENV,
+  RUN_TMP_ENV,
   deriveRequestId,
   evidencePathProblem,
   loomToolDescription,
   loomToolParameters as nativeToolParameters,
+  materializeReadBack,
+  materializedExtension,
   parseEnvelope,
   planInvocation,
   piToolResult,
+  readPayload,
   readWorkflowContracts,
   resolveTrustedCli,
   runInvocation,
   validateLoomParams as validateNativeParams,
   workflowContracts,
+  workspacePathProblem,
+  workspaceWriteDataProblem,
+  attachmentFilesProblem,
 } from '../crates/rovai-core/src/pi/managed-workflow-tool.ts'
 
 const CORE_CONTRACT = JSON.parse(readFileSync(new URL('./fixtures/pi-workflow/core-input-contract.json', import.meta.url), 'utf8'))
@@ -64,11 +77,18 @@ test('Core input contracts replace guessed fields and reject incomplete operatio
   assert.equal(fields.additionalProperties, false)
   assert.deepEqual(fields.properties.relativePath, CONTRACTS['loom.evidence'].properties.relativePath)
   assert.deepEqual(fields.properties.tasks.items.required, ['taskId', 'title'])
-  for (const operation of LOOM_OPERATION_NAMES.filter(name => name !== 'loom.status')) {
+  // `loom.status` and `thread.message.send` declare no required key in Core's catalog; every other
+  // managed operation refuses an empty input before a child exists.
+  const NO_REQUIRED_INPUT = ['loom.status', 'thread.message.send']
+  for (const operation of LOOM_OPERATION_NAMES.filter(name => !NO_REQUIRED_INPUT.includes(name))) {
     assert.equal(validateLoomParams({ operation, input: {} }).ok, false, operation + ' empty input')
   }
+  // `path` and `files` now belong to the workspace and send operations: they are in the shared
+  // provider schema, and `loom.evidence` still refuses them as its own inputs.
+  assert.equal(fields.properties.path.type, 'string')
+  assert.equal(fields.properties.files.type, 'array')
+  assert.equal(CONTRACTS['loom.evidence'].properties.path, undefined)
   for (const key of ['path', 'files', 'filePath', 'paths', 'file']) {
-    assert.equal(fields.properties[key], undefined)
     assert.equal(validateLoomParams({ operation: 'loom.evidence', input: { [key]: 'result.md' } }).code, 'loom_input_not_allowed:' + key)
   }
   const help = loomToolDescription(CONTRACTS)
@@ -208,7 +228,29 @@ const LOOM_OPERATION_NAMES = [
   'loom.submit',
   'loom.inspect',
   'loom.stage-review',
+  'loom.workspace.list',
+  'loom.workspace.read',
+  'loom.workspace.write',
+  'thread.message.send',
 ]
+
+/** Operation → the exact fixed argv this tool may spawn. Never assembled from model text. */
+const EXPECTED_ARGV = {
+  'loom.status': ['loom', 'status'],
+  'loom.skill_suggest': ['loom', 'skill-suggest'],
+  'loom.plan': ['loom', 'plan'],
+  'loom.release': ['loom', 'release'],
+  'loom.claim': ['loom', 'claim'],
+  'loom.claim_heartbeat': ['loom', 'claim-heartbeat'],
+  'loom.evidence': ['loom', 'evidence'],
+  'loom.submit': ['loom', 'submit'],
+  'loom.inspect': ['loom', 'inspect'],
+  'loom.stage-review': ['loom', 'stage-review'],
+  'loom.workspace.list': ['workspace', 'list'],
+  'loom.workspace.read': ['workspace', 'read'],
+  'loom.workspace.write': ['workspace', 'write'],
+  'thread.message.send': ['send'],
+}
 
 function freshDir(prefix) {
   return mkdtempSync(join(tmpdir(), prefix))
@@ -294,22 +336,20 @@ function fakeSpawn(options = {}) {
 // 1 · operation table and argv
 // ---------------------------------------------------------------------------
 
-test('1 · the tool reaches exactly the ten LOOM operations through fixed argv words', () => {
+test('1 · the tool reaches exactly the managed operations through fixed argv words', () => {
   assert.equal(LOOM_TOOL_NAME, 'rovai_loom')
   assert.deepEqual([...LOOM_OPERATIONS], LOOM_OPERATION_NAMES)
   assert.equal(new Set(LOOM_OPERATIONS).size, LOOM_OPERATION_NAMES.length, 'no duplicate operations')
   for (const operation of LOOM_OPERATION_NAMES) {
     const argv = LOOM_OPERATION_ARGV[operation]
     assert.ok(Array.isArray(argv), `${operation} must map to argv`)
-    assert.equal(argv.length, 2, `${operation} argv is exactly two words`)
-    assert.equal(argv[0], 'loom')
-    // The fixed CLI word is the operation suffix with underscores hyphenated (`claim_heartbeat`
-    // reaches `rovai loom claim-heartbeat`), so the assertion still pins the exact word.
-    assert.equal(argv[1], operation.slice('loom.'.length).replace(/_/gu, '-'))
+    assert.deepEqual([...argv], EXPECTED_ARGV[operation], `${operation} argv is fixed`)
+    // No word is ever derived from model text: every argv entry is a literal CLI word.
+    for (const word of argv) assert.match(word, /^[a-z-]+$/u)
     assert.ok(LOOM_INPUT_KEYS[operation], `${operation} must declare its closed input keys`)
   }
-  // Anything outside the ten has no argv and no input keys.
-  for (const operation of ['loom.workspace.list', 'loom.workspace.run', 'bash', 'thread.message.send', '']) {
+  // Anything outside the managed set has no argv and no input keys.
+  for (const operation of ['loom.workspace.run', 'loom.workspace.poll', 'loom.workspace.cancel', 'bash', 'thread.list', '']) {
     assert.equal(LOOM_OPERATION_ARGV[operation], undefined)
     assert.equal(LOOM_INPUT_KEYS[operation], undefined)
   }
@@ -794,6 +834,312 @@ test('12 · an oversized JSON stdin payload is refused before any child exists',
   } finally {
     await rm(current.root, { recursive: true, force: true })
   }
+})
+
+// ---------------------------------------------------------------------------
+// 14 · workspace write/read/send parameters and the managed stdin budget
+// ---------------------------------------------------------------------------
+
+/** One read page in the exact shape Core's `render_page` emits for a completed read. */
+function readPage(result, extra = {}) {
+  return JSON.stringify({
+    requestId: 'wrpc_' + '1'.repeat(64), state: 'completed', runId: 'run', sessionId: 'session',
+    attempt: 1, deadlineUnixMs: 10_000, lastSeq: 2, nextAfterSeq: 2, hasMore: false,
+    outputBytes: 0, omittedBytes: 0, archives: [],
+    events: [
+      { seq: 1, body: { kind: 'accepted' } },
+      { seq: 2, body: { kind: 'completed', result } },
+    ],
+    ...extra,
+  })
+}
+
+function readResult(result) {
+  return { isError: false, code: 'ok', text: readPage(result), indeterminate: false }
+}
+
+/** An in-memory filesystem seam: no real directory, no real child. */
+function fakeMaterializeFs(options = {}) {
+  const directory = options.directory ?? '/run-tmp'
+  const files = new Map(options.files ?? [])
+  return {
+    files,
+    canonicalDirectory(path) {
+      if (options.directoryVisible === false) return null
+      return path === directory ? directory : null
+    },
+    createExclusive(path, bytes) {
+      if (options.createFails) throw Object.assign(new Error('create failed'), { code: options.createFails })
+      if (files.has(path)) throw Object.assign(new Error('exists'), { code: 'EEXIST' })
+      files.set(path, Buffer.from(bytes))
+    },
+    readRegularFile(path) {
+      return files.get(path) ?? null
+    },
+    canonicalFile(path) {
+      if (options.fileEscape) return `/elsewhere/${path.split('/').pop()}`
+      return files.has(path) ? path : null
+    },
+  }
+}
+
+test('14 · a 1 MiB workspace write fits the managed stdin budget and one byte more is refused', () => {
+  const current = fixture()
+  try {
+    const exact = Buffer.alloc(MAX_WRITE_BYTES, 0x41)
+    const planned = plan(current, {
+      operation: 'loom.workspace.write',
+      input: { workspaceId: 'workspace-1', path: 'deliverables/report.docx', data: exact.toString('base64') },
+    })
+    assert.equal(planned.ok, true, planned.code)
+    assert.deepEqual([...planned.plan.argv], ['workspace', 'write'])
+    assert.ok(
+      Buffer.byteLength(planned.plan.stdin, 'utf8') <= MAX_STDIN_BYTES,
+      'a protocol-maximum write must fit the managed stdin budget',
+    )
+    assert.equal(Buffer.from(JSON.parse(planned.plan.stdin).data, 'base64').length, MAX_WRITE_BYTES)
+
+    // The bridge refuses an over-limit body from its length alone, before a child exists.
+    const oversized = plan(current, {
+      operation: 'loom.workspace.write',
+      input: { workspaceId: 'workspace-1', path: 'out/big.bin', data: Buffer.alloc(MAX_WRITE_BYTES + 1, 0x41).toString('base64') },
+    })
+    assert.equal(oversized.ok, false)
+    assert.equal(oversized.code, 'loom_workspace_write_data_too_large')
+    assert.equal('plan' in oversized, false)
+
+    // A write is one relative path plus complete base64; nothing else is reachable.
+    assert.match(validateLoomParams({ operation: 'loom.workspace.write', input: { workspaceId: 'w', path: '../x', data: 'eA==' } }).code, /loom_workspace_path_parent_escape/u)
+    assert.match(validateLoomParams({ operation: 'loom.workspace.write', input: { workspaceId: 'w', path: '.git/HEAD', data: 'eA==' } }).code, /loom_workspace_path_git_metadata/u)
+    assert.match(validateLoomParams({ operation: 'loom.workspace.write', input: { workspaceId: 'w', path: 'out/a', data: 'not-base64' } }).code, /loom_workspace_write_data_not_base64/u)
+    for (const key of ['mode', 'append', 'delete', 'outputPath', 'command']) {
+      assert.match(
+        validateLoomParams({ operation: 'loom.workspace.write', input: { workspaceId: 'w', path: 'out/a', data: 'eA==', [key]: 'x' } }).code,
+        new RegExp(`loom_input_not_allowed:${key}`, 'u'),
+      )
+    }
+    // Exactly 1 MiB of decoded bytes is the ceiling, from the length alone.
+    assert.equal(workspaceWriteDataProblem(Buffer.alloc(MAX_WRITE_BYTES, 1).toString('base64')), null)
+    assert.equal(workspaceWriteDataProblem(Buffer.alloc(MAX_WRITE_BYTES + 1, 1).toString('base64')), 'write_data_too_large')
+    // A read path may name Git metadata; only a write target may not.
+    assert.equal(workspacePathProblem('.git/HEAD', { write: false }), null)
+    assert.equal(workspacePathProblem('.git/HEAD', { write: true }), 'path_git_metadata')
+    assert.equal(workspacePathProblem('a//b', { write: false }), 'path_empty_segment')
+    assert.equal(workspacePathProblem('dir\\file', { write: false }), 'path_not_relative')
+  } finally { rm(current.root, { recursive: true, force: true }) }
+})
+
+test('15 · an untruncated read becomes one generated local file under ROVAI_RUN_TMP', () => {
+  const payload = Buffer.from('UEsDBBQAAAAIAA==', 'base64')
+  const sha = createHash('sha256').update(payload).digest('hex')
+  const expectedName = `${MATERIALIZED_PREFIX}${sha.slice(0, 16)}.docx`
+  // The seam joins with the platform separator, exactly like the production implementation.
+  const runTmp = resolve('/run-tmp')
+  const expectedTarget = join(runTmp, expectedName)
+  const wholeRead = () => readResult({ kind: 'read', encoding: 'base64', data: payload.toString('base64'), offset: 0, truncated: false })
+
+  // 1. A whole read is materialized under the run directory with a content-addressed name.
+  const fsApi = fakeMaterializeFs({ directory: runTmp })
+  const first = materializeReadBack({
+    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'deliverables/report.docx', runTmp, fsApi,
+  })
+  assert.equal(first.localFile.path, expectedTarget)
+  assert.equal(first.localFile.bytes, payload.length)
+  assert.equal(first.localFile.sha256, sha)
+  assert.ok(fsApi.files.get(expectedTarget).equals(payload), 'the copy holds the exact bytes')
+  assert.match(first.text, /local file: .*loom-read-[0-9a-f]{16}\.docx/u)
+  assert.match(first.text, /thread\.message\.send files/u)
+
+  // 2. The same bytes map to the same name and are reused, never re-written.
+  const again = materializeReadBack({
+    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'deliverables/report.docx', runTmp, fsApi,
+  })
+  assert.equal(again.localFile.path, first.localFile.path)
+  assert.match(again.text, /already materialized/u)
+
+  // 3. A name already holding different bytes is a conflict, not an overwrite.
+  const conflictFs = fakeMaterializeFs({ directory: runTmp, files: [[expectedTarget, Buffer.from('different')]] })
+  const conflict = materializeReadBack({
+    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'deliverables/report.docx', runTmp, fsApi: conflictFs,
+  })
+  assert.equal(conflict.localFile, undefined)
+  assert.match(conflict.text, /loom_materialize_conflict/u)
+  assert.equal(conflictFs.files.get(expectedTarget).toString(), 'different')
+
+  // 4. Nothing is materialized without a real run directory, a whole page, or a contained result.
+  const noRunTmp = materializeReadBack({
+    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'out.docx', runTmp: undefined, fsApi,
+  })
+  assert.equal(noRunTmp.localFile, undefined)
+  assert.match(noRunTmp.text, /loom_run_tmp_unavailable/u)
+  const relativeRunTmp = materializeReadBack({
+    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'out.docx', runTmp: 'relative/run-tmp', fsApi,
+  })
+  assert.match(relativeRunTmp.text, /loom_run_tmp_unavailable/u)
+  const truncated = materializeReadBack({
+    operation: MATERIALIZE_OPERATION,
+    result: readResult({ kind: 'read', encoding: 'base64', data: payload.toString('base64'), offset: 0, truncated: true }),
+    requestedPath: 'out.docx', runTmp, fsApi,
+  })
+  assert.equal(truncated.localFile, undefined)
+  assert.match(truncated.text, /loom_read_truncated/u)
+  const escaped = materializeReadBack({
+    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'out.docx', runTmp,
+    fsApi: fakeMaterializeFs({ directory: runTmp, fileEscape: true }),
+  })
+  assert.equal(escaped.localFile, undefined)
+  assert.match(escaped.text, /loom_materialize_escaped/u)
+  const createFails = materializeReadBack({
+    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'out.docx', runTmp,
+    fsApi: fakeMaterializeFs({ directory: runTmp, createFails: 'EACCES' }),
+  })
+  assert.equal(createFails.localFile, undefined)
+  assert.match(createFails.text, /loom_materialize_failed/u)
+
+  // 5. A failed operation and every other operation pass through untouched.
+  const failed = { isError: true, code: 'path_rejected', text: 'rejected', indeterminate: false }
+  assert.equal(materializeReadBack({ operation: MATERIALIZE_OPERATION, result: failed, requestedPath: 'a.docx', runTmp: '/run-tmp', fsApi }), failed)
+  const other = { isError: false, code: 'ok', text: '{"kind":"list"}', indeterminate: false }
+  assert.equal(materializeReadBack({ operation: 'loom.workspace.list', result: other, requestedPath: 'a.docx', runTmp: '/run-tmp', fsApi }), other)
+
+  // 6. The model never names the output: only a safe extension of the requested path survives.
+  assert.equal(materializedExtension('deliverables/report.docx'), '.docx')
+  assert.equal(materializedExtension('deliverables/REPORT.DOCX'), '.docx')
+  assert.equal(materializedExtension('payload.exe'), '.bin')
+  assert.equal(materializedExtension('payload.ps1'), '.bin')
+  assert.equal(materializedExtension('payload'), '.bin')
+  assert.equal(materializedExtension('../../etc/passwd'), '.bin')
+  assert.equal(materializedExtension('a/b.tar.gz'), '.gz')
+  assert.equal(materializedExtension(undefined), '.bin')
+  assert.equal(readPayload(readPage({ kind: 'read', encoding: 'utf8', text: 'hello', offset: 0, truncated: false })).ok, true)
+  assert.equal(readPayload('not json').code, 'loom_read_result_unparsable')
+  assert.equal(readPayload(readPage({ kind: 'read', encoding: 'base64', data: 'eA', offset: 0, truncated: false })).code, 'loom_read_result_malformed')
+  assert.equal(readPayload(readPage({ kind: 'read', encoding: 'base64', data: 'eA==', offset: 0, truncated: false }, { state: 'running' })).code, 'loom_read_not_completed:running')
+  assert.equal(readPayload('').code, 'loom_read_result_missing')
+})
+
+test('15b · the production materialization seam writes one private file and never overwrites', async () => {
+  const runTmp = mkdtempSync(join(tmpdir(), 'loom-readback-'))
+  try {
+    const bytes = Buffer.from('fixture-docx-bytes-for-one-run', 'utf8')
+    const result = readResult({ kind: 'read', encoding: 'base64', data: bytes.toString('base64'), offset: 0, truncated: false })
+    const first = materializeReadBack({ operation: MATERIALIZE_OPERATION, result, requestedPath: 'out/report.docx', runTmp })
+    assert.ok(first.localFile, first.text)
+    assert.equal(readFileSync(first.localFile.path).equals(bytes), true, 'the copy is byte-identical')
+    assert.equal(statSync(first.localFile.path).isFile(), true)
+    assert.equal(first.localFile.path.endsWith('.docx'), true)
+    assert.equal(resolve(first.localFile.path).startsWith(resolve(runTmp)), true, 'the copy lives in the run directory')
+    if (process.platform !== 'win32') assert.equal(statSync(first.localFile.path).mode & 0o777, 0o600)
+    // A retry reuses the identical copy instead of failing or rewriting it.
+    const again = materializeReadBack({ operation: MATERIALIZE_OPERATION, result, requestedPath: 'out/report.docx', runTmp })
+    assert.equal(again.localFile.path, first.localFile.path)
+    assert.match(again.text, /already materialized/u)
+    // A different payload never reuses this name.
+    const other = readResult({ kind: 'read', encoding: 'base64', data: Buffer.from('another payload').toString('base64'), offset: 0, truncated: false })
+    const second = materializeReadBack({ operation: MATERIALIZE_OPERATION, result: other, requestedPath: 'out/report.docx', runTmp })
+    assert.notEqual(second.localFile.path, first.localFile.path)
+    assert.equal(existsSync(first.localFile.path) && existsSync(second.localFile.path), true)
+    // A real symlink standing where the copy would go is refused, never followed.
+    const sha = createHash('sha256').update(bytes).digest('hex')
+    const linkedName = `${MATERIALIZED_PREFIX}${sha.slice(0, 16)}.md`
+    const outside = join(runTmp, 'outside-target.txt')
+    writeFileSync(outside, 'outside secret\n', 'utf8')
+    let linked = false
+    try {
+      symlinkSync(outside, join(runTmp, linkedName), 'file')
+      linked = true
+    } catch (error) {
+      if (error?.code !== 'EPERM' && error?.code !== 'EACCES') throw error
+    }
+    if (linked) {
+      const linkResult = materializeReadBack({ operation: MATERIALIZE_OPERATION, result, requestedPath: 'out/report.md', runTmp })
+      assert.equal(linkResult.localFile, undefined)
+      assert.match(linkResult.text, /loom_materialize_conflict/u)
+      assert.equal(readFileSync(outside, 'utf8'), 'outside secret\n')
+    }
+  } finally { await rm(runTmp, { recursive: true, force: true }) }
+})
+
+test('16 · thread.message.send is the ordinary attachment path for a materialized file', () => {
+  const current = fixture()
+  try {
+    const localFile = '/run-tmp/loom-read-0123456789abcdef.docx'
+    const planned = plan(current, { operation: 'thread.message.send', input: { body: 'Delivery attached.', files: [localFile] } })
+    assert.equal(planned.ok, true, planned.code)
+    assert.deepEqual([...planned.plan.argv], ['send'], 'the fixed CLI word is the one group-send verb')
+    assert.deepEqual(JSON.parse(planned.plan.stdin), { body: 'Delivery attached.', files: [localFile] })
+
+    // Identity is never claimable from the payload, and no other key is reachable.
+    for (const key of ['agentRunId', 'runId', 'botId', 'missionId', 'campId', 'creatorId', 'commandId', 'requestId', 'executionEpoch', 'workspaceReal', 'logPath']) {
+      assert.match(
+        validateLoomParams({ operation: 'thread.message.send', input: { [key]: 'forged' } }).code,
+        /loom_identity_not_allowed/u,
+        `${key} must be refused`,
+      )
+    }
+    for (const key of ['file', 'filePath', 'paths', 'attachments', 'taskId', 'threadId']) {
+      assert.match(
+        validateLoomParams({ operation: 'thread.message.send', input: { [key]: 'x' } }).code,
+        new RegExp(`loom_input_not_allowed:${key}`, 'u'),
+        `${key} is not a catalog key`,
+      )
+    }
+    // No shape no authority could accept reaches a child.
+    assert.equal(validateLoomParams({ operation: 'thread.message.send', input: {} }).ok, true)
+    assert.equal(validateLoomParams({ operation: 'thread.message.send', input: { files: [] } }).ok, true)
+    assert.match(validateLoomParams({ operation: 'thread.message.send', input: { files: ['../escape.docx'] } }).code, /loom_send_files_parent_escape/u)
+    assert.match(validateLoomParams({ operation: 'thread.message.send', input: { files: ['a\u0000b'] } }).code, /loom_send_files_nul_byte/u)
+    assert.match(validateLoomParams({ operation: 'thread.message.send', input: { files: 'a.docx' } }).code, /loom_send_files_not_array/u)
+    assert.match(validateLoomParams({ operation: 'thread.message.send', input: { files: Array.from({ length: 11 }, (_, index) => `f${index}.docx`) } }).code, /loom_send_files_too_many/u)
+    assert.equal(attachmentFilesProblem(['/run-tmp/loom-read-0123456789abcdef.docx']), null)
+  } finally { rm(current.root, { recursive: true, force: true }) }
+})
+
+test('15c · the extension wiring resolves the requested path and ROVAI_RUN_TMP in one place', () => {
+  const runTmp = resolve('/run-tmp')
+  const fsApi = fakeMaterializeFs({ directory: runTmp })
+  const result = readResult({ kind: 'read', encoding: 'base64', data: Buffer.from('docx-bytes').toString('base64'), offset: 0, truncated: false })
+  const delivered = applyReadbackForCall({
+    operation: MATERIALIZE_OPERATION,
+    result,
+    params: { operation: MATERIALIZE_OPERATION, input: { workspaceId: 'w', path: 'deliverables/report.docx' } },
+    env: { [RUN_TMP_ENV]: runTmp },
+    fsApi,
+  })
+  assert.ok(delivered.localFile, delivered.text)
+  assert.equal(delivered.localFile.path.endsWith('.docx'), true)
+  // No run directory, no local copy — and the model still sees the read result.
+  const unwired = applyReadbackForCall({
+    operation: MATERIALIZE_OPERATION,
+    result,
+    params: { operation: MATERIALIZE_OPERATION, input: { workspaceId: 'w', path: 'deliverables/report.docx' } },
+    env: {},
+    fsApi,
+  })
+  assert.equal(unwired.localFile, undefined)
+  assert.match(unwired.text, /loom_run_tmp_unavailable/u)
+  // A malformed parameter object can never select a path.
+  const noInput = applyReadbackForCall({ operation: MATERIALIZE_OPERATION, result, params: 'not-an-object', env: { [RUN_TMP_ENV]: runTmp }, fsApi })
+  assert.equal(noInput.localFile !== undefined, true, 'extension falls back to .bin rather than failing')
+  assert.equal(noInput.localFile.path.endsWith('.bin'), true)
+})
+
+test('17 · the managed bridge mirrors Core catalog keys for every bridged operation', () => {
+  const fields = loomToolParameters().properties.input
+  for (const [operation, keys] of Object.entries(LOOM_INPUT_KEYS)) {
+    assert.deepEqual(
+      [...keys].sort(),
+      Object.keys(CONTRACTS[operation].properties).sort(),
+      `${operation} keys must mirror Core's catalog exactly`,
+    )
+  }
+  assert.deepEqual([...LOOM_INPUT_KEYS['loom.workspace.write']].sort(), ['data', 'path', 'requestId', 'timeoutMs', 'workspaceId'])
+  assert.deepEqual([...LOOM_INPUT_KEYS['thread.message.send']].sort(), ['body', 'files', 'mentionUser', 'publicOnly', 'to'])
+  assert.equal(fields.properties.data.type, 'string')
+  assert.equal(fields.properties.data.maxLength, 1_398_104)
+  assert.equal(fields.properties.path.minLength, 1)
+  assert.equal(fields.properties.files.maxItems, 10)
+  assert.equal(fields.properties.workspaceId.maxLength, 128)
 })
 
 // ---------------------------------------------------------------------------

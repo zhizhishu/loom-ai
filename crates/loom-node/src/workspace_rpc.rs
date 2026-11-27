@@ -494,10 +494,16 @@ fn execute_fs(operation:Prepared)->RpcResult<WorkspaceResult> {
         Prepared::Write{root,path,bytes,authority}=>{
             if let Some(authority)=&authority {authority.revalidate()?;}
             let (target,created)=write_target(&root,&path)?;
-            let mut file=fs::OpenOptions::new().write(true).create(true).truncate(true)
-                .open(&target).map_err(|_|RpcErrorCode::StorageUnavailable)?;
-            verify_open_file_inside(&file,&root)?;
-            if !file.metadata().map_err(|_|RpcErrorCode::StorageUnavailable)?.is_file() {return Err(RpcErrorCode::NotFile);}
+            // Open WITHOUT truncating. A target that was swapped for a symlink or for a file
+            // outside the root between the decision above and this open must be rejected before
+            // any byte of the file it names is destroyed.
+            let mut file=open_write_target(&target)?;
+            if let Err(code)=verify_open_file_inside(&file,&root) {drop(file);return Err(code);}
+            let metadata=file.metadata().map_err(|_|RpcErrorCode::StorageUnavailable)?;
+            if !metadata.is_file() {return Err(RpcErrorCode::NotFile);}
+            // Only a handle already proven to be this workspace's regular file is truncated.
+            file.set_len(0).map_err(|_|RpcErrorCode::StorageUnavailable)?;
+            file.seek(SeekFrom::Start(0)).map_err(|_|RpcErrorCode::StorageUnavailable)?;
             file.write_all(&bytes).map_err(|_|RpcErrorCode::StorageUnavailable)?;
             file.flush().map_err(|_|RpcErrorCode::StorageUnavailable)?;
             // The binding must still hold after the only mutating operation, so a
@@ -508,6 +514,20 @@ fn execute_fs(operation:Prepared)->RpcResult<WorkspaceResult> {
         }
         Prepared::Run(_)=>Err(RpcErrorCode::InvalidRequest),
     }
+}
+/// Open one already-decided write target for writing without truncating it. On Unix the narrowest
+/// available guard is `O_NOFOLLOW`, so a final component swapped for a symlink fails the open
+/// itself; elsewhere the existing handle-path proof (`verify_open_file_inside`) runs before the
+/// first truncating call.
+#[cfg(unix)]
+fn open_write_target(target:&Path)->RpcResult<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new().write(true).create(true).custom_flags(libc::O_NOFOLLOW).open(target)
+        .map_err(|error|if error.raw_os_error()==Some(libc::ELOOP) {RpcErrorCode::PathRejected} else {RpcErrorCode::StorageUnavailable})
+}
+#[cfg(not(unix))]
+fn open_write_target(target:&Path)->RpcResult<File> {
+    fs::OpenOptions::new().write(true).create(true).open(target).map_err(|_|RpcErrorCode::StorageUnavailable)
 }
 #[cfg(target_os="linux")]
 fn verify_open_file_inside(file:&File,root:&Path)->RpcResult<()> {

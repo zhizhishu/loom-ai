@@ -7857,8 +7857,8 @@ impl Core {
                         command_execution_payload(execution)
                     }
                 }
-                "loom.workspace.list" | "loom.workspace.read" | "loom.workspace.run"
-                | "loom.workspace.poll" | "loom.workspace.cancel" => {
+                "loom.workspace.list" | "loom.workspace.read" | "loom.workspace.write"
+                | "loom.workspace.run" | "loom.workspace.poll" | "loom.workspace.cancel" => {
                     // The handler uses the authenticated Run and acquires only
                     // short database scopes around admission and replay.
                     drop(database);

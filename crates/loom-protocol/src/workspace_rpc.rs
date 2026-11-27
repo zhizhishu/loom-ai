@@ -502,9 +502,10 @@ impl WorkspaceResult {
     ///
     /// The variant must match the request's operation. Codes: `InvalidRequest`
     /// for a wrong variant, too many entries, an offset mismatch, an oversized
-    /// `output_bytes`, an overflowing output accounting, malformed base64 or
-    /// decoded bytes beyond `max_bytes`; `PathRejected` for an entry name that
-    /// is not a single legal path component. No base64 payload is ever copied
+    /// `output_bytes`, an overflowing output accounting, malformed base64,
+    /// decoded bytes beyond `max_bytes`, or a `bytes_written` that is not
+    /// exactly the decoded length of the written request; `PathRejected` for an
+    /// entry name that is not a single legal path component. No base64 payload is ever copied
     /// into an error.
     pub fn validate_for(&self, request: &WorkspaceRequest) -> Result<(), RpcErrorCode> {
         match (self, &request.operation) {
@@ -548,9 +549,10 @@ impl WorkspaceResult {
                     bytes_written,
                     created: _,
                 },
-                WorkspaceOperation::Write { .. },
+                WorkspaceOperation::Write { data, .. },
             ) => {
-                if *bytes_written > u64::from(MAX_WRITE_BYTES) {
+                let expected = decode_base64_bounded(data, u64::from(MAX_WRITE_BYTES))? as u64;
+                if *bytes_written != expected {
                     return Err(RpcErrorCode::InvalidRequest);
                 }
                 Ok(())
@@ -1765,12 +1767,39 @@ mod tests {
         }
         .validate_for(write_request_ref)
         .is_ok());
+        // The count must be exactly the decoded request length: a short, long or
+        // merely "within the limit" answer is not this write's result.
+        for bytes_written in [0_u64, 8, 10, 65_536, u64::from(MAX_WRITE_BYTES)] {
+            assert_eq!(
+                WorkspaceResult::Write {
+                    bytes_written,
+                    created: false,
+                }
+                .validate_for(write_request_ref),
+                Err(RpcErrorCode::InvalidRequest),
+                "bytes_written {bytes_written}"
+            );
+        }
+        let empty_dispatch = WorkspaceDispatch::new(
+            write_request("empty.txt", String::new()),
+            scope(),
+            "node_b".to_string(),
+            7,
+            1_700_000_000_000,
+        )
+        .expect("valid empty write dispatch");
+        assert!(WorkspaceResult::Write {
+            bytes_written: 0,
+            created: true,
+        }
+        .validate_for(&empty_dispatch.request)
+        .is_ok());
         assert_eq!(
             WorkspaceResult::Write {
-                bytes_written: u64::from(MAX_WRITE_BYTES) + 1,
-                created: false,
+                bytes_written: 1,
+                created: true,
             }
-            .validate_for(write_request_ref),
+            .validate_for(&empty_dispatch.request),
             Err(RpcErrorCode::InvalidRequest)
         );
         for wrong in [

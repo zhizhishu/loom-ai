@@ -125,6 +125,7 @@ fn project_input(operation: &str, input: &Value) -> Result<Value> {
         }
         "loom.workspace.list"
         | "loom.workspace.read"
+        | "loom.workspace.write"
         | "loom.workspace.run"
         | "loom.workspace.poll"
         | "loom.workspace.cancel" => {
@@ -468,6 +469,7 @@ fn project_result(operation: &str, result: &Value) -> Result<Value> {
         }
         "loom.workspace.list"
         | "loom.workspace.read"
+        | "loom.workspace.write"
         | "loom.workspace.run"
         | "loom.workspace.poll"
         | "loom.workspace.cancel" => {

@@ -23,12 +23,15 @@ pub const ROVAI_RUN_TMP_ENV: &str = "ROVAI_RUN_TMP";
 ///
 /// The Pi managed bridge sets this on the exact child process it spawns, derived from the provider
 /// tool-call id plus the authenticated Run binding and the operation. It is never read from model
-/// output, so a payload can never name its own command identity. The CLI accepts it for the ten
-/// `loom.*` operations only; every other operation keeps its previous request-id behaviour.
+/// output, so a payload can never name its own command identity. The CLI accepts it for the managed
+/// operation set only; every other operation keeps its previous request-id behaviour.
 pub const ROVAI_BUILTIN_REQUEST_ID_ENV: &str = "ROVAI_BUILTIN_REQUEST_ID";
 /// The complete operation set the managed workflow tool may reach: the ten LOOM business
-/// operations the CLI already ships. `bash`, MCP, and every other operation stay outside it.
-pub const MANAGED_WORKFLOW_OPERATIONS: [&str; 10] = [
+/// operations the CLI already ships, plus the three workspace RPC operations a managed Run needs
+/// to move real bytes into and out of its authorized workspace, plus the one ordinary group send
+/// that turns those bytes into an attachment. `bash`, MCP, `loom.workspace.run` and every other
+/// operation stay outside it.
+pub const MANAGED_WORKFLOW_OPERATIONS: [&str; 14] = [
     "loom.status",
     "loom.skill_suggest",
     "loom.plan",
@@ -39,6 +42,10 @@ pub const MANAGED_WORKFLOW_OPERATIONS: [&str; 10] = [
     "loom.submit",
     "loom.inspect",
     "loom.stage-review",
+    "loom.workspace.list",
+    "loom.workspace.read",
+    "loom.workspace.write",
+    "thread.message.send",
 ];
 
 pub fn is_managed_workflow_operation(operation: &str) -> bool {
@@ -166,7 +173,7 @@ pub struct BuiltinToolCliIdentity {
     pub action: &'static str,
 }
 
-pub const BUILTIN_TOOL_CLI_IDENTITIES: [BuiltinToolCliIdentity; 45] = [
+pub const BUILTIN_TOOL_CLI_IDENTITIES: [BuiltinToolCliIdentity; 46] = [
     BuiltinToolCliIdentity {
         operation: "thread.message.send",
         group: "send",
@@ -343,6 +350,11 @@ pub const BUILTIN_TOOL_CLI_IDENTITIES: [BuiltinToolCliIdentity; 45] = [
         operation: "loom.workspace.read",
         group: "workspace",
         action: "read",
+    },
+    BuiltinToolCliIdentity {
+        operation: "loom.workspace.write",
+        group: "workspace",
+        action: "write",
     },
     BuiltinToolCliIdentity {
         operation: "loom.workspace.run",
@@ -1148,6 +1160,7 @@ fn error_contracts(operation: &str) -> Vec<BuiltinToolErrorContract> {
         operation,
         "loom.workspace.list"
             | "loom.workspace.read"
+            | "loom.workspace.write"
             | "loom.workspace.run"
             | "loom.workspace.poll"
             | "loom.workspace.cancel"
@@ -1222,6 +1235,7 @@ pub fn projection_identity(operation: &str) -> Result<&'static str> {
         | "loom.stage-review"
         | "loom.workspace.list"
         | "loom.workspace.read"
+        | "loom.workspace.write"
         | "loom.workspace.run"
         | "loom.workspace.poll"
         | "loom.workspace.cancel"
@@ -1349,10 +1363,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn managed_workflow_operations_are_exactly_the_ten_loom_business_operations() {
-        assert_eq!(MANAGED_WORKFLOW_OPERATIONS.len(), 10);
+    fn managed_workflow_operations_are_the_loom_business_operations_plus_workspace_and_send() {
+        assert_eq!(MANAGED_WORKFLOW_OPERATIONS.len(), 14);
         for operation in MANAGED_WORKFLOW_OPERATIONS {
-            assert!(operation.starts_with("loom."), "{operation} is not a loom operation");
             assert!(is_managed_workflow_operation(operation));
             // Every one of them is a CLI operation the transport already ships.
             assert!(
@@ -1362,15 +1375,13 @@ mod tests {
                 "{operation} is not a shipped CLI operation"
             );
         }
-        // Workspace RPC, bash and every other operation stay outside the managed workflow set.
+        // `run`, the poll/cancel controls, bash and every other operation stay outside the managed set.
         for operation in [
-            "loom.workspace.list",
-            "loom.workspace.read",
             "loom.workspace.run",
             "loom.workspace.poll",
             "loom.workspace.cancel",
             "thread.list",
-            "thread.message.send",
+            "thread.read",
             "memory.write",
             "mission.update",
             "bash",
