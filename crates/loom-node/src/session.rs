@@ -19,7 +19,15 @@ use tokio::{
     sync::{Notify, mpsc, watch},
 };
 
-const HEARTBEAT: Duration = Duration::from_secs(10);
+/// Heartbeat cadence of this connection. The controller only records arrival
+/// time, so a slower tick costs nothing on an idle link while a socket that
+/// stops answering is still noticed within one interval.
+const HEARTBEAT: Duration = Duration::from_secs(15);
+/// Redial window. Every reconnect after a dropped socket waits somewhere inside
+/// it (see [`reconnect_delay`]), so a fleet that lost the same controller
+/// spreads its retries instead of redialing in lockstep.
+const RECONNECT_MIN: Duration = Duration::from_secs(1);
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const CHUNK: usize = 16 * 1024;
 const CONTROL_QUEUE: usize = 16;
 const OUTPUT_QUEUE: usize = 32;
@@ -198,11 +206,13 @@ pub(crate) async fn serve(
         wake: Notify::new(),
     });
     let flusher = tokio::spawn(flush(Arc::clone(&shared)));
-    let mut delay = Duration::from_millis(200);
+    let mut failures: u32 = 0;
     let connections = async { loop {
         match connect_once(server, node_id, token, &shared).await {
             Ok(Stop::Revoked) => break Err(anyhow::anyhow!("node token was revoked")),
-            Ok(Stop::Closed) => delay = Duration::from_millis(200),
+            // A clean close is not a failing dial: the streak restarts at the
+            // window floor instead of inheriting an older failure count.
+            Ok(Stop::Closed) => failures = 0,
             Err(error) => {
                 if fatal(&error) {
                     break Err(error);
@@ -210,8 +220,8 @@ pub(crate) async fn serve(
                 eprintln!("loom-node: {error:#}");
             }
         }
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(Duration::from_secs(10));
+        tokio::time::sleep(reconnect_delay(failures, reconnect_entropy())).await;
+        failures = failures.saturating_add(1);
     } };
     let mut registry_stop = shared.shutdown.subscribe();
     let result = tokio::select! {
@@ -239,6 +249,49 @@ fn fatal(error: &anyhow::Error) -> bool {
     text.contains("token_revoked")
         || text.contains("token_rejected")
         || text.contains("administrator_rejected")
+}
+
+/// Ceiling of one redial window: it doubles per consecutive failed dial
+/// (2s, 4s, 8s, 16s) and is then pinned at [`RECONNECT_MAX`].
+/// [`RECONNECT_MIN`] stays the floor, so the window never collapses to one
+/// value and a first failure still jitters.
+fn reconnect_ceiling(failures: u32) -> Duration {
+    let floor = RECONNECT_MIN.as_millis() as u64;
+    let steps = 1_u64 << (failures.min(4) + 1);
+    Duration::from_millis((floor * steps).min(RECONNECT_MAX.as_millis() as u64))
+}
+
+/// Full-jitter backoff: the wait is uniform inside
+/// `[RECONNECT_MIN, reconnect_ceiling(failures)]`. `entropy` is the only source
+/// of randomness, so the schedule stays a pure function a test can pin while
+/// two nodes that lost the same controller still draw different waits.
+fn reconnect_delay(failures: u32, entropy: u64) -> Duration {
+    let floor = RECONNECT_MIN.as_millis() as u64;
+    let ceiling = reconnect_ceiling(failures).as_millis() as u64;
+    Duration::from_millis(floor + splitmix64(entropy) % (ceiling - floor + 1))
+}
+
+/// SplitMix64 finalizer: spreads a cheap entropy sample across the whole
+/// window. Jitter only has to decorrelate redials, so no cryptographic source
+/// and no new dependency is introduced for it.
+fn splitmix64(state: u64) -> u64 {
+    let state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let state = (state ^ (state >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let state = (state ^ (state >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    state ^ (state >> 31)
+}
+
+/// Entropy for one redial: wall-clock nanoseconds, the process id and a
+/// counter. Two nodes that start in the same millisecond still sample different
+/// values, and nothing here is derived from a credential.
+fn reconnect_entropy() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TICK: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+    let tick = TICK.fetch_add(1, Ordering::Relaxed);
+    nanos ^ (u64::from(std::process::id()) << 32) ^ tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 async fn connect_once(
@@ -2127,5 +2180,59 @@ mod device_only_tests {
             "a refused Start wrote a durable R1 record: {durable:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// Link timing boundary: the heartbeat cadence and the redial window stay inside
+/// the approved values, and the jitter is a pure function of its own entropy so
+/// the schedule is auditable instead of depending on a global RNG.
+#[cfg(test)]
+mod link_timing_tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_and_redial_window_keep_their_approved_bounds() {
+        assert_eq!(HEARTBEAT, Duration::from_secs(15));
+        assert_eq!(RECONNECT_MIN, Duration::from_secs(1));
+        assert_eq!(RECONNECT_MAX, Duration::from_secs(30));
+        let ceilings: Vec<u64> = (0..=8)
+            .map(|failures| reconnect_ceiling(failures).as_secs())
+            .collect();
+        assert_eq!(ceilings, vec![2, 4, 8, 16, 30, 30, 30, 30, 30]);
+        // No streak length and no entropy sample may leave the approved window.
+        for failures in 0..=64 {
+            for entropy in 0..128 {
+                let delay = reconnect_delay(failures, entropy);
+                assert!(delay >= RECONNECT_MIN, "{failures}/{entropy}: {delay:?}");
+                assert!(delay <= RECONNECT_MAX, "{failures}/{entropy}: {delay:?}");
+                assert!(
+                    delay <= reconnect_ceiling(failures),
+                    "{failures}/{entropy}: {delay:?} exceeded its own ceiling"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn redial_delay_is_reproducible_and_jittered_inside_its_window() {
+        for failures in [0, 3, 8] {
+            let window = reconnect_ceiling(failures);
+            let delays: Vec<Duration> = (0..64)
+                .map(|entropy| reconnect_delay(failures, entropy))
+                .collect();
+            for (entropy, delay) in delays.iter().enumerate() {
+                assert!(
+                    *delay >= RECONNECT_MIN && *delay <= window,
+                    "{failures}/{entropy} left its window: {delay:?}"
+                );
+                // The schedule is a pure function: one sample, one wait.
+                assert_eq!(reconnect_delay(failures, entropy as u64), *delay);
+            }
+            // Different nodes must not pick the same wait: a single fixed value
+            // would restore the lockstep redial the jitter exists to prevent.
+            let widest = *delays.iter().max().expect("samples")
+                - *delays.iter().min().expect("samples");
+            assert!(widest > Duration::ZERO, "no jitter at {failures}: {delays:?}");
+        }
     }
 }
