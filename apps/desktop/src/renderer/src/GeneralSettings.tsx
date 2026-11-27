@@ -465,7 +465,7 @@ export function GeneralSettings({
                     disabled={!preferences || ownerPermissionBusy}
                     onChange={(event) => void setOwnerPermission(row.key, event.target.value as OwnerPermissionValue)}
                   >
-                    {ownerPermissionChoices.map((choice) => <option key={choice.value} value={choice.value}><UiText zh={choice.label} /></option>)}
+                    {row.choices.map((value) => <option key={value} value={value}><UiText zh={ownerPermissionChoiceLabels[value]} /></option>)}
                   </select>
                 </label>
               )
@@ -606,19 +606,14 @@ function HelpCircleIcon(): React.JSX.Element {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M9.8 9a2.4 2.4 0 0 1 4.65.8c0 1.8-2.45 2.05-2.45 3.7" /><path d="M12 17h.01" /></svg>
 }
 
-const ownerPermissionRows: Array<{ key: OwnerPermissionKey; label: string; defaultValue: OwnerPermissionValue; description: string }> = [
-  { key: 'computerUse', label: '电脑操作', defaultValue: 'allow', description: '截图、点击、键盘和文字输入' },
-  { key: 'commandExecution', label: '命令执行', defaultValue: 'allow', description: '在 Host 工作区运行命令' },
-  { key: 'installDependency', label: '依赖安装', defaultValue: 'allow', description: '安装或新增项目依赖' },
-  { key: 'hostFileWrite', label: 'Host 写文件', defaultValue: 'ask', description: '写入或删除 Host 文件、授权额外文件权限' },
-  { key: 'networkAccess', label: '联网', defaultValue: 'allow', description: '网络访问与网络写入' },
-  { key: 'gitPush', label: 'Git 推送', defaultValue: 'deny', description: '推送 Git 引用到远端' }
+const ownerPermissionRows: Array<{ key: OwnerPermissionKey; label: string; defaultValue: OwnerPermissionValue; description: string; choices: OwnerPermissionValue[] }> = [
+  { key: 'computer_use', label: '电脑操作', defaultValue: 'allow', description: '截图、点击、键盘和文字输入', choices: ['allow', 'deny'] },
+  { key: 'install_dependency', label: '依赖安装', defaultValue: 'allow', description: '安装或新增项目依赖', choices: ['allow', 'ask', 'deny'] },
+  { key: 'write_outside_repo', label: '写出工作区', defaultValue: 'ask', description: '写入或删除工作区外文件、授权额外文件权限', choices: ['ask', 'deny'] },
+  { key: 'network', label: '联网', defaultValue: 'allow', description: '网络访问与网络写入', choices: ['allow', 'ask', 'deny'] },
+  { key: 'git_push', label: 'Git 推送', defaultValue: 'deny', description: '推送 Git 引用到远端', choices: ['allow', 'deny'] }
 ]
-const ownerPermissionChoices: Array<{ value: OwnerPermissionValue; label: string }> = [
-  { value: 'allow', label: '允许' },
-  { value: 'ask', label: '询问' },
-  { value: 'deny', label: '拒绝' }
-]
+const ownerPermissionChoiceLabels: Record<OwnerPermissionValue, string> = { allow: '允许', ask: '询问', deny: '拒绝' }
 
 function missingAgentProfile(agentId: string): AgentProfile {
   return {

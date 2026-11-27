@@ -1637,8 +1637,14 @@ ipcMain.handle('rovai:general-preferences-set-one-click-new-conversation', (_eve
 })
 
 ipcMain.handle('rovai:general-preferences-set-owner-permission', (_event, key: unknown, value: unknown) => {
-  const keys = new Set(['computerUse', 'commandExecution', 'installDependency', 'hostFileWrite', 'networkAccess', 'gitPush'])
-  if (typeof key !== 'string' || !keys.has(key) || typeof value !== 'string' || !['allow', 'ask', 'deny'].includes(value)) {
+  const choices: Record<string, string[]> = {
+    computer_use: ['allow', 'deny'],
+    install_dependency: ['allow', 'ask', 'deny'],
+    write_outside_repo: ['ask', 'deny'],
+    network: ['allow', 'ask', 'deny'],
+    git_push: ['allow', 'deny']
+  }
+  if (typeof key !== 'string' || !choices[key] || typeof value !== 'string' || !choices[key].includes(value)) {
     throw new Error('Invalid owner permission preference')
   }
   return hostGeneralPreferences().setOwnerPermission(key as never, value as never)

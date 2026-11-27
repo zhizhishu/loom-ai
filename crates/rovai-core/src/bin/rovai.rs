@@ -2719,7 +2719,7 @@ mod tests {
             &["workspace", "poll", "--help"],
             &["workspace", "cancel", "--help"],
         ];
-        assert_eq!(exact_paths.len(), 42);
+        assert_eq!(exact_paths.len(), 43);
         for path in exact_paths {
             let args = path
                 .iter()

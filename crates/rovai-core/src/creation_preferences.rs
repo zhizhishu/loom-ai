@@ -123,10 +123,9 @@ pub fn owner_permission(data_dir: &Path, key: &str) -> Option<String> {
 
 pub(crate) fn valid_owner_permission(key: &str, value: &str) -> bool {
     match key {
-        "computerUse" | "commandExecution" | "installDependency" | "networkAccess" => {
-            matches!(value, "allow" | "ask" | "deny")
-        }
-        "hostFileWrite" | "gitPush" => matches!(value, "allow" | "ask" | "deny"),
+        "install_dependency" | "network" => matches!(value, "allow" | "ask" | "deny"),
+        "write_outside_repo" => matches!(value, "ask" | "deny"),
+        "computer_use" | "git_push" => matches!(value, "allow" | "deny"),
         _ => false,
     }
 }

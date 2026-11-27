@@ -37,12 +37,12 @@ describe('Host-backed general preferences', () => {
     const shared = {
       ...creationPreferences({
         ...DEFAULT_GENERAL_PREFERENCES,
-        ownerPermissions: { commandExecution: 'ask' }
+        ownerPermissions: { install_dependency: 'ask' }
       }),
       botControlModes: { 'agent-a': 'full' }
     }
     const preferences = withHostConversationPreferences(local, async <T>() => structuredClone(shared) as T)
-    await expect(preferences.get()).resolves.toMatchObject({ ownerPermissions: { commandExecution: 'ask' } })
+    await expect(preferences.get()).resolves.toMatchObject({ ownerPermissions: { install_dependency: 'ask' } })
   })
 
   it('does not block local presentation changes on a second Host read', async () => {

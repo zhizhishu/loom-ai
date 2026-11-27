@@ -1606,7 +1606,7 @@ impl AgentGrants {
         let Some(config) = &self.config else {
             return "ask".to_string();
         };
-        rovai_core::creation_preferences::owner_permission(&config.data_dir, "computerUse")
+        rovai_core::creation_preferences::owner_permission(&config.data_dir, "computer_use")
             .unwrap_or_else(|| "allow".to_string())
     }
 

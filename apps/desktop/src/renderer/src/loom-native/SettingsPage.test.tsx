@@ -12,8 +12,10 @@ const sidebar = (query: string) => renderToStaticMarkup(createElement(SettingsSi
 describe('settings page parts', () => {
   it('places Mikka owner permission rows in the native preferences surface',()=>{
     const source=readFileSync(new URL('./SettingsPersonal.tsx',import.meta.url),'utf8')
-    for(const text of ['管理员','电脑操作','命令执行','依赖安装','Host 写文件','联网','Git 推送','settings-owner-permissions']) expect(source).toContain(text)
-    for(const key of ['computerUse','commandExecution','installDependency','hostFileWrite','networkAccess','gitPush']) expect(source).toContain(key)
+    for(const text of ['管理员','电脑操作','依赖安装','写出工作区','联网','Git 推送','settings-owner-permissions']) expect(source).toContain(text)
+    for(const key of ['computer_use','install_dependency','write_outside_repo','network','git_push']) expect(source).toContain(key)
+    expect(source).not.toContain('commandExecution')
+    expect(source).not.toContain('networkAccess')
   })
   it('routes native About to the Desktop provider or the existing remote Server surface',()=>{
     const source=readFileSync(new URL('./SettingsPersonal.tsx',import.meta.url),'utf8')

@@ -3458,7 +3458,7 @@ export interface InterfaceLanguageSnapshot {
   readError: StructuredError | null
 }
 
-export type OwnerPermissionKey = 'computerUse' | 'commandExecution' | 'installDependency' | 'hostFileWrite' | 'networkAccess' | 'gitPush'
+export type OwnerPermissionKey = 'computer_use' | 'install_dependency' | 'write_outside_repo' | 'network' | 'git_push'
 export type OwnerPermissionValue = 'allow' | 'ask' | 'deny'
 
 export interface GeneralPreferencesSnapshot extends GeneralPreferencesStorage, InterfaceLanguageSnapshot {

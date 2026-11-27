@@ -119,7 +119,7 @@ export function PreferencesSection({ environment, theme, onTheme }: SettingsPers
       {ownerPermissionRows.map(row => {
         const value = ownerPermissions[row.key] ?? row.defaultValue
         return <SettingRow key={row.key} title={row.label} description={row.description}>
-          <ChoiceMenu value={value} choices={ownerPermissionChoices} label={row.label} theme={theme} disabled={ownerPermissionBusy !== null} onChange={value => changeOwnerPermission(row.key, value as OwnerPermissionValue)}/>
+          <ChoiceMenu value={value} choices={row.choices.map(value => ({ value, label: ownerPermissionChoiceLabels[value] }))} label={row.label} theme={theme} disabled={ownerPermissionBusy !== null} onChange={value => changeOwnerPermission(row.key, value as OwnerPermissionValue)}/>
         </SettingRow>
       })}
       {ownerPermissionError && <SettingRow title="管理员权限" description={ownerPermissionError}/>}
@@ -131,19 +131,14 @@ export function PreferencesSection({ environment, theme, onTheme }: SettingsPers
   </>
 }
 
-const ownerPermissionRows: Array<{ key: OwnerPermissionKey; label: string; defaultValue: OwnerPermissionValue; description: string }> = [
-  { key: 'computerUse', label: '电脑操作', defaultValue: 'allow', description: '截图、点击、键盘和文字输入' },
-  { key: 'commandExecution', label: '命令执行', defaultValue: 'allow', description: '在 Host 工作区运行命令' },
-  { key: 'installDependency', label: '依赖安装', defaultValue: 'allow', description: '安装或新增项目依赖' },
-  { key: 'hostFileWrite', label: 'Host 写文件', defaultValue: 'ask', description: '写入或删除 Host 文件、授权额外文件权限' },
-  { key: 'networkAccess', label: '联网', defaultValue: 'allow', description: '网络访问与网络写入' },
-  { key: 'gitPush', label: 'Git 推送', defaultValue: 'deny', description: '推送 Git 引用到远端' }
+const ownerPermissionRows: Array<{ key: OwnerPermissionKey; label: string; defaultValue: OwnerPermissionValue; description: string; choices: OwnerPermissionValue[] }> = [
+  { key: 'computer_use', label: '电脑操作', defaultValue: 'allow', description: '截图、点击、键盘和文字输入', choices: ['allow', 'deny'] },
+  { key: 'install_dependency', label: '依赖安装', defaultValue: 'allow', description: '安装或新增项目依赖', choices: ['allow', 'ask', 'deny'] },
+  { key: 'write_outside_repo', label: '写出工作区', defaultValue: 'ask', description: '写入或删除工作区外文件、授权额外文件权限', choices: ['ask', 'deny'] },
+  { key: 'network', label: '联网', defaultValue: 'allow', description: '网络访问与网络写入', choices: ['allow', 'ask', 'deny'] },
+  { key: 'git_push', label: 'Git 推送', defaultValue: 'deny', description: '推送 Git 引用到远端', choices: ['allow', 'deny'] }
 ]
-const ownerPermissionChoices: Array<{ value: OwnerPermissionValue; label: string }> = [
-  { value: 'allow', label: '允许' },
-  { value: 'ask', label: '询问' },
-  { value: 'deny', label: '拒绝' }
-]
+const ownerPermissionChoiceLabels: Record<OwnerPermissionValue, string> = { allow: '允许', ask: '询问', deny: '拒绝' }
 
 /** 通知: in-app switches only — no push timing and no external channel (personal build). */
 export function NotificationsSection(_props: SettingsPersonalProps) {

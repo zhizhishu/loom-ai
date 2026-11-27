@@ -3577,29 +3577,27 @@ fn owner_permission_key(input: &CanonicalActionInput) -> Option<&'static str> {
             .iter()
             .any(|needle| command.contains(needle))
             {
-                Some("installDependency")
+                Some("install_dependency")
             } else {
-                Some("commandExecution")
+                None
             }
         }
         CanonicalActionInput::FileWrite { .. } | CanonicalActionInput::FileDelete { .. } => {
-            Some("hostFileWrite")
+            Some("write_outside_repo")
         }
         CanonicalActionInput::GitMutation { operation, .. } => {
             if operation == "push" {
-                Some("gitPush")
+                Some("git_push")
             } else {
-                Some("hostFileWrite")
+                Some("write_outside_repo")
             }
         }
-        CanonicalActionInput::NetworkWrite { .. } | CanonicalActionInput::NetworkAccess { .. } => {
-            Some("networkAccess")
-        }
+        CanonicalActionInput::NetworkWrite { .. } | CanonicalActionInput::NetworkAccess { .. } => Some("network"),
         CanonicalActionInput::RuntimePermissionGrant { permissions, .. } => {
             if permissions["network"]["enabled"].as_bool() == Some(true) {
-                Some("networkAccess")
+                Some("network")
             } else {
-                Some("hostFileWrite")
+                Some("write_outside_repo")
             }
         }
         _ => None,
@@ -3635,8 +3633,8 @@ fn owner_permission_decision(
             }
         }
         _ => match key {
-            "hostFileWrite" => "ask",
-            "gitPush" => "deny",
+            "write_outside_repo" => "ask",
+            "git_push" => "deny",
             _ => "allow",
         },
     };
@@ -4204,7 +4202,7 @@ mod tests {
             payload: PrepareActionCommand {
                 action_id: action_id.to_string(),
                 input: CanonicalActionInput::ShellCommand {
-                    argv: vec!["cargo".to_string(), "test".to_string()],
+                    argv: vec!["npm".to_string(), "install".to_string()],
                     cwd: fixture.workspace.clone(),
                     environment_refs: Vec::new(),
                     command_transport: None,
@@ -4236,7 +4234,7 @@ mod tests {
             payload: PrepareActionCommand {
                 action_id: action_id.to_string(),
                 input: CanonicalActionInput::ShellCommand {
-                    argv: vec!["cargo".to_string(), "test".to_string()],
+                    argv: vec!["npm".to_string(), "install".to_string()],
                     cwd: fixture.workspace.clone(),
                     environment_refs: Vec::new(),
                     command_transport: None,
@@ -4882,14 +4880,14 @@ mod tests {
     #[test]
     fn owner_command_permission_controls_runtime_managed_shell_approval() {
         let mut fixture = fixture("allow");
-        let service = ActionSafetyService::default();
         crate::creation_preferences::execute(
             &fixture.directory,
             &mut fixture.database,
             "preferences.ownerPermissions.set",
-            json!({"key": "commandExecution", "value": "ask"}),
+            json!({"key": "install_dependency", "value": "ask"}),
         )
         .unwrap();
+        let service = ActionSafetyService::default();
         let ask_prepare =
             intercepted_prepare_envelope(&fixture, "action-owner-ask", "item-owner-ask");
         let asked = service
@@ -4911,7 +4909,7 @@ mod tests {
             &fixture.directory,
             &mut fixture.database,
             "preferences.ownerPermissions.set",
-            json!({"key": "commandExecution", "value": "deny"}),
+            json!({"key": "install_dependency", "value": "deny"}),
         )
         .unwrap();
         let deny_prepare =
@@ -5013,7 +5011,7 @@ mod tests {
             &fixture.directory,
             &mut fixture.database,
             "preferences.ownerPermissions.set",
-            json!({"key": "commandExecution", "value": "ask"}),
+            json!({"key": "install_dependency", "value": "ask"}),
         )
         .unwrap();
         let service = ActionSafetyService::default();
@@ -5650,7 +5648,7 @@ mod tests {
             &fixture.directory,
             &mut fixture.database,
             "preferences.ownerPermissions.set",
-            json!({"key": "commandExecution", "value": "ask"}),
+            json!({"key": "install_dependency", "value": "ask"}),
         )
         .unwrap();
         let service = ActionSafetyService::default();
