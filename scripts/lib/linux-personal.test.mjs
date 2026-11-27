@@ -51,5 +51,5 @@ test('linux computer runtime packages helper bridge and pinned Pillow wheel sele
 
 test('linux package manifest requires web frontend, Pi and computer runtime', () => {
   const packager = read('scripts/package-linux-personal.mjs')
-  for (const snippet of ['web-ui/index.html', 'runtime/pi/pi-bundle.json', 'runtime/computer/computer-bundle.json', "target: 'linux-x64'", 'runtime/extensions/pi-purge/upstream/extensions/pi-purge.ts', '983a3c3cc3011928a33805d84414060729fd2aa81822bc7ba94008943a65d71d']) assert.ok(packager.includes(snippet), snippet)
+  for (const snippet of ['web-ui/index.html', 'runtime/pi/pi-bundle.json', 'runtime/computer/computer-bundle.json', "target: 'linux-x64'", 'runtime/extensions/pi-purge/upstream/extensions/pi-purge.ts', 'runtime/office/linux-x64/office-bundle.json', 'runtime/office/linux-x64/libreoffice/program/soffice', 'runtime/office/linux-x64/poppler/bin/pdftoppm', '983a3c3cc3011928a33805d84414060729fd2aa81822bc7ba94008943a65d71d']) assert.ok(packager.includes(snippet), snippet)
 })

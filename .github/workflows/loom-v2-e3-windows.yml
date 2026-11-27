@@ -31,6 +31,7 @@ on:
       - scripts/install-loom-personal.cmd
       - scripts/manage-loom-personal.ps1
       - scripts/package-computer-runtime.ps1
+      - scripts/package-office-runtime.ps1
       - scripts/runtime/computer-windows.json
       - scripts/lib/personal-install.test.mjs
       - resources/computer/**
@@ -401,6 +402,10 @@ jobs:
           $hookManifestSha = (Get-FileHash -LiteralPath $hookManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
           & ./scripts/package-computer-runtime.ps1 -Destination (Join-Path $kit 'runtime/computer') -CacheDirectory (Join-Path $env:RUNNER_TEMP 'loom-computer-downloads')
           if ($LASTEXITCODE -ne 0) { throw 'Pinned computer runtime staging failed' }
+          & ./scripts/package-office-runtime.ps1 -Destination (Join-Path $kit 'runtime/office/windows-x64') -CacheDirectory (Join-Path $env:RUNNER_TEMP 'loom-office-downloads')
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned office runtime staging failed' }
+          if (!(Test-Path (Join-Path $kit 'runtime/office/windows-x64/libreoffice/program/soffice.exe'))) { throw 'Bundled LibreOffice missing' }
+          if (!(Test-Path (Join-Path $kit 'runtime/office/windows-x64/poppler/bin/pdftoppm.exe'))) { throw 'Bundled pdftoppm missing' }
           $computerBundle = Get-Content (Join-Path $kit 'runtime/computer/computer-bundle.json') -Raw | ConvertFrom-Json
           & (Join-Path $kit 'runtime/computer/python/python.exe') -I -B -m unittest discover -s resources/computer -p 'test_*.py' -v
           if ($LASTEXITCODE -ne 0) { throw 'Bundled computer helper/bridge regression failed' }

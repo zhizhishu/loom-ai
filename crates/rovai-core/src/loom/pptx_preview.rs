@@ -25,14 +25,50 @@ pub struct LoomArtifactPptxPreview {
     pub slides: Vec<LoomArtifactPptxSlide>,
 }
 
-fn which(name: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| {
+fn which(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
             let path = dir.join(name);
-            path.is_file()
-                || (cfg!(windows) && [".exe", ".bat", ".cmd"].iter().any(|suffix| dir.join(format!("{name}{suffix}")).is_file()))
+            if path.is_file() { return Some(path) }
+            if cfg!(windows) {
+                for suffix in [".exe", ".bat", ".cmd"] {
+                    let path = dir.join(format!("{name}{suffix}"));
+                    if path.is_file() { return Some(path) }
+                }
+            }
+            None
         })
     })
+}
+
+fn bundled_office_command(name: &str) -> Option<PathBuf> {
+    let root = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let candidates: &[&str] = if cfg!(windows) {
+        match name {
+            "soffice" => &["runtime/office/windows-x64/libreoffice/program/soffice.exe"],
+            _ => &["runtime/office/windows-x64/poppler/bin/pdftoppm.exe", "runtime/office/windows-x64/poppler/pdftoppm.exe"],
+        }
+    } else {
+        match name {
+            "soffice" => &["runtime/office/linux-x64/libreoffice/program/soffice"],
+            _ => &["runtime/office/linux-x64/poppler/bin/pdftoppm"],
+        }
+    };
+    candidates.iter().map(|relative| root.join(relative)).find(|path| path.is_file())
+}
+
+fn office_command(name: &str) -> Option<PathBuf> {
+    bundled_office_command(name).or_else(|| which(name))
+}
+
+fn poppler_ld_library_path() -> Option<std::ffi::OsString> {
+    if cfg!(windows) { return None }
+    let root = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let office = root.join("runtime/office/linux-x64");
+    if !office.join("poppler/bin/pdftoppm").is_file() { return std::env::var_os("LD_LIBRARY_PATH") }
+    let mut paths = vec![office.join("poppler/lib")];
+    if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") { paths.extend(std::env::split_paths(&existing)) }
+    std::env::join_paths(paths).ok()
 }
 
 fn zip_entries(bytes: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
@@ -232,8 +268,8 @@ fn slide_info(bytes: &[u8]) -> Result<Vec<SlideInfo>, String> {
 }
 
 fn conversion_command_missing() -> Option<&'static str> {
-    let soffice = which("soffice");
-    let pdftoppm = which("pdftoppm");
+    let soffice = office_command("soffice").is_some();
+    let pdftoppm = office_command("pdftoppm").is_some();
     match (soffice, pdftoppm) {
         (true, true) => None,
         (false, true) => Some("soffice"),
@@ -267,7 +303,7 @@ fn render_with_soffice(bytes: &[u8], root: &Path, info: &[SlideInfo]) -> Result<
     fs::write(&input, bytes).map_err(|e| e.to_string())?;
     let profile = root.join("lo-profile");
     fs::create_dir_all(&profile).map_err(|e| e.to_string())?;
-    let output = Command::new("soffice")
+    let output = Command::new(office_command("soffice").ok_or("soffice missing")?)
         .arg(format!("-env:UserInstallation=file://{}", profile.display()))
         .args(["--headless", "--convert-to", "pdf", "--outdir"]).arg(root).arg(&input)
         .env("SAL_USE_VCLPLUGIN", "svp")
@@ -276,7 +312,8 @@ fn render_with_soffice(bytes: &[u8], root: &Path, info: &[SlideInfo]) -> Result<
     if !output.status.success() || !pdf.is_file() {
         return Err(format!("PDF conversion failed: {}", String::from_utf8_lossy(&output.stderr).trim()))
     }
-    let output = Command::new("pdftoppm").args(["-jpeg", "-r", "100"]).arg(&pdf).arg(root.join("slide"))
+    let output = Command::new(office_command("pdftoppm").ok_or("pdftoppm missing")?).args(["-jpeg", "-r", "100"]).arg(&pdf).arg(root.join("slide"))
+        .env("LD_LIBRARY_PATH", poppler_ld_library_path().unwrap_or_default())
         .output().map_err(|e| format!("pdftoppm failed to start: {e}"))?;
     if !output.status.success() { return Err("Image conversion failed".into()) }
     let mut images: Vec<PathBuf> = fs::read_dir(root).map_err(|e| e.to_string())?
