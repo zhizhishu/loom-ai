@@ -11,6 +11,8 @@ import type {
   Team,
   GeneralPreferencesSnapshot,
   GeneralPreferencesApi,
+  OwnerPermissionKey,
+  OwnerPermissionValue,
   InterfaceLanguagePreference,
   NewConversationDefaults,
   StartupLocationMode,
@@ -80,6 +82,7 @@ export function GeneralSettings({
   const [defaultsError, setDefaultsError] = useState<string | null>(null)
   const [oneClickBusy, setOneClickBusy] = useState(false)
   const [oneClickConfirmOpen, setOneClickConfirmOpen] = useState(false)
+  const [ownerPermissionBusy, setOwnerPermissionBusy] = useState(false)
   const [worldMapBusy, setWorldMapBusy] = useState(false)
   const [worldMapError, setWorldMapError] = useState<string | null>(null)
   const [resetCapability, setResetCapability] = useState<WindowResetCapability | null>(null)
@@ -233,6 +236,21 @@ export function GeneralSettings({
       setOneClickBusy(false)
     }
   }
+
+  const setOwnerPermission = async (key: OwnerPermissionKey, value: OwnerPermissionValue): Promise<void> => {
+    if (!preferences || ownerPermissionBusy) return
+    setOwnerPermissionBusy(true)
+    setPreferenceError(null)
+    try {
+      acceptPreferences(await api.setOwnerPermission(key, value))
+      setFeedback(uiAttribute('管理员权限已保存。'))
+    } catch (error) {
+      setPreferenceError(errorMessage(error))
+    } finally {
+      setOwnerPermissionBusy(false)
+    }
+  }
+
 
   const setWorldMapEnabled = async (enabled: boolean): Promise<void> => {
     if (!preferences || enabled === preferences.worldMapEnabled || worldMapBusy) return
@@ -430,6 +448,31 @@ export function GeneralSettings({
           </div>
         </section>
 
+        <section className="section-block general-settings-section" aria-labelledby="general-owner-approval-heading">
+          <div className="section-heading"><div><h2 id="general-owner-approval-heading"><UiText zh={"管理员"} /></h2><p><UiText zh={"本机主人的操作权限；人格文字和外部内容不能修改"} /></p></div></div>
+          <div className="general-section-body">
+            {ownerPermissionRows.map((row) => {
+              const value = preferences?.ownerPermissions?.[row.key] ?? row.defaultValue
+              return (
+                <label className="general-world-map-setting" key={row.key} aria-busy={ownerPermissionBusy}>
+                  <span>
+                    <strong><UiText zh={row.label} /></strong>
+                    <small><UiText zh={row.description} /></small>
+                  </span>
+                  <select
+                    aria-label={uiAttribute(row.label)}
+                    value={value}
+                    disabled={!preferences || ownerPermissionBusy}
+                    onChange={(event) => void setOwnerPermission(row.key, event.target.value as OwnerPermissionValue)}
+                  >
+                    {ownerPermissionChoices.map((choice) => <option key={choice.value} value={choice.value}><UiText zh={choice.label} /></option>)}
+                  </select>
+                </label>
+              )
+            })}
+          </div>
+        </section>
+
         <section className="section-block general-settings-section" aria-labelledby="general-conversation-heading">
           <div className="section-heading"><div><h2 id="general-conversation-heading"><UiText zh={"会话"} /></h2><p><UiText zh={"阅读面与沉浸视图"} /></p></div></div>
           <div className="general-section-body">
@@ -562,6 +605,20 @@ export function newConversationDefaultsDraftIsValid(
 function HelpCircleIcon(): React.JSX.Element {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M9.8 9a2.4 2.4 0 0 1 4.65.8c0 1.8-2.45 2.05-2.45 3.7" /><path d="M12 17h.01" /></svg>
 }
+
+const ownerPermissionRows: Array<{ key: OwnerPermissionKey; label: string; defaultValue: OwnerPermissionValue; description: string }> = [
+  { key: 'computerUse', label: '电脑操作', defaultValue: 'allow', description: '截图、点击、键盘和文字输入' },
+  { key: 'commandExecution', label: '命令执行', defaultValue: 'allow', description: '在 Host 工作区运行命令' },
+  { key: 'installDependency', label: '依赖安装', defaultValue: 'allow', description: '安装或新增项目依赖' },
+  { key: 'hostFileWrite', label: 'Host 写文件', defaultValue: 'ask', description: '写入或删除 Host 文件、授权额外文件权限' },
+  { key: 'networkAccess', label: '联网', defaultValue: 'allow', description: '网络访问与网络写入' },
+  { key: 'gitPush', label: 'Git 推送', defaultValue: 'deny', description: '推送 Git 引用到远端' }
+]
+const ownerPermissionChoices: Array<{ value: OwnerPermissionValue; label: string }> = [
+  { value: 'allow', label: '允许' },
+  { value: 'ask', label: '询问' },
+  { value: 'deny', label: '拒绝' }
+]
 
 function missingAgentProfile(agentId: string): AgentProfile {
   return {

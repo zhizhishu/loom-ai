@@ -439,6 +439,7 @@ pub(crate) struct Config {
     bridge: PathBuf,
     origin: String,
     root: PathBuf,
+    data_dir: PathBuf,
 }
 
 impl Config {
@@ -458,6 +459,7 @@ impl Config {
             bridge,
             origin,
             root: data_dir.join("computer-grants"),
+            data_dir: data_dir.to_owned(),
         })
     }
 }
@@ -1568,6 +1570,7 @@ impl AgentGrants {
                 python: PathBuf::from("/nonexistent/python"),
                 bridge: PathBuf::from("/nonexistent/mcp_bridge.py"),
                 origin: "http://127.0.0.1:8443".to_owned(),
+                data_dir: root.parent().unwrap_or(&root).to_owned(),
                 root,
             }),
             mcp,
@@ -1575,17 +1578,36 @@ impl AgentGrants {
     }
 
     fn mode(&self, assistant_id: &str) -> AgentControlMode {
-        self.modes
+        if let Some(mode) = self
+            .modes
             .lock()
             .ok()
             .and_then(|modes| modes.get(assistant_id).copied())
-            .unwrap_or(AgentControlMode::Ask)
+        {
+            return mode;
+        }
+        if let Some(config) = &self.config {
+            return AgentControlMode::parse(&rovai_core::creation_preferences::bot_control_mode(
+                &config.data_dir,
+                assistant_id,
+            ))
+            .unwrap_or(AgentControlMode::Ask);
+        }
+        AgentControlMode::Ask
     }
 
     fn set_mode(&self, assistant_id: &str, mode: AgentControlMode) {
         if let Ok(mut modes) = self.modes.lock() {
             modes.insert(assistant_id.to_owned(), mode);
         }
+    }
+
+    fn owner_computer_permission(&self) -> String {
+        let Some(config) = &self.config else {
+            return "ask".to_string();
+        };
+        rovai_core::creation_preferences::owner_permission(&config.data_dir, "computerUse")
+            .unwrap_or_else(|| "allow".to_string())
     }
 
     fn queue_approval(
@@ -1595,12 +1617,16 @@ impl AgentGrants {
         event: &EventBody,
         step: Option<&str>,
     ) -> Result<String, Failure> {
-        if self.mode(&grant.authority.bot_id) == AgentControlMode::Full
-            || self
+        let owner_permission = self.owner_computer_permission();
+        if owner_permission == "deny" {
+            return Err(Failure::code("computer_agent_permission_denied"));
+        }
+        let run_approved = owner_permission != "ask"
+            && self
                 .run_approved
                 .lock()
-                .is_ok_and(|approved| approved.contains(&grant.id))
-        {
+                .is_ok_and(|approved| approved.contains(&grant.id));
+        if self.mode(&grant.authority.bot_id) == AgentControlMode::Full || run_approved {
             return Ok(String::new());
         }
         let now = wall_clock();
@@ -2493,6 +2519,16 @@ pub(crate) async fn set_control_mode(
     let Some(mode) = AgentControlMode::parse(&body.mode) else {
         return reject("computer_agent_invalid_request");
     };
+    if let Some(config) = &state.agents.config
+        && rovai_core::creation_preferences::set_bot_control_mode(
+            &config.data_dir,
+            &body.assistant_id,
+            mode.label(),
+        )
+        .is_err()
+    {
+        return reject("computer_agent_mode_save_failed");
+    }
     state.agents.set_mode(&body.assistant_id, mode);
     Json(json!({"assistantId": body.assistant_id, "mode": mode.label()})).into_response()
 }

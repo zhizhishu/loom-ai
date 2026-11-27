@@ -1636,6 +1636,14 @@ ipcMain.handle('rovai:general-preferences-set-one-click-new-conversation', (_eve
   return hostGeneralPreferences().setOneClickNewConversationEnabled(enabled)
 })
 
+ipcMain.handle('rovai:general-preferences-set-owner-permission', (_event, key: unknown, value: unknown) => {
+  const keys = new Set(['computerUse', 'commandExecution', 'installDependency', 'hostFileWrite', 'networkAccess', 'gitPush'])
+  if (typeof key !== 'string' || !keys.has(key) || typeof value !== 'string' || !['allow', 'ask', 'deny'].includes(value)) {
+    throw new Error('Invalid owner permission preference')
+  }
+  return hostGeneralPreferences().setOwnerPermission(key as never, value as never)
+})
+
 ipcMain.handle('rovai:general-preferences-set-world-map', (_event, enabled: unknown) => {
   if (typeof enabled !== 'boolean') throw new Error('Invalid world map preference')
   return hostGeneralPreferences().setWorldMapEnabled(enabled)

@@ -32,6 +32,7 @@ import { shouldSendComposerKey } from '../../../shared/shortcuts'
 import { adapterLabel } from '../runtime-products'
 import { hasThreadResults, resultStatusLabel, threadResultEntries, type ThreadSegment } from './thread-artifacts'
 import { ThreadResults } from './ThreadResults'
+import type { ComputerAgentMode, ComputerAgentPort } from './host-services'
 
 /** 群成员系统行（验收 C2）：由 timeline 的群成员变更事件生成，是聊天流条目，不写库、不进「会话记录」。 */
 export type MemberSystemLine = {
@@ -106,7 +107,7 @@ function ApprovalAge({ requestedAt }: { requestedAt: string | null }) {
   return <small className="ln-approval-age" data-aged={aging.aged || undefined}>{text}</small>
 }
 
-export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, quote = null, onRemoveQuote, onDraft, onFiles, onSend, onPrompt, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onPreviewAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager, onRetryRun, onConfigureRuntime, onOpenRuntimeSetup, hostPlatform = null, questions = [], onAnswerQuestion, onStopRun, stoppingRunIds = [], onOpenTaskCitation }: {
+export function ConversationView({ item, snapshot, agents, bundles, loading, sending, draft, files, error, quote = null, onRemoveQuote, onDraft, onFiles, onSend, onPrompt, onProfile, onArtifact, onShowSidebar, sidebarHidden, onShowWork, inspectorHidden, onAttachment, onPreviewAttachment, onResolveApproval, approvalBusy, onMembers, onWorkspaceManager, onRetryRun, onConfigureRuntime, onOpenRuntimeSetup, hostPlatform = null, questions = [], onAnswerQuestion, onStopRun, stoppingRunIds = [], onOpenTaskCitation, computerAgents = null }: {
   item: ConversationItem | null; snapshot: ThreadSnapshot | null; agents: AgentProfile[]; bundles: WorkBundle[]; loading: boolean; sending: boolean
   draft: string; files: File[]; error: string | null
   /** 成果里选中的文字：在输入框上方等待随下一条消息发出。 */
@@ -123,6 +124,8 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   onStopRun?(run: AgentRunView): void; stoppingRunIds?: readonly string[]
   /** Open a cited LOOM task in the work inspector; absent outside the app shell. */
   onOpenTaskCitation?(taskId: string): void
+  /** Host-owned computer/runtime control mode port; absent in tests or unsupported hosts. */
+  computerAgents?: ComputerAgentPort | null
 }) {
   const scroll = useRef<HTMLDivElement>(null)
   const input = useRef<HTMLTextAreaElement>(null)
@@ -146,6 +149,9 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   const mentionToken = useRef<string | null>(null)
   const pendingCaret = useRef<number | null>(null)
   const activeAgent = agents.find(agent => agent.agentId === (item?.agentId || snapshot?.thread.defaultLeadAgentId))
+  const [fullMode, setFullMode] = useState<ComputerAgentMode>('ask')
+  const [fullModeReady, setFullModeReady] = useState(false)
+  const [fullModeBusy, setFullModeBusy] = useState(false)
   const messages = useMemo(() => snapshot?.messages.filter(message => !message.withdrawn) ?? [], [snapshot?.messages])
   const visibleMessages = useMemo(() => messages.filter(message => message.authorType !== 'system'), [messages])
   const systemMessages = useMemo(() => messages.filter(message => message.authorType === 'system'), [messages])
@@ -171,6 +177,10 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   const activeMembers = useMemo(() => snapshot ? agents.filter(agent => snapshot.members.some(member => member.agentId === agent.agentId && member.membershipStatus === 'active')) : agents, [snapshot?.members,agents])
   // 两位以上在册成员才算群聊。群的称呼挂在群上，不挂在其中某一位助手身上。
   const isGroup = (snapshot?.members.filter(member => member.membershipStatus === 'active').length ?? 0) > 1
+  const composerAgentId = isGroup
+    ? mentionRecipient(draft, activeMembers) ?? activeAgent?.agentId
+    : activeAgent?.agentId
+  const composerAgent = agents.find(agent => agent.agentId === composerAgentId) ?? activeAgent
   // @ 补全只在群聊、且会话条目与快照同步时开：单聊、快照缺失、两者不同步一律没有候选。
   const scope = mentionScope(item, snapshot, isGroup)
   // 草稿在别处被改写（发送后清空、换会话）时上一轮的区间立刻作废，不留悬空候选。
@@ -195,6 +205,26 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   const lastId = flowEntries[flowEntries.length - 1]?.key
   // 换会话就是换候选范围：上一轮的候选和光标区间一律丢掉。
   useEffect(() => { mentionToken.current = null; setMention(null); setMentionIndex(0); setSegment('chat') }, [item?.id, snapshot?.thread.id])
+  useEffect(() => {
+    if (!computerAgents?.modeStatus || !composerAgentId) { setFullMode('ask'); setFullModeReady(false); return }
+    let stale = false
+    setFullModeReady(false)
+    void computerAgents.modeStatus(composerAgentId).then(result => {
+      if (stale || result.assistantId !== composerAgentId) return
+      setFullMode(result.mode === 'full' ? 'full' : 'ask')
+      setFullModeReady(true)
+    }).catch(() => { if (!stale) { setFullMode('ask'); setFullModeReady(false) } })
+    return () => { stale = true }
+  }, [computerAgents, composerAgentId])
+  const chooseFullMode = (mode: ComputerAgentMode): void => {
+    if (!computerAgents?.setMode || !composerAgentId || fullModeBusy || mode === fullMode) return
+    setFullModeBusy(true)
+    void computerAgents.setMode(composerAgentId, mode).then(result => {
+      if (result.assistantId !== composerAgentId || result.mode !== mode) throw new Error('mode mismatch')
+      setFullMode(mode)
+      setFullModeReady(true)
+    }).catch(() => setFullModeReady(false)).finally(() => setFullModeBusy(false))
+  }
   // 补全后把光标放回正文：受控 textarea 要等新值渲染完再设区间。
   useEffect(() => {
     if (pendingCaret.current === null || !input.current) return
@@ -335,7 +365,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
           {handoff ? <details className="ln-execution-record"><summary><Icon name="branch" size={14}/><span>执行记录</span><Icon name="right" size={12}/></summary><AgentMarkdown text={message.body}/></details>
             : <div className="ln-message-content"><CollapsibleMessage>{quoted.quote && <ArtifactQuoteLine quote={quoted.quote}/>}<AgentMarkdown text={quoted.text}/></CollapsibleMessage></div>}
           {message.attachments.length > 0 && snapshot && <MessageAttachments attachments={message.attachments} threadId={snapshot.thread.id} messageId={message.id} loadPreview={onPreviewAttachment} onOpen={attachmentId => onAttachment(message.id, attachmentId)}/>}
-          <div className="ln-message-actions"><button type="button" aria-label="复制消息" title="复制消息" onClick={() => { void navigator.clipboard.writeText(quoted.text).then(() => { setCopied(message.id); window.setTimeout(() => setCopied(null), 1500) }) }}><Icon name={copied === message.id ? 'check' : 'copy'} size={13}/></button><time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time></div>
+          <div className="ln-message-actions">{!user && author?.agentId === composerAgentId && fullMode === 'full' && <span className="ln-message-permission-badge">全权限</span>}<button type="button" aria-label="复制消息" title="复制消息" onClick={() => { void navigator.clipboard.writeText(quoted.text).then(() => { setCopied(message.id); window.setTimeout(() => setCopied(null), 1500) }) }}><Icon name={copied === message.id ? 'check' : 'copy'} size={13}/></button><time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time></div>
         </article>
       })}
       {artifacts.length > 0 && <div className="ln-delivered-files">{artifacts.map(selection => <button type="button" className="ln-artifact-card" key={selection.artifact.artifactId} onClick={() => onArtifact(selection)}><span className="ln-document-icon"><Icon name="file" size={22}/></span><span><strong>{selection.artifact.relativePath.split(/[\\/]/).pop()}</strong><small>{resultStatusLabel(selection.candidate)}</small></span><Icon name="right" size={15}/></button>)}</div>}
@@ -355,7 +385,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
         : bottomNewCount === 0 && <button type="button" className="ln-jump-latest" title="回到最新消息" aria-label="回到最新消息" onClick={jump}><Icon name="down" size={18}/></button>)}
       {error && <div className="ln-send-error" role="alert" data-slot="send-error"><strong>请求失败，请稍后重试。</strong>{error.trim() && error.trim() !== '请求失败，请稍后重试。' && <small>{error}</small>}<p>你的输入已保留。</p><button type="button" disabled={sending || (!draft.trim() && !files.length)} onClick={() => onSend(isGroup ? mentionRecipient(draft, activeMembers) : undefined)}>{sending ? '正在重试…' : '重试此回复'}</button></div>}
       {snapshot?.approvals.filter(approval => approval.status === 'pending').map(approval => <section className="ln-approval-request" key={approval.id} aria-label="等待你的授权" data-state={approval.status} aria-busy={approvalBusy}><strong><Icon name="hand" size={16}/>需要你确认<span className="ln-approval-state" data-state={approval.status}>{approvalStatusLabel(approval.status)}</span></strong><p>{approval.actionSummary}</p>{approval.reason && <small>{approval.reason}</small>}<ApprovalAge requestedAt={approval.requestedAt}/><p className="ln-approval-scope">{agents.find(agent => agent.agentId === approval.agentId)?.displayName || '当前助手'} · {approval.options.some(option => option.kind === 'allow_session') ? '持续授权仅限此原生会话，具体范围见选项。' : '本次请求按运行端提供的范围授权。'}</p><div>{approval.options.map(option => <button type="button" disabled={approvalBusy} key={option.optionId} title={option.consequence} className={option.kind === 'allow_once' ? 'is-once' : option.kind === 'allow_session' ? 'is-persistent' : ''} onClick={() => onResolveApproval(approval.id, option.optionId)}>{option.label}</button>)}</div></section>)}
-      {resolvedApproval && <p className="ln-approval-result" data-slot="approval-result" data-state={resolvedApproval.status} aria-label={`${approvalStatusLabel(resolvedApproval.status)}的授权`}><Icon name={resolvedApproval.status === 'approved' ? 'check' : 'blocked'} size={14}/><span>{resolvedApproval.actionSummary}</span><em>{approvalStatusLabel(resolvedApproval.status)}</em></p>}
+      {resolvedApproval && <p className="ln-approval-result" data-slot="approval-result" data-state={resolvedApproval.status} aria-label={`${approvalStatusLabel(resolvedApproval.status, resolvedApproval.resolutionCode)}的授权`}><Icon name={resolvedApproval.status === 'approved' ? 'check' : 'blocked'} size={14}/><span>{resolvedApproval.actionSummary}</span><em>{approvalStatusLabel(resolvedApproval.status, resolvedApproval.resolutionCode)}</em></p>}
       {segment === 'chat' && <form className="ln-composer" onPaste={event => { if (pasteAttachments(event.clipboardData, files, onFiles)) { event.preventDefault(); event.stopPropagation() } }} onSubmit={event => { event.preventDefault(); if (!sending && !composing.current && (draft.trim() || files.length)) onSend(isGroup ? mentionRecipient(draft, activeMembers) : undefined) }}>
         {quote && onRemoveQuote && <ArtifactQuoteChip quote={quote} onRemove={onRemoveQuote}/>}
         <PendingAttachments files={files} onRemove={onFiles}/>
@@ -394,7 +424,7 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
             }
           }}/>
         {isGroup && activeMembers.length > 0 && <p className="ln-composer-hint">写 <strong>@名字</strong> 指定谁回复，不 @ 时由服务端挑选。可 @ {activeMembers.map(agent => agent.displayName).join('、')}</p>}
-        <footer className="ln-composer-footer"><div className="ln-composer-left"><input ref={fileInput} type="file" multiple accept={USER_ATTACHMENT_ACCEPT} hidden onChange={event => { addPickedAttachments(event.target.files, files, onFiles); event.target.value = '' }}/><IconButton icon="plus" label="添加图片或附件（也可直接粘贴图片）" onClick={() => fileInput.current?.click()}/></div><button className="ln-send-button" type="submit" aria-label={sending ? '正在发送' : '发送消息'} disabled={sending || (!draft.trim() && !files.length)}>{sending ? <span className="ln-spinner"/> : <Icon name="up" size={17}/>}</button></footer>
+        <footer className="ln-composer-footer"><div className="ln-composer-left">{computerAgents?.setMode && composerAgent && <button type="button" className={fullMode === 'full' ? 'ln-action is-primary ln-full-mode-toggle' : 'ln-action ln-full-mode-toggle'} aria-pressed={fullMode === 'full'} disabled={!fullModeReady || fullModeBusy} title={`${composerAgent.displayName} 的全权限运行只影响这个助手`} onClick={() => chooseFullMode(fullMode === 'full' ? 'ask' : 'full')}>{fullMode === 'full' ? '全权限运行中' : '全权限运行'}</button>}<input ref={fileInput} type="file" multiple accept={USER_ATTACHMENT_ACCEPT} hidden onChange={event => { addPickedAttachments(event.target.files, files, onFiles); event.target.value = '' }}/><IconButton icon="plus" label="添加图片或附件（也可直接粘贴图片）" onClick={() => fileInput.current?.click()}/></div><button className="ln-send-button" type="submit" aria-label={sending ? '正在发送' : '发送消息'} disabled={sending || (!draft.trim() && !files.length)}>{sending ? <span className="ln-spinner"/> : <Icon name="up" size={17}/>}</button></footer>
       </form>}
     </div>
   </main>
@@ -423,7 +453,8 @@ export function runRuntimeGuidance(agent: AgentProfile | null): { available: boo
  * `approved → 已同意`、`rejected → 已拒绝`、`answered → 已填写意见`，pending 兜底
  * `awaitingYourChoice`（「等待你的选择」）。LOOM 的授权状态词表与之一一对应。
  */
-export function approvalStatusLabel(status: ActionApprovalView['status']): string {
+export function approvalStatusLabel(status: ActionApprovalView['status'], resolutionCode?: string | null): string {
+  if (status === 'approved' && resolutionCode === 'bot_full_permission') return '全权限'
   return ({ pending: '等待你的选择', approved: '已同意', denied: '已拒绝', cancelled: '已取消', expired: '已过期' } as const)[status]
 }
 

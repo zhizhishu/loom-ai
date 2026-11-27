@@ -32,6 +32,19 @@ describe('Host-backed general preferences', () => {
     expect(await preferences.setInterfaceLanguagePreference('zh-CN')).toMatchObject({ interfaceLanguagePreference: 'zh-CN', interfaceLanguage: 'zh-CN' })
     await expect(preferences.get()).rejects.toThrow('offline')
   })
+  it('ignores Host-side per-Bot control modes when merging owner permissions', async () => {
+    const local = localPreferences(DEFAULT_GENERAL_PREFERENCES)
+    const shared = {
+      ...creationPreferences({
+        ...DEFAULT_GENERAL_PREFERENCES,
+        ownerPermissions: { commandExecution: 'ask' }
+      }),
+      botControlModes: { 'agent-a': 'full' }
+    }
+    const preferences = withHostConversationPreferences(local, async <T>() => structuredClone(shared) as T)
+    await expect(preferences.get()).resolves.toMatchObject({ ownerPermissions: { commandExecution: 'ask' } })
+  })
+
   it('does not block local presentation changes on a second Host read', async () => {
     const local = localPreferences(DEFAULT_GENERAL_PREFERENCES)
     const shared = creationPreferences(DEFAULT_GENERAL_PREFERENCES)

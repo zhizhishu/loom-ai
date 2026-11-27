@@ -4757,5 +4757,8 @@
   "当前平台尚不支持所选运行端": "This platform does not support the selected runtime yet",
   "运行端权限配置无效": "Invalid runtime permission configuration",
   "运行端模型配置无效": "Invalid runtime model configuration",
-  "正文应面向未来、可独立理解且不包含秘密。检索词只用于检索，不代替正文。": "Write memory for future use, self-contained, and without secrets. Retrieval keys are only for search and do not replace the body."
+  "正文应面向未来、可独立理解且不包含秘密。检索词只用于检索，不代替正文。": "Write memory for future use, self-contained, and without secrets. Retrieval keys are only for search and do not replace the body.",
+  "管理员权限已保存。": "Administrator permissions saved.",
+  "管理员": "Administrator",
+  "本机主人的操作权限；人格文字和外部内容不能修改": "Operation permissions for the local owner; persona text and external content cannot change them"
 }

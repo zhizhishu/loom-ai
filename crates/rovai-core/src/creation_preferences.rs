@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{io::Read, path::Path};
+use std::{collections::BTreeMap, io::Read, path::Path};
 
 #[derive(Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -17,6 +17,10 @@ pub struct Snapshot {
     pub new_conversation_team_id: Option<String>,
     pub new_conversation_defaults_require_confirmation: bool,
     pub one_click_new_conversation_enabled: bool,
+    #[serde(default)]
+    pub owner_permissions: BTreeMap<String, String>,
+    #[serde(default)]
+    pub bot_control_modes: BTreeMap<String, String>,
 }
 
 impl Snapshot {
@@ -34,6 +38,20 @@ impl Snapshot {
                 !self.one_click_new_conversation_enabled
                     && !self.new_conversation_defaults_require_confirmation,
                 "Custom members are missing"
+            );
+        }
+        for (key, value) in &self.owner_permissions {
+            anyhow::ensure!(
+                valid_owner_permission(key, value),
+                "Invalid owner permission"
+            );
+        }
+        for (agent_id, mode) in &self.bot_control_modes {
+            anyhow::ensure!(
+                !agent_id.is_empty()
+                    && agent_id.chars().count() <= 200
+                    && matches!(mode.as_str(), "ask" | "full"),
+                "Invalid Bot control mode"
             );
         }
         Ok(())
@@ -84,6 +102,101 @@ pub(crate) fn clear_deleted_team(connection: &Connection, id: &str) -> Result<()
     Ok(())
 }
 
+pub fn owner_permission(data_dir: &Path, key: &str) -> Option<String> {
+    let database_path = data_dir.join("rovai.sqlite");
+    if !database_path.exists() {
+        return None;
+    }
+    rusqlite::Connection::open(database_path)
+        .ok()
+        .and_then(|connection| {
+            connection
+                .query_row(
+                    "SELECT json_extract((SELECT state_json FROM creation_preferences WHERE singleton=1), ?1)",
+                    [format!("$.ownerPermissions.{key}")],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten()
+        })
+}
+
+pub(crate) fn valid_owner_permission(key: &str, value: &str) -> bool {
+    match key {
+        "computerUse" | "commandExecution" | "installDependency" | "networkAccess" => {
+            matches!(value, "allow" | "ask" | "deny")
+        }
+        "hostFileWrite" | "gitPush" => matches!(value, "allow" | "ask" | "deny"),
+        _ => false,
+    }
+}
+
+pub fn bot_control_mode(data_dir: &Path, agent_id: &str) -> String {
+    let database_path = data_dir.join("rovai.sqlite");
+    if !database_path.exists() {
+        return "ask".to_string();
+    }
+    rusqlite::Connection::open(database_path)
+        .ok()
+        .and_then(|connection| {
+            connection
+                .query_row(
+                    "SELECT state_json FROM creation_preferences WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+        })
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| {
+            value["botControlModes"][agent_id]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .filter(|mode| matches!(mode.as_str(), "ask" | "full"))
+        .unwrap_or_else(|| "ask".to_string())
+}
+
+pub fn set_bot_control_mode(data_dir: &Path, agent_id: &str, mode: &str) -> Result<()> {
+    anyhow::ensure!(
+        !agent_id.is_empty() && matches!(mode, "ask" | "full"),
+        "Invalid Bot control mode"
+    );
+    let connection = rusqlite::Connection::open(data_dir.join("rovai.sqlite"))?;
+    let text: Option<String> = connection
+        .query_row(
+            "SELECT state_json FROM creation_preferences WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut value = text
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "newConversationDefaults": null,
+                "newConversationDefaultsRequireConfirmation": false,
+                "oneClickNewConversationEnabled": false,
+                "ownerPermissions": {},
+                "botControlModes": {}
+            })
+        });
+    if !value
+        .get("botControlModes")
+        .is_some_and(|item| item.is_object())
+    {
+        value["botControlModes"] = serde_json::json!({});
+    }
+    value["botControlModes"][agent_id] = serde_json::Value::String(mode.to_string());
+    connection.execute(
+        "INSERT INTO creation_preferences(singleton,state_json) VALUES(1,?1)
+        ON CONFLICT(singleton) DO UPDATE SET state_json=excluded.state_json",
+        [serde_json::to_string(&value)?],
+    )?;
+    Ok(())
+}
+
 pub fn execute(
     root: &Path,
     database: &mut Database,
@@ -114,7 +227,7 @@ pub fn execute(
     }
     let mut next = saved.clone().unwrap_or_default();
     match method {
-        "preferences.newConversation.get" => {
+        "preferences.newConversation.get" | "preferences.ownerPermissions.get" => {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
             struct Empty {}
@@ -122,6 +235,20 @@ pub fn execute(
             let value = serde_json::to_value(next)?;
             tx.commit()?;
             return Ok((value, false));
+        }
+        "preferences.ownerPermissions.set" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            struct Set {
+                key: String,
+                value: String,
+            }
+            let input: Set = serde_json::from_value(params)?;
+            anyhow::ensure!(
+                valid_owner_permission(&input.key, &input.value),
+                "Invalid owner permission"
+            );
+            next.owner_permissions.insert(input.key, input.value);
         }
         "preferences.newConversation.initialize" => {
             let mut legacy: Snapshot = serde_json::from_value(params)?;
