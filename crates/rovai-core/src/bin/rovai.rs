@@ -3587,7 +3587,7 @@ mod tests {
     #[test]
     fn loom_plan_help_names_the_cli_operations_reference() {
         let description = builtin_tool_description("loom.plan", true).unwrap();
-        let summary = "Import the current Mission's one LOOM plan. Default Lead only. A Mission accepts one plan; it cannot be replaced. Importing starts approved automatic dispatch for assigned tasks; do not release, message, claim, or implement them in the Lead run. Pass the plan as JSON with --input-file; the exact file shape is in the cli-operations LOOM reference.";
+        let summary = "Import the current Mission's one LOOM plan. Default Lead only. A Mission accepts one plan; it cannot be replaced. Importing starts approved automatic dispatch for assigned tasks; do not release, message, claim, or implement them in the Lead run. In multi-task plans, task acceptanceCriteria must reference only that task output; cross-task Mission criteria belong on the terminal task. Pass the plan as JSON with --input-file; the exact file shape is in the cli-operations LOOM reference.";
         assert_eq!(description.summary, summary);
         let help = operation_help_text(&description);
         assert!(help.starts_with(&format!("rovai loom plan\n{summary}\n")));

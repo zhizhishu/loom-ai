@@ -729,7 +729,8 @@ pub fn tool_definitions() -> Vec<Value> {
             "taskId": id_schema(),
             "title": {"type": "string", "minLength": 1, "maxLength": 200},
             "description": {"type": "string", "maxLength": 12000},
-            "assigneeAgentId": id_schema()
+            "assigneeAgentId": id_schema(),
+            "acceptanceCriteria": {"type": "array", "minItems": 1, "items": criterion}
         }
     });
     let dependency = json!({
@@ -807,7 +808,7 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({
             "name": LOOM_PLAN_TOOL_NAME,
             "title": "Import the current Mission's plan",
-            "description": "Import the current Mission's one LOOM plan. Default Lead only. A Mission accepts one plan; it cannot be replaced. Importing starts approved automatic dispatch for assigned tasks; do not release, message, claim, or implement them in the Lead run. Pass the plan as JSON with --input-file; the exact file shape is in the cli-operations LOOM reference.",
+            "description": "Import the current Mission's one LOOM plan. Default Lead only. A Mission accepts one plan; it cannot be replaced. Importing starts approved automatic dispatch for assigned tasks; do not release, message, claim, or implement them in the Lead run. In multi-task plans, task acceptanceCriteria must reference only that task output; cross-task Mission criteria belong on the terminal task. Pass the plan as JSON with --input-file; the exact file shape is in the cli-operations LOOM reference.",
             "inputSchema": {
                 "type": "object", "additionalProperties": false,
                 "required": ["goal", "criteria", "tasks"],
@@ -1647,8 +1648,8 @@ mod tests {
     { "criterionId": "report-exists", "text": "out/report.md exists and covers the three points" }
   ],
   "tasks": [
-    { "taskId": "report-draft", "title": "Draft the report", "description": "Write out/report.md", "assigneeAgentId": "<worker-a-agent-id>" },
-    { "taskId": "report-final", "title": "Finish the report", "description": "Produce the final report", "assigneeAgentId": "<worker-b-agent-id>" }
+    { "taskId": "report-draft", "title": "Draft the report", "description": "Write out/report.md", "assigneeAgentId": "<worker-a-agent-id>", "acceptanceCriteria": [{ "criterionId": "draft-file", "text": "out/report.md draft exists" }] },
+    { "taskId": "report-final", "title": "Finish the report", "description": "Produce the final report", "assigneeAgentId": "<worker-b-agent-id>", "acceptanceCriteria": [{ "criterionId": "report-exists", "text": "out/report.md exists and covers the three points" }] }
   ],
   "dependencies": [
     { "upstreamTaskId": "report-draft", "downstreamTaskId": "report-final", "condition": "task_done" }
@@ -1656,7 +1657,7 @@ mod tests {
 }
 ```
 
-Optional: `acceptanceCriteriaVersion` (top level), `description` and `assigneeAgentId` (per task), `condition` (per dependency, `task_done` or `artifact_accepted`, lowercase), `dependencies` itself."#;
+Optional: `acceptanceCriteriaVersion` (top level), `description`, `assigneeAgentId` and task-scoped `acceptanceCriteria` (per task), `condition` (per dependency, `task_done` or `artifact_accepted`, lowercase), `dependencies` itself."#;
 
     fn reference_plan_example(reference: &str) -> Value {
         let plan = reference
@@ -1698,13 +1699,19 @@ Optional: `acceptanceCriteriaVersion` (top level), `description` and `assigneeAg
                         "taskId": "report-draft",
                         "title": "Draft the report",
                         "description": "Write out/report.md",
-                        "assigneeAgentId": "<worker-a-agent-id>"
+                        "assigneeAgentId": "<worker-a-agent-id>",
+                        "acceptanceCriteria": [
+                            {"criterionId": "draft-file", "text": "out/report.md draft exists"}
+                        ]
                     },
                     {
                         "taskId": "report-final",
                         "title": "Finish the report",
                         "description": "Produce the final report",
-                        "assigneeAgentId": "<worker-b-agent-id>"
+                        "assigneeAgentId": "<worker-b-agent-id>",
+                        "acceptanceCriteria": [
+                            {"criterionId": "report-exists", "text": "out/report.md exists and covers the three points"}
+                        ]
                     }
                 ],
                 "dependencies": [

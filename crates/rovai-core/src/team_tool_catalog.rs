@@ -1686,7 +1686,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             plan["description"],
-            "Import the current Mission's one LOOM plan. Default Lead only. A Mission accepts one plan; it cannot be replaced. Importing starts approved automatic dispatch for assigned tasks; do not release, message, claim, or implement them in the Lead run. Pass the plan as JSON with --input-file; the exact file shape is in the cli-operations LOOM reference."
+            "Import the current Mission's one LOOM plan. Default Lead only. A Mission accepts one plan; it cannot be replaced. Importing starts approved automatic dispatch for assigned tasks; do not release, message, claim, or implement them in the Lead run. In multi-task plans, task acceptanceCriteria must reference only that task output; cross-task Mission criteria belong on the terminal task. Pass the plan as JSON with --input-file; the exact file shape is in the cli-operations LOOM reference."
         );
         assert_eq!(plan["inputSchema"]["additionalProperties"], false);
         assert_eq!(

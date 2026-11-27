@@ -32,7 +32,7 @@ Skill file shape. Every object has exactly these fields:
 
 ## Plan
 
-Read `rovai loom status` first. A Mission accepts one plan and it cannot be replaced, so draft it from the Mission's full definition (`rovai mission get`) before importing. Write 2–8 tasks a member can finish and hand over; assign every implementation task to the active member who must produce it, copying real member ids from `rovai mission get`; give each acceptance criterion a short stable `criterionId`. Task ids are unique across every Mission, so start each with a word from this Mission, such as `report-draft`, never a bare `t1`. Use `task_done` dependencies for ordering and `artifact_accepted` only when the downstream task needs the User-accepted output.
+Read `rovai loom status` first. A Mission accepts one plan and it cannot be replaced, so draft it from the Mission's full definition (`rovai mission get`) before importing. Write 2–8 tasks a member can finish and hand over; assign every implementation task to the active member who must produce it, copying real member ids from `rovai mission get`; give each acceptance criterion a short stable `criterionId`. In a multi-task plan, put task-scoped `acceptanceCriteria` on each task and make them mention only that task's own output; put cross-task Mission criteria only on the terminal task, never copy future final artifacts into upstream worker tasks. Task ids are unique across every Mission, so start each with a word from this Mission, such as `report-draft`, never a bare `t1`. Use `task_done` dependencies for ordering and `artifact_accepted` only when the downstream task needs the User-accepted output.
 
 After importing, stop the Lead run. Importing seeds the personal default control policy and Core automatically releases and dispatches every assigned task whose dependencies are met. Do not release tasks, message assignees, claim tasks, or implement assigned work from the Lead run. Write implementation tasks rather than separate stage-review tasks; the control plane dispatches the independent review itself.
 
@@ -45,8 +45,8 @@ Plan file shape (`rovai loom plan --input-file plan.json`). Every object has exa
     { "criterionId": "report-exists", "text": "out/report.md exists and covers the three points" }
   ],
   "tasks": [
-    { "taskId": "report-draft", "title": "Draft the report", "description": "Write out/report.md", "assigneeAgentId": "<worker-a-agent-id>" },
-    { "taskId": "report-final", "title": "Finish the report", "description": "Produce the final report", "assigneeAgentId": "<worker-b-agent-id>" }
+    { "taskId": "report-draft", "title": "Draft the report", "description": "Write out/report.md", "assigneeAgentId": "<worker-a-agent-id>", "acceptanceCriteria": [{ "criterionId": "draft-file", "text": "out/report.md draft exists" }] },
+    { "taskId": "report-final", "title": "Finish the report", "description": "Produce the final report", "assigneeAgentId": "<worker-b-agent-id>", "acceptanceCriteria": [{ "criterionId": "report-exists", "text": "out/report.md exists and covers the three points" }] }
   ],
   "dependencies": [
     { "upstreamTaskId": "report-draft", "downstreamTaskId": "report-final", "condition": "task_done" }
@@ -54,7 +54,7 @@ Plan file shape (`rovai loom plan --input-file plan.json`). Every object has exa
 }
 ```
 
-Optional: `acceptanceCriteriaVersion` (top level), `description` and `assigneeAgentId` (per task), `condition` (per dependency, `task_done` or `artifact_accepted`, lowercase), `dependencies` itself.
+Optional: `acceptanceCriteriaVersion` (top level), `description`, `assigneeAgentId` and task-scoped `acceptanceCriteria` (per task), `condition` (per dependency, `task_done` or `artifact_accepted`, lowercase), `dependencies` itself.
 
 ## Deliver
 

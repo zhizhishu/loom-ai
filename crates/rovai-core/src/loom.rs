@@ -432,6 +432,10 @@ pub struct LoomPlanImportTask {
     pub description: String,
     #[serde(default)]
     pub assignee_agent_id: Option<String>,
+    /// Task-scoped acceptance criteria. When absent, the plan-level snapshot is inherited for
+    /// compatibility; multi-task plans should provide criteria that name only this task's outputs.
+    #[serde(default)]
+    pub acceptance_criteria: Option<Vec<LoomPlanImportCriterion>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -581,6 +585,7 @@ struct ImportedTask<'a> {
     title: &'a str,
     description: &'a str,
     assignee_agent_id: Option<&'a str>,
+    acceptance_criteria_json: String,
 }
 
 /// Three-colour DFS over the submitted edges (WHITE unvisited, GRAY on the current
@@ -732,6 +737,35 @@ pub fn plan_import(
                 format!("LOOM task {task_id} description exceeds 16000 characters"),
             ));
         }
+        let task_acceptance_criteria_json = if let Some(criteria) = &task.acceptance_criteria {
+            if criteria.is_empty() {
+                return Err(LoomPlanImportError::rejection(
+                    LOOM_INVALID_INPUT,
+                    format!("LOOM task {task_id} acceptanceCriteria must not be empty when present"),
+                ));
+            }
+            let mut task_criterion_ids: HashSet<&str> = HashSet::new();
+            let mut rows: Vec<ImportedCriterion<'_>> = Vec::with_capacity(criteria.len());
+            for criterion in criteria {
+                let criterion_id = criterion.criterion_id.trim();
+                if criterion_id.is_empty() {
+                    return Err(LoomPlanImportError::rejection(
+                        LOOM_INVALID_INPUT,
+                        format!("every acceptance criterion on LOOM task {task_id} requires a criterionId"),
+                    ));
+                }
+                if !task_criterion_ids.insert(criterion_id) {
+                    return Err(LoomPlanImportError::rejection(
+                        LOOM_CRITERION_DUPLICATE,
+                        format!("criterionId {criterion_id} is submitted more than once on task {task_id}"),
+                    ));
+                }
+                rows.push(ImportedCriterion { criterion_id, text: criterion.text.trim() });
+            }
+            serde_json::to_string(&rows)?
+        } else {
+            acceptance_criteria_json.clone()
+        };
         task_rows.push(ImportedTask {
             task_id,
             title,
@@ -741,6 +775,7 @@ pub fn plan_import(
                 .as_deref()
                 .map(str::trim)
                 .filter(|agent_id| !agent_id.is_empty()),
+            acceptance_criteria_json: task_acceptance_criteria_json,
         });
     }
 
@@ -858,7 +893,7 @@ pub fn plan_import(
                 task.title,
                 task.description,
                 task.assignee_agent_id,
-                &acceptance_criteria_json,
+                &task.acceptance_criteria_json,
                 &now,
             ],
         )?;
@@ -5140,6 +5175,7 @@ mod tests {
             title: title.into(),
             description: String::new(),
             assignee_agent_id: None,
+            acceptance_criteria: None,
         }
     }
 
@@ -5388,6 +5424,25 @@ mod tests {
             serde_json::Value::Null,
             "assertion dependency_resolution_wire_shape_is_null"
         );
+    }
+
+    #[test]
+    fn task_scoped_acceptance_criteria_replace_the_plan_snapshot() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM task scoped criteria");
+        let mut input = plan_input(&mission_id);
+        input.tasks[0].acceptance_criteria = Some(vec![criterion(
+            "worker-file",
+            "acceptance/worker-a.md contains exactly the worker lines",
+        )]);
+
+        plan_import(&mut database, input).unwrap();
+        let tasks = tasks_list(&database, &mission_id).unwrap();
+        let worker = tasks.iter().find(|task| task.task_id == "task_a").unwrap();
+        let final_task = tasks.iter().find(|task| task.task_id == "task_b").unwrap();
+        assert_eq!(worker.acceptance_criteria.criteria.len(), 1);
+        assert_eq!(worker.acceptance_criteria.criteria[0].criterion_id, "worker-file");
+        assert_eq!(final_task.acceptance_criteria.criteria.len(), 2);
     }
 
     #[test]
