@@ -125,3 +125,9 @@
 4. **2.0 云上链接 flight**：五项 sha 已列，但它跑的是**旧 `a4ea6da` Linux 包二进制**（`/tmp/final-a4-smoke/pkg`），**未在 `1ea3bff` 上验证**，只能当**既有链接通路（旧 `a4ea6da` 包）**回执抽查，不得当基线证据；执行环境是 Devin VM **进程隔离而非容器**，且缺截图/run id。`1ea3bff` 自己的 trial 只到打包流水线与产物 sha（Linux `46052485873` + tar sha256 `737925180f805d780a50cf56c0413a1e739de476c2bbb46d5e610474129bd103`；Windows `46052481730` + 解包文件树 artifact `15226860608`，无单一包 sha）。
 5. 对 `T22` 全矩阵、`T22c`、`T35`、`E5-B`、`E7` 不要当作已验收；这些是当前最明显缺口或范围外项。
 6. `T22b`/`T23`–`T26`/`T29`–`T34` 仍是 `a4ea6da` 以前的旧版证据（commit 多数未写入回执），不要读成当前候选已验。
+
+## 待办：证据索引缺口（2026-11-28 补记）
+
+- **已知坏夹具，不在本单修**：`scripts/lib/loom-runtime-settings-ui.test.mjs` 在当前 base 上已坏 —— `scripts/fixtures/loom-runtime-settings/renderer.tsx` 第 6 行仍 import 已删除的 `apps/desktop/src/renderer/src/loom-native/NativeSetup`（第 85 行使用）。
+- **归属**：**不是** `cand/pi-provider-settings` 引入的回归，属既有夹具缺口，**不在本单修**，也不改变本索引任何表格事实。
+- **后续**：单独立项修夹具（改引用现存组件）或替换该引用；修好前该测试的失败不计入任何条目的验收结论。
