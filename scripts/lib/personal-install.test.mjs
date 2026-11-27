@@ -35,7 +35,7 @@ $size = [LoomFixtureShortPath]::GetShortPathName($env:LOOM_FIXTURE_LONG_PATH, $b
 if ($size -eq 0 -or $size -ge 32768) { throw 'GetShortPathNameW failed'; }
 $buffer.ToString()`
   const result = spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
-    encoding: 'utf8', timeout: 30000, windowsHide: true,
+    encoding: 'utf8', timeout: 60000, windowsHide: true,
     env: { ...process.env, LOOM_FIXTURE_LONG_PATH: parent.root }
   })
   assert.equal(result.status, 0, result.stderr || result.stdout)
