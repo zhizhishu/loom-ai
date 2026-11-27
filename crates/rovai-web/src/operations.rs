@@ -557,6 +557,7 @@ impl Operation {
                     // same admission list as the text they replace.
                     "bytesBase64",
                     "mediaType",
+                    "pptxPreview",
                     "unavailableReason",
                 ],
             ),
@@ -1112,6 +1113,7 @@ mod tests {
             "artifactId":"artifact_fixture", "relativePath":"chart.png",
             "contentType":null, "sizeBytes":4, "sha256":"fixture_digest",
             "text":null, "bytesBase64":"iVBORw==", "mediaType":"image/png",
+            "pptxPreview":{"status":"missing_dependency","missingDependency":"soffice","error":null,"slides":[]},
             "unavailableReason":null
         });
         let mut media_with_private_field = media_result.clone();
