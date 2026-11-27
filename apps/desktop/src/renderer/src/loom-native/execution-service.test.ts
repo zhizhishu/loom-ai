@@ -180,6 +180,46 @@ describe('可选远端运行端与工作区', () => {
   })
 })
 
+describe('远端工作区准备', () => {
+  it('prepares with exactly the admitted params, never a browser-named campId', async () => {
+    const receipt = {
+      missionId: 'm1', campId: 'camp_1', nodeId: 'node-1', ownerName: 'Box', ownerRole: 'remote',
+      worktree: '/srv/ws-1', source: '/srv/source', branch: 'rovai/m1', baseSha: null
+    }
+    const { rpc, calls } = recorded(async () => receipt)
+    const service = createExecutionService(rpc, null)
+    expect(await service.prepareRemote({ missionId: 'm1', nodeId: 'node-1', sourceRoot: '/srv/source' }))
+      .toEqual(receipt)
+    expect(calls).toEqual([{
+      method: 'missions.workspace.prepareRemote',
+      params: { missionId: 'm1', nodeId: 'node-1', sourceRoot: '/srv/source' }
+    }])
+  })
+
+  it('keeps the refusal code of a prepare that did not happen', async () => {
+    const { rpc } = recorded(async () => { throw nodeFailure('node_not_found') })
+    const service = createExecutionService(rpc, null)
+    await expect(service.prepareRemote({ missionId: 'm1', nodeId: 'node-missing', sourceRoot: '/srv/source' }))
+      .rejects.toMatchObject({ code: 'node_not_found' })
+  })
+
+  it('reads the Mission of the open Thread instead of guessing one', async () => {
+    const missions = [
+      { missionId: 'm0', threadId: 'camp_0' },
+      { missionId: 'm1', threadId: 'camp_1' }
+    ]
+    const { rpc, calls } = recorded(async () => missions)
+    const service = createExecutionService(rpc, null)
+    expect(await service.missionOfThread('camp_1')).toBe('m1')
+    expect(await service.missionOfThread('camp_missing')).toBeNull()
+    // 没有线程就没有可读的使命，也不发任何请求。
+    const quiet = recorded(async () => missions)
+    expect(await createExecutionService(quiet.rpc, null).missionOfThread(null)).toBeNull()
+    expect(quiet.calls).toHaveLength(0)
+    expect(calls.filter((call) => call.method === 'missions.list')).toHaveLength(2)
+  })
+})
+
 describe('控制器：CAS、冲突与结果不明', () => {
   it('is one shared controller per port, so the fence cannot fork', () => {
     const service = createExecutionService(recorded(async () => view()).rpc, null)

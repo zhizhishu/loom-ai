@@ -1,4 +1,4 @@
-import type { ExecutionNodeRecord } from '@contracts'
+import type { ExecutionNodeRecord, MissionRecord } from '@contracts'
 // 只借类型：ThreadClient 是已认证的 Core 通道，这里不发任何自制 RPC。
 import type { ThreadClient } from '../camp-client'
 import { readErrorMessage } from '../error-message'
@@ -20,7 +20,7 @@ import {
 } from '../member-execution-target-model'
 
 /**
- * 「助手在哪台机器上跑」的数据层：两个真实 Core 调用 + 一次节点列表读。
+ * 「助手在哪台机器上跑」的数据层：运行位置读写 + 一次远端工作区准备 + 节点列表读。
  *
  * 它不持有第二份状态。CAS（expectedRevision）、冲突/结果不明栅栏、脏比较
  * 全部留在纯 ExecutionTargetController 里，这里只是把网络接到它身上。
@@ -42,6 +42,29 @@ export type ExecutionSaveInput = {
   memberId: string
   expectedRevision: number
   selection: ExecutionTargetSelection | null
+}
+
+/**
+ * The admitted remote workspace prepare. The Host reads the Mission's own Thread
+ * itself, so `campId` is never the browser's to name.
+ */
+export type PrepareRemoteWorkspaceInput = {
+  missionId: string
+  nodeId: string
+  sourceRoot: string
+}
+
+/** The workspace projection `POST /api/v1/nodes/workspaces` also returns. */
+export type PrepareRemoteWorkspaceReceipt = {
+  missionId: string
+  campId: string
+  nodeId: string
+  ownerName: string
+  ownerRole: string
+  worktree: string
+  source: string
+  branch: string
+  baseSha: string | null
 }
 
 export class ExecutionRequestError extends Error {
@@ -71,6 +94,9 @@ export function remoteRuntimes(view: ExecutionTargetView | null): ExecutionTarge
 export type ExecutionService = {
   read(memberId: string): Promise<ExecutionTargetView>
   save(input: ExecutionSaveInput): Promise<ExecutionTargetReceipt>
+  prepareRemote(input: PrepareRemoteWorkspaceInput): Promise<PrepareRemoteWorkspaceReceipt>
+  /** The Mission this Thread is, or `null` when the Thread has none. */
+  missionOfThread(threadId: string | null): Promise<string | null>
   nodes(): Promise<ExecutionNodeListRead>
   workspaces(view: ExecutionTargetView | null, nodeId: string): ExecutionTargetWorkspace[]
   runtimes(view: ExecutionTargetView | null): ExecutionTargetAdapterKind[]
@@ -99,11 +125,31 @@ export function createExecutionService(rpc: ExecutionRpc, nodes: NodeApi | null)
       selection: input.selection
     }).catch((error: unknown) => { throw asExecutionError(error) })
 
+  /** One prepare on one node. It creates the workspace; it never saves a target. */
+  const prepareRemote = (input: PrepareRemoteWorkspaceInput): Promise<PrepareRemoteWorkspaceReceipt> =>
+    rpc.request<PrepareRemoteWorkspaceReceipt>('missions.workspace.prepareRemote', {
+      missionId: input.missionId,
+      nodeId: input.nodeId,
+      sourceRoot: input.sourceRoot
+    }).catch((error: unknown) => {
+      throw new ExecutionRequestError(requestCode(error), readErrorMessage(error, '准备工作区没有完成'))
+    })
+
+  /** A Thread is a Mission's Thread only when Core already says so; never inferred. */
+  const missionOfThread = async (threadId: string | null): Promise<string | null> => {
+    if (!threadId) return null
+    const missions = await rpc.request<readonly MissionRecord[]>('missions.list')
+      .catch((error: unknown) => { throw asExecutionError(error) })
+    return missions?.find((mission) => mission.threadId === threadId)?.missionId ?? null
+  }
+
   let shared: ExecutionTargetController | null = null
 
   return {
     read,
     save,
+    prepareRemote,
+    missionOfThread,
     async nodes() {
       if (!nodes) return { status: 'unavailable', code: 'nodes_unavailable' }
       try {
