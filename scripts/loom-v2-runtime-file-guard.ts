@@ -46,7 +46,7 @@ const GUARD_TOOLS = Object.freeze(['read', 'write', 'edit'])
 
 // The one managed Core business tool the explicitly chosen `workspace_workflow` policy adds. It is a
 // typed bridge to the ten `loom.*` operations Core already ships — never `bash`, never an arbitrary
-// command, never MCP. This guard stays authoritative for it: the operation must be one of the ten,
+// command. This guard stays authoritative for it: the operation must be one of the ten,
 // and a `loom.evidence` path goes through the SAME `read` path policy as the native tool.
 const LOOM_TOOL_NAME = 'rovai_loom'
 const LOOM_OPERATIONS = Object.freeze([
@@ -69,6 +69,33 @@ const GRANT_TOOL_SETS = Object.freeze([
   Object.freeze(['read', 'write', 'edit']),
   Object.freeze(['read', 'write', 'edit', LOOM_TOOL_NAME])
 ])
+
+// MCP is not part of the file grant itself. When Core deliberately projects MCP into a workflow
+// Run, the managed MCP document proves which computer bridge Pi loaded; this guard admits only
+// `mcp__<server-label>__` tools from entries carrying the Host computer-grant environment marker.
+const MCP_TOOL_PREFIX = 'mcp__'
+function mcpServerLabel(serverName) {
+  let hash = 0x811c9dc5
+  for (let index = 0; index < serverName.length; index += 1) {
+    hash ^= serverName.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return hash.toString(16).padStart(8, '0').slice(0, 8)
+}
+function projectedMcpToolPrefixes() {
+  const path = process.env.ROVAI_PI_MCP_FILE
+  if (typeof path !== 'string' || path.length === 0) return new Set()
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8'))
+    if (!parsed || !Array.isArray(parsed.servers)) return new Set()
+    return new Set(parsed.servers
+      .filter((server) => server && typeof server.name === 'string'
+        && server.env && typeof server.env.LOOM_COMPUTER_AGENT_GRANT === 'string')
+      .map((server) => `${MCP_TOOL_PREFIX}${mcpServerLabel(server.name)}__`))
+  } catch {
+    return new Set()
+  }
+}
 
 // Deny-listed path segments (lowercased, compared per segment) and suffixes. A grant never grants
 // VCS internals, credentials, auth/models config, or private keys, even inside the workspace.
@@ -468,6 +495,7 @@ export default async function loomRuntimeFileGuard(pi) {
   }
 
   const grant = loaded.grant
+  const mcpToolPrefixes = projectedMcpToolPrefixes()
   // P0 step 3: the LOOM claim a Run holds moves after this process starts (`loom.claim`, and later a
   // takeover with a new fence), and Core re-issues this exact document when it does. A launch-time
   // snapshot would decide a `write` on an authorisation the Run no longer holds — the r9 failure — so
@@ -552,12 +580,23 @@ export default async function loomRuntimeFileGuard(pi) {
       if (!live.ok) return block(live.reason)
       const active = live.grant
       if (at > active.expiresAtEpochMs) return block('grant_expired')
-      if (!GRANT_TOOL_UNIVERSE.includes(toolName)) return block('tool_not_allowed')
-      if (!active.allowedTools.includes(toolName)) return block('tool_not_granted')
+      const projectedMcp = active.allowedTools.includes(LOOM_TOOL_NAME)
+        && [...mcpToolPrefixes].some((prefix) => toolName.startsWith(prefix))
+      if (!projectedMcp && !GRANT_TOOL_UNIVERSE.includes(toolName)) return block('tool_not_allowed')
+      if (!projectedMcp && !active.allowedTools.includes(toolName)) return block('tool_not_granted')
 
       const handlerCwd = typeof ctx?.cwd === 'string' && ctx.cwd.length > 0 ? realpathOrNull(ctx.cwd) : null
       if (handlerCwd === null) return block('cwd_unresolvable')
       if (compareKey(handlerCwd) !== compareKey(active.workspaceReal)) return block('cwd_mismatch')
+
+      if (projectedMcp) {
+        const allowedLogged = log({
+          t: 'decision', at, toolCallId, toolName, decision: 'allow',
+          reasonCode: 'mcp_projection_granted', relPath: null, pathSha256: sha256('')
+        })
+        if (!allowedLogged) return block('guard_log_write_failed', { supersededDecision: 'allow' })
+        return undefined
+      }
 
       // The managed business tool carries no file `path` argument of its own, so it gets its own
       // decision instead of the native path policy: a closed operation, and for `loom.evidence` the
