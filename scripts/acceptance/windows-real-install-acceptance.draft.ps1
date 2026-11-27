@@ -390,8 +390,23 @@ function Write-TextFile([string]$Path, [string]$Content) {
 function New-OoxmlPackage([string]$Directory, [string]$TargetPath) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
     if ([IO.File]::Exists($TargetPath)) { [IO.File]::Delete($TargetPath) }
-    [IO.Compression.ZipFile]::CreateFromDirectory(
-        $Directory, $TargetPath, [IO.Compression.CompressionLevel]::Optimal, $false)
+    # CreateFromDirectory emits backslash entry names on .NET Framework/PS5.1, which
+    # breaks OOXML part lookups (e.g. GetEntry('word/document.xml')). Write entries
+    # manually so every name is a forward-slash relative path.
+    $rootFull = [IO.Path]::GetFullPath($Directory).TrimEnd('\', '/')
+    $archive = [IO.Compression.ZipFile]::Open($TargetPath, 'Create')
+    try {
+        foreach ($file in [IO.Directory]::GetFiles($rootFull, '*', [IO.SearchOption]::AllDirectories)) {
+            $relative = $file.Substring($rootFull.Length).TrimStart('\', '/')
+            $entryName = $relative.Replace('\', '/')
+            $entry = $archive.CreateEntry($entryName, [IO.Compression.CompressionLevel]::Optimal)
+            $entryStream = $entry.Open()
+            try {
+                $source = [IO.File]::OpenRead($file)
+                try { $source.CopyTo($entryStream) } finally { $source.Dispose() }
+            } finally { $entryStream.Dispose() }
+        }
+    } finally { $archive.Dispose() }
     return $TargetPath
 }
 
