@@ -267,6 +267,12 @@ fn slide_info(bytes: &[u8]) -> Result<Vec<SlideInfo>, String> {
     if out.is_empty() { Err("no slides in presentation order".into()) } else { Ok(out) }
 }
 
+fn libreoffice_profile_url(profile: &Path) -> Result<String, String> {
+    url::Url::from_file_path(profile)
+        .map(|url| url.to_string())
+        .map_err(|()| format!("LibreOffice profile is not an absolute path: {}", profile.display()))
+}
+
 fn conversion_command_missing() -> Option<&'static str> {
     let soffice = office_command("soffice").is_some();
     let pdftoppm = office_command("pdftoppm").is_some();
@@ -303,8 +309,9 @@ fn render_with_soffice(bytes: &[u8], root: &Path, info: &[SlideInfo]) -> Result<
     fs::write(&input, bytes).map_err(|e| e.to_string())?;
     let profile = root.join("lo-profile");
     fs::create_dir_all(&profile).map_err(|e| e.to_string())?;
+    let profile_url = libreoffice_profile_url(&profile)?;
     let output = Command::new(office_command("soffice").ok_or("soffice missing")?)
-        .arg(format!("-env:UserInstallation=file://{}", profile.display()))
+        .arg(format!("-env:UserInstallation={profile_url}"))
         .args(["--headless", "--convert-to", "pdf", "--outdir"]).arg(root).arg(&input)
         .env("SAL_USE_VCLPLUGIN", "svp")
         .output().map_err(|e| format!("soffice failed to start: {e}"))?;
@@ -342,7 +349,8 @@ fn render_with_soffice(bytes: &[u8], root: &Path, info: &[SlideInfo]) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::attr;
+    use super::{attr, libreoffice_profile_url};
+    use std::path::Path;
     #[test]
     fn attr_reads_both_quote_forms() {
         assert_eq!(attr("<x r:id=\"rId2\"/>", "r:id").as_deref(), Some("rId2"));
@@ -358,5 +366,27 @@ mod tests {
         assert!(rels.contains("about:blank"));
         assert!(rels.contains("https://example.test"));
         assert!(!rels.contains("file:///etc/passwd"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn libreoffice_profile_url_is_a_windows_file_url() {
+        let profile = Path::new(r"C:\Users\loom\AppData\Local\Temp\loom-pptx-1\lo profile");
+        let url = libreoffice_profile_url(profile).unwrap();
+        assert!(url.starts_with("file:///C:/"), "{url}");
+        assert!(!url.contains('\\'), "{url}");
+        assert!(url.contains("lo%20profile"), "{url}");
+        assert!(libreoffice_profile_url(Path::new(r"relative\lo profile")).is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn libreoffice_profile_url_is_a_unix_file_url() {
+        let profile = Path::new("/tmp/loom-pptx-1/lo profile");
+        let url = libreoffice_profile_url(profile).unwrap();
+        assert!(url.starts_with("file:///tmp/loom-pptx-1/"), "{url}");
+        assert!(!url.contains('\\'), "{url}");
+        assert!(url.contains("lo%20profile"), "{url}");
+        assert!(libreoffice_profile_url(Path::new("relative/lo profile")).is_err());
     }
 }
