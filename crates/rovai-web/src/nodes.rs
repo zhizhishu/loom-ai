@@ -3912,10 +3912,12 @@ mod tests {
     }
 
     /// A disconnect retires pending computer calls instead of leaving a caller
-    /// to wait out a deadline for a socket that is already gone.
+    /// to wait out a deadline for a socket that is already gone. An input that
+    /// was already queued is unconfirmed, not the same result as a call that
+    /// never left the Host.
     #[tokio::test]
-    async fn detach_fails_pending_computer_requests_instead_of_waiting_out_the_deadline() {
-        use loom_protocol::computer::{ComputerOpV1, ComputerRequestV1};
+    async fn detach_marks_a_sent_pending_input_unconfirmed_instead_of_not_sent() {
+        use loom_protocol::computer::{ComputerInputV1, ComputerOpV1, ComputerRequestV1};
         let hub = Arc::new(test_hub());
         let (node_id, mut frames) = attach_reports(&hub, Vec::new()).await;
         let generation = hub.inner.lock().await.nodes[&node_id].generation;
@@ -3931,7 +3933,11 @@ mod tests {
                     ComputerRequestV1 {
                         version: COMPUTER_VERSION,
                         request_id: "req_pending".to_owned(),
-                        op: ComputerOpV1::Info {},
+                        op: ComputerOpV1::Input {
+                            input: ComputerInputV1::Text {
+                                text: "a".to_owned(),
+                            },
+                        },
                     },
                     Duration::from_secs(30),
                 )
@@ -3942,8 +3948,52 @@ mod tests {
         hub.detach(&node_id, generation).await;
         assert_eq!(
             call.await.expect("join").err(),
-            Some("node_offline"),
-            "a detached node left the caller waiting instead of failing it"
+            Some("computer_input_unconfirmed"),
+            "a sent input on a detached node must be unconfirmed, not not-sent"
+        );
+        assert!(hub.inner.lock().await.computer_waits.is_empty());
+    }
+
+    /// The deadline is also after the frame was queued. It must be reported as
+    /// an unconfirmed input, never as node_offline/not-sent.
+    #[tokio::test]
+    async fn an_input_deadline_is_reported_as_unconfirmed_and_is_not_replayed() {
+        use loom_protocol::computer::{ComputerInputV1, ComputerOpV1, ComputerRequestV1};
+        let hub = Arc::new(test_hub());
+        let (node_id, mut frames) = attach_reports(&hub, Vec::new()).await;
+        let generation = hub.inner.lock().await.nodes[&node_id].generation;
+        hub.set_computer_versions(&node_id, generation, vec![COMPUTER_VERSION])
+            .await;
+        let call = tokio::spawn({
+            let hub = Arc::clone(&hub);
+            let node_id = node_id.clone();
+            async move {
+                hub.computer_request(
+                    &node_id,
+                    generation,
+                    ComputerRequestV1 {
+                        version: COMPUTER_VERSION,
+                        request_id: "req_timeout".to_owned(),
+                        op: ComputerOpV1::Input {
+                            input: ComputerInputV1::Text {
+                                text: "a".to_owned(),
+                            },
+                        },
+                    },
+                    Duration::from_millis(50),
+                )
+                .await
+            }
+        });
+        assert!(frames.recv().await.is_some(), "the request was not sent");
+        assert_eq!(
+            call.await.expect("join").err(),
+            Some("computer_timeout"),
+            "a sent input deadline must not be reported as not-sent"
+        );
+        assert!(
+            frames.try_recv().is_err(),
+            "a timed-out input must not be replayed"
         );
         assert!(hub.inner.lock().await.computer_waits.is_empty());
     }

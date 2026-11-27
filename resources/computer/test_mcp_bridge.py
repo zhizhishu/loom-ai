@@ -245,6 +245,40 @@ class Protocol(unittest.TestCase):
         finally:
             fixture.close()
 
+    def test_a_sent_but_unconfirmed_input_tells_the_model_to_check_first(self):
+        fixture = Fixture(
+            status=502,
+            body={"ok": False, "error": {"code": "computer_agent_input_unknown"}},
+        )
+        try:
+            response = self.call(fixture, "req-unconfirmed", "text", {"text": "hi", "step": "Type"})
+            self.assertTrue(response["result"]["isError"])
+            text = response["result"]["content"][0]["text"]
+            self.assertEqual(text, bridge.UNCONFIRMED_TEXT)
+            self.assertIn("UNCONFIRMED", text)
+            self.assertIn("DISCONNECTED/TIMEOUT", text)
+            self.assertIn("Do not retry automatically", text)
+            self.assertEqual(len(fixture.requests), 1, "the bridge must not replay")
+        finally:
+            fixture.close()
+
+    def test_a_not_sent_input_is_reported_as_offline_not_unconfirmed(self):
+        fixture = Fixture(
+            status=503,
+            body={"ok": False, "error": {"code": "computer_agent_node_offline"}},
+        )
+        try:
+            response = self.call(fixture, "req-offline", "text", {"text": "hi", "step": "Type"})
+            self.assertTrue(response["result"]["isError"])
+            text = response["result"]["content"][0]["text"]
+            self.assertEqual(text, bridge.NOT_SENT_TEXT)
+            self.assertIn("NOT SENT", text)
+            self.assertIn("OFFLINE/not-sent", text)
+            self.assertNotEqual(text, bridge.UNCONFIRMED_TEXT)
+            self.assertEqual(len(fixture.requests), 1, "the bridge must not replay")
+        finally:
+            fixture.close()
+
     def test_a_revoked_grant_is_fatal_and_stops_further_calls(self):
         fixture = Fixture(status=401, body={"ok": False, "error": {"code": "computer_agent_grant_revoked"}})
         try:

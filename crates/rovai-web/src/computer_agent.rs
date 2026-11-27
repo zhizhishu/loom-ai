@@ -2793,6 +2793,9 @@ fn map_computer(code: &'static str) -> Failure {
         | "computer_view_limit" => Failure::code("computer_agent_view_unavailable"),
         "computer_device_mismatch" => Failure::code("computer_agent_device_mismatch"),
         "computer_input_unknown" => Failure::fatal("computer_agent_input_unknown"),
+        "computer_input_not_sent" | "node_offline" => {
+            Failure::code("computer_agent_node_offline")
+        }
         "computer_busy" | "computer_throttled" => Failure::code("computer_agent_endpoint_busy"),
         "session_required" => Failure::code("computer_agent_owner_session_required"),
         "computer_consent_required" => Failure::code("computer_agent_consent_required"),
@@ -4063,6 +4066,16 @@ mod tests {
                 "a reveal that is not exactly this server must fail closed ({case})"
             );
         }
+    }
+
+    #[test]
+    fn not_sent_and_unconfirmed_inputs_keep_distinct_public_codes() {
+        let not_sent = map_computer("computer_input_not_sent");
+        assert_eq!(not_sent.code, "computer_agent_node_offline");
+        assert!(!not_sent.revoke);
+        let unconfirmed = map_computer("computer_input_unknown");
+        assert_eq!(unconfirmed.code, "computer_agent_input_unknown");
+        assert!(unconfirmed.revoke);
     }
 
     #[test]

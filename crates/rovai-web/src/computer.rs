@@ -207,6 +207,10 @@ pub(crate) enum Failure {
     /// A remote device did not confirm that it drained and released physical
     /// input. This is never a success, and the Host never retries it silently.
     Unconfirmed,
+    /// The input was refused before any frame could be queued for the node.
+    /// Nothing reached the device, so this is a clean not-sent result rather
+    /// than an unknown side effect.
+    NotSent,
 }
 
 impl Failure {
@@ -222,6 +226,7 @@ impl Failure {
             Self::Failed => "computer_capture_failed",
             Self::Unsupported => "computer_unsupported",
             Self::Unconfirmed => "computer_release_unconfirmed",
+            Self::NotSent => "computer_input_not_sent",
         }
     }
 
@@ -230,6 +235,8 @@ impl Failure {
             Self::Unavailable => "computer_unsupported",
             // Refused before injecting: nothing reached the OS.
             Self::Unsupported => "computer_input_unsupported",
+            // A node call that never left the Host. This is not an unknown effect.
+            Self::NotSent => "computer_input_not_sent",
             // Any attempted input may already have reached the OS. One code, so
             // the client can never mistake a partial send for a clean refusal.
             Self::EncoderUnavailable

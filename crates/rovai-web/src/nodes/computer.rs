@@ -13,7 +13,7 @@ use super::{Hub, Inner};
 use loom_protocol::ServerMessage;
 use loom_protocol::computer::{
     COMPUTER_VERSION, ComputerCodeV1, ComputerDeviceV1, ComputerFrameChunkV1,
-    ComputerFrameHeaderV1, ComputerReplyV1, ComputerRequestV1, MAX_FRAME_BYTES,
+    ComputerFrameHeaderV1, ComputerOpV1, ComputerReplyV1, ComputerRequestV1, MAX_FRAME_BYTES,
 };
 use std::{
     sync::Arc,
@@ -88,6 +88,9 @@ impl Hub {
     ) -> Result<ComputerOutcome, &'static str> {
         request.validate().map_err(code_text)?;
         let request_id = request.request_id.clone();
+        // Only an input can have an external side effect whose reply was lost.
+        // Capture/info/release keep their existing retirement code.
+        let is_input = matches!(&request.op, ComputerOpV1::Input { .. });
         let (generation, rx) = {
             let mut inner = self.inner.lock().await;
             if inner.revoked.contains(node_id) {
@@ -163,7 +166,10 @@ impl Hub {
         match tokio::time::timeout(budget, rx).await {
             Ok(Ok(outcome)) => Ok(outcome),
             // A dropped sender means the waiter was retired by a disconnect or a
-            // revocation. The caller must treat that as unknown, never success.
+            // revocation after the frame was queued. An input may therefore have
+            // reached the node: report unconfirmed, never success and never the
+            // same code as a call that failed before send.
+            Ok(Err(_)) if is_input => Err("computer_input_unconfirmed"),
             Ok(Err(_)) => Err("node_offline"),
             Err(_) => {
                 self.abandon_computer_wait(node_id, &request_id);

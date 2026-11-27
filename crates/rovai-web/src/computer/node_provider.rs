@@ -257,7 +257,7 @@ impl Provider for NodeProvider {
         let input = wire_input(command);
         let outcome = self
             .call(ComputerOpV1::Input { input })
-            .map_err(|_| Failure::InputFailed)?;
+            .map_err(input_transport_failure)?;
         match outcome.reply.code {
             ComputerCodeV1::Ok => Ok(()),
             code => Err(failure(code)),
@@ -272,6 +272,18 @@ impl Provider for NodeProvider {
             Ok(outcome) if outcome.reply.code.is_ok() => Ok(()),
             _ => Err(Failure::Unconfirmed),
         }
+    }
+}
+
+/// Map a transport failure on the input path to PiBot's two cases.
+///
+/// `computer_input_unconfirmed` and `computer_timeout` are only returned after
+/// the frame was queued: the node may already have injected the input. Every
+/// other error is admission/send failure, which proves nothing left the Host.
+fn input_transport_failure(code: &'static str) -> Failure {
+    match code {
+        "computer_input_unconfirmed" | "computer_timeout" => Failure::Unconfirmed,
+        _ => Failure::NotSent,
     }
 }
 
@@ -1066,6 +1078,31 @@ mod tests {
         );
         assert_eq!(Failure::Unconfirmed.input_code(), "computer_input_unknown");
         assert_eq!(Failure::Timeout.input_code(), "computer_input_unknown");
+        assert_eq!(Failure::NotSent.input_code(), "computer_input_not_sent");
+    }
+
+    #[test]
+    fn input_transport_failures_keep_not_sent_separate_from_unconfirmed() {
+        // Admission/send failures never put a frame on the node.
+        for code in [
+            "node_offline",
+            "node_connection_changed",
+            "computer_version_unsupported",
+            "computer_busy",
+            "node_backpressure",
+            "token_revoked",
+        ] {
+            assert_eq!(input_transport_failure(code), Failure::NotSent, "{code}");
+        }
+        // These two are returned only after the request was queued.
+        assert_eq!(
+            input_transport_failure("computer_input_unconfirmed"),
+            Failure::Unconfirmed
+        );
+        assert_eq!(
+            input_transport_failure("computer_timeout"),
+            Failure::Unconfirmed
+        );
     }
 
     #[test]
