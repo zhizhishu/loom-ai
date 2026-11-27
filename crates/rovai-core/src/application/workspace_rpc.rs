@@ -9,7 +9,7 @@ use crate::{
         WorkspaceArchiveKind, WorkspaceArchiveReceipt, WorkspaceRpcStore,
         archive_completed_results,
     },
-    workspace_rpc_authority::resolve_workspace_authority,
+    workspace_rpc_authority::{resolve_mission_remote_workspace, resolve_workspace_authority},
 };
 use base64::Engine as _;
 use loom_protocol::workspace_rpc::*;
@@ -225,6 +225,17 @@ fn settled(state: RequestState) -> bool {
             | RequestState::Unknown
     )
 }
+/// The four operations that reach a prepared workspace. `poll` and `cancel` name
+/// a request, so they never carry a workspace target.
+fn targets_workspace(operation: &str) -> bool {
+    matches!(
+        operation,
+        "loom.workspace.list"
+            | "loom.workspace.read"
+            | "loom.workspace.write"
+            | "loom.workspace.run"
+    )
+}
 
 impl Core {
     pub(super) async fn handle_workspace_rpc_operation(
@@ -269,6 +280,16 @@ impl Core {
         input: &Value,
         call_id: &str,
     ) -> Result<Value, RpcErrorCode> {
+        // `workspaceId` may be omitted by the caller; the authenticated Run's
+        // Mission then selects the target. The resolver runs before the request is
+        // built, so the wire request still carries one concrete id and
+        // `WorkspaceRequest` keeps its single meaning.
+        let targeted = if targets_workspace(operation) {
+            self.workspace_target_input(authenticated, input).await?
+        } else {
+            input.clone()
+        };
+        let input = &targeted;
         // Cached status remains readable when no transport is online. New
         // requests still fail closed through the grant's missing generation.
         let transport = self.remote_runtime_services.workspace_transport().ok();
@@ -457,6 +478,47 @@ impl Core {
             }
             _ => Err(RpcErrorCode::InvalidRequest),
         }
+    }
+
+    /// Fill in the one target the caller left implicit.
+    ///
+    /// An explicit `workspaceId` is passed through untouched and keeps the
+    /// existing authority behaviour. An omitted one is resolved from the
+    /// authenticated Run, never from model-supplied identity: exactly one ready
+    /// remote workspace is used, none is `NotFound` and several are
+    /// `InvalidRequest` because guessing would write on the wrong machine.
+    async fn workspace_target_input(
+        &self,
+        authenticated: &AuthenticatedTeamToolRun,
+        input: &Value,
+    ) -> Result<Value, RpcErrorCode> {
+        let mut payload = input.clone();
+        let explicit = {
+            let fields = payload.as_object().ok_or(RpcErrorCode::InvalidRequest)?;
+            match fields.get("workspaceId") {
+                Some(Value::String(id)) => {
+                    // Present but unusable is a malformed request, not an omission.
+                    if id.is_empty() {
+                        return Err(RpcErrorCode::InvalidRequest);
+                    }
+                    true
+                }
+                Some(_) => return Err(RpcErrorCode::InvalidRequest),
+                None => false,
+            }
+        };
+        if explicit {
+            return Ok(payload);
+        }
+        let workspace_id = {
+            let database = self.database.lock().await;
+            resolve_mission_remote_workspace(database.connection(), authenticated)?
+        };
+        payload
+            .as_object_mut()
+            .ok_or(RpcErrorCode::InvalidRequest)?
+            .insert("workspaceId".to_owned(), Value::String(workspace_id));
+        Ok(payload)
     }
 
     /// Archive only an authorized complete journal snapshot. No DB mutex is

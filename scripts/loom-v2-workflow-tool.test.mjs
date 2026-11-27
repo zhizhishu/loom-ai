@@ -77,12 +77,28 @@ test('Core input contracts replace guessed fields and reject incomplete operatio
   assert.equal(fields.additionalProperties, false)
   assert.deepEqual(fields.properties.relativePath, CONTRACTS['loom.evidence'].properties.relativePath)
   assert.deepEqual(fields.properties.tasks.items.required, ['taskId', 'title'])
-  // `loom.status` and `thread.message.send` declare no required key in Core's catalog; every other
-  // managed operation refuses an empty input before a child exists.
-  const NO_REQUIRED_INPUT = ['loom.status', 'thread.message.send']
+  // `loom.status`, `thread.message.send` and `loom.workspace.list` declare no required key in
+  // Core's catalog; every other managed operation refuses an empty input before a child exists.
+  // A workspace operation names its target by omission: Core then uses this Mission's only ready
+  // remote workspace, and two candidates must be named explicitly. `read`/`write` still require
+  // their own `path` (and `data`), which is what the loop below covers.
+  const NO_REQUIRED_INPUT = ['loom.status', 'thread.message.send', 'loom.workspace.list']
   for (const operation of LOOM_OPERATION_NAMES.filter(name => !NO_REQUIRED_INPUT.includes(name))) {
     assert.equal(validateLoomParams({ operation, input: {} }).ok, false, operation + ' empty input')
   }
+  // The mirror of Core's catalog: no workspace operation lists `workspaceId` as required any more,
+  // while the key stays available so an explicit target is still accepted.
+  assert.deepEqual(CONTRACTS['loom.workspace.list'].required, [])
+  assert.deepEqual(CONTRACTS['loom.workspace.read'].required, ['path'])
+  assert.deepEqual(CONTRACTS['loom.workspace.write'].required, ['path', 'data'])
+  for (const operation of ['loom.workspace.list', 'loom.workspace.read', 'loom.workspace.write']) {
+    assert.equal(CONTRACTS[operation].properties.workspaceId.maxLength, 128, operation + ' property')
+  }
+  assert.equal(
+    validateLoomParams({ operation: 'loom.workspace.list', input: {} }).ok,
+    true,
+    'an omitted workspaceId is a valid target',
+  )
   // `path` and `files` now belong to the workspace and send operations: they are in the shared
   // provider schema, and `loom.evidence` still refuses them as its own inputs.
   assert.equal(fields.properties.path.type, 'string')

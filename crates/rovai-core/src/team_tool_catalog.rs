@@ -1189,7 +1189,8 @@ fn workspace_rpc_success_schema() -> Value {
     )
 }
 fn workspace_rpc_definitions() -> Vec<Value> {
-    let id = json!({"type":"string","minLength":1,"maxLength":128});
+    let id = json!({"type":"string","minLength":1,"maxLength":128,
+        "description":"Optional prepared workspace ID. Omit it and Core uses this Mission's only ready remote workspace; when the Mission has more than one, name the one to use."});
     let relative = json!({"type":"string","maxLength":4096,"description":"Path relative to the prepared workspace; absolute paths and traversal are refused."});
     let initial = json!({
         "workspaceId":id,
@@ -1198,10 +1199,12 @@ fn workspace_rpc_definitions() -> Vec<Value> {
     });
     let output = workspace_rpc_success_schema();
     [
-        ("list","List a remote workspace","List bounded entries in a prepared workspace. The active Run and workspace owner determine access.",vec!["workspaceId"]),
-        ("read","Read a remote workspace file","Read at most 1 MiB. A whole, untruncated read from offset zero receives a Core-verified archive receipt.",vec!["workspaceId","path"]),
-        ("write","Write a remote workspace file","Write one contained file with complete base64 bytes, at most 1 MiB decoded. The path is relative to the prepared workspace, no directory is created, and nothing is deleted.",vec!["workspaceId","path","data"]),
-        ("run","Run an allowed remote workspace tool","Run the fixed git.status tool. No shell program or environment can be supplied. Retry by request ID to observe the same execution.",vec!["workspaceId","toolId"]),
+        // `workspaceId` stays available but is no longer required: Core resolves the one
+        // ready remote workspace of this Run's Mission, and two candidates must be named.
+        ("list","List a remote workspace","List bounded entries in a prepared workspace. The active Run and workspace owner determine access. Omit workspaceId to use this Mission's only ready remote workspace; with more than one, name it.",vec![]),
+        ("read","Read a remote workspace file","Read at most 1 MiB. A whole, untruncated read from offset zero receives a Core-verified archive receipt. Omit workspaceId to use this Mission's only ready remote workspace; with more than one, name it.",vec!["path"]),
+        ("write","Write a remote workspace file","Write one contained file with complete base64 bytes, at most 1 MiB decoded. The path is relative to the prepared workspace, no directory is created, and nothing is deleted. Omit workspaceId to use this Mission's only ready remote workspace; with more than one, name it.",vec!["path","data"]),
+        ("run","Run an allowed remote workspace tool","Run the fixed git.status tool. No shell program or environment can be supplied. Retry by request ID to observe the same execution. Omit workspaceId to use this Mission's only ready remote workspace; with more than one, name it.",vec!["toolId"]),
         ("poll","Poll a workspace request","Read a bounded event page for an existing request owned by this Run. Unknown outcomes stay unknown until actual Node evidence resolves them.",vec!["requestId"]),
         ("cancel","Cancel a workspace request","Request cancellation of one request. Cancellation becomes final only after the Node confirms its process boundary stopped.",vec!["requestId"]),
     ].into_iter().map(|(action,title,description,required)|{
@@ -2118,6 +2121,54 @@ mod tests {
 #[cfg(test)]
 mod workspace_rpc_contract_tests {
     use super::*;
+
+    /// `workspaceId` is an optional target, not a required field: omitting it asks
+    /// Core for this Mission's only ready remote workspace, and more than one must
+    /// be named. The property and its bound stay, so an explicit id is unchanged.
+    #[test]
+    fn workspace_operations_take_the_workspace_id_as_an_optional_target() {
+        for action in ["list", "read", "write", "run"] {
+            let name = format!("loom.workspace.{action}");
+            let definition = builtin_tool_definitions()
+                .iter()
+                .find(|definition| definition["name"].as_str() == Some(name.as_str()))
+                .expect("the operation is in the catalog");
+            let schema = &definition["inputSchema"];
+            assert!(
+                !schema["required"]
+                    .as_array()
+                    .expect("every catalog input schema declares required")
+                    .iter()
+                    .any(|key| key.as_str() == Some("workspaceId")),
+                "{name} must not require workspaceId"
+            );
+            assert_eq!(schema["properties"]["workspaceId"]["maxLength"], json!(128));
+            assert!(
+                schema["properties"]["workspaceId"]["description"]
+                    .as_str()
+                    .expect("the optional target explains itself")
+                    .contains("only ready remote workspace"),
+                "{name} must say how an omitted workspaceId is chosen"
+            );
+        }
+        // The omission is a valid call; the shape each operation does need is not relaxed.
+        validate_builtin_tool_input("loom.workspace.list", &json!({})).unwrap();
+        validate_builtin_tool_input("loom.workspace.read", &json!({"path":"data.txt"})).unwrap();
+        validate_builtin_tool_input(
+            "loom.workspace.write",
+            &json!({"path":"out/report.md","data":"eA=="}),
+        )
+        .unwrap();
+        validate_builtin_tool_input("loom.workspace.run", &json!({"toolId":"git.status"}))
+            .unwrap();
+        validate_builtin_tool_input("loom.workspace.list", &json!({"workspaceId":"ws_1"}))
+            .unwrap();
+        assert!(validate_builtin_tool_input("loom.workspace.read", &json!({})).is_err());
+        assert!(
+            validate_builtin_tool_input("loom.workspace.run", &json!({"workspaceId":"ws_1"}))
+                .is_err()
+        );
+    }
     #[test]
     fn workspace_rpc_schema_rejects_identity_injection_arbitrary_commands_and_unbounded_results() {
         let good = json!({"workspaceId":"workspace","path":"data.txt"});

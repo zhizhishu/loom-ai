@@ -409,14 +409,13 @@
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
-        "required": [
-          "workspaceId"
-        ],
+        "required": [],
         "properties": {
           "workspaceId": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 128
+            "maxLength": 128,
+            "description": "Optional prepared workspace ID. Omit it and Core uses this Mission's only ready remote workspace; when the Mission has more than one, name the one to use."
           },
           "requestId": {
             "type": "string",
@@ -452,14 +451,14 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "workspaceId",
           "path"
         ],
         "properties": {
           "workspaceId": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 128
+            "maxLength": 128,
+            "description": "Optional prepared workspace ID. Omit it and Core uses this Mission's only ready remote workspace; when the Mission has more than one, name the one to use."
           },
           "requestId": {
             "type": "string",
@@ -501,7 +500,6 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "workspaceId",
           "path",
           "data"
         ],
@@ -509,7 +507,8 @@
           "workspaceId": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 128
+            "maxLength": 128,
+            "description": "Optional prepared workspace ID. Omit it and Core uses this Mission's only ready remote workspace; when the Mission has more than one, name the one to use."
           },
           "requestId": {
             "type": "string",
