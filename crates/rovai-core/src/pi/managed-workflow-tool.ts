@@ -19,7 +19,9 @@
  * writes one generated copy under `ROVAI_RUN_TMP` (mode 0600, exclusive create, content-addressed
  * name), then reports that absolute path. `thread.message.send` `files` is the existing ordinary
  * attachment path, and Core's `camp_attachment` accepts exactly workspace or `ROVAI_RUN_TMP`
- * sources, so the model never needs a filesystem capability of its own.
+ * sources, so the model never needs a filesystem capability of its own. A `files` entry is a
+ * workspace-relative path or that run-private copy; the bridge refuses any other absolute host path
+ * before a child starts.
  *
  * This file is a pure contract plus one injected-runtime helper:
  * - No top-level side effects: importing it starts no process and touches no credential or
@@ -40,7 +42,7 @@
 
 import { createHash } from "node:crypto"
 import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, realpathSync, statSync, writeSync } from "node:fs"
-import { extname, isAbsolute, join, resolve } from "node:path"
+import { extname, isAbsolute, join, resolve, sep } from "node:path"
 import { StringDecoder } from "node:string_decoder"
 
 export const LOOM_TOOL_NAME = "rovai_loom"
@@ -400,6 +402,7 @@ export function readWorkflowContracts(file: string): WorkflowContracts {
 export function validateLoomParams(
   params: unknown,
   contracts: WorkflowContracts,
+  sendPaths?: SendPathContext,
 ): { ok: true; call: LoomCall } | { ok: false; code: string } {
   if (!isRecord(params)) return { ok: false, code: "loom_params_not_object" }
   for (const key of Object.keys(params)) {
@@ -440,7 +443,7 @@ export function validateLoomParams(
     if (problem) return { ok: false, code: `loom_workspace_${problem}` }
   }
   if (operation === "thread.message.send") {
-    const problem = attachmentFilesProblem(rawInput.files)
+    const problem = attachmentFilesProblem(rawInput.files, sendPaths)
     if (problem) return { ok: false, code: `loom_send_${problem}` }
   }
   return { ok: true, call: { operation, input: rawInput } }
@@ -463,12 +466,14 @@ export function workspaceWriteDataProblem(data: string): string | null {
 /**
  * Pre-check the local sources one group send may name.
  *
- * Each entry must be a non-empty local path string with no NUL and no parent segment. Core's
- * `camp_attachment::freeze_agent_sources` is the authority: it accepts only the AgentRun workspace
- * or `ROVAI_RUN_TMP`, refuses symlinks and parent components, and freezes a copy. This refuses
- * only shapes no authority could accept.
+ * Each entry must be a non-empty local path string with no NUL and no parent segment. A relative
+ * entry is resolved by Core against the Run workspace; an absolute entry is only admissible when it
+ * is this Run's own materialized copy inside the canonical `ROVAI_RUN_TMP`. Core's
+ * `camp_attachment::freeze_agent_sources` is still the authority: it accepts only the AgentRun
+ * workspace or `ROVAI_RUN_TMP`, refuses symlinks and parent components, and freezes a copy. This
+ * refuses every other host path — and every shape no authority could accept — before a child exists.
  */
-export function attachmentFilesProblem(raw: unknown): string | null {
+export function attachmentFilesProblem(raw: unknown, paths?: SendPathContext): string | null {
   if (raw === undefined || raw === null) return null
   if (!Array.isArray(raw)) return "files_not_array"
   if (raw.length > 10) return "files_too_many"
@@ -478,7 +483,44 @@ export function attachmentFilesProblem(raw: unknown): string | null {
     if (entry.length > 4096) return "files_too_long"
     if (entry.split(/[\\/]+/).some((segment) => segment === "..")) return "files_parent_escape"
   }
+  return absoluteFilesProblem(raw, paths)
+}
+
+/** The run-private directory Core handed this Host, plus the filesystem seam a test can drive. */
+export type SendPathContext = { runTmp?: unknown; fsApi?: MaterializeFs }
+
+/**
+ * Refuse an arbitrary absolute host path.
+ *
+ * An absolute entry may only name the run-private copy this bridge materialized: `ROVAI_RUN_TMP`
+ * must canonicalize to an existing directory, and the entry must be a regular non-symlink file
+ * whose own canonical path is inside it. A Host with no usable run directory refuses every absolute
+ * entry rather than guessing.
+ */
+function absoluteFilesProblem(files: readonly string[], paths?: SendPathContext): string | null {
+  const absolute = files.filter(isAbsoluteHostPath)
+  if (absolute.length === 0) return null
+  const fsApi = paths?.fsApi ?? materializeFs()
+  const runTmp = paths?.runTmp
+  const root = typeof runTmp === "string" && runTmp.length > 0 ? fsApi.canonicalDirectory(runTmp) : null
+  if (root === null) return "path_not_allowed"
+  for (const entry of absolute) {
+    const settled = fsApi.canonicalFile(entry)
+    if (settled === null || !containedIn(root, settled)) return "path_not_allowed"
+  }
   return null
+}
+
+/** Absolute, drive-qualified or host-rooted: every shape Core would resolve as a host path. */
+function isAbsoluteHostPath(entry: string): boolean {
+  return isAbsolute(entry) || entry.startsWith("/") || entry.startsWith("\\") || /^[A-Za-z]:/u.test(entry)
+}
+
+/** True when `target` is the canonical directory itself or lies beneath it. */
+function containedIn(root: string, target: string): boolean {
+  const base = norm(root).replace(/[\\/]+$/u, "")
+  const full = norm(target)
+  return full === base || full.startsWith(base + sep)
 }
 
 /**
@@ -536,6 +578,7 @@ export function loomToolDescription(contracts: WorkflowContracts): string {
     "Examples show JSON shape. Replace example task, member, candidate and artifact identifiers with actual current values. relativePath is a file path relative to the Mission workspace.",
     "A workspace path is always relative to the prepared Mission workspace: no absolute path, no `..`, no backslash and no `.git` component. `loom.workspace.write` stores exactly one file from complete base64 `data` (at most 1 MiB decoded); it cannot create a directory, delete a file, or run anything.",
     "To deliver real bytes (for example a .docx) into the group: call loom.workspace.read with offset 0 and a maxBytes large enough for the whole file. When the read is not truncated this bridge writes one run-private copy and returns its absolute `localFile` path. Pass exactly that path in thread.message.send files; never invent an output path and never paste binary content into body. If the read reports truncated, re-read with a larger maxBytes; there is no local copy for a partial file.",
+    "thread.message.send files accepts only a path relative to the Mission workspace or that returned run-private `localFile` path; any other absolute host path is refused.",
   ]
   for (const operation of LOOM_OPERATIONS) {
     const schema = contracts[operation]
@@ -589,7 +632,9 @@ export function planInvocation(options: {
   if (typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt) || nowMs >= expiresAt) {
     return { ok: false, code: "loom_grant_expired" }
   }
-  const validated = validateLoomParams(options.params, options.contracts)
+  const validated = validateLoomParams(options.params, options.contracts, {
+    runTmp: options.baseEnv[RUN_TMP_ENV],
+  })
   if (!validated.ok) return validated
   const resolved = resolveTrustedCli(options.cliPath)
   if (!resolved.ok) return resolved
@@ -656,8 +701,9 @@ function base64Payload(raw: unknown): Buffer | null {
 /**
  * Decode the completed result of one read page. Pure: no filesystem, no environment.
  *
- * Only a whole read is materializable. A truncated or partial page is refused, because a local file
- * that silently holds half of a document is worse than no file at all.
+ * Only a whole read is materializable. A truncated page is refused, and so is a page taken from a
+ * nonzero offset: its bytes are one slice of the file, and a local copy that silently holds half of
+ * a document is worse than no file at all.
  */
 export function readPayload(text: unknown):
   | { ok: true; payload: ReadPayload }
@@ -685,6 +731,8 @@ export function readPayload(text: unknown):
   if (typeof result.offset !== "number" || !Number.isSafeInteger(result.offset) || result.offset < 0) {
     return { ok: false, code: "loom_read_offset_invalid" }
   }
+  // A page from a nonzero offset is a slice, never the whole file: it is reported, not materialized.
+  if (result.offset !== 0) return { ok: false, code: "loom_read_offset_nonzero" }
   let bytes: Buffer | null
   let encoding: "utf8" | "base64"
   if (result.encoding === "utf8" && typeof result.text === "string") {

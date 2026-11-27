@@ -8030,7 +8030,7 @@ fn watchdog_scans_past_a_page_of_unapproved_tasks() {
 
 /// External effects are only the operations that can change the workspace. An in-flight `Read` is
 /// ordinary work and must never be read as an uncertain effect (which would stop a healthy
-/// executor); a `Run` whose receipt is genuinely unsettled still is.
+/// executor); a `Run` or `Write` whose receipt is genuinely unsettled still is.
 #[test]
 fn watchdog_separates_an_in_flight_read_from_an_uncertain_external_effect() {
     let now = at(1_800_000_000);
@@ -8139,6 +8139,52 @@ fn watchdog_separates_an_in_flight_read_from_an_uncertain_external_effect() {
         Some("loom.watchdog.external_effect_uncertain"),
         "assertion the_overdue_effect_is_named_as_uncertain"
     );
+
+    // A `Write` changes the workspace exactly like a `Run`, so the same receipt rule decides it:
+    // past its deadline it is the uncertain effect, inside its deadline it is ordinary work.
+    for (label, command_id, deadline_offset_ms, expected_hold) in [
+        (
+            "watchdog overdue write",
+            "command_approve_overdue_write",
+            -1_000,
+            "loom.watchdog.external_effect_uncertain",
+        ),
+        (
+            "watchdog in-flight write",
+            "command_approve_inflight_write",
+            60_000,
+            "loom.watchdog.task_stalled",
+        ),
+    ] {
+        let mut writing = fixture();
+        let write_task = dispatched_running_task(
+            &mut writing,
+            label,
+            command_id,
+            now,
+            chrono::Duration::minutes(50),
+        );
+        let write_json = dispatch_json(
+            &write_task.run_id,
+            serde_json::json!({"kind":"write","path":"out/report.md","data":"eA=="}),
+            now.timestamp_millis() + deadline_offset_ms,
+        );
+        insert(&writing, "request_write", 2, &write_json);
+        writing
+            .connection()
+            .execute(
+                "UPDATE workspace_rpc_requests SET run_id=?1 WHERE request_id='request_write'",
+                [&write_task.run_id],
+            )
+            .unwrap();
+        let write_tick = tick_at(&mut writing, now);
+        assert_eq!(write_tick.blocked, 1, "assertion {label} is held");
+        assert_eq!(
+            watchdog_hold(&writing, &write_task.plan_id).as_deref(),
+            Some(expected_hold),
+            "assertion {label} is judged by its own deadline like a run"
+        );
+    }
 }
 
 /// External-effect boundary, ported from upstream `if (value.uncertainEffect) return

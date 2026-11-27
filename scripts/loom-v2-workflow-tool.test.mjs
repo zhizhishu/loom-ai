@@ -989,6 +989,16 @@ test('15 · an untruncated read becomes one generated local file under ROVAI_RUN
   })
   assert.equal(escaped.localFile, undefined)
   assert.match(escaped.text, /loom_materialize_escaped/u)
+  // A page from a nonzero offset is one slice of the file, never the whole file: it stays a note.
+  const offsetPage = materializeReadBack({
+    operation: MATERIALIZE_OPERATION,
+    result: readResult({ kind: 'read', encoding: 'base64', data: payload.toString('base64'), offset: 1024, truncated: false }),
+    requestedPath: 'out.docx', runTmp, fsApi,
+  })
+  assert.equal(offsetPage.localFile, undefined, 'a nonzero-offset read must not become a complete file')
+  assert.match(offsetPage.text, /loom_read_offset_nonzero/u)
+  assert.match(offsetPage.text, /No local attachment copy/u)
+  assert.equal(fsApi.files.size, 1, 'only the whole read produced a copy')
   const createFails = materializeReadBack({
     operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'out.docx', runTmp,
     fsApi: fakeMaterializeFs({ directory: runTmp, createFails: 'EACCES' }),
@@ -1015,6 +1025,8 @@ test('15 · an untruncated read becomes one generated local file under ROVAI_RUN
   assert.equal(readPayload('not json').code, 'loom_read_result_unparsable')
   assert.equal(readPayload(readPage({ kind: 'read', encoding: 'base64', data: 'eA', offset: 0, truncated: false })).code, 'loom_read_result_malformed')
   assert.equal(readPayload(readPage({ kind: 'read', encoding: 'base64', data: 'eA==', offset: 0, truncated: false }, { state: 'running' })).code, 'loom_read_not_completed:running')
+  assert.equal(readPayload(readPage({ kind: 'read', encoding: 'base64', data: 'eA==', offset: 64, truncated: false })).code, 'loom_read_offset_nonzero')
+  assert.equal(readPayload(readPage({ kind: 'read', encoding: 'utf8', text: 'tail', offset: 5, truncated: false })).code, 'loom_read_offset_nonzero')
   assert.equal(readPayload('').code, 'loom_read_result_missing')
 })
 
@@ -1060,11 +1072,14 @@ test('15b · the production materialization seam writes one private file and nev
   } finally { await rm(runTmp, { recursive: true, force: true }) }
 })
 
-test('16 · thread.message.send is the ordinary attachment path for a materialized file', () => {
+test('16 · thread.message.send is the ordinary attachment path for a materialized file', async () => {
   const current = fixture()
+  const runTmp = mkdtempSync(join(tmpdir(), 'loom-send-path-'))
   try {
-    const localFile = '/run-tmp/loom-read-0123456789abcdef.docx'
-    const planned = plan(current, { operation: 'thread.message.send', input: { body: 'Delivery attached.', files: [localFile] } })
+    const localFile = join(runTmp, `${MATERIALIZED_PREFIX}0123456789abcdef.docx`)
+    writeFileSync(localFile, 'docx-bytes', 'utf8')
+    const planned = plan(current, { operation: 'thread.message.send', input: { body: 'Delivery attached.', files: [localFile] } },
+      { baseEnv: { PATH: '/usr/bin', [CLI_ENV]: current.cliPath, [RUN_TMP_ENV]: runTmp } })
     assert.equal(planned.ok, true, planned.code)
     assert.deepEqual([...planned.plan.argv], ['send'], 'the fixed CLI word is the one group-send verb')
     assert.deepEqual(JSON.parse(planned.plan.stdin), { body: 'Delivery attached.', files: [localFile] })
@@ -1091,8 +1106,62 @@ test('16 · thread.message.send is the ordinary attachment path for a materializ
     assert.match(validateLoomParams({ operation: 'thread.message.send', input: { files: ['a\u0000b'] } }).code, /loom_send_files_nul_byte/u)
     assert.match(validateLoomParams({ operation: 'thread.message.send', input: { files: 'a.docx' } }).code, /loom_send_files_not_array/u)
     assert.match(validateLoomParams({ operation: 'thread.message.send', input: { files: Array.from({ length: 11 }, (_, index) => `f${index}.docx`) } }).code, /loom_send_files_too_many/u)
-    assert.equal(attachmentFilesProblem(['/run-tmp/loom-read-0123456789abcdef.docx']), null)
-  } finally { rm(current.root, { recursive: true, force: true }) }
+    assert.equal(attachmentFilesProblem([localFile], { runTmp }), null)
+    assert.equal(attachmentFilesProblem(['deliverables/report.docx']), null, 'a relative path needs no run directory')
+  } finally {
+    await rm(current.root, { recursive: true, force: true })
+    await rm(runTmp, { recursive: true, force: true })
+  }
+})
+
+test('16b · a send attachment is workspace-relative or this Run\'s own run-private copy', async () => {
+  const current = fixture()
+  const runTmp = mkdtempSync(join(tmpdir(), 'loom-send-run-tmp-'))
+  const outside = mkdtempSync(join(tmpdir(), 'loom-send-outside-'))
+  try {
+    const delivered = join(runTmp, `${MATERIALIZED_PREFIX}0123456789abcdef.docx`)
+    writeFileSync(delivered, 'docx-bytes', 'utf8')
+    const secret = join(outside, 'secret.docx')
+    writeFileSync(secret, 'secret-bytes', 'utf8')
+    const env = { PATH: '/usr/bin', [CLI_ENV]: current.cliPath, [RUN_TMP_ENV]: runTmp }
+    const send = (files, baseEnv = env) => plan(current, { operation: 'thread.message.send', input: { files } }, { baseEnv })
+    const refused = (files, baseEnv = env) => {
+      const outcome = send(files, baseEnv)
+      assert.equal(outcome.ok, false, `${JSON.stringify(files)} must be refused`)
+      assert.equal(outcome.code, 'loom_send_path_not_allowed', `${JSON.stringify(files)} code`)
+      assert.equal('plan' in outcome, false, 'no child is planned for a refused path')
+    }
+    // The generated run-private copy and every workspace-relative path are accepted.
+    assert.equal(send([delivered]).ok, true, send([delivered]).code)
+    assert.equal(send(['deliverables/report.docx']).ok, true)
+    assert.equal(send(['deliverables/report.docx'], { PATH: '/usr/bin', [CLI_ENV]: current.cliPath }).ok, true)
+    // Any other absolute host path is refused: outside the run directory, the directory itself, a
+    // name that is not a real file, and a Host with no usable ROVAI_RUN_TMP at all.
+    refused([secret])
+    refused([delivered, secret])
+    refused([runTmp])
+    refused([join(runTmp, 'missing.docx')])
+    refused([resolve(runTmp, '..', 'escape.docx')])
+    refused([delivered], { PATH: '/usr/bin', [CLI_ENV]: current.cliPath })
+    refused([delivered], { PATH: '/usr/bin', [CLI_ENV]: current.cliPath, [RUN_TMP_ENV]: join(runTmp, 'gone') })
+    // A symlink inside the run directory is a host path this bridge never follows.
+    let linked = false
+    try {
+      symlinkSync(secret, join(runTmp, 'link.docx'), 'file')
+      linked = true
+    } catch (error) {
+      if (error?.code !== 'EPERM' && error?.code !== 'EACCES') throw error
+    }
+    if (linked) refused([join(runTmp, 'link.docx')])
+    // The existing shape, count, NUL and parent checks still answer first.
+    assert.equal(send(['../escape.docx']).code, 'loom_send_files_parent_escape')
+    assert.equal(send(['a\u0000b']).code, 'loom_send_files_nul_byte')
+    assert.equal(send(Array.from({ length: 11 }, (_, index) => `${index}.docx`)).code, 'loom_send_files_too_many')
+  } finally {
+    await rm(current.root, { recursive: true, force: true })
+    await rm(runTmp, { recursive: true, force: true })
+    await rm(outside, { recursive: true, force: true })
+  }
 })
 
 test('15c · the extension wiring resolves the requested path and ROVAI_RUN_TMP in one place', () => {
