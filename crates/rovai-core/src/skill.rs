@@ -5727,7 +5727,7 @@ mod loom_reference_tests {
             "Plan file shape (`rovai loom plan --input-file plan.json`). Every object has exactly these fields; leave an optional field out instead of sending `null`, and add no other fields:"
         ));
         assert!(plan.contains(
-            "Optional: `acceptanceCriteriaVersion` (top level), `description` and `assigneeAgentId` (per task), `condition` (per dependency, `task_done` or `artifact_accepted`, lowercase), `dependencies` itself."
+            "Optional: `acceptanceCriteriaVersion` (top level), `description`, `assigneeAgentId` and task-scoped `acceptanceCriteria` (per task), `condition` (per dependency, `task_done` or `artifact_accepted`, lowercase), `dependencies` itself."
         ));
         assert!(plan.contains("\"condition\": \"task_done\""));
     }

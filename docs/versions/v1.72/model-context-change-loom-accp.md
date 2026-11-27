@@ -1,9 +1,9 @@
 ---
 document_type: model-context-change
 version: v1.72
-revision: 4
+revision: 5
 confirmation_status: confirmed
-confirmed_revision: 4
+confirmed_revision: 5
 confirmed_by: local_user
 confirmed_at: 2026-11-26
 last_updated: 2026-11-26
@@ -397,3 +397,25 @@ Pi managed workflow tool 的说明同步为同一规则。inputSchema/outputSche
 ### r4 验证
 
 新增 Core 测试验证首次导入播种默认策略、自动派发 EXECUTE、非 assignee 不能认领；既有 catalog/CLI/reference 样例测试按新文本更新。
+
+## r5 修订（2026-11-26，已二次确认）
+
+起因：真包 §5 证明首版控制策略已能自动派工和 Review，但计划级验收快照复制到每个任务后形成循环依赖：上游 worker 的用户验收要求下游 final artifact 已存在，而 final 又等待 worker done。Hark 明确指示对照 Mikka factory，约束“任务的验收条件只能引用本任务产出”。
+
+### r5 变更后（精确合同）
+
+`loom.plan` 的 task input schema 增加可选 `acceptanceCriteria`（数组项仍为 `{criterionId,text}`）。省略时保持兼容、继承 Plan 顶层快照；提供时该任务使用自己的任务级快照。多任务 Plan 必须按提示词规则把跨任务/ Mission 级条件只放在终末任务，上游 worker 的条件只引用它自己产出的文件、证据或事实，禁止把未来 final artifact/验收报告写入上游任务。
+
+cli-operations 参考和 Pi managed workflow tool 同步该规则；身份、权限、输出结构不变。r5 后 `loom.plan` description 全文：
+
+```text
+Import the current Mission's one LOOM plan. Default Lead only. A Mission accepts one plan; it cannot be replaced. Importing starts approved automatic dispatch for assigned tasks; do not release, message, claim, or implement them in the Lead run. In multi-task plans, task acceptanceCriteria must reference only that task output; cross-task Mission criteria belong on the terminal task. Pass the plan as JSON with --input-file; the exact file shape is in the cli-operations LOOM reference.
+```
+
+### r5 二次确认
+
+用户/Hark 于 2026-11-26 12:15 明确指示“查本地 Mikka factory……怎么约束「任务的验收条件只能引用本任务产出」——照抄它的约束（导入时校验并拒绝/或提示词规则，参考怎样就怎样）”。Mikka 本地参考没有 Plan-import 表单向校验；其验收 criteria 属于当前 candidate/check 视图，结构性按任务/候选验收，因此本 revision 采用任务级 schema + 提示词规则，不伪造可验证的语义拒绝。
+
+### r5 验证
+
+新增 Core 测试 `task_scoped_acceptance_criteria_replace_the_plan_snapshot`；reference/schema/managed workflow 样例同步。

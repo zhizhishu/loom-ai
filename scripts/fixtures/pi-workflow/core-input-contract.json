@@ -119,6 +119,30 @@
                   "type": "string",
                   "minLength": 1,
                   "maxLength": 200
+                },
+                "acceptanceCriteria": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "criterionId",
+                      "text"
+                    ],
+                    "properties": {
+                      "criterionId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200
+                      },
+                      "text": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000
+                      }
+                    }
+                  }
                 }
               }
             }

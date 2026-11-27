@@ -360,7 +360,7 @@ export function loomToolDescription(contracts: WorkflowContracts): string {
   const examples: Record<string, Record<string, unknown>> = {
     "loom.status": {},
     "loom.skill_suggest": { name: "triage-release", description: "Triage a release", instructions: "Inspect evidence before shipping.", rationale: "The user confirmed this repeatable workflow." },
-    "loom.plan": { goal: "Deliver the requested file", criteria: [{ criterionId: "file", text: "File is registered and awaits User acceptance" }], tasks: [{ taskId: "task-1", title: "Write the requested file", assigneeAgentId: "member-agent-id" }] },
+    "loom.plan": { goal: "Deliver the requested file", criteria: [{ criterionId: "file", text: "File is registered and awaits User acceptance" }], tasks: [{ taskId: "task-1", title: "Write the requested file", assigneeAgentId: "member-agent-id", acceptanceCriteria: [{ criterionId: "file", text: "The requested file exists" }] }] },
     "loom.release": { taskId: "task-1" },
     "loom.claim": { taskId: "task-1" },
     "loom.claim_heartbeat": { claimId: "claim-from-claim", fenceGeneration: 1 },
@@ -371,7 +371,7 @@ export function loomToolDescription(contracts: WorkflowContracts): string {
   }
   const lines = [
     "Call one current-Mission operation as {operation, input}. Put the operation's JSON fields inside input. Run, Member and Mission identity come from Core authentication.",
-    "Read status first. Only the Default Lead imports the one plan; importing starts the approved automatic dispatch for assigned tasks. Do not release, message, claim, or implement those tasks in the Lead run. An assigned worker claims only its own task before writing, registers each actual file with relativePath, then submits the returned artifactId values. Submit leaves the delivery awaiting User acceptance.",
+    "Read status first. Only the Default Lead imports the one plan; importing starts the approved automatic dispatch for assigned tasks. Do not release, message, claim, or implement those tasks in the Lead run. In a multi-task plan, task acceptanceCriteria must name only that task's own output; cross-task Mission criteria belong only on the terminal task. An assigned worker claims only its own task before writing, registers each actual file with relativePath, then submits the returned artifactId values. Submit leaves the delivery awaiting User acceptance.",
     "For stage-review, inspect first and copy that candidateId, policyRevision and manifestHash. Review only an authorized task assigned to you; do not review your own output or accept for the User.",
     "Examples show JSON shape. Replace example task, member, candidate and artifact identifiers with actual current values. relativePath is a file path relative to the Mission workspace.",
   ]
