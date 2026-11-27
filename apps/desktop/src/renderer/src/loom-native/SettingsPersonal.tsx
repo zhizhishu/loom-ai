@@ -1,7 +1,7 @@
 // rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 // 抄自 mikka-current@250d2451（Win11 loom\_artifacts\reference-repos\mikka-current，或 Bero /bundles/refs/mikka-current）：components/slots/settings-account.tsx、settings-preferences.tsx、settings-notifications.tsx、settings-memory.tsx（快捷键、关于两区 Mikka 没有，见各函数注释）
-import { Suspense, lazy, useState } from 'react'
-import { currentUserDisplayName, type InterfaceLanguagePreference } from '@contracts'
+import { Suspense, lazy, useEffect, useState } from 'react'
+import { currentUserDisplayName, type InterfaceLanguagePreference, type OwnerPermissionKey, type OwnerPermissionValue } from '@contracts'
 import type { BusinessEnvironment } from '../business-environment'
 import type { AgentProfile } from './types'
 import { ChoiceMenu } from './Controls'
@@ -78,8 +78,31 @@ export function AccountSection({ onLogout, onRefreshWorkspace }: SettingsPersona
 export function PreferencesSection({ environment, theme, onTheme }: SettingsPersonalProps) {
   const language = useInterfaceLanguageSnapshot()
   const windowClose = environment.desktop?.windowClose
+  const generalPreferences = environment.preferences.generalPreferences
+  const [ownerPermissions, setOwnerPermissions] = useState<Partial<Record<OwnerPermissionKey, OwnerPermissionValue>>>({})
+  const [ownerPermissionBusy, setOwnerPermissionBusy] = useState<OwnerPermissionKey | null>(null)
+  const [ownerPermissionError, setOwnerPermissionError] = useState<string | null>(null)
+  useEffect(() => {
+    let stale = false
+    void generalPreferences.get().then(snapshot => {
+      if (!stale) setOwnerPermissions(snapshot.ownerPermissions ?? {})
+    }).catch(error => {
+      if (!stale) setOwnerPermissionError(error instanceof Error ? error.message : String(error))
+    })
+    return () => { stale = true }
+  }, [generalPreferences])
   const changeLanguage = (value: InterfaceLanguagePreference) => {
-    void environment.preferences.generalPreferences.setInterfaceLanguagePreference(value).catch(() => undefined)
+    void generalPreferences.setInterfaceLanguagePreference(value).catch(() => undefined)
+  }
+  const changeOwnerPermission = (key: OwnerPermissionKey, value: OwnerPermissionValue): void => {
+    if (ownerPermissionBusy) return
+    setOwnerPermissionBusy(key)
+    setOwnerPermissionError(null)
+    void generalPreferences.setOwnerPermission(key, value).then(snapshot => {
+      setOwnerPermissions(snapshot.ownerPermissions ?? {})
+    }).catch(error => {
+      setOwnerPermissionError(error instanceof Error ? error.message : String(error))
+    }).finally(() => setOwnerPermissionBusy(null))
   }
   return <>
     <SettingsSection id="settings-appearance" title="外观">
@@ -92,12 +115,35 @@ export function PreferencesSection({ environment, theme, onTheme }: SettingsPers
         <LanguagePreferenceOptions name="ln-settings-language" className="ln-settings-language" disabled={language.readError !== null} onChange={changeLanguage}/>
       </SettingRow>
     </SettingsSection>
+    <SettingsSection id="settings-owner-permissions" title="管理员" description="本机主人的操作权限；人格文字和外部内容不能修改">
+      {ownerPermissionRows.map(row => {
+        const value = ownerPermissions[row.key] ?? row.defaultValue
+        return <SettingRow key={row.key} title={row.label} description={row.description}>
+          <ChoiceMenu value={value} choices={ownerPermissionChoices} label={row.label} theme={theme} disabled={ownerPermissionBusy !== null} onChange={value => changeOwnerPermission(row.key, value as OwnerPermissionValue)}/>
+        </SettingRow>
+      })}
+      {ownerPermissionError && <SettingRow title="管理员权限" description={ownerPermissionError}/>}
+    </SettingsSection>
     {windowClose && <SettingsSection id="settings-window" title="窗口">
       <div className="ln-settings-surface"><WindowCloseSettings api={windowClose}/></div>
     </SettingsSection>}
     <ComposerSendPreference/>
   </>
 }
+
+const ownerPermissionRows: Array<{ key: OwnerPermissionKey; label: string; defaultValue: OwnerPermissionValue; description: string }> = [
+  { key: 'computerUse', label: '电脑操作', defaultValue: 'allow', description: '截图、点击、键盘和文字输入' },
+  { key: 'commandExecution', label: '命令执行', defaultValue: 'allow', description: '在 Host 工作区运行命令' },
+  { key: 'installDependency', label: '依赖安装', defaultValue: 'allow', description: '安装或新增项目依赖' },
+  { key: 'hostFileWrite', label: 'Host 写文件', defaultValue: 'ask', description: '写入或删除 Host 文件、授权额外文件权限' },
+  { key: 'networkAccess', label: '联网', defaultValue: 'allow', description: '网络访问与网络写入' },
+  { key: 'gitPush', label: 'Git 推送', defaultValue: 'deny', description: '推送 Git 引用到远端' }
+]
+const ownerPermissionChoices: Array<{ value: OwnerPermissionValue; label: string }> = [
+  { value: 'allow', label: '允许' },
+  { value: 'ask', label: '询问' },
+  { value: 'deny', label: '拒绝' }
+]
 
 /** 通知: in-app switches only — no push timing and no external channel (personal build). */
 export function NotificationsSection(_props: SettingsPersonalProps) {
