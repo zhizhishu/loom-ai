@@ -449,7 +449,8 @@ pub enum Operation {
 impl Operation {
     pub fn timeout(self) -> std::time::Duration {
         std::time::Duration::from_secs(match self {
-            Self::MissionCleanupRetry
+            Self::LoomArtifactPreview
+            | Self::MissionCleanupRetry
             | Self::MissionChanges
             | Self::MissionFileDiff
             | Self::RuntimeCheck
