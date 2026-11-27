@@ -5009,6 +5009,13 @@ mod tests {
     #[test]
     fn intercepted_action_is_claimed_only_with_the_leased_authorization_delivery() {
         let mut fixture = fixture("ask");
+        crate::creation_preferences::execute(
+            &fixture.directory,
+            &mut fixture.database,
+            "preferences.ownerPermissions.set",
+            json!({"key": "commandExecution", "value": "ask"}),
+        )
+        .unwrap();
         let service = ActionSafetyService::default();
         let prepare = intercepted_prepare_envelope(&fixture, "action-intercepted", "item-1");
         let prepared = service
@@ -5639,6 +5646,13 @@ mod tests {
     #[test]
     fn restart_preserves_intercepted_approvals_and_authorization_deliveries() {
         let mut fixture = fixture("ask");
+        crate::creation_preferences::execute(
+            &fixture.directory,
+            &mut fixture.database,
+            "preferences.ownerPermissions.set",
+            json!({"key": "commandExecution", "value": "ask"}),
+        )
+        .unwrap();
         let service = ActionSafetyService::default();
         for (action_id, item_id) in [
             ("action-awaiting-user", "item-awaiting-user"),
