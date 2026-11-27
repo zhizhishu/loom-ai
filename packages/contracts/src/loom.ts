@@ -723,6 +723,8 @@ export interface LoomDispatch {
   policyRevision: number
   recipientAgentId: string
   deliveryId: string | null
+  /** 已领取这次投递的执行；旧 Host 可能不下发此只读投影字段。 */
+  agentRunId?: string | null
   status: 'waiting' | 'dispatched' | 'settled' | 'blocked' | 'cancelled'
   reason: string | null
   createdAt: string

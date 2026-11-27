@@ -7122,6 +7122,129 @@ fn handoff_accepted_input_loss_reconciles_only_after_successor_fact() {
 }
 
 #[test]
+fn review_manual_continuation_can_answer_and_reconcile_unknown() {
+    use crate::run_continuation::{ContinueAgentRunCommand, continue_agent_run};
+
+    let mut database = fixture();
+    let now = chrono::Utc::now();
+    let task = retry_test_task(&mut database, now);
+    let (claim_id, fence_generation) = open_claim_of(&database, &task.plan_id, "task_a", &task.run_id);
+    let candidate = candidate_record(
+        &mut database,
+        LoomCandidateRecordInput {
+            mission_id: task.mission_id.clone(),
+            task_id: "task_a".into(),
+            agent_run_id: task.run_id.clone(),
+            claim_id,
+            fence_generation,
+            command_id: "continued_review_original_candidate".into(),
+            content_hash: "sha256:continued-review-candidate".into(),
+            evidence_ids: vec![],
+            acceptance_criteria_version: "ac-v1".into(),
+            previous_candidate_id: None,
+        },
+    )
+    .unwrap();
+    persist_retry_fixture_terminal(&database, &task.run_id, "succeeded");
+    let review_run = dispatched_review_run(&mut database, &task.camp_id, &candidate.candidate_id);
+    let (review_dispatch, _, _) = latest_dispatch_and_run(&database, "task_a");
+    persist_accepted_input_handoff_loss(&database, &review_run, false);
+    assert_eq!(tick_at(&mut database, now + chrono::Duration::seconds(5)).admitted, 0);
+    let blocked: (String, String) = database.connection().query_row(
+        "SELECT status, reason FROM loom_control_dispatch WHERE dispatch_id=?1",
+        [&review_dispatch], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(blocked, ("BLOCKED".into(), "accepted_input_outcome_unknown".into()));
+
+    let mut continuation = command(ContinueAgentRunCommand {
+        camp_id: task.camp_id.clone(),
+        agent_run_id: review_run.clone(),
+        use_new_session: false,
+    });
+    continuation.camp_id = Some(task.camp_id.clone());
+    assert_eq!(
+        continue_agent_run(&mut database, &continuation).unwrap().result.code,
+        "agent_run.continuation_requested"
+    );
+    let mut continued = claim_mission_lane(&mut database, &task.camp_id, 1);
+    assert_eq!(continued.len(), 1);
+    let continued_run = continued.pop().unwrap();
+    assert_ne!(continued_run, review_run);
+    assert_eq!(
+        claim_the_run(&mut database, &task.camp_id, &continued_run).result.status,
+        crate::command::CommandResultStatus::Accepted,
+    );
+
+    assert_eq!(tick_at(&mut database, now + chrono::Duration::seconds(6)).admitted, 0);
+    let still_blocked: String = database.connection().query_row(
+        "SELECT status FROM loom_control_dispatch WHERE dispatch_id=?1",
+        [&review_dispatch], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(still_blocked, "BLOCKED", "starting the continuation is not its output");
+
+    let manifest = control::candidate_manifest_hash(database.connection(), &candidate.candidate_id).unwrap();
+    let recorded = control::stage_review_record(
+        &mut database,
+        &task.mission_id,
+        REVIEWER_AGENT,
+        &continued_run,
+        "continued_review_pass",
+        stage_input(&candidate.candidate_id, 1, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap();
+    assert!(!recorded.replayed);
+    persist_retry_fixture_terminal(&database, &continued_run, "succeeded");
+    assert_eq!(
+        tick_at(&mut database, now + chrono::Duration::seconds(7)).admitted,
+        1,
+        "the answered review should release only the task's verification handoff"
+    );
+    let reconciled: (String, String) = database.connection().query_row(
+        "SELECT status, reason FROM loom_control_dispatch WHERE dispatch_id=?1",
+        [review_dispatch], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(reconciled, ("SETTLED".into(), "loom.dispatch_manual_continuation_reconciled".into()));
+}
+
+#[test]
+fn handoff_manual_continuation_reconciles_unknown_after_success() {
+    use crate::run_continuation::{ContinueAgentRunCommand, continue_agent_run};
+
+    let mut database = fixture();
+    let now = chrono::Utc::now();
+    let task = retry_test_task(&mut database, now);
+    let handoff_run = retry_test_handoff_run(&mut database, &task);
+    let (handoff_dispatch, _, _) = latest_dispatch_and_run(&database, "task_a");
+    persist_accepted_input_handoff_loss(&database, &handoff_run, false);
+    assert_eq!(tick_at(&mut database, now + chrono::Duration::seconds(5)).admitted, 0);
+
+    let mut continuation = command(ContinueAgentRunCommand {
+        camp_id: task.camp_id.clone(),
+        agent_run_id: handoff_run.clone(),
+        use_new_session: false,
+    });
+    continuation.camp_id = Some(task.camp_id.clone());
+    assert_eq!(
+        continue_agent_run(&mut database, &continuation).unwrap().result.code,
+        "agent_run.continuation_requested"
+    );
+    let mut continued = claim_mission_lane(&mut database, &task.camp_id, 1);
+    assert_eq!(continued.len(), 1);
+    let continued_run = continued.pop().unwrap();
+    assert_eq!(
+        claim_the_run(&mut database, &task.camp_id, &continued_run).result.status,
+        crate::command::CommandResultStatus::Accepted,
+    );
+    persist_retry_fixture_terminal(&database, &continued_run, "succeeded");
+    assert_eq!(tick_at(&mut database, now + chrono::Duration::seconds(6)).admitted, 0);
+    let reconciled: (String, String) = database.connection().query_row(
+        "SELECT status, reason FROM loom_control_dispatch WHERE dispatch_id=?1",
+        [handoff_dispatch], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(reconciled, ("SETTLED".into(), "loom.dispatch_manual_continuation_reconciled".into()));
+}
+
+#[test]
 fn handoff_user_closed_unknown_outcome_does_not_redispatch() {
     let mut database = fixture();
     let now = chrono::Utc::now();

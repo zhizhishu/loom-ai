@@ -122,6 +122,22 @@ describe('native reference frontend boundaries', () => {
     expect(workStatus({task,candidate:first,mission,hasArtifact:false,control:observed()}))
       .toMatchObject({label:'准备中',group:'进行中'})
   })
+  it('surfaces accepted-input outcome-unknown dispatches as recovery waiting on you', () => {
+    const recovery = dispatch({
+      kind: 'handoff', status: 'blocked', reason: 'accepted_input_outcome_unknown',
+      deliveryId: 'delivery-1', agentRunId: 'run-unknown'
+    })
+    const control = observed({ dispatches: [recovery] })
+    expect(workStatus({ task: { ...task, status: 'in_review' }, mission, candidate: first, control }))
+      .toMatchObject({ label: '等你处理', group: '等待你', icon: 'hand' })
+    expect(attentionFactsFromWork([{ task, mission, candidate: first, hasArtifact: true, reviews: [], control }]))
+      .toMatchObject([{ id: 't', kind: 'review', title: 'Actual work' }])
+    expect(workStatus({ task, mission, candidate: first, control: unknown('not_read') }).group).not.toBe('等待你')
+    expect(workStatus({
+      task: { ...task, status: 'done' }, mission,
+      candidate: { ...first, acceptanceStatus: 'accepted' as const }, control
+    }).group).toBe('已完成')
+  })
   it('does not hide blocked work behind a pending candidate', () => {
     expect(workStatus({task:{...task,status:'blocked'},mission,candidate:first}).group).toBe('受阻')
   })

@@ -291,6 +291,9 @@ pub struct LoomDispatch {
     pub policy_revision: i64,
     pub recipient_agent_id: String,
     pub delivery_id: Option<String>,
+    /// The Run that claimed this Delivery, when admission already attached one. Read-only
+    /// projection only: it lets the Owner continue a known interrupted Run without inventing IDs.
+    pub agent_run_id: Option<String>,
     pub status: LoomDispatchStatus,
     pub reason: Option<String>,
     pub created_at: String,
@@ -936,7 +939,11 @@ pub fn stage_review_record(
         &candidate_id,
         policy_revision,
     )? {
-        ReviewSource::DispatchedTo(dispatched_run_id) if dispatched_run_id == trusted_run_id => {}
+        ReviewSource::DispatchedTo(dispatched_run_id)
+            if dispatched_run_id == trusted_run_id
+                || continuation_successor_run_ids(&transaction, &dispatched_run_id)?
+                    .iter()
+                    .any(|run_id| *run_id == trusted_run_id) => {}
         ReviewSource::DispatchedTo(dispatched_run_id) => {
             return Err(LoomCommandError::rejection(
                 LOOM_STAGE_REVIEW_SOURCE_UNBOUND,
@@ -1592,6 +1599,30 @@ enum ReviewSource {
     NeverRequested,
 }
 
+/// Runs created by explicit User continuations of `source_run_id`, newest lineage included.
+/// A continuation is the same authorized input under a new Run; it is not a new autonomous actor.
+fn continuation_successor_run_ids(connection: &Connection, source_run_id: &str) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "WITH RECURSIVE chain(run_id, depth) AS (
+             SELECT ?1, 0
+             UNION
+             SELECT delivery.claimed_agent_run_id, chain.depth + 1
+             FROM chain
+             JOIN camp_run_continuation continuation
+               ON continuation.source_agent_run_id = chain.run_id
+             JOIN camp_message_delivery delivery ON delivery.id = continuation.delivery_id
+             WHERE delivery.claimed_agent_run_id IS NOT NULL AND chain.depth < 32
+         )
+         SELECT run_id FROM chain WHERE depth > 0 ORDER BY depth",
+    )?;
+    let rows = statement.query_map([source_run_id], |row| row.get::<_, String>(0))?;
+    let mut runs = Vec::new();
+    for row in rows {
+        runs.push(row?);
+    }
+    Ok(runs)
+}
+
 /// Which Run, under which authorization, the platform bound this Candidate's review to.
 ///
 /// The ledger is keyed by `(REVIEW, plan, task, candidate, authorization revision)`, so a Candidate
@@ -1997,14 +2028,17 @@ fn read_stage_review_by_command(
 
 fn read_dispatches(connection: &Connection, plan_id: &str) -> Result<Vec<LoomDispatch>> {
     let mut statement = connection.prepare(
-        "SELECT dispatch_id, task_id, kind, candidate_id, policy_revision, recipient_agent_id,
-                delivery_id, status, reason, created_at
-         FROM loom_control_dispatch WHERE plan_id=?1
-         ORDER BY created_at, dispatch_id",
+        "SELECT dispatch.dispatch_id, dispatch.task_id, dispatch.kind, dispatch.candidate_id,
+                dispatch.policy_revision, dispatch.recipient_agent_id, dispatch.delivery_id,
+                delivery.claimed_agent_run_id, dispatch.status, dispatch.reason, dispatch.created_at
+         FROM loom_control_dispatch AS dispatch
+         LEFT JOIN camp_message_delivery AS delivery ON delivery.id = dispatch.delivery_id
+         WHERE dispatch.plan_id=?1
+         ORDER BY dispatch.created_at, dispatch.dispatch_id",
     )?;
     let rows = statement.query_map([plan_id], |row| {
         let kind: String = row.get(2)?;
-        let status: String = row.get(7)?;
+        let status: String = row.get(8)?;
         Ok(LoomDispatch {
             dispatch_id: row.get(0)?,
             task_id: row.get(1)?,
@@ -2014,10 +2048,11 @@ fn read_dispatches(connection: &Connection, plan_id: &str) -> Result<Vec<LoomDis
             policy_revision: row.get(4)?,
             recipient_agent_id: row.get(5)?,
             delivery_id: row.get(6)?,
+            agent_run_id: row.get(7)?,
             status: LoomDispatchStatus::parse(&status)
                 .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?,
-            reason: row.get(8)?,
-            created_at: row.get(9)?,
+            reason: row.get(9)?,
+            created_at: row.get(10)?,
         })
     })?;
     let mut dispatches = Vec::new();

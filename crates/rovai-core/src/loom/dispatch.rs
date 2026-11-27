@@ -89,7 +89,7 @@ use super::super::watchdog::{
     WATCHDOG_MAX_RECOVERIES, WatchdogDecision, WatchdogProgress, WatchdogState,
     factory_watchdog_decision,
 };
-use super::{LoomControlPolicy, active_member, read_policy};
+use super::{LoomControlPolicy, active_member, continuation_successor_run_ids, read_policy};
 use crate::agent_profile::{AdapterKind, RuntimeReadiness, RuntimeReadinessStatus};
 use crate::collaboration::{
     LoomDispatchAdmission, LoomDispatchAdmissionOutcome, admit_loom_dispatch_message,
@@ -1847,6 +1847,7 @@ fn reconcile_dispatches(transaction: &Transaction<'_>, now: &str) -> Result<()> 
         )?;
     }
     reconcile_superseded_handoffs(transaction, now)?;
+    reconcile_manual_continuation_dispatches(transaction, now)?;
     Ok(())
 }
 
@@ -1876,6 +1877,138 @@ fn reconcile_superseded_handoffs(transaction: &Transaction<'_>, now: &str) -> Re
                  AND (task.status='DONE' OR candidate.acceptance_status<>'PENDING'))",
         [now],
     )?;
+    Ok(())
+}
+
+/// Whether an explicit User continuation of `source_run_id` produced the durable fact this
+/// dispatch was asking for. Starting a continuation proves nothing; only the same successor fact
+/// that would have settled the original Run closes the unknown outcome.
+fn manual_continuation_output_reached(
+    transaction: &Transaction<'_>,
+    kind: &str,
+    plan_id: &str,
+    task_id: &str,
+    candidate_id: Option<&str>,
+    policy_revision: i64,
+    source_run_id: &str,
+) -> Result<bool> {
+    let successors = continuation_successor_run_ids(transaction, source_run_id)?;
+    if successors.is_empty() {
+        return Ok(false);
+    }
+    match kind {
+        EXECUTE => {
+            for run_id in successors {
+                let exists: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM loom_candidate
+                                   WHERE plan_id=?1 AND task_id=?2 AND agent_run_id=?3)",
+                    params![plan_id, task_id, run_id],
+                    |row| row.get(0),
+                )?;
+                if exists {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        REVIEW => {
+            let Some(candidate_id) = candidate_id else {
+                return Ok(false);
+            };
+            for run_id in successors {
+                let exists: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM loom_stage_review
+                                   WHERE plan_id=?1 AND candidate_id=?2 AND policy_revision=?3
+                                     AND reviewer_agent_run_id=?4)",
+                    params![plan_id, candidate_id, policy_revision, run_id],
+                    |row| row.get(0),
+                )?;
+                if exists {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        REWORK => {
+            let Some(candidate_id) = candidate_id else {
+                return Ok(false);
+            };
+            for run_id in successors {
+                let exists: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM loom_candidate
+                                   WHERE plan_id=?1 AND previous_candidate_id=?2 AND agent_run_id=?3)",
+                    params![plan_id, candidate_id, run_id],
+                    |row| row.get(0),
+                )?;
+                if exists {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        HANDOFF => {
+            for run_id in successors {
+                let exists: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM camp_message_delivery
+                                   WHERE claimed_agent_run_id=?1 AND status='settled')",
+                    [run_id],
+                    |row| row.get(0),
+                )?;
+                if exists {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Close an unknown dispatch only after its User-authorized continuation creates the durable
+/// output the original dispatch required. This is still not a replay: the continuation itself is
+/// the User's explicit decision, and the ledger listens only for persisted successor facts.
+fn reconcile_manual_continuation_dispatches(transaction: &Transaction<'_>, now: &str) -> Result<()> {
+    let rows = {
+        let mut statement = transaction.prepare(
+            "SELECT dispatch.dispatch_id, dispatch.plan_id, dispatch.task_id, dispatch.kind,
+                    dispatch.candidate_id, dispatch.policy_revision, delivery.claimed_agent_run_id
+             FROM loom_control_dispatch dispatch
+             JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+             WHERE dispatch.status='BLOCKED' AND dispatch.reason='accepted_input_outcome_unknown'
+               AND delivery.claimed_agent_run_id IS NOT NULL
+             ORDER BY dispatch.created_at, dispatch.dispatch_id",
+        )?;
+        let mapped = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (dispatch_id, plan_id, task_id, kind, candidate_id, policy_revision, source_run_id) in rows {
+        if manual_continuation_output_reached(
+            transaction,
+            &kind,
+            &plan_id,
+            &task_id,
+            candidate_id.as_deref(),
+            policy_revision,
+            &source_run_id,
+        )? {
+            transaction.execute(
+                "UPDATE loom_control_dispatch
+                 SET status='SETTLED', reason='loom.dispatch_manual_continuation_reconciled', updated_at=?2
+                 WHERE dispatch_id=?1 AND status='BLOCKED' AND reason='accepted_input_outcome_unknown'",
+                params![dispatch_id, now],
+            )?;
+        }
+    }
     Ok(())
 }
 

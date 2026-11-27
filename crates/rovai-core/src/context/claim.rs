@@ -233,6 +233,7 @@ impl ClaimedBatchContext {
         skills: &SkillSelectionSnapshot,
         previous_boundary: i64,
         additional_messages: bool,
+        continuation_input: bool,
     ) -> Result<Self> {
         let mut selected = self.clone();
         let mut snapshot = prospective_delivery_snapshot(transaction, request)?;
@@ -251,12 +252,31 @@ impl ClaimedBatchContext {
         selected.run_input = run_input;
         let mut facts: Value = serde_json::from_str(&selected.run_facts.payload_json)?;
         facts["historyHint"] = json!(public_history_hint(previous_boundary, additional_messages));
+        if continuation_input {
+            facts["retry"] = json!({
+                "requiredAction": "check_existing_results_before_repeating_external_effects",
+                "instruction": "先检查已有成果，不重复外部操作。",
+            });
+        }
         selected.run_facts.payload_json = serde_json::to_string(&facts)?;
         selected.run_facts.references.push(RunFactRef {
             fact: "history_hint".into(),
             task_id: None,
             mission_id: None,
         });
+        if continuation_input
+            && !selected
+                .run_facts
+                .references
+                .iter()
+                .any(|reference| reference.fact == "retry")
+        {
+            selected.run_facts.references.push(RunFactRef {
+                fact: "retry".into(),
+                task_id: None,
+                mission_id: None,
+            });
+        }
         while selected.payload_len()? > request.max_payload_bytes && !selected.tasks.is_empty() {
             selected.tasks.pop();
             selected.omitted_tasks += 1;
