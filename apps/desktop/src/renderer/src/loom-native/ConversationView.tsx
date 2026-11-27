@@ -155,12 +155,12 @@ export function ConversationView({ item, snapshot, agents, bundles, loading, sen
   const wakeLines = useMemo(() => snapshot ? wakeRestoreLines(snapshot, agents) : [], [snapshot, agents])
   const terminalRuns = useMemo(() => snapshot?.agentRuns.filter(run => ['succeeded', 'failed', 'cancelled'].includes(run.status)) ?? [], [snapshot?.agentRuns])
   // 最近一次运行：失败时仍在末尾保留可操作的失败卡；终态事实本身进入上面的时间流。
-  const latestRun = useMemo(() => {
+  const endedRun = useMemo(() => {
     const runs = [...(snapshot?.agentRuns ?? [])]
+      .filter(run => ['succeeded', 'failed', 'cancelled'].includes(run.status))
       .sort((left, right) => (left.startedAt ?? left.createdAt).localeCompare(right.startedAt ?? right.createdAt))
     return runs[runs.length - 1] ?? null
   }, [snapshot?.agentRuns])
-  const endedRun = latestRun && ['succeeded', 'failed', 'cancelled'].includes(latestRun.status) ? latestRun : null
   // Mikka approval-card `:573-576`：处理完的授权不整块消失，交互区收起后降级成一条结论行。
   // 这里只留最近一次已处理的请求，避免历史授权把输入区顶走。
   const resolvedApproval = useMemo(() => {
