@@ -1579,7 +1579,7 @@ pub(crate) enum SameRunClaim {
     /// The authenticated `loom.claim` tool asks for its own Task again after Core pre-claimed it for
     /// this very Run: the held claim *is* the answer. Nothing is renewed, nothing is granted to any
     /// other Run, and the receipt is the claim this Run already held rather than a replay of this
-    /// command id.
+    /// command id. A direct continuation of the terminal holder may instead succeed that claim.
     ReturnHeld,
     /// Core's pre-execution admission of one execution epoch: the same Run's earlier lease is
     /// revoked and the fence advances, because the new epoch is a new holder of the same Task. A
@@ -1606,7 +1606,8 @@ pub fn claim_acquire(
 
 /// The authenticated `loom.claim` tool. Core may already have claimed the Task for this very Run
 /// when it admitted the Run to execution, so the Run's own live claim is returned instead of a
-/// refusal; every other holder, and every expired lease, keeps the general rule.
+/// refusal; every other holder, and every expired lease, keeps the general rule. A Run admitted
+/// from an authorized continuation of the terminal holder inherits that still-open claim.
 pub fn claim_acquire_reusing_own_lease(
     database: &mut Database,
     input: LoomClaimAcquireInput,
@@ -1617,6 +1618,39 @@ pub fn claim_acquire_reusing_own_lease(
     let result = claim_acquire_in(&transaction, input, SameRunClaim::ReturnHeld)?;
     transaction.commit()?;
     Ok(result)
+}
+
+/// Whether `agent_run_id` is the Run the scheduler admitted from the immutable continuation of
+/// `holder_run_id`. The Delivery that produced the successor is the ownership proof; the holder
+/// must already be terminal, and the continuation must stay inside the same Camp and agent.
+fn direct_continuation_claim_successor(
+    connection: &rusqlite::Connection,
+    holder_run_id: &str,
+    agent_run_id: &str,
+) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM camp_run_continuation AS continuation
+             JOIN camp_message_delivery AS delivery ON delivery.id=continuation.delivery_id
+             JOIN agent_run AS source ON source.id=continuation.source_agent_run_id
+             JOIN agent_run AS successor ON successor.id=?2
+             JOIN conversation AS source_conversation
+               ON source_conversation.id=source.conversation_id
+             JOIN conversation AS successor_conversation
+               ON successor_conversation.id=successor.conversation_id
+             WHERE continuation.source_agent_run_id=?1
+               AND delivery.claimed_agent_run_id=?2
+               AND source.status IN ('succeeded','failed','cancelled')
+               AND source_conversation.agent_id=successor_conversation.agent_id
+               AND COALESCE(source.camp_id,source_conversation.camp_id)
+                   = COALESCE(successor.camp_id,successor_conversation.camp_id)
+               AND delivery.camp_id=COALESCE(source.camp_id,source_conversation.camp_id)
+               AND delivery.recipient_agent_id=source_conversation.agent_id
+         )",
+        params![holder_run_id, agent_run_id],
+        |row| row.get(0),
+    )?)
 }
 
 /// The claim write itself, on a caller-owned transaction, so a Run's execution admission and the
@@ -1650,7 +1684,7 @@ pub(crate) fn claim_acquire_in(
     // new lease from a stale instant that may already have run out.
     let now = chrono::Utc::now();
     let claimed_at = now.to_rfc3339();
-    let lease_expires_at = (now + chrono::Duration::seconds(lease_seconds)).to_rfc3339();
+    let mut lease_expires_at = (now + chrono::Duration::seconds(lease_seconds)).to_rfc3339();
     let mission_exists: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM mission WHERE id=?1)",
         [&mission_id],
@@ -1772,9 +1806,14 @@ pub(crate) fn claim_acquire_in(
         if !lease_expired(&held_lease_expires_at, now) {
             // A live lease belongs to its holder. Only the same Run, asking as the same claimant,
             // may read it back or revoke it, and only in the shape the caller declared; nothing
-            // here renews a lease, and no other Run is ever handed somebody else's Task.
+            // here renews a lease, and no other Run is ever handed somebody else's Task. The one
+            // exception is the holder's direct continuation, whose claim row is replaced at a
+            // higher fence instead of being read back under the old holder's identity.
             let same_holder = held_run_id == agent_run_id
                 && held_claimant.as_deref() == claimant_agent_id.as_deref();
+            let continues_holder = same_run_claim == SameRunClaim::ReturnHeld
+                && held_claimant.as_deref() == claimant_agent_id.as_deref()
+                && direct_continuation_claim_successor(transaction, &held_run_id, &agent_run_id)?;
             match same_run_claim {
                 SameRunClaim::ReturnHeld if same_holder => {
                     let held = transaction.query_row(
@@ -1787,6 +1826,18 @@ pub(crate) fn claim_acquire_in(
                     // Not a replay of this command id: this Run held the Task before the call and
                     // reads back the lease it took then, unrenewed and unextended.
                     return Ok(held.into_result(&mission_id, false));
+                }
+                SameRunClaim::ReturnHeld if continues_holder => {
+                    // The continuation continues the same authorized work, so its claim may not
+                    // expire earlier than the one it succeeds.
+                    if let Ok(held_expiry) =
+                        chrono::DateTime::parse_from_rfc3339(&held_lease_expires_at)
+                        && held_expiry.with_timezone(&chrono::Utc) > now
+                        && held_expiry.with_timezone(&chrono::Utc)
+                            > now + chrono::Duration::seconds(lease_seconds)
+                    {
+                        lease_expires_at = held_expiry.with_timezone(&chrono::Utc).to_rfc3339();
+                    }
                 }
                 SameRunClaim::RevokeOwnLease if same_holder => {}
                 _ => {
@@ -6191,6 +6242,555 @@ mod tests {
             open_claims(&database, "task_a"),
             1,
             "assertion exactly_one_run_holds_the_task"
+        );
+    }
+
+    /// A Mission's Camp and the existing conversation of one member.
+    fn mission_camp(database: &OwnedTestDatabase, mission_id: &str) -> String {
+        database
+            .connection()
+            .query_row("SELECT camp_id FROM mission WHERE id=?1", [mission_id], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn conversation_for_agent(
+        database: &OwnedTestDatabase,
+        camp_id: &str,
+        agent_id: &str,
+    ) -> String {
+        if let Some(conversation_id) = database
+            .connection()
+            .query_row(
+                "SELECT id FROM conversation WHERE camp_id=?1 AND agent_id=?2 ORDER BY created_at LIMIT 1",
+                params![camp_id, agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+        {
+            return conversation_id;
+        }
+        let conversation_id = format!("conversation-continuation-{}", uuid::Uuid::new_v4().simple());
+        let now = chrono::Utc::now().to_rfc3339();
+        database
+            .connection()
+            .execute(
+                "INSERT INTO conversation(id,camp_id,agent_id,version,created_at,updated_at)
+                 VALUES(?1,?2,?3,1,?4,?4)",
+                params![&conversation_id, camp_id, agent_id, &now],
+            )
+            .unwrap();
+        conversation_id
+    }
+
+    fn continuation_anchor_message(database: &OwnedTestDatabase, camp_id: &str) -> String {
+        let message_id = format!("message-continuation-{}", uuid::Uuid::new_v4().simple());
+        let sequence: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COALESCE(MAX(sequence),0)+1 FROM camp_message WHERE camp_id=?1",
+                [camp_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        database
+            .connection()
+            .execute(
+                "INSERT INTO camp_message(
+                    id,camp_id,sequence,author_type,author_id,body,structured_content_json,
+                    content_digest,address_mode,addressed_agent_ids_json,version,created_at,updated_at
+                 ) VALUES(?1,?2,?3,'system','continuation-test','anchor','[]','anchor',
+                    'default','[]',1,?4,?4)",
+                params![&message_id, camp_id, sequence, &now],
+            )
+            .unwrap();
+        message_id
+    }
+
+    fn insert_continuation_run(
+        database: &OwnedTestDatabase,
+        camp_id: &str,
+        conversation_id: &str,
+        run_id: &str,
+        status: &str,
+        ended_at: Option<&str>,
+    ) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let anchor_message_id = continuation_anchor_message(database, camp_id);
+        database
+            .connection()
+            .execute(
+                "INSERT INTO agent_run(
+                    id,camp_id,conversation_id,initial_camp_context_through_sequence,
+                    initial_conversation_context_through_sequence,responsibility_key,
+                    start_reason,purpose,completion_role,effective_config_json,status,
+                    idempotency_key,execution_epoch,version,created_at,updated_at,ended_at,
+                    invocation_kind,anchor_message_id,current_public_tail_sequence
+                 ) VALUES(?1,?2,?3,0,0,?1,'initial','continuation claim lineage',
+                    'required','{}',?4,?1,1,1,?5,?5,?6,'batch',?7,0)",
+                params![run_id, camp_id, conversation_id, status, &now, ended_at, &anchor_message_id],
+            )
+            .unwrap();
+    }
+
+    fn link_continuation_delivery(
+        database: &OwnedTestDatabase,
+        camp_id: &str,
+        source_run_id: &str,
+        successor_run_id: &str,
+        recipient_agent_id: &str,
+    ) {
+        let delivery_id = format!("delivery-continuation-{}", uuid::Uuid::new_v4().simple());
+        let queue_sequence: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COALESCE(MAX(queue_sequence),0)+1 FROM camp_message_delivery
+                 WHERE camp_id=?1 AND recipient_agent_id=?2",
+                params![camp_id, recipient_agent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        database
+            .connection()
+            .execute(
+                "INSERT INTO camp_message_delivery(
+                    id,camp_id,message_id,source_kind,recipient_agent_id,
+                    recipient_membership_version_at_admission,queue_sequence,status,
+                    claimed_agent_run_id,version,created_at,claimed_at,updated_at
+                 ) VALUES(?1,?2,NULL,'continuation',?3,1,?4,'claimed',?5,1,?6,?6,?6)",
+                params![
+                    &delivery_id,
+                    camp_id,
+                    recipient_agent_id,
+                    queue_sequence,
+                    successor_run_id,
+                    &now
+                ],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                "INSERT INTO camp_run_continuation(delivery_id,source_agent_run_id,use_new_session)
+                 VALUES(?1,?2,0)",
+                params![&delivery_id, source_run_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn direct_continuation_inherits_the_terminal_holders_claim_and_can_deliver() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM continuation claim");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        seed_evidence(&mut database, &mission_id);
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let camp_id = mission_camp(&database, &mission_id);
+        let conversation_id = conversation_for_agent(&database, &camp_id, "agent_1");
+        insert_continuation_run(
+            &database,
+            &camp_id,
+            &conversation_id,
+            "run_source",
+            "failed",
+            Some("2026-01-01T00:00:00Z"),
+        );
+        insert_continuation_run(
+            &database,
+            &camp_id,
+            &conversation_id,
+            "run_continuation",
+            "running",
+            None,
+        );
+        let source_claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_source", "command_source"),
+        )
+        .unwrap();
+        link_continuation_delivery(
+            &database,
+            &camp_id,
+            "run_source",
+            "run_continuation",
+            "agent_1",
+        );
+
+        let continuation_claim = claim_acquire_reusing_own_lease(
+            &mut database,
+            claim_input(
+                &mission_id,
+                "task_a",
+                "run_continuation",
+                "command_continuation",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            continuation_claim.agent_run_id, "run_continuation",
+            "assertion continuation_receives_a_claim_of_its_own"
+        );
+        assert_ne!(
+            continuation_claim.claim_id, source_claim.claim_id,
+            "assertion continuation_binds_a_new_claim_row"
+        );
+        assert_eq!(
+            continuation_claim.fence_generation,
+            source_claim.fence_generation + 1,
+            "assertion continuation_advances_the_fence"
+        );
+        assert!(
+            released_at(&database, &source_claim.claim_id).is_some(),
+            "assertion continuation_releases_the_terminal_holders_claim"
+        );
+        assert_eq!(
+            open_claims(&database, "task_a"),
+            1,
+            "assertion continuation_leaves_one_holder"
+        );
+        let now = chrono::Utc::now();
+        assert!(
+            live_claim_for_run(database.connection(), "run_source", now)
+                .unwrap()
+                .is_none(),
+            "assertion the_superseded_source_no_longer_holds_a_live_claim"
+        );
+
+        // A second continuation of the same source cannot become a second holder.
+        insert_continuation_run(
+            &database,
+            &camp_id,
+            &conversation_id,
+            "run_continuation_two",
+            "succeeded",
+            Some("2026-01-01T00:00:00Z"),
+        );
+        link_continuation_delivery(
+            &database,
+            &camp_id,
+            "run_source",
+            "run_continuation_two",
+            "agent_1",
+        );
+        let second = claim_acquire_reusing_own_lease(
+            &mut database,
+            claim_input(
+                &mission_id,
+                "task_a",
+                "run_continuation_two",
+                "command_continuation_two",
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&second),
+            LOOM_CLAIM_HELD,
+            "assertion a_second_continuation_cannot_replace_the_first_holder"
+        );
+
+        write_workspace_file(&database, &mission_id, "report.md", "continued delivery");
+        let evidence = artifact_register(
+            &mut database,
+            "agent_1",
+            LoomArtifactRegisterInput {
+                mission_id: mission_id.clone(),
+                task_id: Some("task_a".into()),
+                agent_run_id: Some("run_continuation".into()),
+                relative_path: "report.md".into(),
+                content_type: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            evidence.artifact.agent_run_id.as_deref(),
+            Some("run_continuation"),
+            "assertion continuation_registers_evidence_under_its_own_claim"
+        );
+        let candidate = candidate_record(
+            &mut database,
+            candidate_input_for(
+                &mission_id,
+                "task_a",
+                "run_continuation",
+                "command_submit",
+                &continuation_claim,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            candidate.agent_run_id, "run_continuation",
+            "assertion continuation_submits_the_candidate"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "IN_REVIEW",
+            "assertion continuation_delivery_advances_the_task"
+        );
+    }
+
+    #[test]
+    fn a_run_without_continuation_lineage_still_reads_claim_held() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM no continuation lineage");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let camp_id = mission_camp(&database, &mission_id);
+        let conversation_id = conversation_for_agent(&database, &camp_id, "agent_1");
+        insert_continuation_run(
+            &database,
+            &camp_id,
+            &conversation_id,
+            "run_source",
+            "failed",
+            Some("2026-01-01T00:00:00Z"),
+        );
+        let source_claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_source", "command_source"),
+        )
+        .unwrap();
+
+        let error = claim_acquire_reusing_own_lease(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_other", "command_other"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_HELD,
+            "assertion an_unrelated_run_cannot_take_the_claim"
+        );
+        assert_eq!(
+            released_at(&database, &source_claim.claim_id),
+            None,
+            "assertion a_refused_takeover_keeps_the_holder"
+        );
+    }
+
+    #[test]
+    fn a_running_claim_holder_is_not_inherited_by_its_continuation() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM running holder continuation");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let camp_id = mission_camp(&database, &mission_id);
+        let conversation_id = conversation_for_agent(&database, &camp_id, "agent_1");
+        insert_continuation_run(
+            &database,
+            &camp_id,
+            &conversation_id,
+            "run_source",
+            "running",
+            None,
+        );
+        insert_continuation_run(
+            &database,
+            &camp_id,
+            &conversation_id,
+            "run_continuation",
+            "succeeded",
+            Some("2026-01-01T00:00:00Z"),
+        );
+        let source_claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_source", "command_source"),
+        )
+        .unwrap();
+        link_continuation_delivery(
+            &database,
+            &camp_id,
+            "run_source",
+            "run_continuation",
+            "agent_1",
+        );
+
+        let error = claim_acquire_reusing_own_lease(
+            &mut database,
+            claim_input(
+                &mission_id,
+                "task_a",
+                "run_continuation",
+                "command_continuation",
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_HELD,
+            "assertion a_non_terminal_holder_is_never_replaced"
+        );
+        assert_eq!(
+            released_at(&database, &source_claim.claim_id),
+            None,
+            "assertion the_running_holders_claim_stays_open"
+        );
+    }
+
+    #[test]
+    fn continuation_inheritance_requires_the_same_agent_and_delivery_recipient() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM continuation agent scope");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let camp_id = mission_camp(&database, &mission_id);
+        let source_conversation = conversation_for_agent(&database, &camp_id, "agent_1");
+        let other_conversation = conversation_for_agent(&database, &camp_id, "agent_2");
+        insert_continuation_run(
+            &database,
+            &camp_id,
+            &source_conversation,
+            "run_source",
+            "failed",
+            Some("2026-01-01T00:00:00Z"),
+        );
+        insert_continuation_run(
+            &database,
+            &camp_id,
+            &other_conversation,
+            "run_other_agent",
+            "running",
+            None,
+        );
+        let source_claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_source", "command_source"),
+        )
+        .unwrap();
+        link_continuation_delivery(
+            &database,
+            &camp_id,
+            "run_source",
+            "run_other_agent",
+            "agent_1",
+        );
+        let other_agent = claim_acquire_reusing_own_lease(
+            &mut database,
+            LoomClaimAcquireInput {
+                claimant_agent_id: Some("agent_2".into()),
+                ..claim_input(
+                    &mission_id,
+                    "task_a",
+                    "run_other_agent",
+                    "command_other_agent",
+                )
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&other_agent),
+            LOOM_CLAIM_HELD,
+            "assertion a_continuation_of_another_agent_cannot_inherit"
+        );
+
+        insert_continuation_run(
+            &database,
+            &camp_id,
+            &source_conversation,
+            "run_wrong_recipient",
+            "running",
+            None,
+        );
+        link_continuation_delivery(
+            &database,
+            &camp_id,
+            "run_source",
+            "run_wrong_recipient",
+            "agent_2",
+        );
+        let recipient_mismatch = claim_acquire_reusing_own_lease(
+            &mut database,
+            claim_input(
+                &mission_id,
+                "task_a",
+                "run_wrong_recipient",
+                "command_wrong_recipient",
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&recipient_mismatch),
+            LOOM_CLAIM_HELD,
+            "assertion a_delivery_for_another_recipient_cannot_inherit"
+        );
+        assert_eq!(
+            released_at(&database, &source_claim.claim_id),
+            None,
+            "assertion scoped_refusals_leave_the_original_claim_open"
+        );
+    }
+
+    #[test]
+    fn a_released_claim_is_not_revived_by_a_continuation() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM released continuation claim");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let camp_id = mission_camp(&database, &mission_id);
+        let conversation_id = conversation_for_agent(&database, &camp_id, "agent_1");
+        insert_continuation_run(
+            &database,
+            &camp_id,
+            &conversation_id,
+            "run_source",
+            "failed",
+            Some("2026-01-01T00:00:00Z"),
+        );
+        insert_continuation_run(
+            &database,
+            &camp_id,
+            &conversation_id,
+            "run_continuation",
+            "running",
+            None,
+        );
+        let source_claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_source", "command_source"),
+        )
+        .unwrap();
+        let released_at_value = "2026-01-02T00:00:00+00:00";
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_claim SET released_at=?1 WHERE claim_id=?2",
+                params![released_at_value, &source_claim.claim_id],
+            )
+            .unwrap();
+        link_continuation_delivery(
+            &database,
+            &camp_id,
+            "run_source",
+            "run_continuation",
+            "agent_1",
+        );
+
+        let acquired = claim_acquire_reusing_own_lease(
+            &mut database,
+            claim_input(
+                &mission_id,
+                "task_a",
+                "run_continuation",
+                "command_continuation",
+            ),
+        )
+        .unwrap();
+        assert_ne!(
+            acquired.claim_id, source_claim.claim_id,
+            "assertion a_released_claim_is_never_returned_as_the_continuation_claim"
+        );
+        assert_eq!(
+            released_at(&database, &source_claim.claim_id).as_deref(),
+            Some(released_at_value),
+            "assertion a_released_claim_keeps_its_conclusion"
+        );
+        assert_eq!(
+            acquired.fence_generation,
+            source_claim.fence_generation + 1,
+            "assertion a_new_claim_after_release_still_advances_the_fence"
         );
     }
 
