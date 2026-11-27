@@ -10,6 +10,11 @@ import { SETTINGS_SECTIONS } from './settings-sections'
 const sidebar = (query: string) => renderToStaticMarkup(createElement(SettingsSidebar, { sections: SETTINGS_SECTIONS, current: 'devices', query, onQuery() {}, onSelect() {} }))
 
 describe('settings page parts', () => {
+  it('places Mikka owner permission rows in the native preferences surface',()=>{
+    const source=readFileSync(new URL('./SettingsPersonal.tsx',import.meta.url),'utf8')
+    for(const text of ['管理员','电脑操作','命令执行','依赖安装','Host 写文件','联网','Git 推送','settings-owner-permissions']) expect(source).toContain(text)
+    for(const key of ['computerUse','commandExecution','installDependency','hostFileWrite','networkAccess','gitPush']) expect(source).toContain(key)
+  })
   it('routes native About to the Desktop provider or the existing remote Server surface',()=>{
     const source=readFileSync(new URL('./SettingsPersonal.tsx',import.meta.url),'utf8')
     expect(source).toContain('environment.desktop?.appUpdates')
