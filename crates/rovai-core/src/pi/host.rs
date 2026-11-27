@@ -594,10 +594,11 @@ fn append_host_arguments(
     purge_extension: Option<&Path>,
 ) {
     command.args(["--mode", "rpc"]);
-    command.args(["--no-themes", "--approve"]);
-    // Only the explicit managed guard is added: the pre-existing isolation switches (including
-    // `--no-extensions`) stay exactly as the frozen launch already declared them. `--tools` carries the
-    // comma-joined tool list Core derived from the frozen access mode, never a caller-composed list.
+    command.args(["--no-themes", "--approve", "--no-extensions"]);
+    // Pi CLI semantics: `--no-extensions` disables user/project extension discovery while explicit
+    // `--extension` paths still load. Only the managed guard/host/question/purge files below are admitted.
+    // `--tools` carries the comma-joined tool list Core derived from the frozen access mode,
+    // never a caller-composed list.
     if let Some((guard_path, tools)) = file_access {
         // The managed question tool has no filesystem or execution capability.
         command.args(["--tools", &format!("{tools},ask_user_question"), "--extension"]).arg(guard_path);
@@ -4515,6 +4516,7 @@ done
                 "rpc",
                 "--no-themes",
                 "--approve",
+                "--no-extensions",
                 "--extension",
                 "/private/rovai-pi-host-v12.ts",
                 "--extension",
@@ -4527,7 +4529,6 @@ done
             "--no-prompt-templates",
             "--no-builtin-tools",
             "--no-approve",
-            "--no-extensions",
         ] {
             assert!(!production_args.iter().any(|argument| argument == forbidden));
         }
@@ -4555,6 +4556,7 @@ done
                     "rpc",
                     "--no-themes",
                     "--approve",
+                    "--no-extensions",
                     "--tools",
                     &format!("{tools},ask_user_question"),
                     "--extension",
@@ -4576,7 +4578,6 @@ done
                 "--no-prompt-templates",
                 "--no-builtin-tools",
                 "--no-approve",
-                "--no-extensions",
                 "--no-builtin-read",
             ] {
                 assert!(!production_args.iter().any(|argument| argument == forbidden));
