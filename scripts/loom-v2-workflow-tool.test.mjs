@@ -78,7 +78,7 @@ test('Core input contracts replace guessed fields and reject incomplete operatio
   }
   assert.match(help, /loom.plan: required input fields: goal, criteria, tasks/u)
   assert.match(help, /loom.evidence: required input fields: relativePath/u)
-  assert.match(help, /Claim a released task before writing/u)
+  assert.match(help, /An assigned worker claims only its own task before writing/u)
   const fixturePath = new URL('./fixtures/pi-workflow/core-input-contract.json', import.meta.url)
   assert.deepEqual(readWorkflowContracts(fileURLToPath(fixturePath)), CONTRACTS)
   const changed = structuredClone(CORE_CONTRACT)
