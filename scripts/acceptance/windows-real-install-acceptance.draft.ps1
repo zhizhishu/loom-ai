@@ -1,0 +1,1004 @@
+#requires -Version 5.1
+<#
+    DRAFT / NOT EXECUTED. Windows real-install acceptance for the LOOM personal package.
+    Written for stock Windows PowerShell 5.1 only: Expand-Archive, Invoke-RestMethod,
+    Invoke-WebRequest, Start-Process, Wait-Process, taskkill.exe and .NET Framework
+    assemblies that ship with Windows. No third-party module, no network call except
+    the loopback Host under test.
+
+    Reference material read while writing this draft (read-only):
+      scripts/manage-loom-personal.ps1
+        :2-9       param block, Port default 64852 (this draft uses 18990)
+        :273-295   Run-Loom: environment, "LOOM: http://127.0.0.1:<port>/",
+                   `& rovai-server.exe --data-dir <data> --listen 127.0.0.1:<port>`
+        :299-339   Install: absolute short paths, package/data/install separation
+        :324       installation.json holds current commit, dataDirectory and port
+        :361-371   stable Manage-Loom.ps1 / Start-Loom.cmd entry points
+        :395-415   Start: reads state, re-verifies and runs the installed version
+      scripts/lib/personal-install.test.mjs
+        :458       start through Start-Loom.cmd (cmd.exe /d /c)
+        :475-484   readiness = GET / returns 200 <html and the listener is the installed build
+        :486-499   administrator token file <data>\server-token, POST /api/v1/login
+                   {protocolVersion: 5, administratorToken}, POST /api/v1/request
+                   {operation, params} with Bearer session token
+        :299,350   stop the exact test-owned tree with taskkill.exe /T /F
+      scripts/lib/create-configured-camp.mjs
+        :51-70     ComposerDocument v2 explicit member addressing
+      scripts/lib/minimax-live-qualification.mjs
+        :94        threads.create {commandId,name,workspace,memberAgentIds,defaultLeadAgentId,collaborationMode}
+        :104-105   thread.messages.send {commandId,threadId,content,sourceAttachments,quotes,
+                   replyToThreadMessageId,deliveryMode,steerTargets,execution} ->
+                   commandResult.status 'accepted', payload.threadMessageId
+      scripts/lib/host-web.test.mjs
+        :318-364   /api/v1/uploads multipart: intent {commandId,threadId,expectedRevision,
+                   displayName,byteSize,sha256} + file part; response .draft is the
+                   LocalAttachmentSourceRef usable as sourceAttachments[]
+      scripts/smoke-skills.mjs
+        :528-552   runtime.installations.list -> snapshot.models; members.runtime.set with
+                   model {mode:'explicit',modelId,options}; members.get readback
+      scripts/smoke-stop-continue.mjs:92-95
+                   agentRuns.cancel {commandId, command:{threadId,agentRunId,expectedVersion}}
+      scripts/probe-steer-version.mjs:100-104
+                   the cancel version comes from camps.open agentRuns[].version
+      scripts/lib/loom-v2-official-host-electron-review.test.mjs:286,439-440,468
+                   loom.artifact.preview {missionId,artifactId} reads archived bytes;
+                   host.web.stop / core.shutdown are the planned-stop evidence
+      crates/rovai-core/src/read_model.rs:375-423
+                   AgentRunView: id,status,version,inputMessageIds,runtimeModel
+      crates/rovai-core/src/read_model.rs:305-318 + read_model/message_model.rs:11-15
+                   ThreadMessageView.authorType/body/runtimeModel.modelId
+      crates/rovai-core/src/local_attachment_source.rs:34-47
+                   LocalAttachmentSourceRef (deny_unknown_fields); extractedText is the
+                   admitted "browser-extracted Office document text" input channel
+      crates/rovai-core/src/loom/pptx_preview.rs:234-247,264-290
+                   soffice + pdftoppm probe, status missing_dependency / ready /
+                   conversion_failed -- mirrors the SKIP_LIBREOFFICE decision
+      crates/rovai-core/src/loom.rs:1216-1219
+                   LoomArtifactPreviewInput {missionId, artifactId}
+      crates/rovai-web/src/operations.rs:58,270,342,376,386,392,419,615
+                   Web boundary admits camps.open, runtime.installations.list,
+                   thread.messages.send, agentRuns.cancel, threads.create,
+                   members.runtime.set, loom.artifact.preview
+
+    Hard rules encoded below:
+      * the model credential is read from $env:OCT_API_KEY only, fails fast when absent,
+        and is never written to a log, command line, report or exception;
+      * every path stays under a short work root (default C:\loomacc);
+      * default port 18990, never 64851/64852;
+      * a missing LibreOffice only records SKIP_LIBREOFFICE, never a product failure.
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)][string]$PackageZip,
+    [int]$Port = 18990,
+    [string]$WorkRoot = (Join-Path $env:SystemDrive 'loomacc'),
+    [string]$ModelId = 'deepseek-v4.1-flash',
+    [int]$ReadyTimeoutSeconds = 180,
+    [int]$RunTimeoutSeconds = 420,
+    [int]$StopTimeoutSeconds = 120
+)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+if ($Port -in @(64851, 64852)) { throw 'Port 64851/64852 belongs to the owner instances; choose 18990.' }
+
+$script:Origin = "http://127.0.0.1:$Port"
+$script:Results = New-Object 'Collections.Generic.List[object]'
+$script:Secrets = New-Object 'Collections.Generic.List[string]'
+$script:Utf8 = New-Object Text.UTF8Encoding($false)
+$script:AdminToken = $null
+$script:SessionToken = $null
+$script:Evidence = [ordered]@{}
+# Fallback log location only; Assert-ShortWorkRoot replaces it with <workRoot>\logs.
+$script:Paths = [ordered]@{ logs = [IO.Path]::GetTempPath() }
+$script:Launcher = $null
+$script:InstallDirectory = $null
+$script:DataDirectory = $null
+
+# --------------------------------------------------------------------------------------
+# reporting, redaction, tiny helpers
+# --------------------------------------------------------------------------------------
+
+function Add-Secret([string]$Value) {
+    if ($Value -and $Value.Length -ge 8 -and -not $script:Secrets.Contains($Value)) {
+        [void]$script:Secrets.Add($Value)
+    }
+}
+
+function Hide-Secrets([string]$Text) {
+    $hidden = [string]$Text
+    foreach ($secret in $script:Secrets) {
+        $hidden = $hidden.Replace($secret, '[REDACTED]')
+    }
+    return $hidden
+}
+
+function Add-Result([string]$Id, [string]$Status, [string]$Detail) {
+    $entry = [pscustomobject]@{
+        id = $Id
+        status = $Status
+        detail = Hide-Secrets $Detail
+        at = (Get-Date).ToString('o')
+    }
+    [void]$script:Results.Add($entry)
+    Write-Host ('[{0}] {1}: {2}' -f $entry.status, $entry.id, $entry.detail)
+}
+
+function Get-Value($Object, [string]$Name) {
+    if ($null -eq $Object) { return $null }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($property) { return $property.Value }
+    return $null
+}
+
+function New-CommandId { return [Guid]::NewGuid().ToString() }
+
+function New-Directory([string]$Path) {
+    if (-not [IO.Directory]::Exists($Path)) { [void][IO.Directory]::CreateDirectory($Path) }
+    return $Path
+}
+
+function Wait-Until([scriptblock]$Probe, [int]$TimeoutSeconds, [int]$IntervalMilliseconds = 300) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $value = & $Probe
+        if ($value) { return $value }
+        Start-Sleep -Milliseconds $IntervalMilliseconds
+    }
+    return $null
+}
+
+function Get-FileSha256([string]$Path) {
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+# --------------------------------------------------------------------------------------
+# HTTP: loopback Host only
+# --------------------------------------------------------------------------------------
+
+function Read-ErrorBody($WebException) {
+    $response = $null
+    if ($WebException -is [System.Net.WebException]) { $response = $WebException.Response }
+    if (-not $response) { return '' }
+    try {
+        $stream = $response.GetResponseStream()
+        if (-not $stream) { return '' }
+        $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8)
+        try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+    } catch { return '' }
+}
+
+function Invoke-JsonPost([string]$Url, $Body, [string]$Bearer, [int]$TimeoutSeconds = 120) {
+    $headers = @{}
+    if ($Bearer) { $headers['Authorization'] = "Bearer $Bearer" }
+    $json = $Body | ConvertTo-Json -Depth 30 -Compress
+    try {
+        $response = Invoke-WebRequest -Uri $Url -Method Post -UseBasicParsing -TimeoutSec $TimeoutSeconds `
+            -ContentType 'application/json' -Headers $headers -Body $json
+        return ($response.Content | ConvertFrom-Json)
+    } catch {
+        $status = 'transport'
+        $errorBody = ''
+        if ($_.Exception -is [System.Net.WebException] -and $_.Exception.Response) {
+            $status = [int]$_.Exception.Response.StatusCode
+            $errorBody = Read-ErrorBody $_.Exception
+        }
+        $detail = Hide-Secrets ('{0} -> HTTP {1} {2}' -f $Url, $status, $errorBody)
+        throw $detail
+    }
+}
+
+function Try-CoreRequest([string]$Operation, $Params, [int]$TimeoutSeconds = 120) {
+    $body = [ordered]@{ operation = $Operation; params = $Params }
+    try {
+        $response = Invoke-JsonPost -Url ($script:Origin + '/api/v1/request') -Body $body `
+            -Bearer $script:SessionToken -TimeoutSeconds $TimeoutSeconds
+    } catch {
+        return @{ Ok = $false; Status = 'transport'; Code = 'transport'; Message = (Hide-Secrets $_.Exception.Message); Result = $null }
+    }
+    $failure = Get-Value $response 'error'
+    if ($failure) {
+        return @{
+            Ok = $false
+            Status = 200
+            Code = [string](Get-Value $failure 'code')
+            Message = Hide-Secrets ([string](Get-Value $failure 'message'))
+            Result = $null
+        }
+    }
+    return @{ Ok = $true; Status = 200; Code = $null; Message = $null; Result = (Get-Value $response 'result') }
+}
+
+function Invoke-CoreRequest([string]$Operation, $Params, [int]$TimeoutSeconds = 120) {
+    $reply = Try-CoreRequest $Operation $Params $TimeoutSeconds
+    if (-not $reply.Ok) {
+        throw ("operation {0} failed: status={1} code={2} message={3}" -f $Operation, $reply.Status, $reply.Code, $reply.Message)
+    }
+    return $reply.Result
+}
+
+function Invoke-Upload([string]$ThreadId, [string]$FilePath, [string]$DisplayName) {
+    $bytes = [IO.File]::ReadAllBytes($FilePath)
+    $intent = [ordered]@{
+        commandId = New-CommandId
+        threadId = $ThreadId
+        expectedRevision = 1
+        displayName = $DisplayName
+        byteSize = $bytes.Length
+        sha256 = (Get-FileSha256 $FilePath)
+    }
+    $boundary = '----loomacc' + [Guid]::NewGuid().ToString('N')
+    $stream = New-Object IO.MemoryStream
+    try {
+        $write = {
+            param([byte[]]$Chunk)
+            $stream.Write($Chunk, 0, $Chunk.Length)
+        }
+        $intentPart = "--$boundary`r`nContent-Disposition: form-data; name=`"intent`"`r`n" +
+            "Content-Type: application/json`r`n`r`n" + ($intent | ConvertTo-Json -Depth 8 -Compress) + "`r`n"
+        & $write ($script:Utf8.GetBytes($intentPart))
+        $filePart = "--$boundary`r`nContent-Disposition: form-data; name=`"file`"; filename=`"$DisplayName`"`r`n" +
+            "Content-Type: application/octet-stream`r`n`r`n"
+        & $write ($script:Utf8.GetBytes($filePart))
+        & $write $bytes
+        & $write ($script:Utf8.GetBytes("`r`n--$boundary--`r`n"))
+        $payload = $stream.ToArray()
+    } finally { $stream.Dispose() }
+    try {
+        $response = Invoke-WebRequest -Uri ($script:Origin + '/api/v1/uploads') -Method Post -UseBasicParsing `
+            -TimeoutSec 180 -Headers @{ Authorization = "Bearer $script:SessionToken" } `
+            -ContentType "multipart/form-data; boundary=$boundary" -Body $payload
+    } catch {
+        $status = 'transport'
+        $errorBody = ''
+        if ($_.Exception -is [System.Net.WebException] -and $_.Exception.Response) {
+            $status = [int]$_.Exception.Response.StatusCode
+            $errorBody = Read-ErrorBody $_.Exception
+        }
+        throw (Hide-Secrets ("upload {0} failed: HTTP {1} {2}" -f $DisplayName, $status, $errorBody))
+    }
+    $parsed = $response.Content | ConvertFrom-Json
+    $draft = Get-Value $parsed 'draft'
+    if (-not $draft) { throw "upload $DisplayName returned no draft" }
+    return $draft
+}
+
+function New-SourceRef($Draft, [string]$ExtractedText) {
+    # Only the fields admitted by LocalAttachmentSourceRef are forwarded
+    # (crates/rovai-core/src/local_attachment_source.rs:34-47).
+    $reference = [ordered]@{
+        id = [string](Get-Value $Draft 'id')
+        sourcePath = [string](Get-Value $Draft 'sourcePath')
+        displayName = [string](Get-Value $Draft 'displayName')
+        kind = [string](Get-Value $Draft 'kind')
+        mediaType = Get-Value $Draft 'mediaType'
+        observedByteSize = Get-Value $Draft 'observedByteSize'
+    }
+    if ($ExtractedText) { $reference['extractedText'] = $ExtractedText }
+    return $reference
+}
+
+# --------------------------------------------------------------------------------------
+# campaign helpers over the real Core
+# --------------------------------------------------------------------------------------
+
+function Get-CampSnapshot([string]$ThreadId) {
+    return Invoke-CoreRequest 'camps.open' ([ordered]@{ traceId = New-CommandId; threadId = $ThreadId })
+}
+
+function New-Camp([string]$AgentId, [string]$Name) {
+    $created = Invoke-CoreRequest 'threads.create' ([ordered]@{
+            commandId = New-CommandId
+            name = $Name
+            workspace = $null
+            memberAgentIds = @($AgentId)
+            defaultLeadAgentId = $AgentId
+            collaborationMode = 'peer'
+        })
+    $status = [string](Get-Value $created 'status')
+    $threadId = Get-Value (Get-Value $created 'payload') 'threadId'
+    if ($status -ne 'applied' -or -not $threadId) {
+        throw "threads.create was not applied: $status"
+    }
+    return [string]$threadId
+}
+
+function Send-ThreadMessage([string]$ThreadId, [string]$AgentId, [string]$Text, $SourceRefs) {
+    $content = [ordered]@{
+        version = 2
+        segments = @(
+            [ordered]@{ kind = 'atom'; atom = [ordered]@{ type = 'member'; agentId = $AgentId } },
+            [ordered]@{ kind = 'text'; text = " $Text" }
+        )
+    }
+    $sent = Invoke-CoreRequest 'thread.messages.send' ([ordered]@{
+            commandId = New-CommandId
+            threadId = $ThreadId
+            content = $content
+            sourceAttachments = @($SourceRefs)
+            quotes = @()
+            replyToThreadMessageId = $null
+            deliveryMode = 'start'
+            steerTargets = @()
+            execution = [ordered]@{
+                taskId = $null
+                purpose = 'Windows real-install acceptance'
+                completionRole = 'required'
+            }
+        })
+    $commandResult = Get-Value $sent 'commandResult'
+    $status = [string](Get-Value $commandResult 'status')
+    $messageId = Get-Value (Get-Value $commandResult 'payload') 'threadMessageId'
+    if ($status -ne 'accepted' -or -not $messageId) {
+        throw "thread.messages.send was not accepted: $status"
+    }
+    return [string]$messageId
+}
+
+function Get-NewRun($Snapshot, [string]$MessageId, $ExcludedIds) {
+    $candidates = @()
+    foreach ($run in @(Get-Value $Snapshot 'agentRuns')) {
+        if (-not $run) { continue }
+        $id = [string](Get-Value $run 'id')
+        if ($ExcludedIds.Contains($id)) { continue }
+        $candidates += $run
+    }
+    foreach ($run in $candidates) {
+        if (@(Get-Value $run 'inputMessageIds') -contains $MessageId) { return $run }
+    }
+    if ($candidates.Count -gt 0) { return $candidates[$candidates.Count - 1] }
+    return $null
+}
+
+function Wait-RunTerminal([string]$ThreadId, $Run) {
+    $runId = [string](Get-Value $Run 'id')
+    $terminal = @('succeeded', 'failed', 'cancelled')
+    $settled = Wait-Until -TimeoutSeconds $RunTimeoutSeconds -Probe {
+        $snapshot = Get-CampSnapshot $ThreadId
+        foreach ($candidate in @(Get-Value $snapshot 'agentRuns')) {
+            if ($candidate -and [string](Get-Value $candidate 'id') -eq $runId) {
+                if ($terminal -contains [string](Get-Value $candidate 'status')) { return $candidate }
+            }
+        }
+        return $null
+    }
+    return $settled
+}
+
+function Get-AgentReply($Snapshot, [string]$SinceMessageId) {
+    $seen = $false
+    $reply = $null
+    foreach ($message in @(Get-Value $Snapshot 'messages')) {
+        if (-not $message) { continue }
+        $id = [string](Get-Value $message 'id')
+        if (-not $seen -and $id -eq $SinceMessageId) { $seen = $true; continue }
+        if (-not $seen) { continue }
+        if ([string](Get-Value $message 'authorType') -eq 'agent') { $reply = $message }
+    }
+    return $reply
+}
+
+# --------------------------------------------------------------------------------------
+# Office files: minimal OOXML written with the .NET Framework zip API
+# --------------------------------------------------------------------------------------
+
+function Write-TextFile([string]$Path, [string]$Content) {
+    [void](New-Directory ([IO.Path]::GetDirectoryName($Path)))
+    [IO.File]::WriteAllText($Path, $Content, $script:Utf8)
+}
+
+function New-OoxmlPackage([string]$Directory, [string]$TargetPath) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+    if ([IO.File]::Exists($TargetPath)) { [IO.File]::Delete($TargetPath) }
+    [IO.Compression.ZipFile]::CreateFromDirectory(
+        $Directory, $TargetPath, [IO.Compression.CompressionLevel]::Optimal, $false)
+    return $TargetPath
+}
+
+function New-DocxFile([string]$Path, [string]$Text) {
+    $staging = Join-Path ([IO.Path]::GetDirectoryName($Path)) 'docx-src'
+    if ([IO.Directory]::Exists($staging)) { [IO.Directory]::Delete($staging, $true) }
+    Write-TextFile (Join-Path $staging '[Content_Types].xml') (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+        '<Default Extension="xml" ContentType="application/xml"/>' +
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
+        '</Types>')
+    Write-TextFile (Join-Path $staging '_rels/.rels') (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>' +
+        '</Relationships>')
+    $escaped = [System.Security.SecurityElement]::Escape($Text)
+    Write-TextFile (Join-Path $staging 'word/document.xml') (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' +
+        "<w:p><w:r><w:t>$escaped</w:t></w:r></w:p><w:sectPr/></w:body></w:document>")
+    return (New-OoxmlPackage $staging $Path)
+}
+
+function New-PptxFile([string]$Path, [string]$Text) {
+    $staging = Join-Path ([IO.Path]::GetDirectoryName($Path)) 'pptx-src'
+    if ([IO.Directory]::Exists($staging)) { [IO.Directory]::Delete($staging, $true) }
+    Write-TextFile (Join-Path $staging '[Content_Types].xml') (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+        '<Default Extension="xml" ContentType="application/xml"/>' +
+        '<Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>' +
+        '<Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>' +
+        '</Types>')
+    Write-TextFile (Join-Path $staging '_rels/.rels') (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>' +
+        '</Relationships>')
+    Write-TextFile (Join-Path $staging 'ppt/presentation.xml') (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" ' +
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" ' +
+        'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">' +
+        '<p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst>' +
+        '<p:sldSz cx="12192000" cy="6858000"/><p:notesSz cx="6858000" cy="9144000"/></p:presentation>')
+    Write-TextFile (Join-Path $staging 'ppt/_rels/presentation.xml.rels') (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>' +
+        '</Relationships>')
+    $escaped = [System.Security.SecurityElement]::Escape($Text)
+    Write-TextFile (Join-Path $staging 'ppt/slides/slide1.xml') (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" ' +
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" ' +
+        'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree>' +
+        '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>' +
+        '<p:sp><p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr/>' +
+        "<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang=`"en-US`"/><a:t>$escaped</a:t></a:r></a:p></p:txBody></p:sp>" +
+        '</p:spTree></p:cSld></p:sld>')
+    return (New-OoxmlPackage $staging $Path)
+}
+
+function Get-OoxmlText([string]$Path, [string]$EntryName) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+    $zip = [IO.Compression.ZipFile]::OpenRead($Path)
+    try {
+        $entry = $zip.GetEntry($EntryName)
+        if (-not $entry) { return $null }
+        $reader = New-Object IO.StreamReader($entry.Open(), [Text.Encoding]::UTF8)
+        try { $xml = $reader.ReadToEnd() } finally { $reader.Dispose() }
+    } finally { $zip.Dispose() }
+    $text = [regex]::Replace($xml, '<[^>]+>', ' ')
+    $text = [System.Net.WebUtility]::HtmlDecode($text)
+    return ([regex]::Replace($text, '\s+', ' ')).Trim()
+}
+
+# --------------------------------------------------------------------------------------
+# package, install, start, stop
+# --------------------------------------------------------------------------------------
+
+function Assert-ShortWorkRoot {
+    if (-not [IO.Path]::IsPathRooted($WorkRoot)) { throw 'WorkRoot must be an absolute path.' }
+    $root = [IO.Path]::GetFullPath($WorkRoot).TrimEnd('\')
+    if ($root.Length -gt 40) { throw "WorkRoot must stay short for Expand-Archive: $($root.Length) characters" }
+    if ($root -match '(^|\\)\.\.?(\\|$)') { throw 'WorkRoot must not contain . or .. segments.' }
+    $script:Paths['work'] = New-Directory $root
+    foreach ($name in @('pkg', 'inst', 'data', 'logs', 'files')) {
+        $script:Paths[$name] = New-Directory (Join-Path $root $name)
+    }
+    $script:InstallDirectory = $script:Paths['inst']
+    $script:DataDirectory = $script:Paths['data']
+}
+
+function Expand-Package {
+    if (-not (Test-Path -LiteralPath $PackageZip -PathType Leaf)) { throw "package zip not found: $PackageZip" }
+    $copy = Join-Path $script:Paths['work'] 'pkg.zip'
+    Copy-Item -LiteralPath $PackageZip -Destination $copy -Force
+    $extracted = Join-Path $script:Paths['work'] 'unpacked'
+    if ([IO.Directory]::Exists($extracted)) { [IO.Directory]::Delete($extracted, $true) }
+    Expand-Archive -LiteralPath $copy -DestinationPath $extracted -Force
+    $candidates = @(Get-ChildItem -LiteralPath $extracted -Filter 'candidate-manifest.json' -Recurse -Depth 2 -File -ErrorAction SilentlyContinue)
+    if ($candidates.Count -eq 0) { throw 'candidate-manifest.json is missing: this is not a LOOM personal package.' }
+    $root = $candidates[0].DirectoryName
+    if (-not (Test-Path -LiteralPath (Join-Path $root 'Manage-Loom.ps1') -PathType Leaf)) {
+        throw 'Manage-Loom.ps1 is missing from the extracted package.'
+    }
+    return $root
+}
+
+function Invoke-Manager([string[]]$Arguments, [string]$LogName) {
+    $manager = Join-Path $packageRoot 'Manage-Loom.ps1'
+    $out = Join-Path $script:Paths['logs'] ($LogName + '.out.txt')
+    $err = Join-Path $script:Paths['logs'] ($LogName + '.err.txt')
+    $process = Start-Process -FilePath 'powershell.exe' -PassThru -Wait -WindowStyle Hidden `
+        -ArgumentList (@('-NoLogo', '-NoProfile', '-NonInteractive', '-File', ('"' + $manager + '"')) + $Arguments) `
+        -RedirectStandardOutput $out -RedirectStandardError $err
+    return @{ ExitCode = $process.ExitCode; StdOut = $out; StdErr = $err }
+}
+
+function Install-Package {
+    $result = Invoke-Manager @(
+        '-Action', 'Install',
+        '-PackageDirectory', ('"' + $packageRoot + '"'),
+        '-InstallDirectory', ('"' + $script:InstallDirectory + '"'),
+        '-DataDirectory', ('"' + $script:DataDirectory + '"'),
+        '-Port', [string]$Port
+    ) 'install'
+    if ($result.ExitCode -ne 0) {
+        throw "Manage-Loom.ps1 -Action Install exited $($result.ExitCode); see logs\install.err.txt"
+    }
+    $statePath = Join-Path $script:InstallDirectory 'installation.json'
+    if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) { throw 'installation.json was not written.' }
+    $state = [IO.File]::ReadAllText($statePath) | ConvertFrom-Json
+    $script:Evidence['installation'] = [ordered]@{
+        current = Get-Value $state 'current'
+        port = Get-Value $state 'port'
+        dataDirectory = Get-Value $state 'dataDirectory'
+        installDirectory = $script:InstallDirectory
+    }
+    if ([int](Get-Value $state 'port') -ne $Port) { throw 'installation.json recorded a different port.' }
+}
+
+function Start-LoomConsole {
+    # Start-Loom.cmd is the product entry point (personal-install.test.mjs:458).
+    $out = Join-Path $script:Paths['logs'] 'server.out.txt'
+    $err = Join-Path $script:Paths['logs'] 'server.err.txt'
+    $script:Launcher = Start-Process -FilePath 'cmd.exe' -ArgumentList '/d', '/c', 'Start-Loom.cmd' `
+        -WorkingDirectory $script:InstallDirectory -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $out -RedirectStandardError $err
+    return $script:Launcher
+}
+
+function Get-ListenerProcess {
+    $connection = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $connection) { return $null }
+    return (Get-Process -Id $connection.OwningProcess -ErrorAction SilentlyContinue)
+}
+
+function Wait-ServerReady {
+    $ready = Wait-Until -TimeoutSeconds $ReadyTimeoutSeconds -IntervalMilliseconds 500 -Probe {
+        if ($script:Launcher -and $script:Launcher.HasExited) { return $null }
+        try {
+            $probe = Invoke-WebRequest -Uri ($script:Origin + '/') -UseBasicParsing -TimeoutSec 5
+            if ($probe.StatusCode -eq 200 -and $probe.Content -match '<html') { return $true }
+        } catch { return $null }
+        return $null
+    }
+    if (-not $ready) { throw "the installed Server did not become healthy within $ReadyTimeoutSeconds s" }
+    $listener = Get-ListenerProcess
+    if (-not $listener) { throw "no process listens on port $Port" }
+    $installedRoot = [IO.Path]::GetFullPath($script:InstallDirectory).TrimEnd('\') + '\'
+    $listenerPath = [string]$listener.Path
+    if (-not $listenerPath.StartsWith($installedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "the listener on port $Port is not the installed version: $listenerPath"
+    }
+    $script:Evidence['listener'] = [ordered]@{ pid = $listener.Id; path = $listenerPath }
+}
+
+function Get-AdministratorToken {
+    $tokenPath = Join-Path $script:DataDirectory 'server-token'
+    $token = Wait-Until -TimeoutSeconds 60 -IntervalMilliseconds 200 -Probe {
+        if (Test-Path -LiteralPath $tokenPath -PathType Leaf) {
+            return ([IO.File]::ReadAllText($tokenPath)).Trim()
+        }
+        return $null
+    }
+    if (-not $token) { throw 'the Server did not persist server-token in the data directory.' }
+    $script:AdminToken = $token
+    Add-Secret $token
+    return $token
+}
+
+function Connect-Administrator {
+    $reply = Invoke-JsonPost -Url ($script:Origin + '/api/v1/login') -Bearer $null -Body ([ordered]@{
+            protocolVersion = 5
+            administratorToken = $script:AdminToken
+        })
+    $sessionToken = [string](Get-Value $reply 'token')
+    if (-not $sessionToken) { throw 'administrator login returned no Bearer token.' }
+    $script:SessionToken = $sessionToken
+    Add-Secret $sessionToken
+    $info = Invoke-CoreRequest 'app.info' ([ordered]@{})
+    $script:Evidence['app'] = [ordered]@{ name = [string](Get-Value $info 'name') }
+}
+
+function Stop-LoomConsole {
+    $launcher = $script:Launcher
+    if ($launcher -and -not $launcher.HasExited) {
+        # Same exact-tree stop as personal-install.test.mjs:299.
+        & taskkill.exe /PID $launcher.Id /T /F | Out-Null
+        try { Wait-Process -Id $launcher.Id -Timeout 30 -ErrorAction SilentlyContinue } catch { }
+    }
+    $listener = Get-ListenerProcess
+    if ($listener) {
+        Stop-Process -Id $listener.Id -Force -ErrorAction SilentlyContinue
+        [void](Wait-Until -TimeoutSeconds 30 -IntervalMilliseconds 200 -Probe {
+                if (-not (Get-ListenerProcess)) { return $true }
+                return $null
+            })
+    }
+    $gone = -not (Get-ListenerProcess)
+    if ($gone) {
+        Add-Result 'STOP_CONSOLE' 'PASS' "port $Port released after the console tree was stopped"
+    } else {
+        Add-Result 'STOP_CONSOLE' 'FAIL' "port $Port is still listening after the stop attempt"
+    }
+    return $gone
+}
+
+# --------------------------------------------------------------------------------------
+# acceptance steps
+# --------------------------------------------------------------------------------------
+
+function Select-MemberAndModel {
+    $members = @(Invoke-CoreRequest 'members.list' ([ordered]@{}))
+    if ($members.Count -eq 0) { throw 'the real Core returned no assistants.' }
+    $agentId = [string](Get-Value $members[0] 'agentId')
+    $profile = Invoke-CoreRequest 'members.get' ([ordered]@{ agentId = $agentId })
+    $runtimeConfiguration = Get-Value $profile 'runtimeConfiguration'
+    $adapterKind = [string](Get-Value $runtimeConfiguration 'adapterKind')
+    $currentModel = [string](Get-Value (Get-Value $runtimeConfiguration 'model') 'modelId')
+
+    if (-not $adapterKind) {
+        $installations = @(Invoke-CoreRequest 'runtime.installations.list' ([ordered]@{}))
+        $adapterKind = [string](Get-Value $installations[0] 'adapterKind')
+    }
+    if (-not $adapterKind) { throw 'the member has no configured runtime adapter.' }
+
+    if ($currentModel -ne $ModelId) {
+        [void](Invoke-CoreRequest 'runtime.product.check' ([ordered]@{ runtimeKind = $adapterKind }))
+        $installation = Wait-Until -TimeoutSeconds 120 -IntervalMilliseconds 1000 -Probe {
+            $list = @(Invoke-CoreRequest 'runtime.installations.list' ([ordered]@{}))
+            foreach ($item in $list) {
+                if ([string](Get-Value $item 'adapterKind') -ne $adapterKind) { continue }
+                if ([string](Get-Value (Get-Value $item 'snapshot') 'probeStatus') -ne 'ready') { continue }
+                return $item
+            }
+            return $null
+        }
+        if (-not $installation) { throw "runtime $adapterKind did not become ready." }
+        $models = @(Get-Value (Get-Value $installation 'snapshot') 'models')
+        $offered = $false
+        foreach ($model in $models) { if ([string](Get-Value $model 'id') -eq $ModelId) { $offered = $true } }
+        if (-not $offered) {
+            throw "model $ModelId is not offered by $adapterKind; no other model is substituted."
+        }
+        $permissions = Get-Value (Get-Value $installation 'memberRuntimeDefaults') 'permissions'
+        $configured = Invoke-CoreRequest 'members.runtime.set' ([ordered]@{
+                commandId = New-CommandId
+                command = [ordered]@{
+                    agentId = $agentId
+                    expectedVersion = Get-Value $profile 'version'
+                    adapterKind = $adapterKind
+                    model = [ordered]@{ mode = 'explicit'; modelId = $ModelId; options = [ordered]@{} }
+                    permissions = $permissions
+                }
+            })
+        if ([string](Get-Value $configured 'status') -ne 'applied') {
+            throw "members.runtime.set for $ModelId was not applied."
+        }
+        $profile = Invoke-CoreRequest 'members.get' ([ordered]@{ agentId = $agentId })
+        $runtimeConfiguration = Get-Value $profile 'runtimeConfiguration'
+    }
+
+    $resolvedModel = [string](Get-Value (Get-Value $runtimeConfiguration 'model') 'modelId')
+    $readiness = [string](Get-Value (Get-Value $profile 'runtimeReadiness') 'status')
+    if ($resolvedModel -ne $ModelId) { throw "the member frozen model is $resolvedModel, not $ModelId." }
+    if ($readiness -ne 'ready') { throw "member runtime readiness is $readiness, not ready." }
+    $script:Evidence['member'] = [ordered]@{
+        agentId = $agentId
+        adapterKind = $adapterKind
+        modelId = $resolvedModel
+        readiness = $readiness
+    }
+    Add-Result 'MEMBER_MODEL' 'PASS' "$agentId uses $adapterKind / $resolvedModel"
+    return $agentId
+}
+
+function Invoke-RealModelTurn([string]$ThreadId, [string]$AgentId) {
+    $nonce = 'LOOM-REPLY-' + (Get-Random -Minimum 100000 -Maximum 999999)
+    $before = Get-CampSnapshot $ThreadId
+    $excluded = New-Object 'Collections.Generic.HashSet[string]'
+    foreach ($run in @(Get-Value $before 'agentRuns')) { if ($run) { [void]$excluded.Add([string](Get-Value $run 'id')) } }
+    $messageId = Send-ThreadMessage $ThreadId $AgentId `
+        "Real-model smoke: reply with exactly the token $nonce and nothing else. Do not use tools." @()
+    $run = Wait-Until -TimeoutSeconds 60 -IntervalMilliseconds 200 -Probe {
+        $snapshot = Get-CampSnapshot $ThreadId
+        return (Get-NewRun $snapshot $messageId $excluded)
+    }
+    if (-not $run) { throw 'no AgentRun was created for the real-model message.' }
+    $run = Wait-RunTerminal $ThreadId $run
+    if (-not $run) { throw "the real-model AgentRun did not reach a terminal state within $RunTimeoutSeconds s." }
+    $status = [string](Get-Value $run 'status')
+    if ($status -ne 'succeeded') {
+        throw ("the real-model AgentRun ended {0} (reason {1})." -f $status, [string](Get-Value $run 'terminalReasonCode'))
+    }
+    $snapshot = Get-CampSnapshot $ThreadId
+    $reply = Get-AgentReply $snapshot $messageId
+    $body = ''
+    if ($reply) { $body = [string](Get-Value $reply 'body') }
+    if ($body -notlike "*$nonce*") { throw 'the assistant reply did not contain the request token.' }
+    $observedModel = Get-Value $run 'runtimeModel'
+    if (-not $observedModel) { $observedModel = Get-Value $reply 'runtimeModel' }
+    $observedModelId = [string](Get-Value $observedModel 'modelId')
+    if ($observedModelId -and $observedModelId -ne $ModelId) {
+        throw "the run reported model $observedModelId, not $ModelId."
+    }
+    if (-not $observedModelId) {
+        Add-Result 'REAL_MODEL_IDENTITY' 'SKIP' 'the Run and the reply reported no runtimeModel.modelId'
+    } else {
+        Add-Result 'REAL_MODEL_IDENTITY' 'PASS' "run reported $observedModelId"
+    }
+    $script:Evidence['realModel'] = [ordered]@{
+        threadId = $ThreadId
+        messageId = $messageId
+        agentRunId = [string](Get-Value $run 'id')
+        runStatus = $status
+        observedModelId = $observedModelId
+        replyPreview = $body.Substring(0, [Math]::Min(200, $body.Length))
+    }
+    Add-Result 'REAL_MODEL' 'PASS' "real reply received for $nonce"
+}
+
+function Invoke-DocxCheck([string]$ThreadId, [string]$AgentId) {
+    $marker = 'LOOM-DOCX-MARKER-' + (Get-Random -Minimum 100000 -Maximum 999999)
+    $path = Join-Path $script:Paths['files'] 'acceptance.docx'
+    [void](New-DocxFile $path ("$marker first acceptance paragraph."))
+    $extracted = Get-OoxmlText $path 'word/document.xml'
+    if ($extracted -notlike "*$marker*") { throw 'the generated docx does not contain its own marker.' }
+    $draft = Invoke-Upload $ThreadId $path 'acceptance.docx'
+    $source = New-SourceRef $draft $extracted
+    $before = Get-CampSnapshot $ThreadId
+    $excluded = New-Object 'Collections.Generic.HashSet[string]'
+    foreach ($run in @(Get-Value $before 'agentRuns')) { if ($run) { [void]$excluded.Add([string](Get-Value $run 'id')) } }
+    $messageId = Send-ThreadMessage $ThreadId $AgentId `
+        "Read the attached acceptance.docx text and reply with the single line that starts with LOOM-DOCX-MARKER. Never guess." @($source)
+    $run = Wait-Until -TimeoutSeconds 60 -IntervalMilliseconds 200 -Probe {
+        $snapshot = Get-CampSnapshot $ThreadId
+        return (Get-NewRun $snapshot $messageId $excluded)
+    }
+    if (-not $run) { throw 'no AgentRun was created for the docx message.' }
+    $run = Wait-RunTerminal $ThreadId $run
+    if (-not $run) { throw "the docx AgentRun did not reach a terminal state within $RunTimeoutSeconds s." }
+    if ([string](Get-Value $run 'status') -ne 'succeeded') {
+        throw ("the docx AgentRun ended {0} (reason {1})." -f [string](Get-Value $run 'status'), [string](Get-Value $run 'terminalReasonCode'))
+    }
+    $reply = Get-AgentReply (Get-CampSnapshot $ThreadId) $messageId
+    $body = ''
+    if ($reply) { $body = [string](Get-Value $reply 'body') }
+    if ($body -notlike "*$marker*") { throw 'the assistant reply did not quote the docx marker.' }
+    $script:Evidence['docx'] = [ordered]@{
+        marker = $marker
+        sourcePath = [string](Get-Value $source 'sourcePath')
+        attachmentId = [string](Get-Value $source 'id')
+        agentRunId = [string](Get-Value $run 'id')
+        replyPreview = $body.Substring(0, [Math]::Min(200, $body.Length))
+    }
+    Add-Result 'DOCX_MARKER' 'PASS' "assistant quoted $marker from the uploaded docx"
+}
+
+function Test-PptxPreviewInterface([string]$ThreadId) {
+    $marker = 'LOOM-PPTX-MARKER-' + (Get-Random -Minimum 100000 -Maximum 999999)
+    $path = Join-Path $script:Paths['files'] 'acceptance.pptx'
+    [void](New-PptxFile $path ("$marker slide one."))
+    $draft = Invoke-Upload $ThreadId $path 'acceptance.pptx'
+    $sourcePath = [string](Get-Value $draft 'sourcePath')
+    if (-not $sourcePath) { throw 'the pptx upload returned no source path.' }
+    Add-Result 'PPTX_UPLOAD' 'PASS' "uploaded acceptance.pptx as $([string](Get-Value $draft 'id'))"
+
+    $soffice = Get-Command 'soffice' -ErrorAction SilentlyContinue
+    $pdftoppm = Get-Command 'pdftoppm' -ErrorAction SilentlyContinue
+    $script:Evidence['pptx'] = [ordered]@{
+        attachmentId = [string](Get-Value $draft 'id')
+        sourcePath = $sourcePath
+        soffice = [bool]$soffice
+        pdftoppm = [bool]$pdftoppm
+    }
+
+    # The page-preview path is loom.artifact.preview over a registered Loom artifact
+    # (crates/rovai-core/src/loom.rs:1216-1219). This acceptance run creates no Loom Mission,
+    # so only the interface admission is asserted here.
+    $probe = Try-CoreRequest 'loom.artifact.preview' ([ordered]@{
+            missionId = 'loom-acc-no-mission'
+            artifactId = 'loom-acc-no-artifact'
+        })
+    # Only an answered call or the "artifact does not belong to this Mission" rejection proves the
+    # operation is routed and admitted (loom.rs:3638-3643); any other code or a transport error fails.
+    if ($probe.Ok) {
+        Add-Result 'PPTX_PREVIEW_INTERFACE' 'PASS' 'loom.artifact.preview answered with a preview result'
+    } elseif ([string]$probe.Code -eq 'LOOM_EVIDENCE_NOT_FOUND') {
+        Add-Result 'PPTX_PREVIEW_INTERFACE' 'PASS' "loom.artifact.preview is routed and admitted the call; Core rejected the placeholder artifact with $($probe.Code)"
+    } else {
+        Add-Result 'PPTX_PREVIEW_INTERFACE' 'FAIL' ("loom.artifact.preview was not routed/admitted: status={0} code={1} message={2}" -f $probe.Status, $probe.Code, $probe.Message)
+    }
+
+    if (-not $soffice -or -not $pdftoppm) {
+        # Same pair the Core probes before rendering (crates/rovai-core/src/loom/pptx_preview.rs:234-247).
+        Add-Result 'PPTX_PREVIEW' 'SKIP_LIBREOFFICE' 'soffice/pdftoppm are not installed; page preview is not exercised and is not a product failure'
+        return
+    }
+    Add-Result 'PPTX_PREVIEW' 'TODO_VERIFY_API' 'page preview needs a registered Loom artifact (missionId/artifactId); LibreOffice present, full path not exercised here'
+}
+
+function Invoke-StopCheck([string]$ThreadId, [string]$AgentId) {
+    $before = Get-CampSnapshot $ThreadId
+    $excluded = New-Object 'Collections.Generic.HashSet[string]'
+    foreach ($run in @(Get-Value $before 'agentRuns')) { if ($run) { [void]$excluded.Add([string](Get-Value $run 'id')) } }
+    $messageId = Send-ThreadMessage $ThreadId $AgentId `
+        'Stop check: write a long, slow answer. Produce at least 800 words and keep working until you are interrupted.' @()
+    $running = Wait-Until -TimeoutSeconds 60 -IntervalMilliseconds 200 -Probe {
+        $snapshot = Get-CampSnapshot $ThreadId
+        $run = Get-NewRun $snapshot $messageId $excluded
+        if (-not $run) { return $null }
+        $status = [string](Get-Value $run 'status')
+        if ($status -eq 'running') { return $run }
+        if (@('succeeded', 'failed', 'cancelled') -contains $status) { return 'terminal' }
+        return $null
+    }
+    if ($null -eq $running) { throw 'no AgentRun appeared for the stop check.' }
+    if ($running -is [string]) {
+        Add-Result 'STOP' 'FAIL' 'stop API was not exercised because the run reached terminal state before cancellation'
+        return
+    }
+    $cancelled = Invoke-CoreRequest 'agentRuns.cancel' ([ordered]@{
+            commandId = New-CommandId
+            command = [ordered]@{
+                threadId = $ThreadId
+                agentRunId = [string](Get-Value $running 'id')
+                expectedVersion = Get-Value $running 'version'
+            }
+        })
+    if ([string](Get-Value $cancelled 'status') -eq 'rejected') {
+        throw "agentRuns.cancel was rejected: $(Hide-Secrets ([string](Get-Value $cancelled 'code')))"
+    }
+    $settled = Wait-Until -TimeoutSeconds $StopTimeoutSeconds -IntervalMilliseconds 300 -Probe {
+        $snapshot = Get-CampSnapshot $ThreadId
+        foreach ($run in @(Get-Value $snapshot 'agentRuns')) {
+            if ($run -and [string](Get-Value $run 'id') -eq [string](Get-Value $running 'id')) {
+                if (@('succeeded', 'failed', 'cancelled') -contains [string](Get-Value $run 'status')) { return $run }
+            }
+        }
+        return $null
+    }
+    if (-not $settled) { throw "the cancelled AgentRun did not settle within $StopTimeoutSeconds s." }
+    $status = [string](Get-Value $settled 'status')
+    if ($status -ne 'cancelled') { throw "agentRuns.cancel left the Run $status." }
+    $script:Evidence['stop'] = [ordered]@{
+        threadId = $ThreadId
+        agentRunId = [string](Get-Value $settled 'id')
+        finalStatus = $status
+        cancelAcknowledgedAt = Get-Value $settled 'cancelAcknowledgedAt'
+    }
+    Add-Result 'STOP' 'PASS' "agentRuns.cancel settled the Run as cancelled"
+}
+
+# --------------------------------------------------------------------------------------
+# log collection
+# --------------------------------------------------------------------------------------
+
+function Clear-SecretFromFile([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    $text = [IO.File]::ReadAllText($Path)
+    $hidden = Hide-Secrets $text
+    if ($hidden -ne $text) { [IO.File]::WriteAllText($Path, $hidden, $script:Utf8) }
+}
+
+function Write-AcceptanceArtifacts {
+    $logRoot = $script:Paths['logs']
+    foreach ($name in @('install.out.txt', 'install.err.txt', 'server.out.txt', 'server.err.txt')) {
+        Clear-SecretFromFile (Join-Path $logRoot $name)
+    }
+    if ($script:InstallDirectory -and (Test-Path -LiteralPath $script:InstallDirectory)) {
+        Get-ChildItem -LiteralPath $script:InstallDirectory -Force |
+            Select-Object Name, Length, LastWriteTime |
+            Format-Table -AutoSize | Out-String |
+            Set-Content -LiteralPath (Join-Path $logRoot 'install-dir.txt') -Encoding UTF8
+        $statePath = Join-Path $script:InstallDirectory 'installation.json'
+        if (Test-Path -LiteralPath $statePath) {
+            Copy-Item -LiteralPath $statePath -Destination (Join-Path $logRoot 'installation.json') -Force
+        }
+    }
+    if ($script:DataDirectory -and (Test-Path -LiteralPath $script:DataDirectory)) {
+        Get-ChildItem -LiteralPath $script:DataDirectory -Force |
+            Select-Object Name, Length, LastWriteTime |
+            Format-Table -AutoSize | Out-String |
+            Set-Content -LiteralPath (Join-Path $logRoot 'data-dir.txt') -Encoding UTF8
+    }
+    $failed = @($script:Results | Where-Object { $_.status -eq 'FAIL' }).Count -gt 0
+    $summary = [ordered]@{
+        kind = 'loom-windows-real-install-acceptance'
+        status = if ($failed) { 'FAIL' } else { 'PASS' }
+        finishedAt = (Get-Date).ToString('o')
+        port = $Port
+        modelId = $ModelId
+        installDirectory = $script:InstallDirectory
+        dataDirectory = $script:DataDirectory
+        packageRoot = $packageRoot
+        credentialSource = 'OCT_API_KEY (value never recorded)'
+        evidence = $script:Evidence
+        results = $script:Results
+    }
+    $summary | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $logRoot 'summary.json') -Encoding UTF8
+    $lines = New-Object 'Collections.Generic.List[string]'
+    $lines.Add('LOOM Windows real-install acceptance')
+    $lines.Add("finished: $((Get-Date).ToString('o'))")
+    $lines.Add("install: $($script:InstallDirectory)")
+    $lines.Add("data:    $($script:DataDirectory)")
+    $lines.Add("port:    $Port   model: $ModelId")
+    $lines.Add('')
+    foreach ($status in @('PASS', 'FAIL', 'SKIP', 'SKIP_LIBREOFFICE', 'SKIP_STOP_WINDOW', 'TODO_VERIFY_API')) {
+        foreach ($entry in @($script:Results | Where-Object { $_.status -eq $status })) {
+            $lines.Add(('{0,-18} {1}: {2}' -f $entry.status, $entry.id, $entry.detail))
+        }
+    }
+    $lines.Add('')
+    $lines.Add("exit code: $(if ($failed) { 1 } else { 0 })")
+    [IO.File]::WriteAllLines((Join-Path $logRoot 'report.txt'), $lines, $script:Utf8)
+    return $failed
+}
+
+# --------------------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------------------
+
+$packageRoot = $null
+$exitCode = 0
+try {
+    Assert-ShortWorkRoot
+    Set-Content -LiteralPath (Join-Path $script:Paths['logs'] 'report.txt') -Value 'acceptance started' -Encoding UTF8
+
+    # FAIL_FAST: the credential is read from the environment only and never echoed.
+    $credential = $env:OCT_API_KEY
+    if (-not $credential -or $credential.Trim().Length -eq 0) {
+        Add-Result 'CREDENTIAL' 'FAIL' 'OCT_API_KEY is not set in this process; FAIL_FAST before install'
+        $exitCode = 2
+        throw 'FAIL_FAST: OCT_API_KEY is missing.'
+    }
+    Add-Secret $credential
+    $credential = $null
+    Add-Result 'CREDENTIAL' 'PASS' 'OCT_API_KEY present and held only in the process environment'
+
+    $packageRoot = Expand-Package
+    Add-Result 'EXTRACT' 'PASS' "package extracted under $($script:Paths['work'])"
+
+    Install-Package
+    Add-Result 'INSTALL' 'PASS' ("installed {0} on port {1}" -f (Get-Value $script:Evidence['installation'] 'current'), $Port)
+
+    [void](Start-LoomConsole)
+    Wait-ServerReady
+    Add-Result 'START' 'PASS' "installed Server answers $($script:Origin)/"
+
+    [void](Get-AdministratorToken)
+    Connect-Administrator
+    Add-Result 'LOGIN' 'PASS' 'administrator token accepted by /api/v1/login'
+
+    $agentId = Select-MemberAndModel
+    $threadId = New-Camp $agentId "Windows real install acceptance $((Get-Date).ToString('yyyyMMdd-HHmmss'))"
+    Add-Result 'CAMP' 'PASS' "created thread $threadId"
+
+    Invoke-RealModelTurn $threadId $agentId
+    Invoke-DocxCheck $threadId $agentId
+    Test-PptxPreviewInterface $threadId
+    Invoke-StopCheck $threadId $agentId
+} catch {
+    Add-Result 'ACCEPTANCE' 'FAIL' (Hide-Secrets $_.Exception.Message)
+} finally {
+    try { if ($script:Launcher) { [void](Stop-LoomConsole) } } catch {
+        Add-Result 'STOP_CONSOLE' 'FAIL' (Hide-Secrets $_.Exception.Message)
+    }
+    try {
+        $failed = Write-AcceptanceArtifacts
+        if ($failed -and $exitCode -eq 0) { $exitCode = 1 }
+    } catch {
+        Write-Host ('log collection failed: ' + (Hide-Secrets $_.Exception.Message))
+        if ($exitCode -eq 0) { $exitCode = 1 }
+    }
+}
+
+$passed = @($script:Results | Where-Object { $_.status -eq 'PASS' }).Count
+$skipped = @($script:Results | Where-Object { $_.status -like 'SKIP*' -or $_.status -eq 'TODO_VERIFY_API' }).Count
+$failed = @($script:Results | Where-Object { $_.status -eq 'FAIL' }).Count
+Write-Host ''
+Write-Host ("acceptance: {0} PASS / {1} SKIP / {2} FAIL; logs in {3}" -f $passed, $skipped, $failed, $script:Paths['logs'])
+exit $exitCode
