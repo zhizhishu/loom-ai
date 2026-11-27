@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::db::Database;
@@ -502,6 +502,7 @@ const LOOM_TASK_NOT_DRAFT: &str = "LOOM_TASK_NOT_DRAFT";
 const LOOM_TASK_NOT_READY: &str = "LOOM_TASK_NOT_READY";
 const LOOM_DEPENDENCY_UNRELEASED: &str = "LOOM_DEPENDENCY_UNRELEASED";
 const LOOM_CLAIM_HELD: &str = "LOOM_CLAIM_HELD";
+const LOOM_CLAIM_ASSIGNEE: &str = "LOOM_CLAIM_ASSIGNEE";
 const LOOM_CLAIM_COMMAND_REUSED: &str = "LOOM_CLAIM_COMMAND_REUSED";
 const LOOM_REMOTE_TARGET_UNAVAILABLE: &str = "LOOM_REMOTE_TARGET_UNAVAILABLE";
 const LOOM_CLAIM_ABSENT: &str = "LOOM_CLAIM_ABSENT";
@@ -883,6 +884,7 @@ pub fn plan_import(
         )?;
         dependency_ids.push(dependency_id);
     }
+    seed_default_control_policy(&transaction, mission_id, &plan_id, &task_rows, &now)?;
     transaction.commit()?;
 
     Ok(LoomPlanImportResult {
@@ -892,6 +894,106 @@ pub fn plan_import(
         task_ids: plan_task_ids.into_iter().map(str::to_string).collect(),
         dependency_ids,
     })
+}
+
+/// Seed the personal-edition default automation grant when a Plan is first imported.
+///
+/// Mikka's factory does not make a person configure a second machine-readable permission after
+/// they have already given the Goal; the Goal itself is the Owner's authorization to execute the
+/// plan. LOOM keeps the durable control-plane table as the only authority, so that approval is
+/// projected here without a migration: every imported Task is in scope, another active Bot is the
+/// independent reviewer, and the initial budget is deliberately small. The Owner can still pause
+/// or rewrite this standing grant through `loom.control.configure`/`pause`.
+fn seed_default_control_policy(
+    transaction: &Transaction<'_>,
+    mission_id: &str,
+    plan_id: &str,
+    task_rows: &[ImportedTask<'_>],
+    now: &str,
+) -> Result<()> {
+    if task_rows.is_empty() || task_rows.iter().any(|task| task.assignee_agent_id.is_none()) {
+        // Automatic execution is only meaningful when every Task names its producer. A partially
+        // assigned Plan keeps the historical manual flow instead of silently dropping the unassigned
+        // remainder from the standing grant.
+        return Ok(());
+    }
+    let control_schema_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='loom_control_policy')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !control_schema_exists {
+        // Legacy databases that predate the control migration must remain writable while they
+        // upgrade; the default is a projection onto the control schema, not a new schema gate.
+        return Ok(());
+    }
+    let (camp_id, lead_agent_id): (String, Option<String>) = transaction.query_row(
+        "SELECT mission.camp_id, camp.default_lead_agent_id FROM mission
+         JOIN camp ON camp.id = mission.camp_id WHERE mission.id=?1",
+        [mission_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let mut statement = transaction.prepare(
+        "SELECT member.agent_id FROM camp_member member
+         JOIN agent_profile profile ON profile.id = member.agent_id
+         WHERE member.camp_id=?1 AND member.status='active' AND member.leave_requested_at IS NULL
+           AND profile.profile_status='present'
+         ORDER BY member.agent_id",
+    )?;
+    let members: Vec<String> = statement
+        .query_map([&camp_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if task_rows.iter().any(|task| {
+        task.assignee_agent_id
+            .is_some_and(|assignee| !members.iter().any(|member| member == assignee))
+    }) {
+        return Ok(());
+    }
+    let mut reviewers = Vec::with_capacity(task_rows.len());
+    for task in task_rows {
+        let assignee = task.assignee_agent_id.unwrap_or("");
+        let reviewer = members
+            .iter()
+            .find(|agent| {
+                agent.as_str() != assignee && Some(agent.as_str()) != lead_agent_id.as_deref()
+            })
+            .or_else(|| members.iter().find(|agent| agent.as_str() != assignee))
+            .cloned();
+        if let Some(reviewer_agent_id) = reviewer {
+            reviewers.push(crate::loom::control::LoomReviewerAssignment {
+                task_id: task.task_id.to_string(),
+                reviewer_agent_id,
+            });
+        }
+    }
+    if reviewers.len() != task_rows.len() {
+        // A one-Bot room cannot provide an independent reviewer. Leave automation off rather
+        // than weakening the review invariant; the Owner can approve a corrected roster later.
+        return Ok(());
+    }
+    let expires_at =
+        (chrono::DateTime::parse_from_rfc3339(now)? + chrono::Duration::hours(24)).to_rfc3339();
+    let task_ids: Vec<String> = task_rows
+        .iter()
+        .map(|task| task.task_id.to_string())
+        .collect();
+    transaction.execute(
+        "INSERT INTO loom_control_policy(plan_id,mission_id,revision,authorization_revision,
+                                        enabled,paused,task_ids_json,reviewers_json,
+                                        max_dispatches,max_reworks_per_task,expires_at,
+                                        approved_by,approved_at,updated_at)
+         VALUES(?1,?2,1,1,1,0,?3,?4,32,2,?5,?6,?7,?7)",
+        params![
+            plan_id,
+            mission_id,
+            serde_json::to_string(&task_ids)?,
+            serde_json::to_string(&reviewers)?,
+            expires_at,
+            crate::current_user::CURRENT_USER_ID,
+            now,
+        ],
+    )?;
+    Ok(())
 }
 
 /// Release input: the Mission-scoped Task that becomes `READY` for claiming.
@@ -1526,14 +1628,14 @@ pub(crate) fn claim_acquire_in(
             format!("mission {mission_id} has no LOOM plan"),
         ));
     };
-    let status: Option<String> = transaction
+    let task_row: Option<(String, Option<String>)> = transaction
         .query_row(
-            "SELECT status FROM loom_task WHERE plan_id=?1 AND task_id=?2",
+            "SELECT status, assignee_agent_id FROM loom_task WHERE plan_id=?1 AND task_id=?2",
             params![&plan_id, &task_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let Some(status) = status else {
+    let Some((status, assignee_agent_id)) = task_row else {
         return Err(LoomCommandError::rejection(
             LOOM_TASK_NOT_FOUND,
             format!("task {task_id} does not belong to the plan of mission {mission_id}"),
@@ -1568,6 +1670,14 @@ pub(crate) fn claim_acquire_in(
         return Err(LoomCommandError::rejection(
             LOOM_TASK_NOT_READY,
             format!("LOOM task {task_id} is {status} and cannot be claimed"),
+        ));
+    }
+    if let Some(assignee) = assignee_agent_id.as_deref()
+        && claimant_agent_id.as_deref() != Some(assignee)
+    {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_ASSIGNEE,
+            format!("LOOM task {task_id} is assigned to {assignee}"),
         ));
     }
     let blocking = blocking_dependencies(transaction, &plan_id, &task_id)?;
@@ -4985,6 +5095,38 @@ mod tests {
             .to_string()
     }
 
+    fn create_mission_with_members(
+        database: &mut OwnedTestDatabase,
+        title: &str,
+        members: &[&str],
+    ) -> String {
+        let workspace = database
+            .directory()
+            .join(format!("loom-workspace-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let created = MissionService::default()
+            .create(
+                database,
+                &command(CreateMissionCommand {
+                    team: None,
+                    title: title.into(),
+                    description: String::new(),
+                    description_content: None,
+                    project_path: workspace.to_string_lossy().into_owned(),
+                    project_binding_kind: ProjectBindingKind::Directory,
+                    member_agent_ids: members.iter().map(|member| (*member).to_string()).collect(),
+                    default_lead_agent_id: members[0].into(),
+                    tags: vec![],
+                    source_attachments: vec![],
+                }),
+            )
+            .unwrap();
+        created.result.payload["missionId"]
+            .as_str()
+            .expect("mission creation must return a missionId")
+            .to_string()
+    }
+
     fn criterion(criterion_id: &str, text: &str) -> LoomPlanImportCriterion {
         LoomPlanImportCriterion {
             criterion_id: criterion_id.into(),
@@ -5838,6 +5980,76 @@ mod tests {
             LOOM_MISSION_NOT_FOUND,
             "assertion release_rejects_an_unknown_mission"
         );
+    }
+
+    #[test]
+    fn first_plan_import_seeds_the_default_control_policy() {
+        let mut database = fixture();
+        let mission_id = create_mission_with_members(
+            &mut database,
+            "LOOM default control",
+            &["agent_1", "agent_2", "agent_3"],
+        );
+        let mut input = plan_input(&mission_id);
+        input.tasks[0].assignee_agent_id = Some("agent_2".into());
+        input.tasks[1].assignee_agent_id = Some("agent_2".into());
+
+        plan_import(&mut database, input).unwrap();
+
+        let (enabled, task_count, reviewer, max_dispatches, max_reworks): (i64, i64, String, i64, i64) = database
+            .connection()
+            .query_row(
+                "SELECT enabled, json_array_length(task_ids_json), reviewers_json,
+                        max_dispatches, max_reworks_per_task
+                 FROM loom_control_policy",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(enabled, 1);
+        assert_eq!(task_count, 2);
+        assert_eq!(max_dispatches, 32);
+        assert_eq!(max_reworks, 2);
+        let reviewers: serde_json::Value = serde_json::from_str(&reviewer).unwrap();
+        assert_eq!(reviewers.as_array().unwrap().len(), 2);
+        for assignment in reviewers.as_array().unwrap() {
+            assert_ne!(assignment["reviewerAgentId"], "agent_2");
+        }
+
+        let admitted = crate::loom::control::admit_due_dispatches(&mut database).unwrap();
+        assert_eq!(admitted, 1);
+        let (kind, recipient, task_status): (String, String, String) = database
+            .connection()
+            .query_row(
+                "SELECT dispatch.kind, dispatch.recipient_agent_id, task.status
+                 FROM loom_control_dispatch dispatch
+                 JOIN loom_task task ON task.plan_id=dispatch.plan_id AND task.task_id=dispatch.task_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "EXECUTE");
+        assert_eq!(recipient, "agent_2");
+        assert_eq!(task_status, "READY");
+    }
+
+    #[test]
+    fn an_assigned_task_cannot_be_claimed_by_another_agent() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claim assignee");
+        let mut input = plan_input(&mission_id);
+        input.tasks[0].assignee_agent_id = Some("agent_2".into());
+        plan_import(&mut database, input).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+
+        let error = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_lead", "command_lead"),
+        )
+        .unwrap_err();
+
+        assert_eq!(command_code(&error), LOOM_CLAIM_ASSIGNEE);
+        assert_eq!(claim_rows(&database), 0);
     }
 
     #[test]

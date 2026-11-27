@@ -1,12 +1,12 @@
 ---
 document_type: model-context-change
 version: v1.72
-revision: 3
+revision: 4
 confirmation_status: confirmed
-confirmed_revision: 3
+confirmed_revision: 4
 confirmed_by: local_user
-confirmed_at: 2026-10-31
-last_updated: 2026-11-01
+confirmed_at: 2026-11-26
+last_updated: 2026-11-26
 ---
 
 # LOOM 编排入口：Agent CLI `rovai loom` 与 cli-operations 参考
@@ -323,11 +323,11 @@ Plan file shape (`rovai loom plan --input-file plan.json`). Every object has exa
     { "criterionId": "report-exists", "text": "out/report.md exists and covers the three points" }
   ],
   "tasks": [
-    { "taskId": "report-draft", "title": "Draft the report", "description": "Write out/report.md" },
-    { "taskId": "report-review", "title": "Review the report" }
+    { "taskId": "report-draft", "title": "Draft the report", "description": "Write out/report.md", "assigneeAgentId": "<worker-a-agent-id>" },
+    { "taskId": "report-final", "title": "Finish the report", "description": "Produce the final report", "assigneeAgentId": "<worker-b-agent-id>" }
   ],
   "dependencies": [
-    { "upstreamTaskId": "report-draft", "downstreamTaskId": "report-review", "condition": "task_done" }
+    { "upstreamTaskId": "report-draft", "downstreamTaskId": "report-final", "condition": "task_done" }
   ]
 }
 ```
@@ -372,3 +372,28 @@ Optional: `acceptanceCriteriaVersion` (top level), `description` and `assigneeAg
 | `pnpm docs:check` | 通过 |
 
 以 root 跑全量 `rovai-core` 时，3 个 `database_admission` 测试会因 SQLite WAL ctime 失败；本轮过滤未包含它们，未复跑。
+
+
+## r4 修订（2026-11-26，已二次确认）
+
+起因：个人版最终验收证明新装包 `loom_control_policy_count=0`，Lead 继续按旧手工流程放行、私信并亲自动工，受控工兵与阶段审查没有发生。用户/Hark 明确指示：首次导入计划时按 Mikka factory 默认建立控制策略，不加迁移，初版求快。
+
+### r4 变更后（精确合同）
+
+`loom.plan` description 全文：
+
+```text
+Import the current Mission's one LOOM plan. Default Lead only. A Mission accepts one plan; it cannot be replaced. Importing starts approved automatic dispatch for assigned tasks; do not release, message, claim, or implement them in the Lead run. Pass the plan as JSON with --input-file; the exact file shape is in the cli-operations LOOM reference.
+```
+
+`skills/cli-operations/references/loom.md` 的行为规则改为：导入后 Lead 停止当前 Run；Core 将已指派且依赖满足的任务自动 DRAFT→READY 并派发系统 handoff；Lead 不再 release、message、claim 或亲自实现；实现任务不应另建“阶段审查任务”，独立审查由控制平面派发。首次导入会播种个人版默认授权：全部导入任务、独立 active reviewer、总派发 32、每任务返工 2、24 小时到期。User 可在 Orchestration 查看、暂停、恢复或改写；只有 User 可变更或暂停。被指派任务只能由 assignee 认领。
+
+Pi managed workflow tool 的说明同步为同一规则。inputSchema/outputSchema、身份注入、权限、文件形状、错误结构和 Bootstrap 预算不变。
+
+### r4 二次确认
+
+用户/Hark 于 2026-11-26 10:45 明确指示“按现有代码路径补上默认策略（照 Mikka factory 默认，不新增表），让主助手真的派 WorkerA/Hanzi 各自独立 run，Review 能落库”。该指令即本 revision 的实施确认。
+
+### r4 验证
+
+新增 Core 测试验证首次导入播种默认策略、自动派发 EXECUTE、非 assignee 不能认领；既有 catalog/CLI/reference 样例测试按新文本更新。
