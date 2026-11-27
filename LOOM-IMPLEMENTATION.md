@@ -17,24 +17,25 @@
 | T20 Assignment DAG | PASS / Devin VM / 真 / SWE-2 原始回执待回填 / 未回传 sha |
 | T21 迟到回复 | PASS / Devin VM / 真 / SWE-2 原始回执待回填 / 未回传 sha |
 | T22b Claude 禁用 | PASS / Devin VM / 真 / `/home/ubuntu/final-acc-swe3/artifacts/t22b-claude-disabled.json` sha256 `3f8ab1058676625593a0183b9ed59f730d394b772741f6104f28f3888e19e2e6` / Claude 进程计数 0 |
-| T23 Markdown 人格导入 | PASS / Devin VM / 真 / `/home/ubuntu/final-acc-ext/artifacts/t23-persona-import-validation.json` sha256 `6d79f5a608f595a04d1a0e08e7cb3d92832f354c89fd317f05bc1e2a511ddf76`；回归证据 sha256 `399f06865e23c1ea32353d72993f18a80b368d2f440724d03f85ac1b17b183b2` / 无 |
-| T24 提示词模式/hash | PASS / Devin VM / 真 / 回归证据 `/home/ubuntu/final-regress/artifacts/` sha256 `adb2cf117b99e2d87fdde9f3777deba9a17c493c0f00e63b97aeb2b2ccbdcd80` / Replace 不适用 |
-| T25 记忆隔离与记忆库 | PASS / Devin VM / 真 / 回归证据 sha256 `e964739ebb6afbc52b48c68b85d493bf3d4a1deb9f354be8e43f830787ba3311` / W1/W2 不串，界面可看改暂停删 |
-| T26 恶意扩展 | PASS / Devin VM / 真 / 回归证据 sha256 `3256cb2904b05d4c9a896ddce1839e33877dfcb72ce81cca876ccd90a3c91977` / `--no-extensions` 后目录自动发现关闭 |
-| 提示注入 | PASS / Devin VM / 真 / `/home/ubuntu/final-acc-ext/artifacts/t27-security-summary.json` sha256 `9b6718104ceffe1daef7b08cf8055cd1a05fad8e0f4ff039127fa404cf6aae78`；回归证据 sha256 `db51c30253cf2a70a3465620a1e33f9f8a7c36dc18dff5a99ca396e8cb7924d2` / 无秘密外泄、无 marker、删除目标幸存 |
+| T23 Markdown 人格导入 | PASS / Devin VM / 真 / `/home/ubuntu/final-acc-ext/artifacts/t23-persona-import-validation.json` sha256 `6d79f5a608f595a04d1a0e08e7cb3d92832f354c89fd317f05bc1e2a511ddf76`；回归证据 `/home/ubuntu/final-regress/artifacts/t23-persona-import-validation.json` sha256 `399f06865e23c1ea32353d72993f18a80b368d2f440724d03f85ac1b17b183b2` / 无 |
+| T24 提示词模式/hash | PASS / Devin VM / 真 / 原始 Append 证据 `/home/ubuntu/final-acc-swe3-r2/artifacts/t30-append-r2.json` sha256 `558f06afad4651959f59587b251c79b3ee97222022b911278bef8211ca6c9543`；回归证据 `/home/ubuntu/final-regress/artifacts/t26-purge-append-fixed.json` sha256 `adb2cf117b99e2d87fdde9f3777deba9a17c493c0f00e63b97aeb2b2ccbdcd80` / Replace 不适用 |
+| T25 记忆隔离与记忆库 | PASS / Devin VM / 真 / 原始证据 `/home/ubuntu/final-acc-swe3/artifacts/t25-memory-isolation-final.json` sha256 `57508b7503e86b4356fc3b5b9915f787092c4c1146813c7a98e909b38f314987`；回归证据 `/home/ubuntu/final-regress/artifacts/t19-memory-fixed.json` sha256 `e964739ebb6afbc52b48c68b85d493bf3d4a1deb9f354be8e43f830787ba3311` / W1/W2 不串，界面可看改暂停删 |
+| T26 恶意扩展 | PASS / Devin VM / 真 / 原始证据 `/home/ubuntu/final-acc-ext/artifacts/t26-malicious-plugin-fixed.json` sha256 `b30e1d3afd061003f52a6ab45b5a30e8b7c909684c85fad1aa0beec3b96dbb8c`；回归证据 `/home/ubuntu/final-regress/artifacts/t26-malicious-plugin-fixed.json` sha256 `3256cb2904b05d4c9a896ddce1839e33877dfcb72ce81cca876ccd90a3c91977` / `--no-extensions` 后目录自动发现关闭 |
+| 提示注入 | PASS / Devin VM / 真 / 原始证据 `/home/ubuntu/final-acc-ext/artifacts/t27-prompt-injection-stealth.json` sha256 `9a2b6267a4aa986e06d1f2c71f00a4f55ccd5ad6680d092e6bba386acfc9b306`；回归证据 `/home/ubuntu/final-regress/artifacts/t27-prompt-injection-stealth.json` sha256 `db51c30253cf2a70a3465620a1e33f9f8a7c36dc18dff5a99ca396e8cb7924d2` / 无秘密外泄、无 marker、删除目标幸存 |
 | 换人格不提权 | PASS / Devin VM / 真 / `/home/ubuntu/final-acc-ext/artifacts/t27-persona-privilege.json` sha256 `13359421fa67049f30d1c3f4834cd7055ca400b7d6a83f7c274c74a855d28992` / Grant 冻结不变，越界仍被 Guard 拦截 |
 | 假凭据到期清理 | **不做** / 只读参考对照 / 真 / `/home/ubuntu/final-acc-ext/artifacts/t27-security-summary.json` sha256 `9b6718104ceffe1daef7b08cf8055cd1a05fad8e0f4ff039127fa404cf6aae78` / Mikka/PiBot 参考无此机制；按用户规矩不自造 |
 | T29 Pi Purge 关闭 | PASS / Devin VM / 真 / `/home/ubuntu/final-acc-swe3-r2/artifacts/t29-off-r2.json` sha256 `fb7eef30627111dd986fecee6e8e9d031d376cd0794c4219605b175ed329db83` / Off 无 PromptReceipt 属预期 |
 | T30 Pi Purge 激活 | PASS / Devin VM / 真 / `/home/ubuntu/final-acc-swe3-r2/artifacts/t30-append-r2.json` sha256 `558f06afad4651959f59587b251c79b3ee97222022b911278bef8211ca6c9543`；receipt sha256 `a07d0d6e74652f12b6fdbd0f2dfebd9cca7ae763f4830167ee5e8d8f1d93acad` / 无 |
-| T31 Pi Purge 模式 | PASS（Append） / Devin VM / 真 / 同 T30：run sha256 `558f06afad4651959f59587b251c79b3ee97222022b911278bef8211ca6c9543` / Replace 模式个人版不适用 |
+| T31 Pi Purge 模式 | PASS（Append） / Devin VM / 真 / `/home/ubuntu/final-acc-swe3-r2/artifacts/t30-append-r2.json` sha256 `558f06afad4651959f59587b251c79b3ee97222022b911278bef8211ca6c9543`；receipt `/home/ubuntu/final-acc-swe3-r2/artifacts/t30-pi-purge-receipt.jsonl` sha256 `a07d0d6e74652f12b6fdbd0f2dfebd9cca7ae763f4830167ee5e8d8f1d93acad` / Replace 模式个人版不适用 |
 | T32 多 Bot 隔离 | PASS / Devin VM / 真 / `/home/ubuntu/final-acc-swe3/artifacts/t32-after-restart-final.json` sha256 `beb02a0bdeac7f4d9bbefa1c1031f0e0910f01bb358777f243b454dbd9fb2899` / 并行与重启均不串 |
 | T33 实验室与 Grant 围栏 | PASS / Devin VM / 真 / SWE-2/SWE-4 原始回执待回填 / 未回传 sha |
 | T34 先领后写 | PASS / Devin VM / 真 / SWE-2 原始回执待回填 / 未回传 sha |
 | 重试 3 次 | PASS / Devin VM / 真 / `/home/ubuntu/retry-9711/artifacts/retry-9711-report.json` sha256 `81cbcc450c9f749c4f53beddaf3d1a409898e0786c12ec88d92dd060356ba38a` / Pi input accepted 后上游失效；前三次禁用「自动重试中」，第四次后手动出现 |
+| 合并回归（`4e4a38e`） | 9 PASS / 1 验收未成立后重试已单跑 PASS / Devin VM / 真 / `/home/ubuntu/final-regress/artifacts/final-regression-report.json` sha256 `39031db8ac0a2f03f9bde0b8cb0768d3bd941409d9438ba55fd0a65e2e0c574e` / 当轮重试注入未成立；`9711b0c` 单跑证据见上行 |
 | 电脑审批卡 | PASS / Devin VM / 真 / SWE-4 原始回执待回填 / 未回传 sha |
-| docx/xlsx/pptx 读取 | PASS / Devin VM / 真 / docx 回归证据 sha256 `612561fba3eb373617dd28d7100788e55862f837da2215084835761c863b6cbf`；xlsx/pptx SWE 原始回执待回填 / xlsx/pptx 未回传 sha |
+| docx/xlsx/pptx 读取 | PASS / Devin VM / 真 / docx 回归证据 `/home/ubuntu/final-regress/artifacts/misc-regression.json` sha256 `612561fba3eb373617dd28d7100788e55862f837da2215084835761c863b6cbf`；xlsx/pptx SWE 原始回执待回填 / xlsx/pptx 未回传 sha |
 | xlsx 预览/引用/版本对比 | PASS / Devin VM / 真 / SWE-4 原始回执待回填 / 未回传 sha |
-| 视频播放/预览 | PASS / Devin VM / 真 / 回归证据 sha256 `a35a30bc4918208948999b5bc60a6199fccc445a4eea7cac10950123342c9a48` / 快速回归使用 seeded artifact 验证预览/播放数据路 |
+| 视频播放/预览 | PASS / Devin VM / 真 / 回归证据 `/home/ubuntu/final-regress/artifacts/video-preview-regression.json` sha256 `a35a30bc4918208948999b5bc60a6199fccc445a4eea7cac10950123342c9a48` / 快速回归使用 seeded artifact 验证预览/播放数据路 |
 | chat/responses/claude(messages) 三接口 | PASS / Devin VM / 真 / SWE-4 原始回执待回填 / 未回传 sha |
 | 单 Bot 全权限 + 权限对齐 Mikka | PASS / Devin VM / 真 / SWE-2 原始回执待回填；相关合并 `9711b0c` / 未回传 sha |
 | Codex 个人版 | 不适用 / — / — / 个人版范围决定，无验收证据要求 / 不计入个人版门禁 |
