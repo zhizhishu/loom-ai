@@ -68,6 +68,9 @@ pub fn resolve_workspace_authority(
         policy_revision,
         allow_list: true,
         allow_read: true,
+        // The same mission-workspace authorization that admits a read admits a
+        // write; the node still bounds the target to the prepared worktree.
+        allow_write: true,
         allowed_tools: BTreeSet::from(["git.status".to_owned()]),
         online_generation,
     };
@@ -116,6 +119,7 @@ pub fn revalidate_dispatch(
     let allowed = match &dispatch.request.operation {
         WorkspaceOperation::List { .. } => grant.allow_list,
         WorkspaceOperation::Read { .. } => grant.allow_read,
+        WorkspaceOperation::Write { .. } => grant.allow_write,
         WorkspaceOperation::Run { tool_id, .. } => grant.allowed_tools.contains(tool_id),
     };
     if !allowed {
@@ -197,6 +201,35 @@ mod tests {
         )
         .unwrap();
         revalidate_dispatch(&db, &dispatch).unwrap();
+        // The same mission workspace admits a write on the same scope, and the
+        // dispatch itself still refuses an escaping or unwritable target.
+        use base64::Engine as _;
+        let write = WorkspaceDispatch::new(
+            WorkspaceRequest {
+                version: RPC_VERSION,
+                request_id: "write".into(),
+                workspace_id: "workspace".into(),
+                timeout_ms: 5000,
+                operation: WorkspaceOperation::Write {
+                    path: "out/report.md".into(),
+                    data: base64::engine::general_purpose::STANDARD.encode(b"done"),
+                },
+            },
+            dispatch.scope.clone(),
+            "node-b".into(),
+            3,
+            1000,
+        )
+        .unwrap();
+        revalidate_dispatch(&db, &write).unwrap();
+        let escaping = WorkspaceRequest {
+            operation: WorkspaceOperation::Write {
+                path: "../outside.md".into(),
+                data: base64::engine::general_purpose::STANDARD.encode(b"done"),
+            },
+            ..write.request.clone()
+        };
+        assert_eq!(escaping.validate(), Err(RpcErrorCode::PathRejected));
         db.execute("UPDATE agent_run SET cancel_requested_at='requested'", [])
             .unwrap();
         assert_eq!(

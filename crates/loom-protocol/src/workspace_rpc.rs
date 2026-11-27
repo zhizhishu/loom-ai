@@ -1,5 +1,5 @@
-//! Workspace RPC v1: typed protocol for `A` driving `list` / `read` / `run`
-//! on the node that owns workspace `B`.
+//! Workspace RPC v1: typed protocol for `A` driving `list` / `read` /
+//! `write` / `run` on the node that owns workspace `B`.
 //!
 //! Scope of this module is the wire contract only: types, closed schema,
 //! validation and digests. There is no filesystem access, no process spawn and
@@ -53,6 +53,9 @@ pub const MAX_LIST_ENTRIES: u32 = 200;
 
 /// Maximum `max_bytes` a read operation may request.
 pub const MAX_READ_BYTES: u32 = 1_048_576;
+
+/// Maximum raw bytes a write operation may carry, counted after base64 decode.
+pub const MAX_WRITE_BYTES: u32 = 1_048_576;
 
 /// Maximum raw output bytes one request may produce in total.
 pub const MAX_OUTPUT_BYTES: u64 = 1_048_576;
@@ -196,6 +199,11 @@ pub enum WorkspaceOperation {
         offset: u64,
         max_bytes: u32,
     },
+    /// `path` is relative and must be non-empty; `data` is standard padded
+    /// base64 of the complete new file bytes, at most `MAX_WRITE_BYTES`. The
+    /// node replaces the file in place: no directory is created, nothing is
+    /// deleted, and no other target than a contained regular file is written.
+    Write { path: String, data: String },
     /// `tool_id` is a key into the approved local policy; `args` are kept
     /// verbatim (never shell-interpreted) but bounded; `cwd` is relative and
     /// may be empty for the root. This is not an OS sandbox.
@@ -251,6 +259,10 @@ impl WorkspaceRequest {
                 offset
                     .checked_add(u64::from(*max_bytes))
                     .ok_or(RpcErrorCode::InvalidRequest)?;
+            }
+            WorkspaceOperation::Write { path, data } => {
+                validate_write_path(path)?;
+                decode_base64_bounded(data, u64::from(MAX_WRITE_BYTES))?;
             }
             WorkspaceOperation::Run {
                 tool_id,
@@ -473,6 +485,11 @@ pub enum WorkspaceResult {
         offset: u64,
         truncated: bool,
     },
+    /// `bytes_written` is the count of bytes actually stored, never a path.
+    Write {
+        bytes_written: u64,
+        created: bool,
+    },
     Run {
         exit_code: i32,
         output_bytes: u64,
@@ -525,6 +542,18 @@ impl WorkspaceResult {
                     return Err(RpcErrorCode::InvalidRequest);
                 }
                 decode_base64_bounded(data, u64::from(*max_bytes)).map(|_| ())
+            }
+            (
+                Self::Write {
+                    bytes_written,
+                    created: _,
+                },
+                WorkspaceOperation::Write { .. },
+            ) => {
+                if *bytes_written > u64::from(MAX_WRITE_BYTES) {
+                    return Err(RpcErrorCode::InvalidRequest);
+                }
+                Ok(())
             }
             (
                 Self::Run {
@@ -756,6 +785,21 @@ pub fn validate_relative_path(raw: &str, allow_root: bool) -> Result<(), RpcErro
     Ok(())
 }
 
+/// A write target uses the same relative grammar with one extra rule: no
+/// component may name Git metadata. The prepared workspace is a Git worktree
+/// and `.git` is what binds it, so a write there could invalidate the local
+/// authority facts later operations are checked against.
+pub fn validate_write_path(raw: &str) -> Result<(), RpcErrorCode> {
+    validate_relative_path(raw, false)?;
+    if raw
+        .split('/')
+        .any(|component| component.eq_ignore_ascii_case(".git"))
+    {
+        return Err(RpcErrorCode::PathRejected);
+    }
+    Ok(())
+}
+
 fn validate_path_component(component: &str) -> Result<(), RpcErrorCode> {
     if component.is_empty() || component == "." || component == ".." {
         return Err(RpcErrorCode::PathRejected);
@@ -906,6 +950,7 @@ impl std::fmt::Debug for WorkspaceOperation {
     fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {match self {
         Self::List{path,limit}=>f.debug_struct("List").field("path_bytes",&path.len()).field("limit",limit).finish(),
         Self::Read{path,offset,max_bytes}=>f.debug_struct("Read").field("path_bytes",&path.len()).field("offset",offset).field("max_bytes",max_bytes).finish(),
+        Self::Write{path,data}=>f.debug_struct("Write").field("path_bytes",&path.len()).field("encoded_bytes",&data.len()).finish(),
         Self::Run{tool_id,args,cwd}=>f.debug_struct("Run").field("tool_id",tool_id).field("argument_count",&args.len()).field("cwd_bytes",&cwd.len()).finish(),
     }}
 }
@@ -918,6 +963,7 @@ impl std::fmt::Debug for WorkspaceResult {
     fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {match self {
         Self::List{entries,truncated}=>f.debug_struct("ListResult").field("entry_count",&entries.len()).field("truncated",truncated).finish(),
         Self::Read{data,offset,truncated}=>f.debug_struct("ReadResult").field("encoded_bytes",&data.len()).field("offset",offset).field("truncated",truncated).finish(),
+        Self::Write{bytes_written,created}=>f.debug_struct("WriteResult").field("bytes_written",bytes_written).field("created",created).finish(),
         Self::Run{exit_code,output_bytes,omitted_bytes}=>f.debug_struct("RunResult").field("exit_code",exit_code).field("output_bytes",output_bytes).field("omitted_bytes",omitted_bytes).finish(),
     }}
 }
@@ -1609,6 +1655,175 @@ mod tests {
             .validate_for(run_request_ref),
             Err(RpcErrorCode::InvalidRequest)
         );
+    }
+
+    #[test]
+    fn write_operation_carries_only_a_contained_relative_path_and_bounded_complete_bytes() {
+        fn write_request(path: &str, data: String) -> WorkspaceRequest {
+            WorkspaceRequest {
+                version: RPC_VERSION,
+                request_id: "req_write".to_string(),
+                workspace_id: "ws_1".to_string(),
+                timeout_ms: 30_000,
+                operation: WorkspaceOperation::Write {
+                    path: path.to_string(),
+                    data,
+                },
+            }
+        }
+
+        // A well-formed write round-trips as the tagged `write` operation and is
+        // closed against an unknown field exactly like every other variant.
+        let request = write_request("out/report.md", b64(b"# report\n"));
+        assert_eq!(request.validate(), Ok(()));
+        let json = serde_json::to_string(&request.operation).expect("operation serializes");
+        assert!(json.contains(r#""kind":"write""#), "{json}");
+        assert!(json.contains(r#""data":""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<WorkspaceOperation>(&json).expect("write round trip"),
+            request.operation
+        );
+        let unknown = json.replace("}", r#","mode":"append"}"#);
+        assert!(serde_json::from_str::<WorkspaceOperation>(&unknown).is_err());
+        assert!(serde_json::from_str::<WorkspaceOperation>(
+            r#"{"kind":"write","path":"a","data":"","delete":true}"#
+        )
+        .is_err());
+
+        // The target must be a non-empty relative path with no traversal, no
+        // foreign absolute form and no Git metadata component.
+        for path in [
+            "out/report.md",
+            "report.md",
+            "日本語/файл.txt",
+            "out/deep/file.bin",
+        ] {
+            assert_eq!(write_request(path, b64(b"x")).validate(), Ok(()), "{path}");
+        }
+        for path in [
+            "",
+            "/x.txt",
+            "../x.txt",
+            "./x.txt",
+            "a/../../x.txt",
+            "a//b",
+            "a/",
+            "C:/x.txt",
+            "C:x.txt",
+            "dir\\file",
+            "\\\\host\\share",
+            "a\0b",
+            "a:b",
+            "CON.txt",
+            ".git/config",
+            ".git",
+            "sub/.git/HEAD",
+            "sub/.GIT/HEAD",
+        ] {
+            assert_eq!(
+                write_request(path, b64(b"x")).validate(),
+                Err(RpcErrorCode::PathRejected),
+                "{path:?}"
+            );
+        }
+
+        // Exactly 1 MiB of decoded bytes is admitted; one byte more is not.
+        let exact = b64(&vec![b'x'; MAX_WRITE_BYTES as usize]);
+        assert_eq!(write_request("big.bin", exact.clone()).validate(), Ok(()));
+        let over = b64(&vec![b'x'; MAX_WRITE_BYTES as usize + 1]);
+        assert_eq!(
+            write_request("big.bin", over).validate(),
+            Err(RpcErrorCode::InvalidRequest)
+        );
+        // An empty payload is an empty file, not a deletion.
+        assert_eq!(write_request("empty.txt", String::new()).validate(), Ok(()));
+        assert_eq!(
+            write_request("bad.bin", "not base64!".to_string()).validate(),
+            Err(RpcErrorCode::InvalidRequest)
+        );
+        // Padding-free input is not part of the standard padded grammar.
+        assert_eq!(
+            write_request("bad.bin", STANDARD.encode(b"xy").trim_end_matches('=').to_string())
+                .validate(),
+            Err(RpcErrorCode::InvalidRequest)
+        );
+
+        // The result reports counts only, bounded by the same 1 MiB ceiling, and
+        // cannot stand in for another operation's result.
+        let write_dispatch = WorkspaceDispatch::new(
+            write_request("out/report.md", b64(b"# report\n")),
+            scope(),
+            "node_b".to_string(),
+            7,
+            1_700_000_000_000,
+        )
+        .expect("valid write dispatch");
+        let write_request_ref = &write_dispatch.request;
+        assert!(WorkspaceResult::Write {
+            bytes_written: 9,
+            created: true,
+        }
+        .validate_for(write_request_ref)
+        .is_ok());
+        assert_eq!(
+            WorkspaceResult::Write {
+                bytes_written: u64::from(MAX_WRITE_BYTES) + 1,
+                created: false,
+            }
+            .validate_for(write_request_ref),
+            Err(RpcErrorCode::InvalidRequest)
+        );
+        for wrong in [
+            WorkspaceResult::List {
+                entries: Vec::new(),
+                truncated: false,
+            },
+            WorkspaceResult::Read {
+                data: b64(b"x"),
+                offset: 0,
+                truncated: false,
+            },
+            WorkspaceResult::Run {
+                exit_code: 0,
+                output_bytes: 0,
+                omitted_bytes: 0,
+            },
+        ] {
+            assert_eq!(
+                wrong.validate_for(write_request_ref),
+                Err(RpcErrorCode::InvalidRequest)
+            );
+        }
+        assert!(
+            event(
+                &write_dispatch,
+                2,
+                WorkspaceEventBody::Completed {
+                    result: WorkspaceResult::Write {
+                        bytes_written: 9,
+                        created: true,
+                    },
+                }
+            )
+            .validate_for(&write_dispatch)
+            .is_ok()
+        );
+
+        // Debug stays metadata only: the path text and the payload bytes are
+        // never rendered.
+        let operation = WorkspaceOperation::Write {
+            path: "out/report.md".to_string(),
+            data: b64(b"# report\n"),
+        };
+        let result = WorkspaceResult::Write {
+            bytes_written: 9,
+            created: true,
+        };
+        let rendered = format!("{operation:?}{result:?}");
+        assert!(!rendered.contains("report"), "{rendered}");
+        assert!(!rendered.contains("IyByZXBvcnQ"), "{rendered}");
+        assert!(rendered.contains("path_bytes"), "{rendered}");
+        assert!(rendered.contains("bytes_written"), "{rendered}");
     }
 
     #[test]

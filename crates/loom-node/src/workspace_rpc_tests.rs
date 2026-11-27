@@ -22,7 +22,7 @@ fn executor(root:&Path,mode:&str)->WorkspaceRpcExecutor {
     ]);
     for key in ["SystemRoot","TEMP","TMP"] {if let Some(value)=std::env::var_os(key){env.insert(key.into(),value);}}
     let tools=BTreeMap::from([("fixture".into(),ToolPolicy::new(std::env::current_exe().unwrap(),vec![command_args()],env).unwrap())]);
-    let policy=WorkspacePolicy::new("workspace-1".into(),"mission-1".into(),"node-b".into(),1,root.join("workspace"),true,true,tools).unwrap();
+    let policy=WorkspacePolicy::new("workspace-1".into(),"mission-1".into(),"node-b".into(),1,root.join("workspace"),true,true,true,tools).unwrap();
     WorkspaceRpcExecutor::open("node-b".into(),root.join("journal"),vec![policy]).unwrap()
 }
 fn run_operation()->WorkspaceOperation {WorkspaceOperation::Run{tool_id:"fixture".into(),args:command_args(),cwd:String::new()}}
@@ -106,6 +106,64 @@ async fn same_owner_session_lists_and_reads_bounded_bytes_and_refuses_static_esc
     if linked.is_ok() {
         let escaped=complete(engine.submit_trusted(dispatch("escape",WorkspaceOperation::Read{path:"escape.txt".into(),offset:0,max_bytes:64},5000)).unwrap()).await;
         assert!(matches!(escaped.last().unwrap().body,WorkspaceEventBody::Failed{code:RpcErrorCode::PathRejected}));
+    } else {eprintln!("SYMLINK_PROBE_UNAVAILABLE: OS did not permit fixture link creation");}
+}
+
+#[tokio::test]
+async fn write_replaces_only_a_contained_regular_file_and_refuses_escape_and_oversize() {
+    let root=fixture_root();fs::create_dir_all(root.join("workspace/out")).unwrap();
+    fs::create_dir_all(root.join("escape-dir")).unwrap();
+    fs::write(root.join("outside.txt"),b"OUTSIDE_SECRET").unwrap();
+    let engine=executor(&root,"once");
+    let write=|id:&str,path:&str,bytes:&[u8]|dispatch(id,WorkspaceOperation::Write{path:path.into(),
+        data:STANDARD.encode(bytes)},5000);
+    let created=complete(engine.submit_trusted(write("write-new","out/report.md",b"# report\n")).unwrap()).await;
+    assert!(matches!(created.last().unwrap().body,WorkspaceEventBody::Completed{
+        result:WorkspaceResult::Write{bytes_written:9,created:true}}));
+    assert_eq!(fs::read(root.join("workspace/out/report.md")).unwrap(),b"# report\n");
+    let replaced=complete(engine.submit_trusted(write("write-replace","out/report.md",b"second")).unwrap()).await;
+    assert!(matches!(replaced.last().unwrap().body,WorkspaceEventBody::Completed{
+        result:WorkspaceResult::Write{bytes_written:6,created:false}}));
+    assert_eq!(fs::read(root.join("workspace/out/report.md")).unwrap(),b"second");
+    // No directory is created and an existing directory is not a write target.
+    let absent=complete(engine.submit_trusted(write("write-absent-parent","missing/report.md",b"x")).unwrap()).await;
+    assert!(matches!(absent.last().unwrap().body,WorkspaceEventBody::Failed{code:RpcErrorCode::NotFound}));
+    assert!(!root.join("workspace/missing").exists());
+    let directory=complete(engine.submit_trusted(write("write-directory","out",b"x")).unwrap()).await;
+    assert!(matches!(directory.last().unwrap().body,WorkspaceEventBody::Failed{code:RpcErrorCode::NotFile}));
+    // Traversal and oversize payloads never become a dispatch: the request
+    // grammar refuses them before an owner sees the operation.
+    for path in ["../outside.txt","out/../../outside.txt",".git/HEAD","/etc/passwd","out/report.md."] {
+        let request=WorkspaceRequest{version:RPC_VERSION,request_id:"rejected".into(),
+            workspace_id:"workspace-1".into(),timeout_ms:5000,
+            operation:WorkspaceOperation::Write{path:path.into(),data:STANDARD.encode(b"x")}};
+        assert_eq!(request.validate(),Err(RpcErrorCode::PathRejected),"{path}");
+    }
+    let oversize=WorkspaceRequest{version:RPC_VERSION,request_id:"oversize".into(),
+        workspace_id:"workspace-1".into(),timeout_ms:5000,
+        operation:WorkspaceOperation::Write{path:"big.bin".into(),
+            data:STANDARD.encode(vec![b'x';MAX_WRITE_BYTES as usize+1])}};
+    assert_eq!(oversize.validate(),Err(RpcErrorCode::InvalidRequest));
+    assert!(!root.join("workspace/big.bin").exists());
+    // A symlinked target and a symlinked parent directory are both refused, and
+    // the file outside the workspace is untouched.
+    #[cfg(unix)]
+    let linked=std::os::unix::fs::symlink(root.join("outside.txt"),root.join("workspace/escape.txt"));
+    #[cfg(windows)]
+    let linked=std::os::windows::fs::symlink_file(root.join("outside.txt"),root.join("workspace/escape.txt"));
+    if linked.is_ok() {
+        let escaped=complete(engine.submit_trusted(write("write-symlink","escape.txt",b"ESCAPED")).unwrap()).await;
+        assert!(matches!(escaped.last().unwrap().body,WorkspaceEventBody::Failed{code:RpcErrorCode::PathRejected}));
+        assert_eq!(fs::read(root.join("outside.txt")).unwrap(),b"OUTSIDE_SECRET");
+    } else {eprintln!("SYMLINK_PROBE_UNAVAILABLE: OS did not permit fixture link creation");}
+    #[cfg(unix)]
+    let linked_dir=std::os::unix::fs::symlink(root.join("escape-dir"),root.join("workspace/linked"));
+    #[cfg(windows)]
+    let linked_dir=std::os::windows::fs::symlink_dir(root.join("escape-dir"),root.join("workspace/linked"));
+    if linked_dir.is_ok() {
+        let escaped=complete(engine.submit_trusted(write("write-symlink-dir","linked/x.txt",b"ESCAPED")).unwrap()).await;
+        assert!(matches!(escaped.last().unwrap().body,WorkspaceEventBody::Failed{code:RpcErrorCode::PathRejected}));
+        assert!(!root.join("escape-dir/x.txt").exists());
     } else {eprintln!("SYMLINK_PROBE_UNAVAILABLE: OS did not permit fixture link creation");}
 }
 

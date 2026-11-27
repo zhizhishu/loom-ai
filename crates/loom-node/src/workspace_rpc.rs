@@ -5,7 +5,7 @@
 //! UNKNOWN for unfinished requests and never starts the same request twice.
 use std::{
     collections::{BTreeMap, HashMap}, ffi::OsString, fs::{self,File},
-    io::{Read,Seek,SeekFrom}, path::{Path,PathBuf}, sync::{Arc,Mutex}, time::{Duration,SystemTime,UNIX_EPOCH},
+    io::{Read,Seek,SeekFrom,Write as _}, path::{Path,PathBuf}, sync::{Arc,Mutex}, time::{Duration,SystemTime,UNIX_EPOCH},
 };
 use base64::{Engine as _,engine::general_purpose::STANDARD};
 use loom_protocol::workspace_rpc::*;
@@ -54,27 +54,27 @@ impl ToolPolicy {
 #[derive(Clone,PartialEq,Eq)]
 pub struct WorkspacePolicy {
     workspace_id:String, mission_id:String, owner_node_id:String, revision:u64,
-    root:PathBuf, allow_list:bool, allow_read:bool, tools:BTreeMap<String,ToolPolicy>,
+    root:PathBuf, allow_list:bool, allow_read:bool, allow_write:bool, tools:BTreeMap<String,ToolPolicy>,
     prepared:Option<TrustedPreparedWorkspace>,
 }
 impl WorkspacePolicy {
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn new(workspace_id:String,mission_id:String,owner_node_id:String,revision:u64,root:PathBuf,
-        allow_list:bool,allow_read:bool,tools:BTreeMap<String,ToolPolicy>)->RpcResult<Self> {
+        allow_list:bool,allow_read:bool,allow_write:bool,tools:BTreeMap<String,ToolPolicy>)->RpcResult<Self> {
         if revision==0 || !root.is_absolute() || !root.is_dir() {return Err(RpcErrorCode::InvalidRequest);}
         let root=fs::canonicalize(root).map_err(|_|RpcErrorCode::PathRejected)?;
-        Ok(Self{workspace_id,mission_id,owner_node_id,revision,root,allow_list,allow_read,tools,prepared:None})
+        Ok(Self{workspace_id,mission_id,owner_node_id,revision,root,allow_list,allow_read,allow_write,tools,prepared:None})
     }
     /// The root comes from a completed local prepare, never from a wire request.
     pub fn from_prepared(prepared:TrustedPreparedWorkspace,mission_id:String,revision:u64,
-        allow_list:bool,allow_read:bool,tools:BTreeMap<String,ToolPolicy>)->RpcResult<Self> {
+        allow_list:bool,allow_read:bool,allow_write:bool,tools:BTreeMap<String,ToolPolicy>)->RpcResult<Self> {
         prepared.revalidate()?;
         if revision==0 {return Err(RpcErrorCode::InvalidRequest);}
         CallerScope{run_id:"policy".into(),attempt:1,session_id:"policy".into(),member_id:"policy".into(),
             mission_id:mission_id.clone()}.validate()?;
         Ok(Self{workspace_id:prepared.workspace_id().to_owned(),owner_node_id:prepared.node_id().to_owned(),
-            root:prepared.root().to_owned(),mission_id,revision,allow_list,allow_read,tools,prepared:Some(prepared)})
+            root:prepared.root().to_owned(),mission_id,revision,allow_list,allow_read,allow_write,tools,prepared:Some(prepared)})
     }
     pub fn workspace_id(&self)->&str {&self.workspace_id}
 }
@@ -402,12 +402,20 @@ impl WorkspaceRpcExecutor {
 enum Prepared {
     List{root:PathBuf,path:String,limit:u32,authority:Option<TrustedPreparedWorkspace>},
     Read{root:PathBuf,path:String,offset:u64,max_bytes:u32,authority:Option<TrustedPreparedWorkspace>},
+    Write{root:PathBuf,path:String,bytes:Vec<u8>,authority:Option<TrustedPreparedWorkspace>},
     Run(ProcessSpec),
 }
 fn prepare(policy:&WorkspacePolicy,request:&WorkspaceRequest)->RpcResult<Prepared> {
     match &request.operation {
         WorkspaceOperation::List{path,limit} if policy.allow_list=>Ok(Prepared::List{root:policy.root.clone(),path:path.clone(),limit:*limit,authority:policy.prepared.clone()}),
         WorkspaceOperation::Read{path,offset,max_bytes} if policy.allow_read=>Ok(Prepared::Read{root:policy.root.clone(),path:path.clone(),offset:*offset,max_bytes:*max_bytes,authority:policy.prepared.clone()}),
+        WorkspaceOperation::Write{path,data} if policy.allow_write=>{
+            // The request was already validated; decoding here keeps the bytes
+            // bounded once, before any filesystem work starts.
+            let bytes=STANDARD.decode(data).map_err(|_|RpcErrorCode::InvalidRequest)?;
+            if bytes.len() as u64>MAX_WRITE_BYTES as u64 {return Err(RpcErrorCode::InvalidRequest);}
+            Ok(Prepared::Write{root:policy.root.clone(),path:path.clone(),bytes,authority:policy.prepared.clone()})
+        }
         WorkspaceOperation::Run{tool_id,args,cwd}=>{
             let tool=policy.tools.get(tool_id).ok_or(RpcErrorCode::ToolDenied)?;
             if !tool.argv_variants.iter().any(|allowed|allowed==args) {return Err(RpcErrorCode::ToolDenied);}
@@ -427,6 +435,27 @@ fn resolve(root:&Path,path:&str)->RpcResult<PathBuf> {
     let target=fs::canonicalize(root.join(path)).map_err(|_|RpcErrorCode::NotFound)?;
     if !target.starts_with(root) {return Err(RpcErrorCode::PathRejected);}
     Ok(target)
+}
+/// Resolve a write target without creating anything: the parent must already be
+/// a contained canonical directory in the workspace, the final component must
+/// be a single legal name, and an existing target may not be a symlink or a
+/// directory. The bytes are written afterwards through the generic
+/// `verify_open_file_inside` re-check, so a swap between this decision and the
+/// open is refused rather than followed.
+fn write_target(root:&Path,path:&str)->RpcResult<(PathBuf,bool)> {
+    validate_write_path(path)?;
+    let (parent,name)=path.rsplit_once('/').map_or(("",path),|(parent,name)|(parent,name));
+    let parent=resolve(root,parent)?;
+    if !parent.is_dir() {return Err(RpcErrorCode::NotDirectory);}
+    let target=parent.join(name);
+    let created=match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink()=>return Err(RpcErrorCode::PathRejected),
+        Ok(metadata) if metadata.is_dir()=>return Err(RpcErrorCode::NotFile),
+        Ok(_)=>false,
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>true,
+        Err(_)=>return Err(RpcErrorCode::NotFound),
+    };
+    Ok((target,created))
 }
 fn execute_fs(operation:Prepared)->RpcResult<WorkspaceResult> {
     match operation {
@@ -461,6 +490,21 @@ fn execute_fs(operation:Prepared)->RpcResult<WorkspaceResult> {
             let truncated=data.len()>max_bytes as usize;data.truncate(max_bytes as usize);
             if let Some(authority)=&authority {authority.revalidate()?;}
             Ok(WorkspaceResult::Read{data:STANDARD.encode(data),offset,truncated})
+        }
+        Prepared::Write{root,path,bytes,authority}=>{
+            if let Some(authority)=&authority {authority.revalidate()?;}
+            let (target,created)=write_target(&root,&path)?;
+            let mut file=fs::OpenOptions::new().write(true).create(true).truncate(true)
+                .open(&target).map_err(|_|RpcErrorCode::StorageUnavailable)?;
+            verify_open_file_inside(&file,&root)?;
+            if !file.metadata().map_err(|_|RpcErrorCode::StorageUnavailable)?.is_file() {return Err(RpcErrorCode::NotFile);}
+            file.write_all(&bytes).map_err(|_|RpcErrorCode::StorageUnavailable)?;
+            file.flush().map_err(|_|RpcErrorCode::StorageUnavailable)?;
+            // The binding must still hold after the only mutating operation, so a
+            // write that invalidated the prepared identity is reported, not
+            // silently accepted.
+            if let Some(authority)=&authority {authority.revalidate()?;}
+            Ok(WorkspaceResult::Write{bytes_written:bytes.len() as u64,created})
         }
         Prepared::Run(_)=>Err(RpcErrorCode::InvalidRequest),
     }
