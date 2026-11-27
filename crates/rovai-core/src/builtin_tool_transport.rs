@@ -1088,6 +1088,8 @@ fn error_contracts(operation: &str) -> Vec<BuiltinToolErrorContract> {
             "loom.stage_review_exists",
             "loom.stage_review_replay_conflict",
             "loom.stage_reviewer_run_invalid",
+            // The plan's assignee is immutable; another agent cannot repair this input.
+            "loom.claim_assignee",
         ] {
             errors.push(BuiltinToolErrorContract {
                 code: code.into(),

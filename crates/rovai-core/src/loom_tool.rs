@@ -807,7 +807,7 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({
             "name": LOOM_PLAN_TOOL_NAME,
             "title": "Import the current Mission's plan",
-            "description": "Import the current Mission's one LOOM plan. Default Lead only. A Mission accepts one plan; it cannot be replaced. Does not start work; release tasks and message members separately. Pass the plan as JSON with --input-file; the exact file shape is in the cli-operations LOOM reference.",
+            "description": "Import the current Mission's one LOOM plan. Default Lead only. A Mission accepts one plan; it cannot be replaced. Importing starts approved automatic dispatch for assigned tasks; do not release, message, claim, or implement them in the Lead run. Pass the plan as JSON with --input-file; the exact file shape is in the cli-operations LOOM reference.",
             "inputSchema": {
                 "type": "object", "additionalProperties": false,
                 "required": ["goal", "criteria", "tasks"],
@@ -1395,7 +1395,7 @@ mod tests {
         assert_eq!(status["tasks"].as_array().unwrap().len(), 2);
 
         // The reviewer's read: the latest candidate, its manifest and the authorization that
-        // governs it. No policy exists yet, so the review fields stay null.
+        // governs it. This unassigned fixture keeps the manual flow, so the review fields stay null.
         let visible = caller(&camp_id, "agent_2", "run_reviewer", "cmd_inspect");
         let inspected = invoke(
             &mut database,
@@ -1647,11 +1647,11 @@ mod tests {
     { "criterionId": "report-exists", "text": "out/report.md exists and covers the three points" }
   ],
   "tasks": [
-    { "taskId": "report-draft", "title": "Draft the report", "description": "Write out/report.md" },
-    { "taskId": "report-review", "title": "Review the report" }
+    { "taskId": "report-draft", "title": "Draft the report", "description": "Write out/report.md", "assigneeAgentId": "<worker-a-agent-id>" },
+    { "taskId": "report-final", "title": "Finish the report", "description": "Produce the final report", "assigneeAgentId": "<worker-b-agent-id>" }
   ],
   "dependencies": [
-    { "upstreamTaskId": "report-draft", "downstreamTaskId": "report-review", "condition": "task_done" }
+    { "upstreamTaskId": "report-draft", "downstreamTaskId": "report-final", "condition": "task_done" }
   ]
 }
 ```
@@ -1697,14 +1697,20 @@ Optional: `acceptanceCriteriaVersion` (top level), `description` and `assigneeAg
                     {
                         "taskId": "report-draft",
                         "title": "Draft the report",
-                        "description": "Write out/report.md"
+                        "description": "Write out/report.md",
+                        "assigneeAgentId": "<worker-a-agent-id>"
                     },
-                    { "taskId": "report-review", "title": "Review the report" }
+                    {
+                        "taskId": "report-final",
+                        "title": "Finish the report",
+                        "description": "Produce the final report",
+                        "assigneeAgentId": "<worker-b-agent-id>"
+                    }
                 ],
                 "dependencies": [
                     {
                         "upstreamTaskId": "report-draft",
-                        "downstreamTaskId": "report-review",
+                        "downstreamTaskId": "report-final",
                         "condition": "task_done"
                     }
                 ]

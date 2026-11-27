@@ -371,7 +371,7 @@ export function loomToolDescription(contracts: WorkflowContracts): string {
   }
   const lines = [
     "Call one current-Mission operation as {operation, input}. Put the operation's JSON fields inside input. Run, Member and Mission identity come from Core authentication.",
-    "Read status first. Only the Default Lead imports the one plan and releases tasks. Claim a released task before writing. Register each actual file with relativePath, then submit the returned artifactId values. Submit leaves the delivery awaiting User acceptance.",
+    "Read status first. Only the Default Lead imports the one plan; importing starts the approved automatic dispatch for assigned tasks. Do not release, message, claim, or implement those tasks in the Lead run. An assigned worker claims only its own task before writing, registers each actual file with relativePath, then submits the returned artifactId values. Submit leaves the delivery awaiting User acceptance.",
     "For stage-review, inspect first and copy that candidateId, policyRevision and manifestHash. Review only an authorized task assigned to you; do not review your own output or accept for the User.",
     "Examples show JSON shape. Replace example task, member, candidate and artifact identifiers with actual current values. relativePath is a file path relative to the Mission workspace.",
   ]

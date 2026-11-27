@@ -661,6 +661,45 @@ fn control_stays_off_until_the_owner_approves_a_honourable_policy() {
     );
 }
 
+/// The seeded personal default is a convenience projection, not a hidden Owner command: the first
+/// explicit approval written with the historical empty-state revision replaces it, then normal CAS
+/// rules apply to every later command.
+#[test]
+fn the_first_explicit_configure_replaces_the_seeded_default() {
+    let mut database = fixture();
+    let mission_id = create_mission(&mut database, "control seeded replacement");
+    let mut plan = plan_input(&mission_id);
+    plan.tasks[0].assignee_agent_id = Some(PRODUCER_AGENT.into());
+    plan.tasks[1].assignee_agent_id = Some(PRODUCER_AGENT.into());
+    plan_import(&mut database, plan).unwrap();
+    let seeded = control::get(&database, &mission_id)
+        .unwrap()
+        .policy
+        .expect("a fully assigned first plan seeds the default policy");
+    assert_eq!((seeded.revision, seeded.authorization_revision), (1, 1));
+
+    let approved = control::configure(
+        &mut database,
+        OWNER,
+        policy_input(&mission_id, "command_replace_seeded", REVIEWER_AGENT),
+    )
+    .unwrap();
+    let policy = approved.policy.expect("explicit approval still produces a policy");
+    assert_eq!((policy.revision, policy.authorization_revision), (2, 2));
+
+    let stale = control::configure(
+        &mut database,
+        OWNER,
+        policy_input(&mission_id, "command_replace_seeded_stale", REVIEWER_AGENT),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rejection_code(&stale),
+        "LOOM_CONTROL_REVISION_CONFLICT",
+        "assertion the_first_explicit_configure_turns_on_normal_compare_and_set"
+    );
+}
+
 /// Concurrency boundary: `revision` is the row counter every command compares and sets, while
 /// `authorizationRevision` is the version of the grant. Pausing advances only the first, so a
 /// stale pause is refused but a stage review taken under the standing grant still works; a new
@@ -7387,7 +7426,12 @@ fn watchdog_records_a_long_review_epoch_inside_the_ledger_bound() {
         task_id: long_task.clone(),
         reviewer_agent_id: REVIEWER_AGENT.into(),
     }];
-    control::configure(&mut database, OWNER, policy).unwrap();
+    let approved = control::configure(&mut database, OWNER, policy).unwrap();
+    let authorization_revision = approved
+        .policy
+        .expect("explicit approval produces a policy")
+        .authorization_revision
+        .to_string();
 
     // The product paths stamped their own instants from the wall clock, while this case judges
     // against a fixed clock. A healthy review has to be healthy *at the instant the sweep judges*,
@@ -7431,7 +7475,7 @@ fn watchdog_records_a_long_review_epoch_inside_the_ledger_bound() {
         plan_id.as_str(),
         long_task.as_str(),
         candidate.candidate_id.as_str(),
-        "1",
+        authorization_revision.as_str(),
     ])
     .unwrap();
     assert!(

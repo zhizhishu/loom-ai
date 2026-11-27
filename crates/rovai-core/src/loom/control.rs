@@ -301,7 +301,7 @@ pub struct LoomDispatch {
 #[serde(rename_all = "camelCase")]
 pub struct LoomControlSnapshot {
     pub mission_id: String,
-    /// `None` means no approved policy exists, which is the shipped default: automation is off.
+    /// `None` means no approved policy exists (legacy data, no independent reviewer, or a pre-plan Mission).
     pub policy: Option<LoomControlPolicy>,
     pub stage_reviews: Vec<LoomStageReview>,
     pub dispatches: Vec<LoomDispatch>,
@@ -409,7 +409,18 @@ pub fn configure(
         .optional()?;
     let (revision, authorization_revision, paused) = match standing {
         Some((revision, authorization_revision, paused)) => {
-            if revision != input.expected_revision {
+            // The personal-edition default seeded with the first Plan is not an explicit Owner
+            // command. Let the Owner's first explicit `expectedRevision: 0` approval replace it;
+            // once any CONFIGURE command exists, normal compare-and-set rules apply unchanged.
+            let explicit_configure_exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM loom_control_command
+                               WHERE plan_id=?1 AND kind='CONFIGURE')",
+                [&plan_id],
+                |row| row.get(0),
+            )?;
+            let replacing_seeded_default =
+                input.expected_revision == 0 && !explicit_configure_exists;
+            if revision != input.expected_revision && !replacing_seeded_default {
                 return Err(LoomCommandError::rejection(
                     LOOM_CONTROL_REVISION_CONFLICT,
                     format!(

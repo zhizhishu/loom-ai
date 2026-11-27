@@ -10037,6 +10037,9 @@ impl Core {
                     serde_json::from_value(request.params.clone())?;
                 let mut database = self.database.lock().await;
                 let result = rovai_core::loom::plan_import(&mut database, input)?;
+                drop(database);
+                self.delivery_batch_scheduler_notify.notify_one();
+                self.execution_wake.runs.notify_one();
                 Ok(serde_json::to_value(result)?)
             }
             // Release and claim are the two LOOM write paths that move a Task out of DRAFT

@@ -1,12 +1,12 @@
 ---
 document_type: model-context-change
 version: v1.72
-revision: 1
+revision: 2
 confirmation_status: confirmed
-confirmed_revision: 1
+confirmed_revision: 2
 confirmed_by: local_user
-confirmed_at: 2026-11-06
-last_updated: 2026-11-06
+confirmed_at: 2026-11-26
+last_updated: 2026-11-26
 ---
 
 # LOOM 受权审查与自动接力：模型可见变更 r1
@@ -181,3 +181,10 @@ Bootstrap、ContextManifest 格式、既有 RUN_INPUT formatter、历史选择/�
 ## 二次确认
 
 用户在已收到本稿附件后，通过确认问题 `loom-control-context-r1` 选择“确认 r1，继续接线（Recommended）”。确认覆盖上述 CLI/Skill/系统消息合同及其实现，不覆盖全局安装、生产发布或 DSH 重启。
+
+
+## r2 修订（2026-11-26，已确认）
+
+个人版默认控制授权由首次 Plan 导入播种，不再要求用户先手工打开 Orchestration 批准才有自动化。默认内容为：全部导入任务、独立 active reviewer、总派发 32、每任务返工 2、24 小时到期。User 仍可在 Orchestration 查看、暂停、恢复或改写；首次显式 `expectedRevision: 0` 配置可替换该种子，之后恢复正常 CAS。系统 handoff 文本、审查工具 schema、权限、预算消费和暂停语义不变。
+
+确认依据：用户/Hark 于 2026-11-26 10:45 明确指示按 Mikka factory 默认补默认策略且不新增表。
