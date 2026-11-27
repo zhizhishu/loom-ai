@@ -15,6 +15,8 @@ export const RUNTIME_RENDERER_CORE_METHODS = [
   'runtime.startup.inspect',
   'runtime.startup.check',
   'runtime.startup.save',
+  'pi.modelProvider.get',
+  'pi.modelProvider.save',
   'runtime.networkRecovery.wake',
   'runtimeInputs.reconcile',
   'runtime.modelCatalog.open',

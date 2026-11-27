@@ -1,4 +1,5 @@
 import { CommonEnvironmentEditor, useCommonEnvironment } from './CommonEnvironmentEditor'
+import { PiModelProviderSection } from './PiModelProviderSection'
 import { useThreadClient } from './camp-client'
 import { Activity, useCallback, useEffect, useId, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
@@ -250,6 +251,7 @@ export function RuntimeStartupSettings({ runtimeKind, health, onBack, backLabel,
       </section>
 
       <CommonEnvironmentEditor environment={common} fields={Boolean(nativeTheme)} disabled={locked} onChange={() => { sequence.current++; setInspection(null); setError(null); setSaveCompleted(false) }}/>
+      {runtimeKind === 'pi' && <PiModelProviderSection disabled={busy !== null}/>}
       {saved && error && <p className="inline-error" role="alert">{error}</p>}
       {conflicts.map((conflict) => <div className="runtime-save-conflict" role="alert" key={JSON.stringify(conflict.path)}>
         <p>{conflict.label}<UiText zh={"也在外部修改过，请选择保留哪一项。其他编辑已保留。"} /></p>
