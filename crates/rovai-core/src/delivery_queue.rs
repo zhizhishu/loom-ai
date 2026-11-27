@@ -3279,7 +3279,7 @@ mod tests {
                 crate::loom::control::LoomControlPolicyInput {
                     mission_id: "delivery-queue-mission".into(),
                     command_id: "approve-both-delivery-queue-tasks".into(),
-                    expected_revision: 1,
+                    expected_revision: 2,
                     enabled: true,
                     task_ids: vec!["delivery-queue-task".into(), "delivery-queue-task-2".into()],
                     reviewers: ["delivery-queue-task", "delivery-queue-task-2"]
@@ -3407,7 +3407,7 @@ mod tests {
             crate::loom::control::LoomControlPolicyInput {
                 mission_id: "delivery-queue-mission".into(),
                 command_id: "approve-both-preclaim-tasks".into(),
-                expected_revision: 1,
+                expected_revision: 2,
                 enabled: true,
                 task_ids: vec!["delivery-queue-task".into(), "delivery-queue-task-2".into()],
                 reviewers: ["delivery-queue-task", "delivery-queue-task-2"]
