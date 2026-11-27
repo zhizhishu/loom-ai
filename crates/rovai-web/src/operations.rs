@@ -381,6 +381,12 @@ pub enum Operation {
     PiExtensionUiPending,
     #[serde(rename = "pi.extensionUi.respond")]
     PiExtensionUiRespond,
+    // The Pi provider editor is one section plus one shared environment key. Neither operation
+    // returns the key; the response names the environment variable and its last four characters.
+    #[serde(rename = "pi.modelProvider.get")]
+    PiModelProviderGet,
+    #[serde(rename = "pi.modelProvider.save")]
+    PiModelProviderSave,
     #[serde(rename = "action.approvals.resolve")]
     Approval,
     #[serde(rename = "agentRuns.cancel")]
@@ -531,6 +537,23 @@ impl Operation {
                 }
                 projected
             }
+            // The Pi provider editor keeps its own admission list: the key is reported as an
+            // environment name and a last-four suffix, never as a value.
+            Self::PiModelProviderGet | Self::PiModelProviderSave => select_fields(
+                &value,
+                &[
+                    "status",
+                    "providerId",
+                    "baseUrl",
+                    "api",
+                    "modelIds",
+                    "modelId",
+                    "apiKeyEnv",
+                    "keyConfigured",
+                    "keyLast4",
+                    "keyRevision",
+                ],
+            ),
             // This response is requested by the explicit reveal control. It is
             // never included in a list, event, automatic retry or receipt.
             Self::McpReveal => select_fields(
@@ -719,6 +742,8 @@ impl Operation {
             Self::WithdrawMessage => "camp.messages.withdraw",
             Self::PiExtensionUiPending => "pi.extensionUi.pending",
             Self::PiExtensionUiRespond => "pi.extensionUi.respond",
+            Self::PiModelProviderGet => "pi.modelProvider.get",
+            Self::PiModelProviderSave => "pi.modelProvider.save",
             Self::Approval => "action.approvals.resolve",
             Self::CancelRun => "agentRuns.cancel",
             Self::ContinueRun => "agentRuns.continue",

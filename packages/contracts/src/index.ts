@@ -440,6 +440,20 @@ export interface RuntimeStartupInspection {
   searchEnvironment?: HealthStatus['searchEnvironment']
 }
 
+/** The single Pi provider section LOOM edits. The key is never part of this shape. */
+export interface PiModelProviderSettings {
+  status: 'ready'
+  providerId: string
+  baseUrl: string
+  api: string
+  modelIds: string[]
+  modelId: string
+  apiKeyEnv: string | null
+  keyConfigured: boolean
+  keyLast4: string | null
+  keyRevision: number
+}
+
 export type RuntimeDiscoveryStatus = 'detecting' | 'found' | 'missing'
 
 export type RuntimeSearchPathSource =
@@ -4629,6 +4643,8 @@ export type CoreMethod =
   | 'action.approvals.resolve'
   | 'pi.extensionUi.pending'
   | 'pi.extensionUi.respond'
+  | 'pi.modelProvider.get'
+  | 'pi.modelProvider.save'
   | 'notifications.inbox'
   | 'notifications.threadInterruptions'
   | 'notifications.changesSince'

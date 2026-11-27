@@ -13045,6 +13045,19 @@ impl Core {
                 }
                 Ok(json!(questions))
             }
+            "pi.modelProvider.get" => {
+                let database = self.database.lock().await;
+                rovai_core::pi_provider_settings::get(database.connection(), &self.data_dir)
+            }
+            "pi.modelProvider.save" => {
+                // Only the single Pi provider section and its shared key are admitted here.
+                let params: rovai_core::pi_provider_settings::SaveParams = serde_json::from_value(
+                    request.params.clone(),
+                )
+                .map_err(|_| anyhow::anyhow!("Pi 连接设置输入格式无效。"))?;
+                let mut database = self.database.lock().await;
+                rovai_core::pi_provider_settings::save(&mut database, &self.data_dir, params)
+            }
             "pi.extensionUi.respond" => {
                 let answer: pi::ExtensionUiAnswer = serde_json::from_value(request.params.clone())?;
                 let runtime = self

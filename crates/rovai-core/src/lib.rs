@@ -14,6 +14,7 @@ mod health;
 pub mod hermes;
 mod opencode_compat;
 mod pi;
+pub mod pi_provider_settings;
 mod runtime_fleet;
 mod runtime_mcp;
 
