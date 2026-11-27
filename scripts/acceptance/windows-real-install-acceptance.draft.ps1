@@ -634,52 +634,270 @@ function Stop-LoomConsole {
 # acceptance steps
 # --------------------------------------------------------------------------------------
 
-function Select-MemberAndModel {
+# --------------------------------------------------------------------------------------
+# Pi-only member selection: the personal roster starts with a codex-cli assistant, which
+# a personal Codex user does not have, and Claude Code is disabled for this acceptance.
+# --------------------------------------------------------------------------------------
+
+function ConvertTo-OrderedMap($Value) {
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $map = [ordered]@{}
+        foreach ($key in @($Value.Keys)) { $map[[string]$key] = ConvertTo-OrderedMap ($Value[$key]) }
+        return $map
+    }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $map = [ordered]@{}
+        foreach ($property in @($Value.PSObject.Properties)) {
+            $map[$property.Name] = ConvertTo-OrderedMap ($property.Value)
+        }
+        return $map
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $items = @()
+        foreach ($item in $Value) { $items += , (ConvertTo-OrderedMap $item) }
+        return $items
+    }
+    return $Value
+}
+
+function New-PiModelEntry {
+    return [ordered]@{
+        id = $ModelId
+        name = $ModelId
+        reasoning = $false
+        input = @('text')
+        contextWindow = 131072
+        maxTokens = 16384
+    }
+}
+
+function New-PiProviderEntry {
+    return [ordered]@{
+        name = 'oct-chat gateway'
+        baseUrl = 'https://oct.agent-ai.vip/v1'
+        # Environment reference only: Pi resolves $OCT_API_KEY from its own process
+        # environment, so the literal key never lands in a file
+        # (scripts/accept-loom-live-lead.mjs:578,598; scripts/loom-v2-core-native-pi.mjs:559).
+        apiKey = '$OCT_API_KEY'
+        api = 'openai-completions'
+        models = @((New-PiModelEntry))
+    }
+}
+
+function Set-PiOctChatGateway {
+    # Pi reads its provider catalog from PI_CODING_AGENT_DIR. The personal install exports
+    # that directory as <data>\runtime-home\pi before rovai-server.exe starts
+    # (scripts/manage-loom-personal.ps1:276). Core keeps its own private Pi session root at
+    # <data>\runtime\pi-windows-private-v1 (crates/rovai-core/src/pi/host.rs:3168-3179); that
+    # root is not Pi's config root, so models.json belongs to the agent directory above.
+    $key = $env:OCT_API_KEY
+    if (-not $key -or $key.Trim().Length -eq 0) {
+        throw 'FAIL_FAST: OCT_API_KEY is missing; the oct-chat provider key cannot be referenced.'
+    }
+    $key = $null
+    if (-not $script:DataDirectory) { throw 'the personal data directory is unknown before Pi is configured.' }
+    $agentDirectory = New-Directory (Join-Path $script:DataDirectory 'runtime-home\pi')
+
+    $modelsPath = Join-Path $agentDirectory 'models.json'
+    $document = [ordered]@{ providers = [ordered]@{} }
+    if (Test-Path -LiteralPath $modelsPath -PathType Leaf) {
+        $existingModels = [IO.File]::ReadAllText($modelsPath)
+        if ($existingModels.Trim().Length -gt 0) {
+            try { $document = ConvertTo-OrderedMap ($existingModels | ConvertFrom-Json) }
+            catch { throw "models.json in the Pi agent directory is not valid JSON: $modelsPath" }
+            if (-not ($document -is [System.Collections.IDictionary])) {
+                throw "models.json in the Pi agent directory is not a JSON object: $modelsPath"
+            }
+        }
+    }
+    if (-not $document.Contains('providers') -or -not ($document['providers'] -is [System.Collections.IDictionary])) {
+        $document['providers'] = [ordered]@{}
+    }
+    $written = $false
+    $provider = $document['providers']['oct-chat']
+    if (-not ($provider -is [System.Collections.IDictionary])) {
+        $document['providers']['oct-chat'] = New-PiProviderEntry
+        $provider = $document['providers']['oct-chat']
+        $written = $true
+    }
+    $reference = [string]($provider['apiKey'])
+    if (-not $reference) {
+        $provider['apiKey'] = '$OCT_API_KEY'
+        $written = $true
+    }
+    $offers = @()
+    foreach ($entry in @($provider['models'])) {
+        if ($entry -is [System.Collections.IDictionary]) { $offers += [string]($entry['id']) }
+    }
+    if ($offers -notcontains $ModelId) {
+        $models = @()
+        foreach ($entry in @($provider['models'])) { if ($null -ne $entry) { $models += , $entry } }
+        $models += , (New-PiModelEntry)
+        $provider['models'] = $models
+        $written = $true
+    }
+    if ($written) {
+        Write-TextFile $modelsPath (($document | ConvertTo-Json -Depth 12) + "`r`n")
+    }
+
+    # Pi needs one default provider/model to open its probe Session; existing user
+    # defaults are kept byte-identical.
+    $settingsPath = Join-Path $agentDirectory 'settings.json'
+    $settings = [ordered]@{}
+    if (Test-Path -LiteralPath $settingsPath -PathType Leaf) {
+        $existingSettings = [IO.File]::ReadAllText($settingsPath)
+        if ($existingSettings.Trim().Length -gt 0) {
+            try { $settings = ConvertTo-OrderedMap ($existingSettings | ConvertFrom-Json) }
+            catch { throw "settings.json in the Pi agent directory is not valid JSON: $settingsPath" }
+            if (-not ($settings -is [System.Collections.IDictionary])) {
+                throw "settings.json in the Pi agent directory is not a JSON object: $settingsPath"
+            }
+        }
+    }
+    $settingsChanged = $false
+    if (-not $settings.Contains('defaultProvider') -or -not $settings['defaultProvider']) {
+        $settings['defaultProvider'] = 'oct-chat'
+        $settingsChanged = $true
+    }
+    if (-not $settings.Contains('defaultModel') -or -not $settings['defaultModel']) {
+        $settings['defaultModel'] = $ModelId
+        $settingsChanged = $true
+    }
+    if ($settingsChanged) {
+        Write-TextFile $settingsPath (($settings | ConvertTo-Json -Depth 12) + "`r`n")
+    }
+
+    $script:Evidence['piGateway'] = [ordered]@{
+        agentDirectory = $agentDirectory
+        modelsPath = $modelsPath
+        settingsPath = $settingsPath
+        provider = 'oct-chat'
+        modelId = $ModelId
+        apiKeyReference = 'OCT_API_KEY (value never recorded)'
+        modelsRewritten = $written
+        settingsRewritten = $settingsChanged
+    }
+}
+
+function Get-PiModelParts([string]$Value) {
+    # Pi explicit identity: pi://model?provider=<provider>&id=<id>
+    # (crates/rovai-core/src/pi/host.rs:2198-2205 builds it, :3149-3162 parses it).
+    if ($Value -match '^pi://model\?(.+)$') {
+        $provider = $null
+        $identifier = $null
+        foreach ($pair in ($matches[1] -split '&')) {
+            $name, $raw = $pair -split '=', 2
+            if (-not $raw) { continue }
+            $decoded = [Uri]::UnescapeDataString($raw)
+            if ($name -eq 'provider') { $provider = $decoded }
+            if ($name -eq 'id') { $identifier = $decoded }
+        }
+        return @{ Provider = $provider; Id = $identifier }
+    }
+    return @{ Provider = $null; Id = $Value }
+}
+
+function Test-PiModelId([string]$Value) {
+    if (-not $Value) { return $false }
+    return ((Get-PiModelParts $Value).Id -eq $ModelId)
+}
+
+function Resolve-PiModelId($Installation) {
+    # Prefer the identity the Pi snapshot actually reports; Pi models carry the provider
+    # inside a pi:// id, with a provider field tolerated for a future snapshot shape.
+    foreach ($model in @(Get-Value (Get-Value $Installation 'snapshot') 'models')) {
+        if (-not $model) { continue }
+        $id = [string](Get-Value $model 'id')
+        if (-not $id) { continue }
+        $provider = [string](Get-Value $model 'provider')
+        $parts = Get-PiModelParts $id
+        if (-not $provider) { $provider = $parts.Provider }
+        if ($provider -eq 'oct-chat' -and $parts.Id -eq $ModelId) { return $id }
+    }
+    $encoded = [Uri]::EscapeDataString($ModelId)
+    return "pi://model?provider=oct-chat&id=$encoded"
+}
+
+function Find-PiAssistantId {
     $members = @(Invoke-CoreRequest 'members.list' ([ordered]@{}))
-    if ($members.Count -eq 0) { throw 'the real Core returned no assistants.' }
-    $agentId = [string](Get-Value $members[0] 'agentId')
+    foreach ($member in $members) {
+        if (-not $member) { continue }
+        $configuration = Get-Value $member 'runtimeConfiguration'
+        if ([string](Get-Value $configuration 'adapterKind') -ne 'pi') { continue }
+        return [string](Get-Value $member 'agentId')
+    }
+    return $null
+}
+
+function New-PiAssistant {
+    # The personal onboarding/assistant editor creates a profile with members.create and the
+    # plain CreateAgentProfileCommand shape, then configures the runtime separately
+    # (apps/desktop/src/renderer/src/loom-native/assistant-service.ts:526-562;
+    # apps/desktop/src/renderer/src/onboarding-provisioning.ts:132-142;
+    # crates/rovai-core/src/agent_profile.rs:978-990, :2835-2941).
+    $created = Invoke-CoreRequest 'members.create' ([ordered]@{
+            commandId = (New-CommandId)
+            command = [ordered]@{
+                displayName = 'LOOM Windows acceptance Pi assistant'
+                avatarRef = $null
+                teamRole = 'Windows real-install acceptance runner'
+                professionalResponsibilities = 'Run the real-install acceptance conversation on the oct-chat Pi model only.'
+                personalityTraits = @('precise', 'concise')
+                workingPrinciples = 'Answer only what is asked and never claim unverified results.'
+                growthTopic = ''
+            }
+        })
+    $status = [string](Get-Value $created 'status')
+    $agentId = [string](Get-Value (Get-Value $created 'payload') 'agentId')
+    if ($status -ne 'applied' -or -not $agentId) {
+        throw "members.create for the Pi assistant was not applied: $status"
+    }
+    return $agentId
+}
+
+function Select-MemberAndModel {
+    # Fail fast on the credential and write the oct-chat provider catalog before any Pi
+    # probe runs, so the runtime snapshot can report the model this acceptance needs.
+    [void](Set-PiOctChatGateway)
+    $agentId = Find-PiAssistantId
+    if (-not $agentId) {
+        $agentId = New-PiAssistant
+        Add-Result 'MEMBER_CREATE' 'PASS' "members.create created the Pi assistant $agentId"
+    }
+    $adapterKind = 'pi'
     $profile = Invoke-CoreRequest 'members.get' ([ordered]@{ agentId = $agentId })
     $runtimeConfiguration = Get-Value $profile 'runtimeConfiguration'
-    $adapterKind = [string](Get-Value $runtimeConfiguration 'adapterKind')
     $currentModel = [string](Get-Value (Get-Value $runtimeConfiguration 'model') 'modelId')
 
-    if (-not $adapterKind) {
-        $installations = @(Invoke-CoreRequest 'runtime.installations.list' ([ordered]@{}))
-        $adapterKind = [string](Get-Value $installations[0] 'adapterKind')
+    [void](Invoke-CoreRequest 'runtime.product.check' ([ordered]@{ runtimeKind = $adapterKind }))
+    $installation = Wait-Until -TimeoutSeconds $ReadyTimeoutSeconds -IntervalMilliseconds 1000 -Probe {
+        $list = @(Invoke-CoreRequest 'runtime.installations.list' ([ordered]@{}))
+        foreach ($item in $list) {
+            if ([string](Get-Value $item 'adapterKind') -ne $adapterKind) { continue }
+            if ([string](Get-Value (Get-Value $item 'snapshot') 'probeStatus') -ne 'ready') { continue }
+            return $item
+        }
+        return $null
     }
-    if (-not $adapterKind) { throw 'the member has no configured runtime adapter.' }
+    if (-not $installation) { throw "runtime $adapterKind did not become ready." }
+    $modelId = Resolve-PiModelId $installation
 
-    if ($currentModel -ne $ModelId) {
-        [void](Invoke-CoreRequest 'runtime.product.check' ([ordered]@{ runtimeKind = $adapterKind }))
-        $installation = Wait-Until -TimeoutSeconds 120 -IntervalMilliseconds 1000 -Probe {
-            $list = @(Invoke-CoreRequest 'runtime.installations.list' ([ordered]@{}))
-            foreach ($item in $list) {
-                if ([string](Get-Value $item 'adapterKind') -ne $adapterKind) { continue }
-                if ([string](Get-Value (Get-Value $item 'snapshot') 'probeStatus') -ne 'ready') { continue }
-                return $item
-            }
-            return $null
-        }
-        if (-not $installation) { throw "runtime $adapterKind did not become ready." }
-        $models = @(Get-Value (Get-Value $installation 'snapshot') 'models')
-        $offered = $false
-        foreach ($model in $models) { if ([string](Get-Value $model 'id') -eq $ModelId) { $offered = $true } }
-        if (-not $offered) {
-            throw "model $ModelId is not offered by $adapterKind; no other model is substituted."
-        }
+    if (-not (Test-PiModelId $currentModel)) {
         $permissions = Get-Value (Get-Value $installation 'memberRuntimeDefaults') 'permissions'
         $configured = Invoke-CoreRequest 'members.runtime.set' ([ordered]@{
-                commandId = New-CommandId
+                commandId = (New-CommandId)
                 command = [ordered]@{
                     agentId = $agentId
-                    expectedVersion = Get-Value $profile 'version'
+                    expectedVersion = (Get-Value $profile 'version')
                     adapterKind = $adapterKind
-                    model = [ordered]@{ mode = 'explicit'; modelId = $ModelId; options = [ordered]@{} }
+                    model = [ordered]@{ mode = 'explicit'; modelId = $modelId; options = [ordered]@{} }
                     permissions = $permissions
                 }
             })
         if ([string](Get-Value $configured 'status') -ne 'applied') {
-            throw "members.runtime.set for $ModelId was not applied."
+            $code = [string](Get-Value $configured 'code')
+            throw "members.runtime.set for $modelId was not applied: $code"
         }
         $profile = Invoke-CoreRequest 'members.get' ([ordered]@{ agentId = $agentId })
         $runtimeConfiguration = Get-Value $profile 'runtimeConfiguration'
@@ -687,7 +905,7 @@ function Select-MemberAndModel {
 
     $resolvedModel = [string](Get-Value (Get-Value $runtimeConfiguration 'model') 'modelId')
     $readiness = [string](Get-Value (Get-Value $profile 'runtimeReadiness') 'status')
-    if ($resolvedModel -ne $ModelId) { throw "the member frozen model is $resolvedModel, not $ModelId." }
+    if (-not (Test-PiModelId $resolvedModel)) { throw "the member frozen model is $resolvedModel, not $ModelId." }
     if ($readiness -ne 'ready') { throw "member runtime readiness is $readiness, not ready." }
     $script:Evidence['member'] = [ordered]@{
         agentId = $agentId
