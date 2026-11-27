@@ -105,6 +105,34 @@ describe('global Web connection recovery', () => {
     client.clear()
   })
 
+  it('keeps a LOOM domain rejection typed and live instead of reconciling it as a lost service', async () => {
+    const operations: string[] = []
+    const fetcher = vi.fn<typeof fetch>(async (url, init) => {
+      if (String(url).endsWith('/login')) return Response.json(identity)
+      const request = rpc(init)
+      operations.push(request.operation)
+      if (request.operation === 'commands.reconcile') throw new Error('a LOOM command must not be reconciled')
+      return Response.json({ error: {
+        kind: 'domain_rejection', code: 'LOOM_TASK_NOT_IN_REVIEW',
+        message: 'LOOM task t is BLOCKED and cannot be reviewed'
+      } })
+    })
+    const client = new ConsoleClient(origin, fetcher)
+    await client.login('test')
+    const rejection = await client.request('loom.review.record', {
+      commandId: newCommandId(), missionId: 'm', taskId: 't', candidateId: 'c1'
+    }).catch(error => error)
+    // 真实领域拒绝必须保留 kind/code/message，不能被降级成未知或断线。
+    expect(rejection).toMatchObject({
+      kind: 'domain_rejection', code: 'LOOM_TASK_NOT_IN_REVIEW',
+      message: 'LOOM task t is BLOCKED and cannot be reviewed'
+    })
+    expect(operations).toEqual(['loom.review.record'])
+    expect(client.connectionState).toBe('live')
+    expect(client.pendingCommandCount).toBe(0)
+    client.clear()
+  })
+
   it('waits for an already-running receipt lookup and coalesces repeated recovery clicks', async () => {
     let release: ((response: Response) => void) | undefined
     let sends = 0

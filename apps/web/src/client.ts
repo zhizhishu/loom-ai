@@ -8,7 +8,7 @@ import { uploadRequest } from './upload-request'
 import { newCommandId } from '../../desktop/src/shared/command-id'
 import { recoverLocalThreadSend } from '../../desktop/src/renderer/src/camp-composer-send-recovery'
 import { notifyUnconfirmedThreadSend } from '../../desktop/src/renderer/src/camp-client'
-import type { ThreadReadInvalidation, ChannelKind, ChannelSettingsSnapshot, ExecutionNodeList, ExecutionNodePairing, ExecutionNodeRevocation, FilePreviewBinaryContent, FilePreviewOperationResult, LocalAttachmentSourceView, NodeOutputPage } from '@contracts'
+import type { ThreadReadInvalidation, ChannelKind, ChannelSettingsSnapshot, ExecutionNodeList, ExecutionNodePairing, ExecutionNodeRevocation, FilePreviewBinaryContent, FilePreviewOperationResult, LocalAttachmentSourceView, NodeOutputPage, RovaiRequestFailureKind } from '@contracts'
 
 const HOST_WEB_PROTOCOL_VERSION = 5
 
@@ -42,7 +42,7 @@ function sessionStorageMessage(body: { error?: { code?: string; message?: string
 }
 
 class CoreRequestError extends Error {
-  constructor(readonly code: string, message?: string) { super(message || `操作未完成（${code}）。`) }
+  constructor(readonly code: string, message?: string, readonly kind?: RovaiRequestFailureKind) { super(message || `操作未完成（${code}）。`) }
 }
 
 export class SessionRequired extends Error {
@@ -308,7 +308,10 @@ const RECONCILABLE_COMMANDS = new Set<WebOperation>([
   'missions.status',
   'missions.start',
   'missions.linkPr',
-  'loom.review.record',
+  // `loom.review.record` stays out of this set: Core's `commands.reconcile` does not admit
+  // LOOM operations (web_commands.rs own reconcile whitelist), so a domain rejection would
+  // look like a lost service. The command is already idempotent by `commandId` inside
+  // `review_record`, and the artifact service keeps the original attempt for an explicit retry.
   'loom.verification.record',
   'loom.control.configure',
   'loom.control.pause',
@@ -332,7 +335,7 @@ type UploadTarget = { kind: 'pasted_text' } | { kind: 'single_chat'; conversatio
   | { kind: 'single_chat_pending'; conversationId: string; pendingInputId: string; editToken: string }
 type UploadIntent = { commandId: string; threadId: string; expectedRevision: number; target?: UploadTarget; displayName: string; byteSize: number; sha256: string }
 type PendingUpload = { cancelled?: boolean; signal?: AbortSignal; intent: UploadIntent; data: FormData | null; resolve(draft: unknown): void; reject(error: unknown): void }
-type CommandReceipt = { state: 'unknown' | 'recorded'; result?: unknown; error?: { code: string; message?: string } }
+type CommandReceipt = { state: 'unknown' | 'recorded'; result?: unknown; error?: { kind?: RovaiRequestFailureKind; code: string; message?: string } }
 
 /** Decodes bounded SSE frames; payloads are invalidations, never private Core events. */
 export class InvalidationDecoder {
@@ -801,7 +804,7 @@ export class ConsoleClient {
       const receipt = await this.#rpc<CommandReceipt>('commands.reconcile', { operation: entry.operation, params: entry.params })
       if (this.#pending.get(commandId) !== entry) return
       this.#pending.delete(commandId); this.#notifyPending()
-      if (receipt.state === 'recorded' && receipt.error) entry.reject(new CoreRequestError(receipt.error.code, receipt.error.message))
+      if (receipt.state === 'recorded' && receipt.error) entry.reject(new CoreRequestError(receipt.error.code, receipt.error.message, receipt.error.kind))
       else if (receipt.state === 'recorded') entry.resolve(receipt.result, 'recovery')
       else entry.reject(error) // Explicit Core completion plus a successful absent-receipt lookup.
     } catch { this.#requireRecovery() /* Still unknown if reconciliation itself could not complete. */ }
@@ -1076,7 +1079,7 @@ export class ConsoleClient {
         const receipt = await this.#rpc<CommandReceipt>('commands.reconcile', { operation: entry.operation, params: entry.params })
         if (receipt.state === 'recorded' && this.#pending.get(id) === entry) {
           this.#pending.delete(id); this.#notifyPending()
-          if (receipt.error) entry.reject(new CoreRequestError(receipt.error.code, receipt.error.message))
+          if (receipt.error) entry.reject(new CoreRequestError(receipt.error.code, receipt.error.message, receipt.error.kind))
           else entry.resolve(receipt.result, 'recovery')
         }
       } catch { /* Unknown stays associated with its original commandId. */ }
@@ -1091,9 +1094,9 @@ export class ConsoleClient {
   async #rpc<T>(operation: WebOperation, params: unknown, recovery = false): Promise<T> {
     const generation = this.#generation
     const response = await this.#authorized('request', { method: 'POST', body: JSON.stringify({ operation, params }) }, recovery || operation === 'commands.reconcile')
-    const body = await this.#readResponse(() => response.json(), generation) as { result: T; error?: { code?: string; message?: string } }
+    const body = await this.#readResponse(() => response.json(), generation) as { result: T; error?: { kind?: RovaiRequestFailureKind; code?: string; message?: string } }
     if (generation !== this.#generation) throw new DOMException('Connection replaced', 'AbortError')
-    if (body.error) throw new CoreRequestError(body.error.code ?? 'request_failed', body.error.message)
+    if (body.error) throw new CoreRequestError(body.error.code ?? 'request_failed', body.error.message, body.error.kind)
     return body.result
   }
 

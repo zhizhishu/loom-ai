@@ -11,6 +11,7 @@ import {
   artifactCandidateFacts,
   artifactReviewKind,
   artifactReviewLabel,
+  artifactReviewRejectionMessage,
   artifactReviewTone,
   discardUnconfirmedReviewAttempt,
   latestCandidateReview,
@@ -392,7 +393,9 @@ describe('only a real, matching receipt marks the attempt completed', () => {
   })
 
   it('a no-task attempt can only weak-check planId shape', async () => {
-    const noTaskFacts = artifactCandidateFacts({ ...bundle([first]), tasks: [] }, artifact, first)
+    // 任务投影缺失时 prepare 已经拒绝（reviewable 精确镜像 Core 的 IN_REVIEW 门）；
+    // 这里手工放行 reviewable，只为单独覆盖「无任务回执只能弱校验 planId」的分支。
+    const noTaskFacts = { ...artifactCandidateFacts({ ...bundle([first]), tasks: [] }, artifact, first), reviewable: true }
     const attempt = prepareArtifactReviewAttempt('m', noTaskFacts, draft())
     expect(attempt.planId).toBeNull()
     expect((await sendArtifactReviewAttempt(
@@ -765,6 +768,37 @@ describe('artifact status is derived from the real control and acceptance projec
     // 链头仍可人工验收（写入口仍只给链头），历史版本保持关闭。
     expect(tip.reviewable).toBe(true)
     expect(artifactCandidateFacts(chain, artifact, null).reviewable).toBe(false)
+  })
+
+  it('a BLOCKED task cannot be accepted from the artifact overlay', async () => {
+    // Core 的 review_record 只在 IN_REVIEW 放行；UI 的 reviewable 必须精确镜像，
+    // 不能先把「接受/退回」拿出来、等提交时再被拒。
+    const blocked: WorkBundle = {
+      ...bundle(),
+      tasks: [{ ...task, status: 'blocked', blockedReason: 'stage review: missing evidence' }]
+    }
+    const blockedFacts = artifactCandidateFacts(blocked, artifact, first)
+    expect(blockedFacts.reviewKind).toBe('blocked')
+    expect(blockedFacts.reviewable).toBe(false)
+    expect(() => prepareArtifactReviewAttempt('m', blockedFacts, draft())).toThrow('不可验收')
+    const request = vi.fn()
+    await expect(submitArtifactReview(rpc(request), 'm', blockedFacts, draft())).rejects.toThrow()
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('only the task status gates reviewable, matching the Core check', () => {
+    // Core 只按 loom_task.status 关门：只写 blocked_reason 的任务仍是 IN_REVIEW，可验收。
+    const dispatchBlocked: WorkBundle = { ...bundle(), tasks: [{ ...task, blockedReason: 'loom.dispatch_budget_exhausted' }] }
+    expect(artifactCandidateFacts(dispatchBlocked, artifact, first).reviewable).toBe(true)
+    // 任务投影缺失时同样不能外推成可验收。
+    expect(artifactCandidateFacts({ ...bundle(), tasks: [] }, artifact, first).reviewable).toBe(false)
+  })
+
+  it('reports LOOM_TASK_NOT_IN_REVIEW as a real Chinese reason, not a lost connection', () => {
+    expect(artifactReviewRejectionMessage('LOOM_TASK_NOT_IN_REVIEW', 'LOOM task t is BLOCKED and cannot be reviewed'))
+      .toContain('任务已不在待验收状态')
+    expect(artifactReviewRejectionMessage('LOOM_REVIEW_EXISTS', 'candidate c1 already carries a review'))
+      .toBe('无法保存：candidate c1 already carries a review')
   })
 
   it('the latest human review of one candidate is picked by time, not array order', () => {

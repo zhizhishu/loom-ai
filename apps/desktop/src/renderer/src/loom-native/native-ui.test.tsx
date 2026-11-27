@@ -17,7 +17,7 @@ import { AgentMarkdown } from './AgentMarkdown'
 import { workStatus, attentionFactsFromWork, flattenWork } from './Inspector'
 import { Inspector } from './Inspector'
 import { ATTENTION_BUDGET } from './attention'
-import { ArtifactReviewStatus } from './ArtifactView'
+import { ArtifactReviewStatus, ArtifactReviewBlockedNotice } from './ArtifactView'
 import { artifactCandidateFacts, previewStateFromResult, reviewDraftComplete, submitArtifactReview, artifactFileName, readArtifactPreview, artifactMediaKind, decodeArtifactBase64, normalizeArtifactMediaType, type LoomRpc } from './artifact-service'
 import { PDF_MAX_CANVAS_PIXELS, pdfPageGeometry, pdfPageSlotSize, pdfRenderErrorMessage, pdfjsAssetUrl, pdfjsWorkerUrl } from './artifact-pdf'
 import { ArtifactPdfPage, ArtifactPdfPreview } from './ArtifactPdfPreview'
@@ -225,8 +225,22 @@ describe('native immutable artifact and explicit acceptance', () => {
     await expect(submitArtifactReview({request} as unknown as LoomRpc,'m',facts,{candidateId:'c1',verdict:'accepted',reason:'Yes',satisfied:['a','b']})).rejects.toThrow()
     expect(request).not.toHaveBeenCalled()
   })
+  it('does not offer acceptance for a BLOCKED task and shows the real blocker instead', () => {
+    const blocked = { ...task, status: 'blocked' as const, blockedReason: 'stage review: missing evidence' }
+    const blockedFacts = artifactCandidateFacts(bundle([first], { tasks: [blocked], control: observed() }), artifact, first)
+    expect(blockedFacts.reviewKind).toBe('blocked')
+    expect(blockedFacts.reviewable).toBe(false)
+    const html = renderToStaticMarkup(createElement(ArtifactReviewBlockedNotice, {
+      reason: blockedFacts.task?.blockedReason ?? null, onRefresh: () => {}
+    }))
+    expect(html).toContain('受阻')
+    expect(html).toContain('stage review: missing evidence')
+    expect(html).toContain('刷新记录')
+    // 不给 Core 无法完成的动作：没有接受/退回、没有提交表单。
+    expect(html).not.toMatch(/接受|退回|确认接受|ln-artifact-review-form/)
+  })
   it('submits exactly the pinned candidate and criteria with no spoofed reviewer identity', async () => {
-    const request=vi.fn().mockResolvedValue({});const facts=artifactCandidateFacts(bundle(),artifact,first)
+    const request=vi.fn().mockResolvedValue({});const facts=artifactCandidateFacts(bundle([first],{tasks:[{...task,status:'in_review'}]}),artifact,first)
     await submitArtifactReview({request} as unknown as LoomRpc,'m',facts,{candidateId:'c1',verdict:'accepted',reason:' Reviewed ',satisfied:['a','b']})
     expect(request).toHaveBeenCalledTimes(1)
     const [method,input]=request.mock.calls[0]

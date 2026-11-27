@@ -237,6 +237,17 @@ const ARTIFACT_REVIEW_LABEL: Record<ArtifactReviewKind, string> = {
   blocked: '受阻'
 }
 
+/**
+ * 人工验收被 Core 拒绝后的界面文案。LOOM_TASK_NOT_IN_REVIEW 换成能指导下一步的中文：
+ * 任务已不在待验收状态（例如被阶段审查改成 BLOCKED），刷新后应按受阻/返工处理。
+ */
+export function artifactReviewRejectionMessage(code: string, message: string): string {
+  if (code === 'LOOM_TASK_NOT_IN_REVIEW') {
+    return '任务已不在待验收状态，当前不能验收。请刷新记录，按受阻或返工状态处理。'
+  }
+  return `无法保存：${message}`
+}
+
 /** 界面文案；`none` 没有话可说，调用方据此不渲染状态位。 */
 export function artifactReviewLabel(kind: ArtifactReviewKind): string {
   return ARTIFACT_REVIEW_LABEL[kind]
@@ -419,7 +430,9 @@ export function artifactCandidateFacts(
       ? null
       : versions.find(entry => entry.candidateId === owner.candidateId)?.version ?? 1,
     latest,
-    reviewable: owner !== null && latest && review === null,
+    // 精确镜像 Core 的验收门（loom.rs review_record）：只有 IN_REVIEW 任务能写人工验收。
+    // 投影里的状态是契约的小写拼写；BLOCKED/READY 等一律不可写，不能只靠提交后被拒。
+    reviewable: owner !== null && latest && review === null && task?.status === 'in_review',
     criteria: owner?.acceptanceCriteria.criteria ?? [],
     criteriaVersion: owner?.acceptanceCriteria.version ?? '',
     reviewKind
