@@ -11896,6 +11896,24 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        // Both queries below find the workspace through its Mission, so a workspace row
+        // without one is invisible to them and would prove nothing about the host filter.
+        let number: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COALESCE(MAX(number),0)+1 FROM mission",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                "INSERT INTO mission(id,number,camp_id,title,description,status,created_at,updated_at)
+                 VALUES('mission_runtime_scope',?2,?1,'Runtime scope','','in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                params![&camp_id, number],
+            )
+            .unwrap();
         let insert = |database: &crate::db::Database, id: &str, host: &str, state: &str| {
             database
                 .connection()
@@ -11912,6 +11930,17 @@ mod tests {
                 .unwrap();
         };
         insert(&database, "ws_remote", "node_b", "preparing");
+        // A row is only reachable through its Mission; assert that before trusting
+        // either answer, so the fixture cannot go vacuous again.
+        let visible: bool = database
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM mission_workspace w JOIN mission m ON m.id=w.mission_id WHERE m.camp_id=?1)",
+                [&camp_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(visible, "the workspace row must be visible through its Mission");
         let workspace = json!({"executionRoot":project_path});
         {
             let transaction = database.connection_mut().transaction().unwrap();
