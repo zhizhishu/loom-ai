@@ -4,6 +4,41 @@
 
 产品要做什么看 [PRODUCT.md](PRODUCT.md)，已选 Mikka/PiBot 三栏 UI 与用户指定猫耳品牌看 [DESIGN.md](DESIGN.md)，架构与每层复用来源看 [LOOM-ARCHITECTURE](docs/loom/LOOM-ARCHITECTURE.md)，交接与施工规则看 [LOOM-HANDOFF](docs/loom/LOOM-HANDOFF.md)，验收标准看 [LOOM-ACCEPTANCE](docs/loom/LOOM-ACCEPTANCE.md)，参考项目看 [参考锁](docs/loom/LOOM-V2-REFERENCE-LOCK.md)。旧计划（含 P0–P14 原设计）已归档于 [plans-2026-11-18](docs/loom/archive/plans-2026-11-18/README.md)，不在本页重复叙述。
 
+
+## 2026-11-26 最终验收汇总（按 LOOM-ACCEPTANCE §6）
+
+> 本表只记今天最终验收结论；每条一行，字段为「编号 / 结论 / 执行位置 / 模型真伪 / 证据路径+sha256 / 已知限制」。SWE-1/2/4 的原始回执未随 14:15 汇总回传到本 VM 时，表中明确写 `待回填`，不把口头汇总伪造成原始证据。
+
+| 编号 | 结论 / 执行位置 / 模型真伪 / 证据路径+sha256 / 已知限制 |
+|---|---|
+| §5 个人版主链 | **实质 PASS** / Devin VM / 真 / SWE-1 原始回执待回填 / kill -9 后单条 HANDOFF 停 `accepted_input_outcome_unknown` 属已接受已知限制；重启恢复修复中 |
+| T19 群聊 @ 路由 | PASS / Devin VM / 真 / `/home/ubuntu/final-regress/artifacts/t19-memory.json` sha256 `395c83b6bce5f195d1a821ce2fbff4d408ff88f0eaf50735f2b45d14339a32b1` / 快速回归证据 |
+| T20 Assignment DAG | PASS / Devin VM / 真 / SWE-2 原始回执待回填 / 未回传 sha |
+| T21 迟到回复 | PASS / Devin VM / 真 / SWE-2 原始回执待回填 / 未回传 sha |
+| T22b Claude 禁用 | PASS / Devin VM / 真 / `/home/ubuntu/final-acc-swe3/artifacts/t22b-claude-disabled.json` sha256 `3f8ab1058676625593a0183b9ed59f730d394b772741f6104f28f3888e19e2e6` / Claude 进程计数 0 |
+| T23 Markdown 人格导入 | PASS / Devin VM / 真 / `/home/ubuntu/final-acc-ext/artifacts/t23-persona-import-validation.json` sha256 `6d79f5a608f595a04d1a0e08e7cb3d92832f354c89fd317f05bc1e2a511ddf76`；回归证据 sha256 `399f06865e23c1ea32353d72993f18a80b368d2f440724d03f85ac1b17b183b2` / 无 |
+| T24 提示词模式/hash | PASS / Devin VM / 真 / 回归证据 `/home/ubuntu/final-regress/artifacts/` sha256 `adb2cf117b99e2d87fdde9f3777deba9a17c493c0f00e63b97aeb2b2ccbdcd80` / Replace 不适用 |
+| T25 记忆隔离与记忆库 | PASS / Devin VM / 真 / 回归证据 sha256 `e964739ebb6afbc52b48c68b85d493bf3d4a1deb9f354be8e43f830787ba3311` / W1/W2 不串，界面可看改暂停删 |
+| T26 恶意扩展 | PASS / Devin VM / 真 / 回归证据 sha256 `3256cb2904b05d4c9a896ddce1839e33877dfcb72ce81cca876ccd90a3c91977` / `--no-extensions` 后目录自动发现关闭 |
+| 提示注入 | PASS / Devin VM / 真 / `/home/ubuntu/final-acc-ext/artifacts/t27-security-summary.json` sha256 `9b6718104ceffe1daef7b08cf8055cd1a05fad8e0f4ff039127fa404cf6aae78`；回归证据 sha256 `db51c30253cf2a70a3465620a1e33f9f8a7c36dc18dff5a99ca396e8cb7924d2` / 无秘密外泄、无 marker、删除目标幸存 |
+| 换人格不提权 | PASS / Devin VM / 真 / `/home/ubuntu/final-acc-ext/artifacts/t27-persona-privilege.json` sha256 `13359421fa67049f30d1c3f4834cd7055ca400b7d6a83f7c274c74a855d28992` / Grant 冻结不变，越界仍被 Guard 拦截 |
+| 假凭据到期清理 | **不做** / 只读参考对照 / 真 / `/home/ubuntu/final-acc-ext/artifacts/t27-security-summary.json` sha256 `9b6718104ceffe1daef7b08cf8055cd1a05fad8e0f4ff039127fa404cf6aae78` / Mikka/PiBot 参考无此机制；按用户规矩不自造 |
+| T29 Pi Purge 关闭 | PASS / Devin VM / 真 / `/home/ubuntu/final-acc-swe3-r2/artifacts/t29-off-r2.json` sha256 `fb7eef30627111dd986fecee6e8e9d031d376cd0794c4219605b175ed329db83` / Off 无 PromptReceipt 属预期 |
+| T30 Pi Purge 激活 | PASS / Devin VM / 真 / `/home/ubuntu/final-acc-swe3-r2/artifacts/t30-append-r2.json` sha256 `558f06afad4651959f59587b251c79b3ee97222022b911278bef8211ca6c9543`；receipt sha256 `a07d0d6e74652f12b6fdbd0f2dfebd9cca7ae763f4830167ee5e8d8f1d93acad` / 无 |
+| T31 Pi Purge 模式 | PASS（Append） / Devin VM / 真 / 同 T30：run sha256 `558f06afad4651959f59587b251c79b3ee97222022b911278bef8211ca6c9543` / Replace 模式个人版不适用 |
+| T32 多 Bot 隔离 | PASS / Devin VM / 真 / `/home/ubuntu/final-acc-swe3/artifacts/t32-after-restart-final.json` sha256 `beb02a0bdeac7f4d9bbefa1c1031f0e0910f01bb358777f243b454dbd9fb2899` / 并行与重启均不串 |
+| T33 实验室与 Grant 围栏 | PASS / Devin VM / 真 / SWE-2/SWE-4 原始回执待回填 / 未回传 sha |
+| T34 先领后写 | PASS / Devin VM / 真 / SWE-2 原始回执待回填 / 未回传 sha |
+| 重试 3 次 | PASS / Devin VM / 真 / `/home/ubuntu/retry-9711/artifacts/retry-9711-report.json` sha256 `81cbcc450c9f749c4f53beddaf3d1a409898e0786c12ec88d92dd060356ba38a` / Pi input accepted 后上游失效；前三次禁用「自动重试中」，第四次后手动出现 |
+| 电脑审批卡 | PASS / Devin VM / 真 / SWE-4 原始回执待回填 / 未回传 sha |
+| docx/xlsx/pptx 读取 | PASS / Devin VM / 真 / docx 回归证据 sha256 `612561fba3eb373617dd28d7100788e55862f837da2215084835761c863b6cbf`；xlsx/pptx SWE 原始回执待回填 / xlsx/pptx 未回传 sha |
+| xlsx 预览/引用/版本对比 | PASS / Devin VM / 真 / SWE-4 原始回执待回填 / 未回传 sha |
+| 视频播放/预览 | PASS / Devin VM / 真 / 回归证据 sha256 `a35a30bc4918208948999b5bc60a6199fccc445a4eea7cac10950123342c9a48` / 快速回归使用 seeded artifact 验证预览/播放数据路 |
+| chat/responses/claude(messages) 三接口 | PASS / Devin VM / 真 / SWE-4 原始回执待回填 / 未回传 sha |
+| 单 Bot 全权限 + 权限对齐 Mikka | PASS / Devin VM / 真 / SWE-2 原始回执待回填；相关合并 `9711b0c` / 未回传 sha |
+| Codex 个人版 | 不适用 / — / — / 个人版范围决定，无验收证据要求 / 不计入个人版门禁 |
+| DSH | 暂停 / — / — / 个人版范围决定，无验收证据要求 / 不计入当前门禁 |
+
 ## 2026-11-26 M7-A Pi 问题桥接（本地候选，未发布）
 
 - 受管加载 `ask_user_question`；只用 Pi RPC `select` / `input`。Core 对四种原生对话保存内存待答状态，LOOM 群聊呈现问题卡片，Run 和关联任务显示「等你回答」。回答/取消经原进程 `respond(id, response)`，校验群聊、Host、Run、执行代次和请求 ID；终止及超时清除。重启不恢复待答问题。
