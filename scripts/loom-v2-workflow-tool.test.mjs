@@ -47,6 +47,7 @@ import {
   MAX_WRITE_BYTES,
   REQUEST_ID_ENV,
   RUN_TMP_ENV,
+  WORKSPACE_PROVIDER_KEYS,
   deriveRequestId,
   evidencePathProblem,
   loomToolDescription,
@@ -100,8 +101,13 @@ test('Core input contracts replace guessed fields and reject incomplete operatio
     'an omitted workspaceId is a valid target',
   )
   // `path` and `files` now belong to the workspace and send operations: they are in the shared
-  // provider schema, and `loom.evidence` still refuses them as its own inputs.
+  // provider schema, and `loom.evidence` still refuses them as its own inputs. The provider sees
+  // only the workspace key's type; Core keeps the detailed `minLength`/`maxLength` bound above.
   assert.equal(fields.properties.path.type, 'string')
+  assert.equal(fields.properties.path.minLength, undefined)
+  assert.equal(fields.properties.path.maxLength, undefined)
+  assert.equal(fields.properties.workspaceId.maxLength, undefined)
+  assert.equal(CONTRACTS['loom.workspace.list'].properties.path.minLength, 1)
   assert.equal(fields.properties.files.type, 'array')
   assert.equal(CONTRACTS['loom.evidence'].properties.path, undefined)
   for (const key of ['path', 'files', 'filePath', 'paths', 'file']) {
@@ -1220,11 +1226,60 @@ test('17 · the managed bridge mirrors Core catalog keys for every bridged opera
   }
   assert.deepEqual([...LOOM_INPUT_KEYS['loom.workspace.write']].sort(), ['data', 'path', 'requestId', 'timeoutMs', 'workspaceId'])
   assert.deepEqual([...LOOM_INPUT_KEYS['thread.message.send']].sort(), ['body', 'files', 'mentionUser', 'publicOnly', 'to'])
-  assert.equal(fields.properties.data.type, 'string')
-  assert.equal(fields.properties.data.maxLength, 1_398_104)
-  assert.equal(fields.properties.path.minLength, 1)
+  // Provider-facing: every workspace key is a bare scalar, while Core's catalog keeps the metadata.
+  for (const key of WORKSPACE_PROVIDER_KEYS) {
+    const catalog = Object.values(CONTRACTS).map(schema => schema.properties[key]).find(property => property)
+    assert.deepEqual(fields.properties[key], { type: catalog.type }, `${key} is a provider scalar`)
+  }
+  assert.equal(fields.properties.data.maxLength, undefined)
+  assert.equal(CONTRACTS['loom.workspace.write'].properties.data.maxLength, 1_398_104)
+  assert.equal(fields.properties.path.minLength, undefined)
+  assert.equal(CONTRACTS['loom.workspace.read'].properties.path.minLength, 1)
   assert.equal(fields.properties.files.maxItems, 10)
-  assert.equal(fields.properties.workspaceId.maxLength, 128)
+  assert.equal(fields.properties.workspaceId.maxLength, undefined)
+  assert.equal(CONTRACTS['loom.workspace.list'].properties.workspaceId.maxLength, 128)
+  // Original operations are not projected: their published schemas are Core's, byte for byte.
+  assert.deepEqual(fields.properties.tasks, CONTRACTS['loom.plan'].properties.tasks)
+  assert.deepEqual(fields.properties.relativePath, CONTRACTS['loom.evidence'].properties.relativePath)
+  assert.deepEqual(fields.properties.criteria, CONTRACTS['loom.plan'].properties.criteria)
+})
+
+test('17b · shallow workspace schemas are a provider-compatibility projection, not looser validation', () => {
+  const fields = loomToolParameters().properties.input
+  // Only `{ type }` survives for a workspace key: no nested or validation-heavy metadata at all.
+  const VALIDATION_METADATA = ['minimum', 'maximum', 'default', 'format', 'minLength', 'maxLength', 'pattern', 'description', 'items']
+  for (const key of WORKSPACE_PROVIDER_KEYS) {
+    assert.deepEqual(Object.keys(fields.properties[key]), ['type'], `${key} carries the type only`)
+    for (const metadata of VALIDATION_METADATA) {
+      assert.equal(Object.hasOwn(fields.properties[key], metadata), false, `${key}.${metadata} is not provider-facing`)
+    }
+  }
+  assert.deepEqual(
+    WORKSPACE_PROVIDER_KEYS.map(key => [key, fields.properties[key].type]),
+    [['workspaceId', 'string'], ['path', 'string'], ['limit', 'integer'], ['offset', 'integer'],
+      ['maxBytes', 'integer'], ['data', 'string'], ['requestId', 'string'], ['timeoutMs', 'integer']],
+  )
+  // The projection is presentation only: Core's catalog metadata and the closed host checks stand.
+  assert.equal(CONTRACTS['loom.workspace.read'].properties.offset.maximum, 18_446_744_073_709_551_616)
+  assert.equal(CONTRACTS['loom.workspace.read'].properties.maxBytes.default, 65_536)
+  assert.equal(CONTRACTS['loom.workspace.list'].properties.limit.maximum, 200)
+  assert.equal(CONTRACTS['loom.workspace.list'].properties.requestId.format, 'uuid')
+  assert.equal(CONTRACTS['loom.workspace.write'].properties.data.maxLength, 1_398_104)
+  // `validateLoomParams` is unchanged: it still refuses a key the workspace operation never
+  // declares, a missing required key, and a payload Core would reject — the shallow schema is not
+  // a second validator and relaxes nothing on the wire.
+  assert.equal(
+    validateLoomParams({ operation: 'loom.workspace.read', input: { path: 'a', maximum: 1 } }).code,
+    'loom_input_not_allowed:maximum',
+  )
+  assert.equal(validateLoomParams({ operation: 'loom.workspace.write', input: { path: 'a' } }).code, 'loom_input_required:data')
+  assert.equal(validateLoomParams({ operation: 'loom.workspace.read', input: { path: '../x' } }).code, 'loom_workspace_path_parent_escape')
+  assert.equal(
+    validateLoomParams({ operation: 'loom.workspace.write', input: { path: 'a', data: 'not-base64' } }).code,
+    'loom_workspace_write_data_not_base64',
+  )
+  // A range bound is Core's: the host bridge does not re-implement it from the projected schema.
+  assert.equal(validateLoomParams({ operation: 'loom.workspace.read', input: { path: 'a', maxBytes: 1_048_577 } }).ok, true)
 })
 
 // ---------------------------------------------------------------------------

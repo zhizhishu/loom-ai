@@ -137,6 +137,25 @@ export const LOOM_INPUT_KEYS: Readonly<Record<string, readonly string[]>> = Obje
 })
 
 /**
+ * The input keys this bridge projects to a provider as bare scalars.
+ *
+ * Every one of them is a workspace-operation key, and every one is a flat string/integer in Core's
+ * catalog. The projection exists only because some providers (OCT/Mistral) refuse the whole tool
+ * when the input object carries nested validation metadata for these keys. Nothing else changes:
+ * `validateLoomParams` and Core's closed catalog schema keep the real bounds.
+ */
+export const WORKSPACE_PROVIDER_KEYS = Object.freeze([
+  "workspaceId",
+  "path",
+  "limit",
+  "offset",
+  "maxBytes",
+  "data",
+  "requestId",
+  "timeoutMs",
+])
+
+/**
  * Identity an operation could try to claim for itself. Never accepted from the model.
  *
  * `claimId` and `fenceGeneration` are intentionally absent: `loom.claim_heartbeat` takes them as
@@ -526,17 +545,28 @@ function containedIn(root: string, target: string): boolean {
 /**
  * Preserve Core's field shapes for providers. Per-operation required keys are named in the
  * description and checked before a child starts; Core still owns final validation.
+ *
+ * Every original operation mirrors its catalog schema byte-for-byte. The three workspace
+ * operations are the one projection: their flat scalar keys are published without
+ * `minimum`/`maximum`/`default`/`format`/`minLength`/`maxLength`/`pattern` or a long description,
+ * because OCT/Mistral otherwise refuses this whole tool as too complex. That shallow shape is a
+ * provider-compatibility projection only: `validateLoomParams` still refuses an unknown key before
+ * a child exists, and Core's closed catalog schema still owns every real bound.
  */
 export function loomToolParameters(contracts: WorkflowContracts): Record<string, unknown> {
   const properties: Record<string, unknown> = {}
   for (const operation of LOOM_OPERATIONS) {
     const fields = contracts[operation]?.properties
     if (!isRecord(fields)) throw new Error("loom_contract_missing")
+    const workspace = operation.startsWith("loom.workspace.")
     for (const [name, schema] of Object.entries(fields)) {
-      if (Object.hasOwn(properties, name) && JSON.stringify(properties[name]) !== JSON.stringify(schema)) {
+      const projected = workspace && WORKSPACE_PROVIDER_KEYS.includes(name)
+        ? providerScalarSchema(name, schema)
+        : JSON.parse(JSON.stringify(schema))
+      if (Object.hasOwn(properties, name) && JSON.stringify(properties[name]) !== JSON.stringify(projected)) {
         throw new Error("loom_contract_property_conflict")
       }
-      properties[name] = JSON.parse(JSON.stringify(schema))
+      properties[name] = projected
     }
   }
   return {
@@ -548,6 +578,14 @@ export function loomToolParameters(contracts: WorkflowContracts): Record<string,
       input: { type: "object", additionalProperties: false, properties },
     },
   }
+}
+
+/** The bare `{ type }` shape a provider sees for one workspace input key. */
+function providerScalarSchema(name: string, schema: unknown): Record<string, unknown> {
+  if (!isRecord(schema) || (schema.type !== "string" && schema.type !== "integer")) {
+    throw new Error(`loom_contract_property_invalid:${name}`)
+  }
+  return { type: schema.type }
 }
 
 // ---------------------------------------------------------------------------
