@@ -483,9 +483,10 @@ function Assert-ShortWorkRoot {
     if ($root.Length -gt 40) { throw "WorkRoot must stay short for Expand-Archive: $($root.Length) characters" }
     if ($root -match '(^|\\)\.\.?(\\|$)') { throw 'WorkRoot must not contain . or .. segments.' }
     $script:Paths['work'] = New-Directory $root
-    foreach ($name in @('pkg', 'inst', 'data', 'logs', 'files')) {
+    foreach ($name in @('pkg', 'data', 'logs', 'files')) {
         $script:Paths[$name] = New-Directory (Join-Path $root $name)
     }
+    $script:Paths['inst'] = Join-Path $root 'inst'
     $script:InstallDirectory = $script:Paths['inst']
     $script:DataDirectory = $script:Paths['data']
 }
@@ -496,7 +497,8 @@ function Expand-Package {
     Copy-Item -LiteralPath $PackageZip -Destination $copy -Force
     $extracted = Join-Path $script:Paths['work'] 'unpacked'
     if ([IO.Directory]::Exists($extracted)) { [IO.Directory]::Delete($extracted, $true) }
-    Expand-Archive -LiteralPath $copy -DestinationPath $extracted -Force
+    Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($copy, $extracted)
     $candidates = @(Get-ChildItem -LiteralPath $extracted -Filter 'candidate-manifest.json' -Recurse -Depth 2 -File -ErrorAction SilentlyContinue)
     if ($candidates.Count -eq 0) { throw 'candidate-manifest.json is missing: this is not a LOOM personal package.' }
     $root = $candidates[0].DirectoryName
