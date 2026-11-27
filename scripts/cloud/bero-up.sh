@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+#
+# LOOM one-command runner for the DE-BERO host.
+#
+#   bash scripts/cloud/bero-up.sh <loom-personal-preview-linux-<sha>.tar.gz>
+#
+# Input is one downloaded CI Linux personal artifact (uploaded by
+# .github/workflows/loom-v2-e3-linux.yml as loom-personal-preview-linux-<sha>,
+# assembled by scripts/package-linux-personal.mjs). Output is a running Core +
+# WebUI behind a cloudflared quick tunnel, plus the operator facts needed to use
+# it: tunnel URL, image tag, where the Owner token lives and the exact command
+# that prints it.
+#
+# Nothing here compiles: no cargo, no pnpm, no npm, no python3, neither inside
+# nor outside the image. The only build is the `runtime` stage of
+# docker/Dockerfile, from binaries CI already built. Nothing secret is printed:
+# the Owner token stays in /data/web-auth.json inside the core container and is
+# read only by an explicit operator command.
+#
+# Why this extracts the payload directly instead of replaying manifest.json:
+#   * The server package is already inside the personal package —
+#     scripts/package-linux-personal.mjs cpSync()s the whole built server package
+#     (rovai, rovai-host, rovai-server, web-ui/, skills/, LICENSE, package-info,
+#     linux-abi.json, manifest.json) into it, then deletes install-server.sh and
+#     replaces README.md with the personal guide.
+#   * docker/Dockerfile consumes exactly this tree: `COPY package/ /opt/rovai/`
+#     (plus entrypoint.sh/healthcheck.sh, staged from this checkout) and
+#     presence checks for web-ui/index.html, skills/cli-operations/SKILL.md,
+#     manifest.json and linux-abi.json. So copying exactly those files is all the
+#     image needs; nothing is rewritten and README.md is not regenerated.
+#   * Strict provenance — dirty=false plus a sha256 replay of every manifest
+#     entry — belongs to scripts/smoke-linux-server.py (Gate A, driven by
+#     .github/workflows/full-check.yml) and the server package's own manifest. It
+#     is not the live Bero acceptance path. CI personal artifacts legitimately
+#     record dirty=true because their workflow checks out pinned reference repos
+#     inside the worktree (_artifacts/reference-repos/pi-purge-current) before
+#     building the server package. This runner therefore uses the CI-produced
+#     binaries as delivered and makes no Gate A provenance claim; it rewrites no
+#     manifest and only warns.
+#   Only the allowlisted payload is copied, so the personal-package extras
+#   (runtime/, rovai-core, loom-node, *-Loom.sh, candidate-manifest.json) simply
+#   never reach the build context or the image.
+set -Eeuo pipefail
+umask 022
+
+usage() {
+  printf 'usage: bash scripts/cloud/bero-up.sh <CI-linux-personal.tar.gz>\n' >&2
+}
+
+die() {
+  printf 'bero-up: %s\n' "$*" >&2
+  exit 1
+}
+
+log() {
+  printf '==> %s\n' "$*" >&2
+}
+
+# Own the working directory from this script's own location, never from $PWD.
+script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) ||
+  die 'could not resolve the script directory'
+repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd -P) ||
+  die 'could not resolve the repository root'
+cd "$repo_root"
+
+for required in docker-compose.yml docker/Dockerfile docker/entrypoint.sh docker/healthcheck.sh; do
+  [ -f "$required" ] || die "$repo_root is not a LOOM checkout: missing $required"
+done
+
+[ "$#" -eq 1 ] || { usage; exit 2; }
+archive_input=$1
+[ -f "$archive_input" ] && [ -r "$archive_input" ] ||
+  die "input is not a readable file: $archive_input"
+case "$archive_input" in
+  *.tar.gz | *.tgz) ;;
+  *) die "expected the CI personal package archive (*.tar.gz), got: $archive_input" ;;
+esac
+archive=$(CDPATH= cd -- "$(dirname -- "$archive_input")" && pwd -P)/$(basename -- "$archive_input")
+
+for tool in docker tar; do
+  command -v "$tool" >/dev/null 2>&1 ||
+    die "$tool is required; install it first (this runner installs nothing)"
+done
+docker compose version >/dev/null 2>&1 ||
+  die 'docker compose (v2) is required; this runner drives docker compose only'
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/loom-bero-up.XXXXXXXX") ||
+  die 'could not create a temporary work directory'
+cleanup() {
+  status=$?
+  trap - EXIT
+  if [ -n "${work:-}" ] && [ -d "$work" ]; then
+    rm -rf -- "$work" || printf 'bero-up: warning: could not remove %s\n' "$work" >&2
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ---------------------------------------------------------------- 1. extract
+log "extracting $(basename -- "$archive")"
+mkdir -p "$work/extract"
+tar -xzf "$archive" -C "$work/extract" ||
+  die "could not extract $archive (is it a complete *.tar.gz?)"
+personal="$work/extract/loom-personal-linux-x64"
+[ -d "$personal" ] ||
+  die "expected a single top-level loom-personal-linux-x64/ directory in $archive"
+
+# ------------------------------------------------- 2. read the package facts
+manifest=$personal/manifest.json
+[ -f "$manifest" ] ||
+  die "loom-personal-linux-x64/manifest.json is missing; not a CI linux personal package"
+grep -Eq '"target"[[:space:]]*:[[:space:]]*"linux-x64"' "$manifest" ||
+  die 'manifest target is not linux-x64; this runner only serves the CI linux-x64 package'
+grep -Eq '"profile"[[:space:]]*:[[:space:]]*"debug"' "$manifest" ||
+  die 'manifest profile is not debug; this runner only serves the CI debug candidate package'
+if grep -Eq '"dirty"[[:space:]]*:[[:space:]]*true' "$manifest"; then
+  log 'warning: manifest records dirty=true (CI stages reference repos in the checkout); continuing — Gate A provenance is not claimed here'
+fi
+source_commit=$(sed -n 's/^[[:space:]]*"commit"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' "$manifest")
+if [ -z "$source_commit" ]; then
+  source_commit=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null) ||
+    die 'manifest.json records no source commit and this checkout has no git HEAD'
+  log "manifest records no source commit; labelling the image from git HEAD $source_commit"
+fi
+
+# ----------------------------------------- 3. stage the docker build context
+# Exactly what docker/Dockerfile copies: the server payload under package/ plus
+# the two container scripts. No source checkout, no .git, no credential, and no
+# personal-package extra can enter the context.
+log 'staging the docker context from the personal package payload'
+context=$work/context
+package=$context/package
+mkdir -p "$package"
+payload=(rovai rovai-host rovai-server web-ui skills LICENSE package-info linux-abi.json manifest.json)
+for item in "${payload[@]}"; do
+  [ -e "$personal/$item" ] && [ ! -L "$personal/$item" ] ||
+    die "the personal package has no regular $item; it is not a complete linux-x64 server package"
+  cp -a -- "$personal/$item" "$package/$item"
+done
+cp docker/Dockerfile docker/entrypoint.sh docker/healthcheck.sh "$context/"
+# smoke-linux-server.py is only used by the `verify` stage, which is not built
+# here (`--target runtime`), so it stays out of the context.
+version=$(sed -n 's/^version=//p' "$package/package-info")
+log "payload: rovai-server ${version:-unknown}, commit $source_commit"
+
+log 'resolving the immutable ubuntu:22.04 base image digest'
+docker pull -q ubuntu:22.04 >/dev/null || die 'could not pull ubuntu:22.04'
+base_image=$(docker inspect --format '{{index .RepoDigests 0}}' ubuntu:22.04) ||
+  die 'could not inspect ubuntu:22.04 after pulling it'
+case "$base_image" in
+  ubuntu@sha256:*) ;;
+  *) die "could not resolve an immutable ubuntu:22.04 digest (got: $base_image)" ;;
+esac
+
+image="loom-bero-core:sha-$source_commit"
+log "building the runtime image $image (no Rust or Node compilation)"
+docker build --progress=plain --target runtime \
+  --build-arg "BASE_IMAGE=$base_image" \
+  --build-arg "SOURCE_COMMIT=$source_commit" \
+  --build-arg BUILD_PROFILE=debug \
+  -t "$image" -f "$context/Dockerfile" "$context" ||
+  die "docker build failed for $image (see the build log above)"
+
+# ---------------------------------------------------- 4. cloudflared + core
+export LOOM_IMAGE="$image"
+log 'starting cloudflared and core'
+docker compose up -d --wait ||
+  die 'docker compose up --wait did not reach a healthy state; inspect: docker compose ps; docker compose logs core'
+
+log 'waiting up to 60s for the cloudflared quick tunnel URL'
+tunnel_url=''
+deadline=$((SECONDS + 60))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  # The quick tunnel URL lives in cloudflared's own log and changes only when
+  # cloudflared restarts, so the most recent URL there is the live one.
+  tunnel_url=$(docker compose logs cloudflared 2>/dev/null |
+    grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -n 1 || true)
+  if [ -n "$tunnel_url" ]; then
+    break
+  fi
+  sleep 2
+done
+[ -n "$tunnel_url" ] ||
+  die 'cloudflared did not print a https://<name>.trycloudflare.com URL within 60s; inspect: docker compose logs cloudflared'
+
+# Only core is recreated, so PUBLIC_ORIGIN takes effect without minting a new
+# tunnel URL. cloudflared keeps running untouched.
+log "recreating core with PUBLIC_ORIGIN=$tunnel_url (cloudflared is left running)"
+PUBLIC_ORIGIN="$tunnel_url" docker compose up -d --force-recreate --wait core ||
+  die 'core did not become healthy with the new PUBLIC_ORIGIN; inspect: docker compose logs core'
+
+# ------------------------------------------------------------ 5. operator output
+cat <<EOF
+
+LOOM Core is up through the cloudflared quick tunnel.
+
+  tunnel URL      : $tunnel_url
+  image           : $image
+  source commit   : $source_commit
+  Owner token file: /data/web-auth.json (inside the core container)
+
+Read the Owner token only when you choose to. Its stdout is a secret: do not
+paste it into logs, issues, URLs or chat.
+  docker compose exec core /opt/rovai/rovai-server --data-dir /data token
+
+Pair another machine as a node (not run by this script):
+  docker compose exec core /opt/rovai/rovai-server --data-dir /data node-pair
+
+The tunnel is outbound-only: nothing publishes a host port. Stop it with
+  docker compose down
+EOF
