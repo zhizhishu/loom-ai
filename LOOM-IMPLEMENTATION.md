@@ -1,9 +1,18 @@
 # LOOM 当前实现与 E0–E7 验收
 
-> **CURRENT IMPLEMENTATION STATUS · 2026-11-17 续开发，未签收。** 本页是 LOOM V2 **实现进度、失败和真实验收唯一汇总**，不是架构规范、第二开发书、发布声明或用户审批。最新状态看下面续开发实测；原固定 SHA 的历史证据保留，不冒充本次全量回归。
+> **CURRENT IMPLEMENTATION STATUS · 2026-11-17 续开发，未签收；2026-11-28 rebase 后当前基线 `1ea3bff`（`m/integrate` 正好等于 `1ea3bff`，其 parent/base 链项为 `2843cbe`）。** 本页是 LOOM V2 **实现进度、失败和真实验收唯一汇总**，不是架构规范、第二开发书、发布声明或用户审批。最新状态看下面续开发实测；原固定 SHA 的历史证据保留，不冒充本次全量回归。
 
 产品要做什么看 [PRODUCT.md](PRODUCT.md)，已选 Mikka/PiBot 三栏 UI 与用户指定猫耳品牌看 [DESIGN.md](DESIGN.md)，架构与每层复用来源看 [LOOM-ARCHITECTURE](docs/loom/LOOM-ARCHITECTURE.md)，交接与施工规则看 [LOOM-HANDOFF](docs/loom/LOOM-HANDOFF.md)，验收标准看 [LOOM-ACCEPTANCE](docs/loom/LOOM-ACCEPTANCE.md)，参考项目看 [参考锁](docs/loom/LOOM-V2-REFERENCE-LOCK.md)。旧计划（含 P0–P14 原设计）已归档于 [plans-2026-11-18](docs/loom/archive/plans-2026-11-18/README.md)，不在本页重复叙述。
 
+## 2026-11-28 候选基线 rebase 到 `m/integrate` = `1ea3bff`（parent/base 链项 `2843cbe`；本轮只改文档，未重跑验收）
+
+> 本节只改判读口径与索引，不新增任何 PASS。逐项证据、截图 sha、run id 与缺口表在 [LOOM-ACCEPTANCE-EVIDENCE-INDEX.md](docs/loom/LOOM-ACCEPTANCE-EVIDENCE-INDEX.md)；下方 2026-11-26 汇总表的结论原样保留，但**不再等同“当前候选已验”**。
+
+- **现在只有一条当前基线，不再是两条并列线**：`m/integrate` 已 rebase 到并正好等于 `1ea3bff821ec84e77d4f82a29b15aff5d1b957fa`（`1ea3bff`），它是**唯一**的当前基线，也是今后 `cand/*` 分支的起点；`2843cbe6fbed7c0b401dc39b375b8fa2911056f8`（`2843cbe`）只是同一条链上的 **parent/base 链项**，不再与 `1ea3bff` 并列当“当前候选”。此前标为“最新版”的 `a4ea6da` / `loom/trial-a4ea6da`，以及 `0f2fa68`、`aa6de92`、`429ecd7`、`9ba97a5`、`8dc3366` 全部降为 **旧版**。
+- **`1ea3bff` trial 流水线两条都 success**：Linux run `46052485873` **success**，artifact `15225925980`，tar 包 sha256 `737925180f805d780a50cf56c0413a1e739de476c2bbb46d5e610474129bd103`；Windows run `46052481730` **success**，personal artifact `15226860608`。Windows artifact 是**解包后的文件树，不是单个包归档**，因此**不填 Windows 包 sha，也不得推定**；可当静态产物证据的只有其中 `candidate-manifest.json` 的 sha256 `e2e6d251537a9db01fa43be2d62f3c9068fe7cc1640f6207e8048571f8a01b04`。这两条只证明**打包流水线跑通、产物存在且可哈希**，**不证明** LibreOffice 行为、从零安装冒烟、Windows 真机验收，也不证明 `1ea3bff` 上跑过云上链接 flight。
+- **云上链接 flight：跑的是旧 `a4ea6da` 包二进制，不是 `1ea3bff` 候选包**：online `ff6a9551efb1bd7b6fb7499c265c37936a9ec504677867d9cd17409fa636f470`、offline `412cd83200c2737b8b9b308d193930f92a98d20aef991757fd8e4ae8ab658505`、reonline `da63e1b0812c1369b0119588719efc4aaad1e2441a27e0ea4f712082d3bf4600`、exec output `73c878906f0593d5f10f014b8b5044485e8069151f06c9ab5c5f8258c7e5426b`、created file `a10b3027833c149b081b9d0e764005f46a6cbc06d126ef41df16715b3fe8fc19`。该次 flight 用的是 `/tmp/final-a4-smoke/pkg` 下**旧的 `a4ea6da` Linux 包二进制**，因此只是**既有链接通路 + 旧 `a4ea6da` 包**的证据，**未在 `1ea3bff` 上验证**，不能证明当前基线。执行位置是 Devin VM，隔离手段是**进程隔离，不是容器**；无截图 sha、无 flight run/session id，证据包自身不带 commit 字段。按现行 E5 口径也**不能**当跨设备/容器级证据。
+- **Windows 超时与验收脚本**：`2bd71a8` 把验收脚本 Windows 超时 30s→60s，对应 PASS run `46048772023`（本轮缺回执正文与截图）；`d35f070` **仅**新增 `scripts/acceptance/windows-real-install-acceptance.draft.ps1`，**未产生** Windows 真机安装验收。两者原本都是 `a4ea6da` 之上的提交，其 diff 已分别以 `dd8b9b9` 和最终树的形式 cherry-pick 进 `1ea3bff` 候选，**代码在候选内**；但它们的测试**没有在 `1ea3bff` 上重跑**，所以仍按“候选内的代码、测试未在候选复验”记账，不记 PASS。
+- **尚未在 `1ea3bff` 重跑的老结论**：§5/T28 两轮全链（轮 1 `429ecd7`、轮 2 `9ba97a5`，非同一 commit）、pptx missing-LibreOffice 浮层、Linux 从零冒烟、双平台包核验（Linux `45974031213` / Windows `45974025818`）、Office 三件读取（`aa6de92`）——均只在 `a4ea6da` 及以前候选验过；`46052485873`（Linux，tar sha256 `737925180f805d780a50cf56c0413a1e739de476c2bbb46d5e610474129bd103`）与 `46052481730`（Windows，解包文件树 artifact `15226860608`）都只证明 `1ea3bff` 的打包流水线与产物存在/可哈希，不替代上述任何一项重跑。LibreOffice 目前只有“缺依赖”负例，“装好 LibreOffice 后逐页预览成功”**没有任何版本的正向证据**。
 
 ## 2026-11-26 最终验收汇总（按 LOOM-ACCEPTANCE §6）
 
