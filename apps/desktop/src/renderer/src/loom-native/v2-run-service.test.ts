@@ -95,6 +95,7 @@ const thread = (over: {
   id?: string
   members?: ThreadMemberView[]
   agentRuns?: AgentRunView[]
+  executionEvidence?: ThreadSnapshot['executionEvidence']
   defaultLeadAgentId?: string | null
 } = {}): ThreadSnapshot => ({
   schemaVersion: 36,
@@ -123,7 +124,7 @@ const thread = (over: {
   messageDeliveries: [],
   turns: [],
   agentRuns: over.agentRuns ?? [],
-  executionEvidence: [],
+  executionEvidence: over.executionEvidence ?? [],
   agentRunFileChanges: [],
   contextManifests: [],
   approvals: [],
@@ -499,7 +500,9 @@ describe('Goal, Bot, Lead and Run facts are projections, not promises', () => {
         status: 'running',
         waitReason: null,
         startedAt: '2026-11-15T01:00:00Z',
-        endedAt: null
+        endedAt: null,
+        fileChanges: [],
+        commandExits: []
       }]
     })
     expect(runFacts(thread()).length).toBe(0)
@@ -517,6 +520,31 @@ describe('Goal, Bot, Lead and Run facts are projections, not promises', () => {
     // 目标与认领是 Mission 作用域的，不因为 Thread 不匹配就丢掉。
     expect(mismatched.goal.mission.missionId).toBe('rvm_1')
     expect(mismatched.claims.status).toBe('observed')
+  })
+
+  it('projects command exit codes only from the matching run epoch', () => {
+    const evidence = (sequence: number, executionEpoch: number, exitCode?: number): ThreadSnapshot['executionEvidence'][number] => ({
+      id: `ev-${sequence}`,
+      agentRunId: 'run-1',
+      executionEpoch,
+      sequence,
+      operationId: 'cmd-1',
+      revision: sequence,
+      changeSequence: sequence,
+      eventType: exitCode === undefined ? 'activity.started' : 'activity.completed',
+      kind: 'command',
+      phase: exitCode === undefined ? 'started' : 'completed',
+      payload: { item: { id: 'cmd-1', type: 'commandExecution', command: 'pnpm test', status: exitCode === undefined ? 'inProgress' : 'completed', ...(exitCode === undefined ? {} : { exitCode }) } },
+      contentBlobId: null,
+      contentByteCount: 0,
+      isTruncated: false,
+      occurredAt: '2026-11-15T01:00:00Z'
+    } as unknown as ThreadSnapshot['executionEvidence'][number])
+    const facts = runFacts(thread({
+      agentRuns: [run('run-1')],
+      executionEvidence: [evidence(1, 1), evidence(2, 1, 0), evidence(3, 2, 1)]
+    }))
+    expect(facts[0].commandExits).toEqual([{ command: 'pnpm test', exitCode: 0 }])
   })
 
   it('always reports the V2 Bot/Goal/capability interfaces as unavailable', async () => {

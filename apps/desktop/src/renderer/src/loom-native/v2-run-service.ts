@@ -311,6 +311,12 @@ export interface V2WorkerFacts {
   claim: V2ReadState<LoomClaim | null>
 }
 
+export interface V2RunCommandExitFact {
+  command: string
+  /** Evidence 里明确记录的数字退出码；没记录就是 null，不拿运行成败冒充。 */
+  exitCode: number | null
+}
+
 /** Run：Thread 里已记录的 AgentRun，只做定位与状态，不推断任务完成。 */
 export interface V2RunFactsEntry {
   agentRunId: string
@@ -321,6 +327,10 @@ export interface V2RunFactsEntry {
   waitReason: string | null
   startedAt: string | null
   endedAt: string | null
+  /** 已完成的文件改动投影；没有投影就是空数组，不据此说「没有改动」。 */
+  fileChanges: ThreadSnapshot['agentRunFileChanges']
+  /** 同一 executionEpoch 里明确投影出的命令与退出码；空数组不表示没有执行过命令。 */
+  commandExits: readonly V2RunCommandExitFact[]
 }
 
 /** 单个状态的三态：已记录 / 未记录 / 读不到。空不等于「没发生」。 */
@@ -407,6 +417,40 @@ export function leadFacts(
   return { agentId, bot, matchesMissionLead: agentId === mission.defaultLeadAgentId }
 }
 
+function objectRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+
+function commandExitFacts(thread: ThreadSnapshot, run: ThreadSnapshot['agentRuns'][number]): V2RunCommandExitFact[] {
+  type Draft = V2RunCommandExitFact & { sequence: number }
+  const byOperation = new Map<string, Draft>()
+  for (const evidence of thread.executionEvidence ?? []) {
+    if (evidence.agentRunId !== run.id || evidence.executionEpoch !== run.executionEpoch) continue
+    const payload = objectRecord(evidence.payload)
+    const item = objectRecord(payload.item)
+    if (evidence.kind !== 'command' && item.type !== 'commandExecution') continue
+    const command = typeof item.command === 'string' ? item.command.trim() : ''
+    if (!command) continue
+    const operation = typeof item.id === 'string' && item.id
+      ? item.id
+      : evidence.operationId ?? command
+    const exit = typeof item.exitCode === 'number' && Number.isInteger(item.exitCode) ? item.exitCode : null
+    const previous = byOperation.get(operation)
+    if (!previous || evidence.sequence >= previous.sequence) {
+      byOperation.set(operation, {
+        command,
+        exitCode: exit ?? previous?.exitCode ?? null,
+        sequence: evidence.sequence
+      })
+    } else if (exit !== null && previous.exitCode === null) {
+      byOperation.set(operation, { ...previous, exitCode: exit })
+    }
+  }
+  return [...byOperation.values()]
+    .sort((left, right) => left.sequence - right.sequence)
+    .map(({ command, exitCode }) => ({ command, exitCode }))
+}
+
 export function runFacts(thread: ThreadSnapshot): V2RunFactsEntry[] {
   return thread.agentRuns.map(run => ({
     agentRunId: run.id,
@@ -415,7 +459,9 @@ export function runFacts(thread: ThreadSnapshot): V2RunFactsEntry[] {
     status: run.status,
     waitReason: run.waitReason ?? null,
     startedAt: run.startedAt,
-    endedAt: run.endedAt
+    endedAt: run.endedAt,
+    fileChanges: (thread.agentRunFileChanges ?? []).filter(changes => changes.agentRunId === run.id),
+    commandExits: commandExitFacts(thread, run)
   }))
 }
 

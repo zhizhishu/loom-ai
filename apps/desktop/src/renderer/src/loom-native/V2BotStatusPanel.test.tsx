@@ -38,6 +38,7 @@ const run = (id: string, agentId: string, taskId: string, status = 'succeeded', 
   taskId,
   status,
   waitReason,
+  executionEpoch: 1,
   startedAt: '2026-11-15T01:00:00Z',
   endedAt: status === 'running' ? null : '2026-11-15T01:10:00Z'
 } as unknown as ThreadSnapshot['agentRuns'][number])
@@ -46,13 +47,17 @@ const thread = (over: {
   id?: string
   members?: ThreadSnapshot['members']
   agentRuns?: ThreadSnapshot['agentRuns']
+  executionEvidence?: ThreadSnapshot['executionEvidence']
+  agentRunFileChanges?: ThreadSnapshot['agentRunFileChanges']
 } = {}): ThreadSnapshot => ({
   thread: {
     id: over.id ?? 'camp-1',
     defaultLeadAgentId: 'bot-a'
   },
   members: over.members ?? [member('bot-a', 'BotA', true), member('bot-b', 'BotB')],
-  agentRuns: over.agentRuns ?? []
+  agentRuns: over.agentRuns ?? [],
+  executionEvidence: over.executionEvidence ?? [],
+  agentRunFileChanges: over.agentRunFileChanges ?? []
 } as unknown as ThreadSnapshot)
 
 const mission = (threadId = 'camp-1'): MissionRecord => ({
@@ -243,6 +248,34 @@ describe('V2 run surface: actual records, readable actions, independent facts', 
     const html=await renderPanel({bundle:ownedBundle()})
     expect(html).toContain('未核验');expect(html).toContain('尚无评审');expect(html).toContain('待决定')
     expect(html).not.toContain('已接受')
+  })
+  it('shows criterion results, evidence links and verification method on the completion summary card', async()=>{
+    const criteria={version:'ac-1',criteria:[{criterionId:'crit-1',text:'测试通过'}]}
+    const completed={...candidate('cand-a',['shot']),acceptanceCriteria:criteria,verificationStatus:'verified' as const,acceptanceStatus:'accepted' as const}
+    const html=await renderPanel({thread:thread({agentRuns:[run('run-1','bot-a','task-a','succeeded')],executionEvidence:[{
+      id:'cmd-done',agentRunId:'run-1',executionEpoch:1,sequence:2,operationId:'cmd-1',revision:2,changeSequence:2,
+      eventType:'activity.completed',kind:'command',phase:'completed',
+      payload:{item:{id:'cmd-1',type:'commandExecution',command:'pnpm test',status:'completed',exitCode:0}},
+      contentBlobId:null,contentByteCount:0,isTruncated:false,occurredAt:'2026-11-15T03:00:00Z'
+    } as unknown as ThreadSnapshot['executionEvidence'][number]],agentRunFileChanges:[{
+      schemaVersion:2,agentRunId:'run-1',executionEpoch:1,files:[],fileCount:2,operationCount:3,additions:8,deletions:2,completedAt:'2026-11-15T03:00:00Z'
+    }]}),bundle:bundle({
+      candidates:[completed],
+      artifacts:[
+        artifact('shot',{relativePath:'capture.png',contentType:'image/png'}),
+        artifact('report',{relativePath:'.loom/acceptance/task-a.md',taskId:'task-a'})
+      ],
+      verifications:[{...verification('cand-a','passed'),method:'pnpm test · exit 0',evidenceIds:['shot']}],
+      reviews:[{...review('cand-a','accepted'),criteriaResults:[{criterionId:'crit-1',satisfied:true,evidenceIds:['shot'],note:null}]}]
+    })})
+    expect(html).toContain('完工摘要')
+    expect(html).toContain('pnpm test · exit 0')
+    expect(html).toContain('退出码 ')
+    expect(html).toContain('pnpm test')
+    expect(html).toContain('打开验收报告')
+    expect(html).toContain('通过 · 测试通过')
+    expect(html).toContain('capture.png')
+    expect(html).toContain('2 个文件 · +8 −2')
   })
   it('an accepted review does not rewrite verification or acceptance', async()=>{
     const html=await renderPanel({bundle:ownedBundle({reviews:[review('cand-a','accepted')]})})

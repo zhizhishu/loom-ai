@@ -1,9 +1,10 @@
 import type { ReactNode } from 'react'
 import type { LoomClaim } from '@contracts'
-import type { ArtifactSelection, WorkBundle } from './types'
+import type { ArtifactSelection, LoomCandidate, WorkBundle } from './types'
 import { Icon } from './icons'
 import { artifactCandidateFacts, artifactVersionLabel } from './artifact-service'
 import { agentRunWaitDetail } from '../../../shared/execution-presentation'
+import { runCompletionChangeText, runCompletionChangeTotals } from '../run-completion-summary'
 import { uiAttribute } from '../interface-language'
 import { claimLeaseState, type V2ReadState, type V2RunFacts, type V2StatusFact, type V2UnavailableReason } from './v2-run-service'
 import './run-status.css'
@@ -46,6 +47,10 @@ function leaseLabel(claim:LoomClaim): string {
   return label(claimLeaseState(claim), { held:'认领有效',expired:'认领已过期',released:'认领已释放' })
 }
 function fileName(path:string): string { return path.split(/[\\/]/u).filter(Boolean).pop() ?? path }
+function latestByTime<T>(rows: readonly T[], time: (row:T)=>string): T | null {
+  return rows.reduce<T | null>((latest,row)=>latest===null || time(row)>=time(latest) ? row : latest,null)
+}
+
 function blockedText(reason:string): string {
   return uiAttribute(({
     'loom.rework_budget_exhausted':'已达到返工次数上限，仍未通过审核。可在下方调整上限后继续。',
@@ -70,6 +75,17 @@ export function V2BotStatusPanel({ facts, bundle, onArtifact }: {
   const lead = facts.lead.status === 'observed' ? facts.lead.value : null
   const artifacts = facts.artifacts.map(entry => ({ entry, context: artifactCandidateFacts(bundle, entry.artifact, entry.candidate) }))
     .sort((left, right) => Number(right.context.latest) - Number(left.context.latest))
+  const completionCards = bundle.tasks.map(task => {
+    const candidate = latestByTime(bundle.candidates.filter(item => item.taskId === task.taskId),item=>item.createdAt)
+    if (!candidate) return null
+    const review = latestByTime(bundle.reviews.filter(item => item.candidateId === candidate.candidateId),item=>item.reviewedAt)
+    const verification = latestByTime(bundle.verifications.filter(item => item.candidateId === candidate.candidateId),item=>item.verifiedAt)
+    const report = latestByTime(bundle.artifacts.filter(item => item.taskId === task.taskId && item.relativePath.includes('.loom/acceptance/')),item=>item.createdAt)
+    const run = runs.find(entry => entry.agentRunId === candidate.agentRunId) ?? null
+    const changes = runCompletionChangeTotals(run?.fileChanges ?? [])
+    return { task, candidate, review, verification, report, changes, commandExits: run?.commandExits ?? [] }
+  }).filter(item => item !== null)
+  const openArtifact = (artifact: typeof bundle.artifacts[number], candidate: LoomCandidate | null) => onArtifact({ artifact, candidate, bundle })
   return <section className="ln-run-panel" aria-label={uiAttribute('运行与成果概览')} data-mission-id={facts.missionId}>
     <div className="ln-run-goal">
       <div className="ln-run-line"><h2>{facts.goal.mission.title}</h2><span className="ln-run-badge">{goalLabel(facts.goal.mission.status)}</span></div>
@@ -78,6 +94,33 @@ export function V2BotStatusPanel({ facts, bundle, onArtifact }: {
         {lead && !lead.matchesMissionLead && <span> · {uiAttribute('负责人记录不一致，请核对')}</span>}</p>
       <ReadNote state={facts.lead}/><ReadNote state={facts.bots}/>
     </div>
+
+    {completionCards.length > 0 && <Group title={uiAttribute('完工摘要')}>
+      <ul className="ln-run-list">{completionCards.map(({ task, candidate, review, verification, report, changes, commandExits }) => <li key={candidate.candidateId} className="ln-run-completion" data-completion-card={candidate.candidateId}>
+        <div className="ln-run-line"><strong>{task.title}</strong><span className="ln-run-badge">{label(candidate.acceptanceStatus,{accepted:'已接受',rejected:'已退回',pending:'待验收'})}</span></div>
+        <p className="ln-run-meta">{uiAttribute('核验：')}{verification ? `${label(verification.result,{passed:'通过',failed:'未通过'})} · ${verification.method}` : uiAttribute('未核验')}</p>
+        {changes && <p className="ln-run-meta">{uiAttribute('改动：')}{runCompletionChangeText(changes)}</p>}
+        {commandExits.length > 0 && <ul className="ln-run-commands">{commandExits.map((entry, index) => <li key={`${entry.command}-${index}`}>
+          <code>{entry.command}</code><span>{uiAttribute('退出码 ')}{entry.exitCode ?? uiAttribute('未记录')}</span>
+        </li>)}</ul>}
+        {[...new Set([...candidate.evidenceIds,...(verification?.evidenceIds ?? [])])].map(evidenceId => {
+          const artifact = bundle.artifacts.find(item => item.artifactId === evidenceId)
+          return artifact ? <button type="button" className="ln-text-action" key={evidenceId} onClick={()=>openArtifact(artifact,candidate)}>{uiAttribute('证据：')}{fileName(artifact.relativePath)}</button> : null
+        })}
+        {report && <button type="button" className="ln-text-action" onClick={()=>openArtifact(report,candidate)}>{uiAttribute('打开验收报告')}</button>}
+        {candidate.acceptanceCriteria.criteria.length > 0 && <ul className="ln-run-criteria">{candidate.acceptanceCriteria.criteria.map(criterion => {
+          const result = review?.criteriaResults.find(item => item.criterionId === criterion.criterionId) ?? null
+          const evidenceIds = result?.evidenceIds ?? []
+          return <li key={criterion.criterionId} data-criterion-id={criterion.criterionId}>
+            <span>{result ? (result.satisfied ? uiAttribute('通过') : uiAttribute('未通过')) : uiAttribute('待验收')} · {criterion.text}</span>
+            {evidenceIds.map(evidenceId => {
+              const artifact = bundle.artifacts.find(item => item.artifactId === evidenceId)
+              return artifact ? <button type="button" className="ln-text-action" key={evidenceId} onClick={()=>openArtifact(artifact,candidate)}>{fileName(artifact.relativePath)}</button> : null
+            })}
+          </li>
+        })}</ul>}
+      </li>)}</ul>
+    </Group>}
 
     <Group title={uiAttribute('成果')}>
       {facts.artifacts.length === 0 ? <p className="ln-run-empty">{uiAttribute('还没有成果文件。')}</p>
