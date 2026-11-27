@@ -60,7 +60,7 @@ export function verifyLinuxComputerRuntime(destination) {
   for (const required of ['python', 'host_desktop.py', 'mcp_bridge.py', 'wheels/INDEX.txt', 'THIRD-PARTY-NOTICES.txt']) {
     if (!manifest.files.some(file => file.path === required)) throw new Error(`computer runtime is incomplete: ${required}`)
   }
-  const probe = spawnSync(join(destination, 'python'), ['-B', '-c', 'import PIL;print(PIL.__version__)'], { encoding: 'utf8' })
+  const probe = spawnSync(join(destination, 'python'), ['-B', '-c', 'from PIL import Image;import PIL;print(PIL.__version__)'], { encoding: 'utf8' })
   if (probe.status !== 0 || probe.stdout.trim() !== LINUX_PILLOW_VERSION) throw new Error(`bundled Pillow probe failed: ${probe.stderr || probe.stdout}`)
   return manifest
 }
@@ -78,12 +78,15 @@ function stage(destination) {
       const wheel = readdirSync(downloads).find(name => name.includes(`-${tag}-`) && name.endsWith('.whl'))
       if (!wheel) throw new Error(`Pillow wheel missing for ${tag}`)
       copyFileSync(join(downloads, wheel), join(destination, 'wheels', wheel))
+      const unpacked = join(destination, 'wheels', `${tag}-pillow`)
+      mkdirSync(unpacked, { recursive: true })
+      run('python3', ['-m', 'zipfile', '-e', join(downloads, wheel), unpacked])
       indexRows.push(`${tag} ${wheel}`)
       rmSync(join(downloads, wheel))
     }
     writeFileSync(join(destination, 'wheels', 'INDEX.txt'), `${indexRows.join('\n')}\n`)
     for (const name of ['host_desktop.py', 'mcp_bridge.py']) copyFileSync(join(repository, 'resources/computer', name), join(destination, name))
-    const shim = `#!/bin/sh\nset -eu\nroot=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\nif command -v python3 >/dev/null 2>&1; then system_python=$(command -v python3)\nelse echo 'LOOM computer runtime requires python3 on Linux/WSL.' >&2; exit 1; fi\ntag=$($system_python -c 'import sys;print(f"cp{sys.version_info.major}{sys.version_info.minor}")' 2>/dev/null || true)\nwheel=\nfor candidate in \"$root\"/wheels/pillow-${LINUX_PILLOW_VERSION}-$tag-*.whl; do\n  if [ -f \"$candidate\" ]; then wheel=$candidate; break; fi\ndone\nif [ -z \"$wheel\" ]; then echo \"LOOM computer runtime has no Pillow wheel for $tag.\" >&2; exit 1; fi\nPYTHONPATH="$wheel\${PYTHONPATH:+:\$PYTHONPATH}" PYTHONNOUSERSITE=1 exec $system_python -B \"$@\"\n`
+    const shim = `#!/bin/sh\nset -eu\nroot=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\nif command -v python3 >/dev/null 2>&1; then system_python=$(command -v python3)\nelse echo 'LOOM computer runtime requires python3 on Linux/WSL.' >&2; exit 1; fi\ntag=$($system_python -c 'import sys;print(f"cp{sys.version_info.major}{sys.version_info.minor}")' 2>/dev/null || true)\nwheel=\nfor candidate in \"$root\"/wheels/pillow-${LINUX_PILLOW_VERSION}-$tag-*.whl; do\n  if [ -f \"$candidate\" ]; then wheel=$candidate; break; fi\ndone\nif [ -z \"$wheel\" ]; then echo \"LOOM computer runtime has no Pillow wheel for $tag.\" >&2; exit 1; fi\nPYTHONPATH="$root/wheels/$tag-pillow\${PYTHONPATH:+:\$PYTHONPATH}" PYTHONNOUSERSITE=1 exec $system_python -B \"$@\"\n`
     writeFileSync(join(destination, 'python'), shim)
     chmodSync(join(destination, 'python'), 0o755)
     writeFileSync(join(destination, 'THIRD-PARTY-NOTICES.txt'), `LOOM Computer runtime for Linux x64\n\nPillow ${LINUX_PILLOW_VERSION} wheels (MIT-CMU) are retained unmodified for supported CPython versions.\nLOOM host_desktop.py and mcp_bridge.py use the repository LICENSE.\nThe package uses the system python3 executable available in the Linux/WSL installation.\n`)

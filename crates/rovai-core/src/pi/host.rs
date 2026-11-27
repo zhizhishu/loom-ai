@@ -55,7 +55,7 @@ use crate::{
 use super::{
     PI_COMMAND_TIMEOUT, PI_HOST_EXTENSION_VERSION, PI_MAX_INBOUND_RECORD_BYTES,
     PI_MAX_OUTBOUND_RECORD_BYTES, PI_PROTOCOL_VERSION, PiFileAccessMode, PiFileGrant, PiIncoming,
-    PiTransportFailure, mode_from_permissions, now_epoch_ms,
+    PiTransportFailure, PI_LOOM_TOOL_NAME, mode_from_permissions, now_epoch_ms,
     assistant_message_text, completed_action, read_jsonl_record, value_id,
 };
 
@@ -587,6 +587,28 @@ fn append_initial_session_argument(command: &mut Command, session_file: Option<&
     }
 }
 
+
+fn pi_mcp_server_label(server_name: &str) -> String {
+    let mut hash = 0x811c9dc5u32;
+    for byte in server_name.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    format!("{hash:08x}")
+}
+
+fn projected_computer_mcp_tools(document: &Value) -> Vec<String> {
+    const COMPUTER_TOOLS: [&str; 5] = ["screenshot", "mouse_click", "key", "text", "wheel"];
+    document.get("servers").and_then(Value::as_array).into_iter().flatten()
+        .filter(|server| server.get("env").and_then(|env| env.get("LOOM_COMPUTER_AGENT_GRANT")).is_some())
+        .filter_map(|server| server.get("name").and_then(Value::as_str))
+        .flat_map(|name| {
+            let label = pi_mcp_server_label(name);
+            COMPUTER_TOOLS.into_iter().map(move |tool| format!("mcp__{label}__{tool}"))
+        })
+        .collect()
+}
+
 fn append_host_arguments(
     command: &mut Command,
     extension_path: &Path,
@@ -699,7 +721,13 @@ impl PiHost {
                 write_private_file(&guard_entry, QUESTION_GUARD.as_bytes())?;
                 let grant_path = config_root.join(GUARD_GRANT_FILE_NAME);
                 write_private_json(&grant_path, &grant.to_document()?)?;
-                Some((guard_entry, grant.allowed_tools.join(","), grant_path))
+                let mut tools = grant.allowed_tools.clone();
+                if grant.allowed_tools.iter().any(|tool| tool == PI_LOOM_TOOL_NAME) {
+                    if let Some(mcp) = launch.mcp {
+                        tools.extend(projected_computer_mcp_tools(&mcp.document));
+                    }
+                }
+                Some((guard_entry, tools.join(","), grant_path))
             }
             None => None,
         };
@@ -2504,9 +2532,12 @@ impl PiRpcRuntimeAdapter {
                         agent_id: &spawn_agent_id,
                         incoming: spawn_incoming,
                         builtin_tools: Some(spawn_builtin_tool_factory.create()?),
-                        // A read-only Run never installs MCP: the policy grants exactly one native tool,
-                        // so projecting MCP servers while denying every `mcp__*` call would be dishonest.
-                        mcp: if spawn_file_grant.is_some() {
+                        // File-only policies still never install MCP. The workflow policy may carry
+                        // Core's frozen per-Run projection; the shared guard admits exactly the server
+                        // labels in that projection and continues to block undeclared extension tools.
+                        mcp: if spawn_file_grant.as_ref().is_some_and(|grant| {
+                            !grant.allowed_tools.iter().any(|tool| tool == PI_LOOM_TOOL_NAME)
+                        }) {
                             None
                         } else {
                             spawn_mcp.as_ref()
