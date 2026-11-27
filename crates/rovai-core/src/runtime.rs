@@ -7245,7 +7245,9 @@ fn workspace_matches_camp(
         [camp_id],
         |row| row.get::<_, String>(0),
     )?;
-    let pending:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM mission_workspace w JOIN mission m ON m.id=w.mission_id WHERE m.camp_id=?1 AND w.state<>'ready')",[camp_id],|r|r.get(0))?;
+    // Only this Host's own preparation gates a local execution root. A remote row is
+    // another machine's worktree and must not keep this camp permanently "not ready".
+    let pending:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM mission_workspace w JOIN mission m ON m.id=w.mission_id WHERE m.camp_id=?1 AND w.state<>'ready' AND w.execution_host_id=(SELECT id FROM mission_execution_host WHERE singleton=1))",[camp_id],|r|r.get(0))?;
     if pending {
         return Ok(false);
     }
@@ -11852,5 +11854,84 @@ mod tests {
         fn away_members_keep_responsibility_but_wait_for_presence_before_dispatch() {
             super::away_members_keep_responsibility_but_wait_for_presence_before_dispatch();
         }
+    }
+
+    /// An execution root is judged against this Host's own preparation. A remote row in
+    /// another state is another machine's worktree and must not invalidate the local root.
+    #[test]
+    fn workspace_matches_camp_ignores_a_pending_remote_row() {
+        use crate::command::{ActorRef, CommandEnvelope};
+        let (mut database, directory) = crate::test_support::seeded_runtime_database_fast();
+        let project = directory.join("workspace");
+        std::fs::create_dir_all(&project).unwrap();
+        let created = CollaborationService::default()
+            .create_camp(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "workspace-matches-camp-host-scope".into(),
+                    actor: ActorRef::User {
+                        user_id: "local_user".into(),
+                    },
+                    camp_id: None,
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: CreateThreadCommand::for_test_with_members(
+                        project.to_string_lossy().into_owned(),
+                        &["agent_1"],
+                        "agent_1",
+                    ),
+                },
+            )
+            .unwrap();
+        let camp_id = created.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // The stored project path is the camp's own fact; do not re-derive it.
+        let project_path: String = database
+            .connection()
+            .query_row(
+                "SELECT project_path FROM camp WHERE id=?1",
+                [&camp_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let insert = |database: &crate::db::Database, id: &str, host: &str, state: &str| {
+            database
+                .connection()
+                .execute(
+                    "INSERT INTO mission_workspace(
+                        id,mission_id,camp_id,execution_host_id,source_directory,repository_root,
+                        git_common_dir,worktree_path,working_directory,base_branch,branch,base_sha,
+                        preparation_token,preparation_kind,generation,state,created_at,updated_at
+                     ) VALUES(?1,'mission_runtime_scope',?2,?3,'/source','/source','/source/.git',
+                        ?4,?4,'main','rovai/mission/runtime_scope','base','token','create',1,?5,
+                        '2026-01-01T00:00:01Z','2026-01-01T00:00:01Z')",
+                    params![id, camp_id, host, format!("/srv/{id}"), state],
+                )
+                .unwrap();
+        };
+        insert(&database, "ws_remote", "node_b", "preparing");
+        let workspace = json!({"executionRoot":project_path});
+        {
+            let transaction = database.connection_mut().transaction().unwrap();
+            // The remote row is still preparing, but it is not this Host's execution root.
+            assert!(workspace_matches_camp(&transaction, &camp_id, &workspace).unwrap());
+            transaction.rollback().unwrap();
+        }
+        // A local preparation in flight still refuses the local root, so the filter is
+        // host scope and not a blanket exemption.
+        let local_host: String = database
+            .connection()
+            .query_row(
+                "SELECT id FROM mission_execution_host WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        insert(&database, "ws_local", &local_host, "preparing");
+        let transaction = database.connection_mut().transaction().unwrap();
+        assert!(!workspace_matches_camp(&transaction, &camp_id, &workspace).unwrap());
+        transaction.rollback().unwrap();
     }
 }

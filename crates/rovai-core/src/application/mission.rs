@@ -949,9 +949,10 @@ impl Core {
                             json!({"missionId": mission_id}),
                         ));
                     };
-                    let workspace = mission_workspace::load_workspaces(tx, &mission_id)?
-                        .into_iter()
-                        .next();
+                    // A cleanup command targets this Host's own execution directory. A remote
+                    // row is another machine's worktree, so it can neither be that target nor
+                    // hide the local row behind `mission.execution_host_unavailable`.
+                    let workspace = mission_workspace::local_workspace(tx, &mission_id)?;
                     let Some(workspace) = workspace else {
                         return Ok(CommandHandlerResult::rejected(
                             "mission.workspace_not_prepared",
@@ -979,17 +980,6 @@ impl Core {
                     {
                         return Ok(CommandHandlerResult::rejected(
                             "mission.workspace_in_use",
-                            json!({"missionId": mission_id}),
-                        ));
-                    }
-                    let current_host: String = tx.query_row(
-                        "SELECT id FROM mission_execution_host WHERE singleton=1",
-                        [],
-                        |row| row.get(0),
-                    )?;
-                    if workspace.execution_host_id != current_host {
-                        return Ok(CommandHandlerResult::rejected(
-                            "mission.execution_host_unavailable",
                             json!({"missionId": mission_id}),
                         ));
                     }
