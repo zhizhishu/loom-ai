@@ -185,6 +185,17 @@ describe('run failure block (Mikka thread-failure)', () => {
     expect(conversation({ snapshot: { agentRuns: [run({ failure: failure() })] } }))
       .toContain('Hanzi · 未配置智能体。先配置好运行端，再重试这次请求。')
   })
+  it('keeps the failed lane visible as automatic while its watchdog retry is running', () => {
+    const original = run({ automaticRetryEligible: true, failure: failure() })
+    const retry = run({ id: 'r2', status: 'running', endedAt: null,
+      createdAt: '2026-11-22T00:40:00.000Z', startedAt: '2026-11-22T00:40:00.000Z',
+      automaticRetryEligible: true, automaticRetryOrdinal: 2 })
+    const html = conversation({ snapshot: { agentRuns: [original, retry] } })
+    expect(html).toContain('ln-run-failure')
+    expect(html).toContain('自动重试中')
+    expect(html).toContain('自动重试最多 3 次，全部失败后才需要手动重试。')
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>自动重试中<\/button>/u)
+  })
   it('keeps the settings entry without blaming a runtime that is ready', () => {
     const ready = profile({
       runtimeConfiguration: { adapterKind: 'claude-code-cli', model: { mode: 'runtime_default' },
