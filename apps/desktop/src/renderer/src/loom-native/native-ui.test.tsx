@@ -328,7 +328,7 @@ describe('workspace dock empty states (Mikka empty.tsx)', () => {
   })
 })
 
-// 媒体预览：图片与 PDF 走同一条 loom.artifact.preview 回执的字节，Markdown/纯文本的行为不动。
+// 媒体预览：图片、PDF 与视频走同一条 loom.artifact.preview 回执的字节，Markdown/纯文本的行为不动。
 // 这里的断言只吃契约字段（mediaType/bytesBase64），不编造 Core 不会返回的形状。
 describe('artifact media preview', () => {
   // 0x89 0x50 0x4e 0x47 = PNG 魔数前四字节；base64 由 Core 的标准编码产生。
@@ -346,6 +346,12 @@ describe('artifact media preview', () => {
   it('maps a PDF to the pdf media state instead of the text body', () => {
     const state = previewStateFromResult(media({ relativePath: 'out/report.pdf', mediaType: 'application/pdf', bytesBase64: 'JVBERi0=' }))
     expect(state).toMatchObject({ status: 'media', media: { mediaType: 'application/pdf', kind: 'pdf' } })
+  })
+  it('maps whitelisted videos to the video media state', () => {
+    for (const mediaType of ['video/mp4', 'video/quicktime', 'video/webm', 'video/x-matroska'] as const) {
+      const state = previewStateFromResult(media({ relativePath: 'out/recording.mp4', mediaType, bytesBase64: 'dmlkZW8=' }))
+      expect(state).toMatchObject({ status: 'media', media: { mediaType, kind: 'video' } })
+    }
   })
   it('never serves media bytes as text even when both fields are present', () => {
     // 字节恰好是 UTF-8 也不行：命中媒体就走媒体，文本分支只属于非媒体文件。
@@ -393,6 +399,9 @@ describe('artifact media preview', () => {
     expect(artifactMediaKind('application/pdf')).toBe('pdf')
     for (const image of ['image/png', 'image/jpeg', 'image/webp', 'image/gif'] as const) {
       expect(artifactMediaKind(image)).toBe('image')
+    }
+    for (const video of ['video/mp4', 'video/quicktime', 'video/webm', 'video/x-matroska'] as const) {
+      expect(artifactMediaKind(video)).toBe('video')
     }
   })
   it('serves pdf.js assets from the privileged protocol on file: pages and relatively on http', () => {

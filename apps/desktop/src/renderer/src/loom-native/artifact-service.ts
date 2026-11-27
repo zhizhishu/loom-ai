@@ -52,16 +52,21 @@ export type ArtifactMediaType =
   | 'image/gif'
   | 'application/pdf'
   | 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  | 'video/mp4'
+  | 'video/quicktime'
+  | 'video/webm'
+  | 'video/x-matroska'
 
-/** 媒体预览：图片走 Blob 灯箱，PDF 走 pdf.js 画布；字节是 Core 归档字节的解码结果。 */
+/** 媒体预览：图片/视频走 Blob，PDF/表格走各自查看器；字节是 Core 归档字节的解码结果。 */
 export type ArtifactMedia = {
   mediaType: ArtifactMediaType
-  kind: 'image' | 'pdf' | 'spreadsheet'
+  kind: 'image' | 'pdf' | 'spreadsheet' | 'video'
   bytes: Uint8Array
 }
 
 const ARTIFACT_MEDIA_TYPES: readonly ArtifactMediaType[] = [
-  'image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  'image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'video/mp4', 'video/quicktime', 'video/webm', 'video/x-matroska'
 ]
 
 /**
@@ -73,10 +78,11 @@ export function normalizeArtifactMediaType(value: unknown): ArtifactMediaType | 
   return ARTIFACT_MEDIA_TYPES.find(entry => entry === value) ?? null
 }
 
-/** 图片与 PDF 在界面上是两种完全不同的渲染路径，判定只在这里做一次。 */
-export function artifactMediaKind(mediaType: ArtifactMediaType): 'image' | 'pdf' | 'spreadsheet' {
+/** 图片、视频、PDF 与表格在界面上是不同渲染路径，判定只在这里做一次。 */
+export function artifactMediaKind(mediaType: ArtifactMediaType): 'image' | 'pdf' | 'spreadsheet' | 'video' {
   if (mediaType === 'application/pdf') return 'pdf'
-  return mediaType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ? 'spreadsheet' : 'image'
+  if (mediaType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet') return 'spreadsheet'
+  return mediaType.startsWith('video/') ? 'video' : 'image'
 }
 
 /**

@@ -40,13 +40,13 @@ import {
 } from './artifact-service'
 
 /**
- * 图片预览的 object URL：切换文件、重试、关闭浮层都必须 revoke，否则 Blob 会一直留在内存里。
+ * 图片/视频预览的 object URL：切换文件、重试、关闭浮层都必须 revoke，否则 Blob 会一直留在内存里。
  * 只负责地址生命周期，字节仍然只来自 Core 的一次预览回执。
  */
-function useArtifactImageUrl(media: ArtifactMedia | null): string | null {
+function useArtifactMediaUrl(media: ArtifactMedia | null, expectedKind: 'image' | 'video'): string | null {
   const [url, setUrl] = useState<string | null>(null)
   useEffect(() => {
-    if (media === null || media.kind !== 'image') {
+    if (media === null || media.kind !== expectedKind) {
       setUrl(null)
       return
     }
@@ -56,7 +56,7 @@ function useArtifactImageUrl(media: ArtifactMedia | null): string | null {
       setUrl(null)
       URL.revokeObjectURL(objectUrl)
     }
-  }, [media])
+  }, [expectedKind, media])
   return url
 }
 
@@ -239,8 +239,9 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
     window.setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
 
-  // 图片的 object URL 只随当前归档字节变化：切到另一份成果、重试或关闭浮层都会 revoke。
-  const imageUrl = useArtifactImageUrl(preview.status === 'media' && preview.media.kind === 'image' ? preview.media : null)
+  // 媒体的 object URL 只随当前归档字节变化：切到另一份成果、重试或关闭浮层都会 revoke。
+  const imageUrl = useArtifactMediaUrl(preview.status === 'media' && preview.media.kind === 'image' ? preview.media : null, 'image')
+  const videoUrl = useArtifactMediaUrl(preview.status === 'media' && preview.media.kind === 'video' ? preview.media : null, 'video')
   const imageMedia = preview.status === 'media' && preview.media.kind === 'image' ? preview.media : null
   const [lightboxOpen, setLightboxOpen] = useState(false)
   useEffect(() => { if (imageUrl === null) setLightboxOpen(false) }, [imageUrl])
@@ -317,19 +318,26 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
             ? <ArtifactPdfPreview bytes={preview.media.bytes} fileName={fileName}/>
             : preview.media.kind === 'spreadsheet'
               ? <ArtifactXlsxPreview bytes={preview.media.bytes} fileName={fileName}/>
-              : imageUrl === null
-              // 字节已经解码，但 object URL 还没就绪：这是短暂的过渡态，不是「没有图」。
-              ? <div className="ln-artifact-state" data-state="reading" role="status">正在准备图片…</div>
-              : <div className="ln-artifact-media" data-media={preview.media.mediaType}>
-                  <button
-                    type="button" className="ln-artifact-image-button"
-                    title="放大查看" aria-label={`放大查看 ${fileName} · 按 Esc 关闭`}
-                    onClick={() => setLightboxOpen(true)}
-                  >
-                    <img className="ln-artifact-image" src={imageUrl} alt={fileName}/>
-                  </button>
-                  <p className="ln-artifact-image-hint">{preview.media.mediaType} · 点击图片放大</p>
-                </div>
+              : preview.media.kind === 'video'
+                ? videoUrl === null
+                  ? <div className="ln-artifact-state" data-state="reading" role="status">正在准备视频…</div>
+                  : <div className="ln-artifact-media" data-media={preview.media.mediaType}>
+                      <video className="ln-artifact-video" src={videoUrl} controls playsInline preload="metadata" aria-label={fileName}/>
+                      <p className="ln-artifact-image-hint">{preview.media.mediaType}</p>
+                    </div>
+                : imageUrl === null
+                // 字节已经解码，但 object URL 还没就绪：这是短暂的过渡态，不是「没有图」。
+                ? <div className="ln-artifact-state" data-state="reading" role="status">正在准备图片…</div>
+                : <div className="ln-artifact-media" data-media={preview.media.mediaType}>
+                    <button
+                      type="button" className="ln-artifact-image-button"
+                      title="放大查看" aria-label={`放大查看 ${fileName} · 按 Esc 关闭`}
+                      onClick={() => setLightboxOpen(true)}
+                    >
+                      <img className="ln-artifact-image" src={imageUrl} alt={fileName}/>
+                    </button>
+                    <p className="ln-artifact-image-hint">{preview.media.mediaType} · 点击图片放大</p>
+                  </div>
           : markdown
             ? <div className="ln-markdown">
                 {comparing && previousPreview?.status === 'reading' && <div className="ln-artifact-state">正在读取上一版…</div>}

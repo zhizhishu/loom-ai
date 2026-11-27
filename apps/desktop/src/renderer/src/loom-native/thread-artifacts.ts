@@ -20,14 +20,15 @@ export const RESULT_GROUP_LABELS: Record<ThreadResultGroup, string> = {
   plans: '计划',
   changes: '改动',
   reports: '报告',
-  captures: '截图'
+  captures: '截图/录屏'
 }
 
 /** 一条成果：既有投影里的已登记产物，selection 原样携带打开既有预览（成果浮层）所需的一切。 */
 export type ThreadResultEntry = { group: ThreadResultGroup; selection: ArtifactSelection }
 
-/** 截图组认这些图片扩展名；与 artifact-service 的媒体白名单同源（Core 只归一这几种图片）。 */
+/** 截图/录屏组认这些媒体扩展名；与 artifact-service/Core 的媒体白名单同源。 */
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif'])
+const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'webm', 'mkv'])
 
 /** 报告组认这些文档扩展名；markdown 判定与 artifactPreviewKind 一致，另收网页、纯文本与 PDF。 */
 const DOCUMENT_EXTENSIONS = new Set(['md', 'markdown', 'mdx', 'txt', 'html', 'htm', 'pdf'])
@@ -45,10 +46,20 @@ export function artifactResultGroup(artifact: Pick<LoomArtifact, 'relativePath' 
   const dot = name.lastIndexOf('.')
   const extension = dot > 0 ? name.slice(dot + 1).toLowerCase() : ''
   const contentType = (artifact.contentType ?? '').toLowerCase()
-  if (contentType.startsWith('image/') || IMAGE_EXTENSIONS.has(extension)) return 'captures'
+  if (contentType.startsWith('image/') || contentType.startsWith('video/') || IMAGE_EXTENSIONS.has(extension) || VIDEO_EXTENSIONS.has(extension)) return 'captures'
   if (segments.some(segment => segment.toLowerCase().includes('plan')) || name.includes('方案')) return 'plans'
   if (DOCUMENT_EXTENSIONS.has(extension) || DOCUMENT_CONTENT_TYPES.some(type => contentType.startsWith(type))) return 'reports'
   return 'changes'
+}
+
+/** captures 里的媒体种类；只按登记路径/内容类型判断，界面不猜测其他文件。 */
+export function artifactCaptureKind(artifact: Pick<LoomArtifact, 'relativePath' | 'contentType'>): 'image' | 'video' | null {
+  if (artifactResultGroup(artifact) !== 'captures') return null
+  const name = artifact.relativePath.split(/[\\/]/u).filter(part => part !== '').pop() ?? artifact.relativePath
+  const extension = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : ''
+  const contentType = (artifact.contentType ?? '').toLowerCase()
+  if (contentType.startsWith('video/') || VIDEO_EXTENSIONS.has(extension)) return 'video'
+  return 'image'
 }
 
 /**

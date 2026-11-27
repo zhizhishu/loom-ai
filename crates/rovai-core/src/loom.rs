@@ -1113,7 +1113,7 @@ pub struct LoomArtifactPreviewResult {
 /// Text previews stay bounded at 256 KiB.
 const MAX_ARTIFACT_PREVIEW_BYTES: i64 = 256 * 1024;
 /// Media previews reuse the chat attachment preview ceiling: the same 8 MiB the composer already
-/// previews, so a screenshot or PDF report is viewable without a second, larger budget.
+/// previews, so a screenshot, short recording or PDF report is viewable without a second, larger budget.
 const MAX_ARTIFACT_MEDIA_PREVIEW_BYTES: i64 = 8 * 1024 * 1024;
 
 /// Canonical media type for an archived media file, or `None` when it is not on the whitelist.
@@ -1140,6 +1140,10 @@ fn artifact_preview_media_type(relative_path: &str) -> Option<&'static str> {
         "gif" => Some("image/gif"),
         "pdf" => Some("application/pdf"),
         "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "mp4" => Some("video/mp4"),
+        "mov" => Some("video/quicktime"),
+        "webm" => Some("video/webm"),
+        "mkv" => Some("video/x-matroska"),
         _ => None,
     }
 }
@@ -9728,6 +9732,10 @@ mod tests {
             ("report.PDF", b"%PDF-1.7\n".to_vec(), "application/pdf"),
             // Valid UTF-8 bytes in a media file still take the media branch, never the text one.
             ("note.png", b"plain text that happens to be utf8".to_vec(), "image/png"),
+            ("recording.mp4", b"video mp4".to_vec(), "video/mp4"),
+            ("recording.mov", b"video mov".to_vec(), "video/quicktime"),
+            ("recording.webm", b"video webm".to_vec(), "video/webm"),
+            ("recording.mkv", b"video mkv".to_vec(), "video/x-matroska"),
         ] {
             std::fs::write(workspace.join(path), &bytes).unwrap();
             let artifact = register(&mut database, &mission_id, path);

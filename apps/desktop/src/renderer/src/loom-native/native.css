@@ -61,6 +61,17 @@
 .ln-result-list{display:flex;flex-direction:column;gap:8px}
 .ln-results-empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;color:var(--ln-muted);font-size:13px;text-align:center;padding:40px 16px}
 .ln-results-empty p{margin:0}
+.ln-capture-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.ln-capture-tile{position:relative;display:block;aspect-ratio:16/9;width:100%;overflow:hidden;padding:0!important;border:1px solid var(--ln-line)!important;border-radius:12px!important;background:var(--ln-card)!important;color:var(--ln-muted)}
+.ln-capture-tile img{display:block;width:100%;height:100%;object-fit:cover;object-position:top}
+.ln-capture-placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
+.ln-capture-play{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:50%;background:var(--ln-bg);color:var(--ln-text);box-shadow:0 1px 5px #0002}
+.ln-capture-play svg{width:15px;height:15px;fill:currentColor;margin-left:2px}
+.ln-surface-dialog.ln-evidence-viewer-dialog{width:min(920px,92vw);max-width:92vw;height:min(800px,calc(100vh - 32px))}
+.ln-evidence-viewer{display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden}.ln-evidence-stage{display:flex;align-items:center;justify-content:center;gap:14px;min-height:0;flex:1;padding:18px 20px;background:var(--ln-soft-fill)}.ln-evidence-media{display:flex;align-items:center;justify-content:center;min-width:0;min-height:0;flex:1}.ln-evidence-step{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;flex:0 0 38px;border-radius:50%;background:var(--ln-bg);border:1px solid var(--ln-line)}.ln-evidence-step:disabled{opacity:.4}.ln-evidence-strip{display:flex;align-items:center;justify-content:center;gap:8px;min-height:88px;padding:10px 16px;overflow-x:auto;border-top:1px solid var(--ln-soft-line)}.ln-evidence-strip .ln-capture-tile{width:104px;flex:0 0 104px;border-radius:9px!important}.ln-evidence-strip .ln-capture-tile[aria-current="true"]{outline:2px solid var(--ln-blue);outline-offset:1px}
+.ln-evidence-viewer img,.ln-evidence-viewer video{display:block;max-width:100%;max-height:calc(100vh - 250px);margin:0 auto;border-radius:10px;background:#000}
+.ln-evidence-loading{min-height:220px;display:flex;align-items:center;justify-content:center;color:var(--ln-muted)}
+@media(max-width:520px){.ln-capture-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .ln-message{display:flex;flex-direction:column;flex:0 0 auto;max-width:100%;align-items:flex-start;min-width:0;position:relative;margin:0;padding:0}
 .ln-message.is-user{align-self:flex-end;align-items:flex-end;max-width:85%;margin:1px 0}.ln-message.is-assistant{align-self:flex-start;width:100%}
 .ln-message-content{max-width:100%;min-width:0}.ln-message.is-user .ln-message-content{padding:12px 17px;border-radius:20px;background:var(--ln-blue);color:#fff}

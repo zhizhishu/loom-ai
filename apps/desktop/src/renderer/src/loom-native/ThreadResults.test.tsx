@@ -28,7 +28,8 @@ const entries = threadResultEntries([bundle([
   artifact({ artifactId: 'a-plan', relativePath: 'docs/plans/auth-v1.md' }),
   artifact({ artifactId: 'a-code', relativePath: 'src/app.ts' }),
   artifact({ artifactId: 'a-report', relativePath: 'out/report.md' }),
-  artifact({ artifactId: 'a-shot', relativePath: 'shots/run.png' })
+  artifact({ artifactId: 'a-shot', relativePath: 'shots/run.png' }),
+  artifact({ artifactId: 'a-video', relativePath: 'shots/demo.mp4', contentType: 'video/mp4' })
 ], [candidate({ candidateId: 'c-code', evidenceIds: ['a-code'], acceptanceStatus: 'accepted' })])], 'th-1')
 
 describe('ThreadResults (成果段)', () => {
@@ -37,11 +38,11 @@ describe('ThreadResults (成果段)', () => {
     expect(html).toContain('计划')
     expect(html).toContain('改动')
     expect(html).toContain('报告')
-    expect(html).toContain('截图')
+    expect(html).toContain('截图/录屏')
     expect(html).toContain('<h3>计划<span class="ln-result-count">1</span></h3>')
     expect(html).toContain('<h3>改动<span class="ln-result-count">1</span></h3>')
     expect(html).toContain('<h3>报告<span class="ln-result-count">1</span></h3>')
-    expect(html).toContain('<h3>截图<span class="ln-result-count">1</span></h3>')
+    expect(html).toContain('<h3>截图/录屏<span class="ln-result-count">2</span></h3>')
     expect(html.split('data-group="')).toHaveLength(5) // 四组 + 外层 aria 载体（空组不出现）
   })
 
@@ -50,6 +51,10 @@ describe('ThreadResults (成果段)', () => {
     expect(html).toContain('data-artifact-id="a-plan"')
     expect(html).toContain('data-artifact-id="a-code"')
     expect(html).toContain('data-artifact-id="a-shot"')
+    expect(html).toContain('data-artifact-id="a-video"')
+    expect(html).toContain('data-capture-kind="video"')
+    expect(html).toContain('ln-capture-grid')
+    expect(html).toContain('ln-capture-play')
     expect(html).toContain('data-artifact-group="captures"')
     expect(html).toContain('aria-label="打开成果：auth-v1.md"')
     expect(html).toContain('已接受') // 候选状态词与聊天流产物卡一致

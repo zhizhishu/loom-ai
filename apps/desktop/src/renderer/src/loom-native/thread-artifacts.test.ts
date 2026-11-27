@@ -3,6 +3,7 @@ import type { LoomArtifact, LoomCandidate, MissionRecord } from '@contracts'
 import type { WorkBundle } from './types'
 import {
   THREAD_RESULT_GROUPS,
+  artifactCaptureKind,
   RESULT_GROUP_LABELS,
   artifactResultGroup,
   hasThreadResults,
@@ -33,10 +34,14 @@ const bundle = (threadId: string, artifacts: LoomArtifact[], candidates: LoomCan
 })
 
 describe('artifactResultGroup', () => {
-  it('puts images in captures by extension or content type, before any name hint', () => {
+  it('puts images and videos in captures by extension or content type, before any name hint', () => {
     expect(artifactResultGroup(artifact({ relativePath: 'shots/run-01.png' }))).toBe('captures')
     expect(artifactResultGroup(artifact({ relativePath: 'out/chart', contentType: 'image/png' }))).toBe('captures')
     expect(artifactResultGroup(artifact({ relativePath: 'photo.jpeg' }))).toBe('captures')
+    expect(artifactResultGroup(artifact({ relativePath: 'shots/demo.mp4' }))).toBe('captures')
+    expect(artifactResultGroup(artifact({ relativePath: 'shots/demo', contentType: 'video/webm' }))).toBe('captures')
+    expect(artifactCaptureKind(artifact({ relativePath: 'shots/demo.mp4' }))).toBe('video')
+    expect(artifactCaptureKind(artifact({ relativePath: 'shots/run.png' }))).toBe('image')
   })
 
   it('puts plan documents in plans by path segment or Chinese title', () => {
@@ -91,7 +96,7 @@ describe('threadResultEntries', () => {
 })
 
 describe('resultGroupViews', () => {
-  it('shows groups in the fixed 计划/改动/报告/截图 order, each with its count', () => {
+  it('shows groups in the fixed 计划/改动/报告/截图/录屏 order, each with its count', () => {
     const entries = threadResultEntries([bundle('th-1', [
       artifact({ artifactId: 'a-report', relativePath: 'out/report.md' }),
       artifact({ artifactId: 'a-shot', relativePath: 'shots/run.png' }),
@@ -99,8 +104,8 @@ describe('resultGroupViews', () => {
       artifact({ artifactId: 'a-code', relativePath: 'src/app.ts' })
     ])], 'th-1')
     const views = resultGroupViews(entries)
-    expect(views.map(view => [view.label, view.count])).toEqual([['改动', 1], ['报告', 1], ['截图', 2]])
-    expect(RESULT_GROUP_LABELS).toEqual({ plans: '计划', changes: '改动', reports: '报告', captures: '截图' })
+    expect(views.map(view => [view.label, view.count])).toEqual([['改动', 1], ['报告', 1], ['截图/录屏', 2]])
+    expect(RESULT_GROUP_LABELS).toEqual({ plans: '计划', changes: '改动', reports: '报告', captures: '截图/录屏' })
   })
 
   it('leaves empty groups out', () => {

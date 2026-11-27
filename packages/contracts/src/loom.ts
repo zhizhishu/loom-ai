@@ -263,7 +263,9 @@ export interface LoomArtifactPreviewResult {
   /**
    * 按不可变 `relativePath` 扩展名归一出的媒体类型；非媒体文件为 null。
    *
-   * 只可能是 `image/png`、`image/jpeg`、`image/webp`、`image/gif`、`application/pdf`。
+   * 只可能是 `image/png`、`image/jpeg`、`image/webp`、`image/gif`、`application/pdf`、
+   * `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`、
+   * `video/mp4`、`video/quicktime`、`video/webm`、`video/x-matroska`。
    * 登记时的 `contentType` 只是展示元数据，不能当安全边界，也不能决定这里。
    * 命中的类型是路径的纯函数：字节因过大/未归档而读不到时仍会给出，那时确实没
    * `bytesBase64`，读端必须先看 `unavailableReason`。
