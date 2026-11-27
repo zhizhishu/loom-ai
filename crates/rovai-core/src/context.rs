@@ -4425,7 +4425,21 @@ fn build_run_facts<R: ContextReadConnection>(
         [&snapshot.agent_run_id],
         |row| row.get(0),
     ).optional()?;
-    if retry_dedupe_key.as_deref().is_some_and(|key| key.contains("watchdog_retry")) {
+    let continuation_claimed: bool = database.context_connection().query_row(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM camp_message_delivery
+            WHERE claimed_agent_run_id = ?1 AND source_kind = 'continuation'
+        )
+        "#,
+        [&snapshot.agent_run_id],
+        |row| row.get(0),
+    )?;
+    if continuation_claimed
+        || retry_dedupe_key
+            .as_deref()
+            .is_some_and(|key| key.contains("watchdog_retry"))
+    {
         facts.retry = Some(RetryFact {
             required_action: "check_existing_results_before_repeating_external_effects",
             instruction: "先检查已有成果，不重复外部操作。",

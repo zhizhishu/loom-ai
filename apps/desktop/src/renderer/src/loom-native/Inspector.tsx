@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { loomLatestCandidate } from '@contracts'
+import { loomLatestCandidate, type LoomDispatch } from '@contracts'
 import type { ThreadClient } from '../camp-client'
 import type { HostWorkbench } from './host-services'
 import type { AgentProfile, ArtifactSelection, InspectorTab, InspectorMode, LoomReview, WorkBundle, WorkControlFacts, WorkItem } from './types'
@@ -14,6 +14,7 @@ import { ComputerWorkspace } from './ComputerWorkspace'
 import { modeFor, panelFor, scopedBundles, type WorkspacePanel, type WorkspaceScope } from './workspace-panel'
 import { artifactCandidateFacts, artifactReviewKind, artifactReviewLabel, type ArtifactReviewKind } from './artifact-service'
 import { summarizeAttention, type AttentionFact } from './attention'
+import { ContinueAgentRunButton } from '../ContinueAgentRunButton'
 
 export function relativeDate(value: string): string {
   const date = new Date(value)
@@ -71,8 +72,30 @@ const REVIEW_ICON: Record<ArtifactReviewKind, IconName | null> = {
  * 卡片状态：先看成果侧的真实结论（M7-C），只有它不下结论时才沿用任务状态本身。
  * 关键约束：助手审查还在办、或控制事实还没读到，候选的 `pending` 都不是「等你」。
  */
+/** 输入已被领取、但进程在结果落账前停止的接力。Core 为防重复外部效果不会自动重放；
+ * 这不是普通受阻，而是必须由 Owner 看清后决定续跑的恢复事实。 */
+export function unknownRecoveryDispatch(item: WorkStatusInput): LoomDispatch | null {
+  if (item.control?.status !== 'observed') return null
+  // Owner 已经验收后，这条历史 unknown 只是诊断事实，不再占「等你处理」。
+  if (item.candidate?.acceptanceStatus === 'accepted') return null
+  const rows = item.control.snapshot.dispatches.filter(dispatch =>
+    dispatch.taskId === item.task.taskId
+    && dispatch.status === 'blocked'
+    && dispatch.reason === 'accepted_input_outcome_unknown'
+  )
+  return rows.length === 0 ? null : rows[rows.length - 1]
+}
+
+export function recoveryKindLabel(kind: LoomDispatch['kind']): string {
+  if (kind === 'review') return '独立审查'
+  if (kind === 'handoff') return '交接'
+  if (kind === 'rework') return '返工'
+  return '执行'
+}
+
 export function workStatus(item: WorkStatusInput): { label: string; group: string; icon: IconName } {
   if (item.waitingForAnswer) return { label: '等你回答', group: '等待你', icon: 'chat' }
+  if (unknownRecoveryDispatch(item) !== null) return { label: '等你处理', group: '等待你', icon: 'hand' }
   const kind = artifactReviewKind({
     // 卡片只跟链头候选：链头没有归档证据时才是「准备中」。
     hasArtifact: item.hasArtifact ?? item.candidate !== null,
@@ -164,6 +187,10 @@ export function Inspector({ agents, bundles, questions = [], agent, mode, tab, o
   const all = useMemo(() => flattenWork(currentBundles, questions), [currentBundles, questions])
   const shown = all.filter(item => (!query || `${item.task.title} ${item.task.description}`.toLocaleLowerCase().includes(query.toLocaleLowerCase())) && (!owner || item.task.assigneeAgentId === owner))
   const selectedTask = all.find(item => item.task.taskId === selectedTaskId) ?? null
+  const selectedRecovery = selectedTask === null ? null : unknownRecoveryDispatch(selectedTask)
+  const [recoveryError, setRecoveryError] = useState<string | null>(null)
+  const [recoverySubmitted, setRecoverySubmitted] = useState<string | null>(null)
+  useEffect(() => { setRecoveryError(null); setRecoverySubmitted(null) }, [selectedTaskId])
   const assets = currentBundles.flatMap(bundle => bundle.artifacts.map(artifact => {
     // 成果行只跟「拥有这份归档」的那个候选：历史成果仍打开它自己的归档，不跳到链头。
     const facts = artifactCandidateFacts(bundle, artifact, null)
@@ -226,7 +253,7 @@ export function Inspector({ agents, bundles, questions = [], agent, mode, tab, o
         : <Empty className="ln-empty--dock"><EmptyHeader><EmptyMedia variant="icon"><Icon name="computer" size={18}/></EmptyMedia><EmptyTitle>还没有可以查看的电脑</EmptyTitle><EmptyDescription>选择助手后可查看对应的执行位置和授权；这台电脑要先在「设置 › 设备」里连接并单独授权，配对不会自动开放屏控。</EmptyDescription></EmptyHeader>{onConnectDevice && <EmptyContent><button type="button" className="ln-action" onClick={onConnectDevice}>去连接设备</button></EmptyContent>}</Empty>)
         : panel === 'flow' || panel === 'assets' && assetView === 'lineage' ? client ? <WorkMap bundles={currentBundles} agents={agents} client={client} onArtifact={onArtifact} onConversation={onOpenConversation} focusedTaskId={selectedTaskId} onTaskSelect={setSelectedTaskId} initialView={panel === 'assets' ? 'assets' : 'flow'} hideViewTabs onCreateWork={onCreateWork}/> : <Empty className="ln-empty--dock"><EmptyHeader><EmptyMedia variant="icon"><Icon name="branch" size={18}/></EmptyMedia><EmptyTitle>流程和成果关系会连在这里</EmptyTitle><EmptyDescription>当前连接未提供工作关系。建立第一项工作后，任务、依赖和成果会按真实记录连起来。</EmptyDescription></EmptyHeader>{onCreateWork && <EmptyContent><button type="button" className="ln-action" onClick={onCreateWork}>创建一项工作</button></EmptyContent>}</Empty>
         : panel === 'assets' ? renderAssets(selectedTaskId ?? undefined)
-        : selectedTask ? <section className="ln-task-detail"><button type="button" className="ln-text-action ln-dock-back" onClick={() => setSelectedTaskId(null)}><Icon name="left" size={14}/>所有工作</button><h1>{selectedTask.task.title}</h1><span className="ln-detail-status"><Icon name={workStatus(selectedTask).icon} size={16}/>{workStatus(selectedTask).label}</span><AgentMarkdown text={selectedTask.task.description || '此任务没有补充说明。'}/>{selectedTask.task.blockedReason && <p className="ln-inline-error">{selectedTask.task.blockedReason}</p>}<h3>交付成果</h3>{renderAssets(selectedTask.task.taskId)}<button type="button" className="ln-text-action" onClick={() => onOpenConversation(selectedTask.mission.threadId)}><Icon name="chat" size={15}/>打开相关对话</button></section> : renderWork()}
+        : selectedTask ? <section className="ln-task-detail"><button type="button" className="ln-text-action ln-dock-back" onClick={() => setSelectedTaskId(null)}><Icon name="left" size={14}/>所有工作</button><h1>{selectedTask.task.title}</h1><span className="ln-detail-status"><Icon name={workStatus(selectedTask).icon} size={16}/>{workStatus(selectedTask).label}</span>{selectedRecovery && <section className="ln-recovery-notice" aria-label="恢复确认"><strong>等你处理：{recoveryKindLabel(selectedRecovery.kind)}结果未知</strong><p>进程在确认这次{recoveryKindLabel(selectedRecovery.kind)}结果前停止。为避免重复外部效果，Core 不会自动重放这次接力。</p><p>续跑会沿用原输入，并带上「先检查已有成果，不重复外部操作」。请先查看已有文件、候选和审查记录。</p>{selectedRecovery.agentRunId && recoverySubmitted !== selectedRecovery.dispatchId ? <ContinueAgentRunButton threadId={selectedTask.mission.threadId} agentRunId={selectedRecovery.agentRunId} appearance="action" actionLabel="检查后继续" onError={setRecoveryError} onApplied={() => { setRecoveryError(null); setRecoverySubmitted(selectedRecovery.dispatchId) }}/> : selectedRecovery.agentRunId ? <p className="ln-recovery-note">已提交续跑，等待新的执行记录出现。</p> : <p className="ln-inline-error">读不到可续跑的原执行记录，暂时不能从这里继续。</p>}{recoveryError && <p className="ln-inline-error">{recoveryError}</p>}</section>}<AgentMarkdown text={selectedTask.task.description || '此任务没有补充说明。'}/>{selectedTask.task.blockedReason && <p className="ln-inline-error">{selectedTask.task.blockedReason}</p>}<h3>交付成果</h3>{renderAssets(selectedTask.task.taskId)}<button type="button" className="ln-text-action" onClick={() => onOpenConversation(selectedTask.mission.threadId)}><Icon name="chat" size={15}/>打开相关对话</button></section> : renderWork()}
     </div>
   </aside>
 }

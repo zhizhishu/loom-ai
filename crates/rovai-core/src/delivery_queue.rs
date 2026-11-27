@@ -1656,6 +1656,7 @@ fn select_batch_prefix(
             &skill_selection,
             previous_public_boundary,
             has_additional_public_messages,
+            atomic_input,
         )?;
         if context.payload_len()? > preview.max_payload_bytes {
             return Ok(match previous_selection {
@@ -4648,6 +4649,12 @@ mod tests {
                 );
             }
             let context = fixture.materialize_run(&run);
+            assert!(
+                context
+                    .rendered_payload
+                    .contains("先检查已有成果，不重复外部操作。"),
+                "User-authorized continuation must carry the anti-duplication instruction"
+            );
             fixture.database.connection().execute(
             "UPDATE conversation SET native_session_id='continuation-session' WHERE id='delivery-queue-agent-1'", [],
         ).unwrap();
