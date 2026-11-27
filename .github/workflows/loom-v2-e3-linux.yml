@@ -62,6 +62,19 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Verify Linux personal packaging contract
         run: node --test scripts/lib/linux-personal.test.mjs
+      - name: Checkout pinned optional Pi Purge source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ZiChuanLan/pi-purge
+          ref: d0196ccfd773b0ed342bd2f25372aff65f1a4a53
+          path: _artifacts/reference-repos/pi-purge-current
+          persist-credentials: false
+      - name: Verify and materialize pinned Pi Purge source bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C _artifacts/reference-repos/pi-purge-current rev-parse HEAD)" = "d0196ccfd773b0ed342bd2f25372aff65f1a4a53"
+          python3 -c "from hashlib import sha256; from pathlib import Path; p = Path('_artifacts/reference-repos/pi-purge-current/extensions/pi-purge.ts'); data = p.read_bytes().replace(b'\\r\\n', b'\\n').replace(b'\\n', b'\\r\\n'); assert sha256(data).hexdigest() == '983a3c3cc3011928a33805d84414060729fd2aa81822bc7ba94008943a65d71d', 'Pi Purge source byte pin mismatch'; p.write_bytes(data)"
       - name: Build Linux server preview
         run: node scripts/build-server.mjs --target-key linux-x64 --debug
       - name: Build Linux LOOM helper binaries
@@ -94,6 +107,7 @@ jobs:
             --server-dir out/server/linux-x64 \
             --pi-dir resources/runtime/pi \
             --computer-dir resources/runtime/computer-linux \
+            --pi-purge-file _artifacts/reference-repos/pi-purge-current/extensions/pi-purge.ts \
             --binary target/debug/rovai-core \
             --binary target/debug/loom-node \
             --output out/linux-personal/loom-personal-linux-x64 \

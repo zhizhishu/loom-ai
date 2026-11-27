@@ -15,6 +15,10 @@ test('linux personal workflow ships one linux x64 artifact and verifies the deli
   assert.match(workflow, /package-linux-personal\.mjs/)
   assert.match(workflow, /loom-personal-preview-linux-\$\{\{ env\.LOOM_SOURCE_COMMIT \}\}/)
   assert.match(workflow, /cmp out\/linux-personal\/loom-personal-linux-x64\.tar\.gz out\/linux-personal-download\/loom-personal-linux-x64\.tar\.gz/)
+  assert.match(workflow, /repository: ZiChuanLan\/pi-purge/)
+  assert.match(workflow, /ref: d0196ccfd773b0ed342bd2f25372aff65f1a4a53/)
+  assert.match(workflow, /983a3c3cc3011928a33805d84414060729fd2aa81822bc7ba94008943a65d71d/)
+  assert.match(workflow, /--pi-purge-file _artifacts\/reference-repos\/pi-purge-current\/extensions\/pi-purge\.ts/)
   assert.match(workflow, /LOOM_COMPUTER_AGENT_PI_MCP='1'/)
 })
 
@@ -47,5 +51,5 @@ test('linux computer runtime packages helper bridge and pinned Pillow wheel sele
 
 test('linux package manifest requires web frontend, Pi and computer runtime', () => {
   const packager = read('scripts/package-linux-personal.mjs')
-  for (const snippet of ['web-ui/index.html', 'runtime/pi/pi-bundle.json', 'runtime/computer/computer-bundle.json', "target: 'linux-x64'"]) assert.ok(packager.includes(snippet), snippet)
+  for (const snippet of ['web-ui/index.html', 'runtime/pi/pi-bundle.json', 'runtime/computer/computer-bundle.json', "target: 'linux-x64'", 'runtime/extensions/pi-purge/upstream/extensions/pi-purge.ts', '983a3c3cc3011928a33805d84414060729fd2aa81822bc7ba94008943a65d71d']) assert.ok(packager.includes(snippet), snippet)
 })
