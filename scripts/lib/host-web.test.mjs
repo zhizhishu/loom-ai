@@ -255,7 +255,7 @@ test('Desktop and Web share one Core while listener failure, revocation and stop
     // Writes use real Core services and independent, proof-bound editing scopes.
     const profiles = await call(first, 'members.list')
     const defaultsMethod = 'preferences.newConversation.'
-    const legacyDefaults = { newConversationDefaults: { memberAgentIds: [profiles[0].agentId], defaultLeadAgentId: profiles[0].agentId }, newConversationDefaultsRequireConfirmation: false, oneClickNewConversationEnabled: true }
+    const legacyDefaults = { newConversationDefaults: { memberAgentIds: [profiles[0].agentId], defaultLeadAgentId: profiles[0].agentId }, newConversationDefaultsRequireConfirmation: false, oneClickNewConversationEnabled: true, ownerPermissions: {}, botControlModes: {} }
     assert.equal((await call(first, defaultsMethod + 'get')).newConversationDefaults, null)
     await host.request(defaultsMethod + 'initialize', legacyDefaults)
     const importedDefaults = { ...legacyDefaults, newConversationTeamId: null }
