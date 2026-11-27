@@ -12,6 +12,7 @@ on:
       - 'resources/computer/**'
       - 'scripts/package-linux-personal.mjs'
       - 'scripts/package-computer-runtime-linux.mjs'
+      - 'scripts/package-office-runtime-linux.sh'
       - 'scripts/manage-loom-personal.sh'
       - 'scripts/start-loom-personal.sh'
       - 'scripts/install-loom-personal.sh'
@@ -62,6 +63,14 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Verify Linux personal packaging contract
         run: node --test scripts/lib/linux-personal.test.mjs
+      - name: Install poppler tools for bundled office preview
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils
+      - name: Stage portable Linux office runtime
+        run: |
+          rm -rf resources/runtime/office-linux
+          scripts/package-office-runtime-linux.sh resources/runtime/office-linux /tmp/loom-office-download-cache
       - name: Checkout pinned optional Pi Purge source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -107,6 +116,7 @@ jobs:
             --server-dir out/server/linux-x64 \
             --pi-dir resources/runtime/pi \
             --computer-dir resources/runtime/computer-linux \
+            --office-dir resources/runtime/office-linux \
             --pi-purge-file _artifacts/reference-repos/pi-purge-current/extensions/pi-purge.ts \
             --binary target/debug/rovai-core \
             --binary target/debug/loom-node \
@@ -151,3 +161,5 @@ jobs:
           test -x out/linux-personal-verify/loom-personal-linux-x64/runtime/computer/python
           test -f out/linux-personal-verify/loom-personal-linux-x64/runtime/computer/host_desktop.py
           test -f out/linux-personal-verify/loom-personal-linux-x64/runtime/computer/mcp_bridge.py
+          test -x out/linux-personal-verify/loom-personal-linux-x64/runtime/office/linux-x64/libreoffice/program/soffice
+          test -x out/linux-personal-verify/loom-personal-linux-x64/runtime/office/linux-x64/poppler/bin/pdftoppm

@@ -13,7 +13,9 @@ const REQUIRED = [
   'runtime/pi/pi-bundle.json', 'runtime/pi/node/node', 'runtime/pi/pi',
   'runtime/computer/computer-bundle.json', 'runtime/computer/python',
   'runtime/computer/host_desktop.py', 'runtime/computer/mcp_bridge.py',
-  'runtime/extensions/pi-purge/upstream/extensions/pi-purge.ts'
+  'runtime/extensions/pi-purge/upstream/extensions/pi-purge.ts',
+  'runtime/office/linux-x64/office-bundle.json', 'runtime/office/linux-x64/libreoffice/program/soffice',
+  'runtime/office/linux-x64/poppler/bin/pdftoppm'
 ]
 const PI_PURGE_SOURCE_SHA256 = '983a3c3cc3011928a33805d84414060729fd2aa81822bc7ba94008943a65d71d'
 const EXECUTABLES = ['rovai-host', 'rovai-server', 'rovai', 'rovai-core', 'loom-node', 'Manage-Loom.sh', 'Start-Loom.sh', 'Install-Loom.sh', 'runtime/pi/pi', 'runtime/pi/node/node', 'runtime/computer/python']
@@ -42,7 +44,7 @@ function parseArgs() {
     const key = args[index]
     if (key === '--verify') out.verify = true
     else if (key === '--binary') out.binaries.push(resolve(args[++index] ?? ''))
-    else if (['--server-dir', '--pi-dir', '--computer-dir', '--pi-purge-file', '--output', '--archive'].includes(key)) out[key.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = resolve(args[++index] ?? '')
+    else if (['--server-dir', '--pi-dir', '--computer-dir', '--office-dir', '--pi-purge-file', '--output', '--archive'].includes(key)) out[key.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = resolve(args[++index] ?? '')
     else throw new Error(`unknown argument: ${key}`)
   }
   return out
@@ -63,7 +65,7 @@ export function verifyLinuxPersonalPackage(root) {
   return manifest
 }
 function stage(options) {
-  for (const key of ['serverDir', 'piDir', 'computerDir', 'piPurgeFile', 'output']) if (!options[key]) throw new Error(`missing --${key.replace(/[A-Z]/g, c => `-${c.toLowerCase()}`)}`)
+  for (const key of ['serverDir', 'piDir', 'computerDir', 'officeDir', 'piPurgeFile', 'output']) if (!options[key]) throw new Error(`missing --${key.replace(/[A-Z]/g, c => `-${c.toLowerCase()}`)}`)
   if (!existsSync(join(options.serverDir, 'rovai-server'))) throw new Error('--server-dir must be a built linux server preview')
   if (existsSync(options.output)) {
     if (readdirSync(options.output).length) throw new Error(`refusing to overwrite non-empty output ${options.output}`)
@@ -77,6 +79,7 @@ function stage(options) {
   mkdirSync(join(options.output, 'runtime'), { recursive: true })
   cpSync(options.piDir, join(options.output, 'runtime/pi'), { recursive: true })
   cpSync(options.computerDir, join(options.output, 'runtime/computer'), { recursive: true })
+  cpSync(options.officeDir, join(options.output, 'runtime/office/linux-x64'), { recursive: true })
   if (!existsSync(options.piPurgeFile) || sha256(options.piPurgeFile) !== PI_PURGE_SOURCE_SHA256) throw new Error('--pi-purge-file must be the pinned pi-purge.ts source bytes')
   const purgeTarget = join(options.output, 'runtime/extensions/pi-purge/upstream/extensions/pi-purge.ts')
   mkdirSync(dirname(purgeTarget), { recursive: true })
