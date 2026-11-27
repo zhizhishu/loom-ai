@@ -360,7 +360,7 @@ export function loomToolDescription(contracts: WorkflowContracts): string {
   const examples: Record<string, Record<string, unknown>> = {
     "loom.status": {},
     "loom.skill_suggest": { name: "triage-release", description: "Triage a release", instructions: "Inspect evidence before shipping.", rationale: "The user confirmed this repeatable workflow." },
-    "loom.plan": { goal: "Deliver the requested file", criteria: [{ criterionId: "file", text: "File is registered and awaits User acceptance" }], tasks: [{ taskId: "task-1", title: "Write the requested file" }] },
+    "loom.plan": { goal: "Deliver the requested file", criteria: [{ criterionId: "file", text: "File is registered and awaits User acceptance" }], tasks: [{ taskId: "task-1", title: "Write the requested file", assigneeAgentId: "member-agent-id" }] },
     "loom.release": { taskId: "task-1" },
     "loom.claim": { taskId: "task-1" },
     "loom.claim_heartbeat": { claimId: "claim-from-claim", fenceGeneration: 1 },
