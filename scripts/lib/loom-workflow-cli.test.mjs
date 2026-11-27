@@ -18,7 +18,7 @@ test('real CLI preserves projected receipts for the native bridge and ordinary C
   const pipe = process.platform === 'win32' ? '\\\\.\\pipe\\rovai-ai-' + process.pid + '-' + randomUUID() : join(root, 'core.sock')
   const endpoint = process.platform === 'win32' ? { transport: 'windows_named_pipe', name: pipe } : { transport: 'unix_socket', path: pipe }
   const contextPath = join(root, 'context.json')
-  await writeFile(contextPath, JSON.stringify({ contractVersion: 45, ipcProtocolVersion: 3,
+  await writeFile(contextPath, JSON.stringify({ contractVersion: 46, ipcProtocolVersion: 3,
     coreEndpoint: endpoint, processId: 'synthetic-process', processToken: 'synthetic-token', tasksEnabled: true,
     lease: { executionRoot: root, runTmp: root, leaseId: 'synthetic-lease', leaseGeneration: 1, leaseToken: 'synthetic-lease-token' }
   }), { mode: 0o600 })
