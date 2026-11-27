@@ -50,22 +50,48 @@
       crates/rovai-core/src/local_attachment_source.rs:34-47
                    LocalAttachmentSourceRef (deny_unknown_fields); extractedText is the
                    admitted "browser-extracted Office document text" input channel
-      crates/rovai-core/src/loom/pptx_preview.rs:234-247,264-290
-                   soffice + pdftoppm probe, status missing_dependency / ready /
-                   conversion_failed -- mirrors the SKIP_LIBREOFFICE decision
+      crates/rovai-core/src/loom/pptx_preview.rs:44-61
+                   office_command() asks bundled_office_command() FIRST and PATH second. The
+                   Windows package ships runtime/office (LibreOffice + poppler), so the
+                   preview never depends on a system soffice/pdftoppm install
+      crates/rovai-core/src/loom/pptx_preview.rs:21-25,286-287
+                   LoomArtifactPptxPreview {status, missingDependency, error, slides}; status
+                   is "ready" only with one slide entry per presentation slide
       crates/rovai-core/src/loom.rs:1216-1219
                    LoomArtifactPreviewInput {missionId, artifactId}
+      crates/rovai-core/src/loom.rs:1236-1245,3689-3696
+                   LoomArtifactPreviewResult.pptxPreview; a .pptx preview reads the archived
+                   bytes of a REGISTERED artifact and renders them on demand
+      crates/rovai-web/src/operations.rs:39-43
+                   registration, claims, task release and stage review stay OFF the network
+                   capability: they belong to the agent side that owns the workspace
+      crates/rovai-core/src/pi/managed-workflow-tool.ts:33-54
+                   the agent side is rovai_loom -> the rovai CLI: loom.status, loom.plan,
+                   loom.release, loom.claim, loom.evidence, loom.submit
+      scripts/accept-loom-live-lead.mjs:1037-1052
+                   missions.create {title,description,projectPath:'',
+                   projectBindingKind:'quick_chat',memberAgentIds,defaultLeadAgentId,tags}
+                   answers payload.missionId/payload.threadId
+      scripts/accept-loom-live-lead.mjs:1055-1062
+                   missions.start answers applied|accepted, never a claim that it already ran
+      scripts/accept-live-device-workspace.mjs:152
+                   the quick_chat local workspace is <data>\quick-chat
+      scripts/lib/loom-pi-purge-production-ui.test.mjs:460-467
+                   the goal template a real Pi run receives: rovai_loom status -> plan
+                   (exactly one task) -> release -> claim -> evidence -> submit, then stop
       crates/rovai-web/src/operations.rs:58,270,342,376,386,392,419,615
                    Web boundary admits camps.open, runtime.installations.list,
                    thread.messages.send, agentRuns.cancel, threads.create,
-                   members.runtime.set, loom.artifact.preview
+                   members.runtime.set, loom.artifacts.list, loom.artifact.preview
 
     Hard rules encoded below:
       * the model credential is read from $env:OCT_API_KEY only, fails fast when absent,
         and is never written to a log, command line, report or exception;
       * every path stays under a short work root (default C:\loomacc);
       * default port 18990, never 64851/64852;
-      * a missing LibreOffice only records SKIP_LIBREOFFICE, never a product failure.
+      * the pptx preview is the REAL artifact preview: the agent registers the uploaded
+        acceptance.pptx through rovai_loom, loom.artifact.preview must answer status
+        "ready", and a preview that is not ready is a FAIL, never a SKIP.
 #>
 [CmdletBinding()]
 param(
@@ -390,8 +416,23 @@ function Write-TextFile([string]$Path, [string]$Content) {
 function New-OoxmlPackage([string]$Directory, [string]$TargetPath) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
     if ([IO.File]::Exists($TargetPath)) { [IO.File]::Delete($TargetPath) }
-    [IO.Compression.ZipFile]::CreateFromDirectory(
-        $Directory, $TargetPath, [IO.Compression.CompressionLevel]::Optimal, $false)
+    # CreateFromDirectory emits backslash entry names on .NET Framework/PS5.1, which
+    # breaks OOXML part lookups (e.g. GetEntry('word/document.xml')). Write entries
+    # manually so every name is a forward-slash relative path.
+    $rootFull = [IO.Path]::GetFullPath($Directory).TrimEnd('\', '/')
+    $archive = [IO.Compression.ZipFile]::Open($TargetPath, 'Create')
+    try {
+        foreach ($file in [IO.Directory]::GetFiles($rootFull, '*', [IO.SearchOption]::AllDirectories)) {
+            $relative = $file.Substring($rootFull.Length).TrimStart('\', '/')
+            $entryName = $relative.Replace('\', '/')
+            $entry = $archive.CreateEntry($entryName, [IO.Compression.CompressionLevel]::Optimal)
+            $entryStream = $entry.Open()
+            try {
+                $source = [IO.File]::OpenRead($file)
+                try { $source.CopyTo($entryStream) } finally { $source.Dispose() }
+            } finally { $entryStream.Dispose() }
+        }
+    } finally { $archive.Dispose() }
     return $TargetPath
 }
 
@@ -473,6 +514,25 @@ function Get-OoxmlText([string]$Path, [string]$EntryName) {
     return ([regex]::Replace($text, '\s+', ' ')).Trim()
 }
 
+function Get-PptxSlideCount([string]$Path) {
+    # The uploaded page count: Core walks one <p:sldId> per slide in presentation order
+    # (crates/rovai-core/src/loom/pptx_preview.rs:229-247), so the same element count in
+    # ppt/presentation.xml is what pptxPreview.slides must report.
+    Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+    $zip = [IO.Compression.ZipFile]::OpenRead($Path)
+    try {
+        $entry = $zip.GetEntry('ppt/presentation.xml')
+        if (-not $entry) { throw 'the generated pptx has no ppt/presentation.xml.' }
+        $reader = New-Object IO.StreamReader($entry.Open(), [Text.Encoding]::UTF8)
+        try { $xml = $reader.ReadToEnd() } finally { $reader.Dispose() }
+    } finally { $zip.Dispose() }
+    # '<p:sldId ' needs the whitespace before its attributes: the bare '<p:sldId' prefix also
+    # matches the '<p:sldIdLst>' container, which is not a slide.
+    $count = [regex]::Matches($xml, '<p:sldId\s').Count
+    if ($count -lt 1) { throw 'the generated pptx declares no slide.' }
+    return $count
+}
+
 # --------------------------------------------------------------------------------------
 # package, install, start, stop
 # --------------------------------------------------------------------------------------
@@ -483,9 +543,11 @@ function Assert-ShortWorkRoot {
     if ($root.Length -gt 40) { throw "WorkRoot must stay short for Expand-Archive: $($root.Length) characters" }
     if ($root -match '(^|\\)\.\.?(\\|$)') { throw 'WorkRoot must not contain . or .. segments.' }
     $script:Paths['work'] = New-Directory $root
-    foreach ($name in @('pkg', 'inst', 'data', 'logs', 'files')) {
+    foreach ($name in @('pkg', 'logs', 'files')) {
         $script:Paths[$name] = New-Directory (Join-Path $root $name)
     }
+    $script:Paths['inst'] = Join-Path $root 'inst'
+    $script:Paths['data'] = Join-Path $root 'data'
     $script:InstallDirectory = $script:Paths['inst']
     $script:DataDirectory = $script:Paths['data']
 }
@@ -496,7 +558,8 @@ function Expand-Package {
     Copy-Item -LiteralPath $PackageZip -Destination $copy -Force
     $extracted = Join-Path $script:Paths['work'] 'unpacked'
     if ([IO.Directory]::Exists($extracted)) { [IO.Directory]::Delete($extracted, $true) }
-    Expand-Archive -LiteralPath $copy -DestinationPath $extracted -Force
+    Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($copy, $extracted)
     $candidates = @(Get-ChildItem -LiteralPath $extracted -Filter 'candidate-manifest.json' -Recurse -Depth 2 -File -ErrorAction SilentlyContinue)
     if ($candidates.Count -eq 0) { throw 'candidate-manifest.json is missing: this is not a LOOM personal package.' }
     $root = $candidates[0].DirectoryName
@@ -631,66 +694,351 @@ function Stop-LoomConsole {
 # acceptance steps
 # --------------------------------------------------------------------------------------
 
-function Select-MemberAndModel {
-    $members = @(Invoke-CoreRequest 'members.list' ([ordered]@{}))
-    if ($members.Count -eq 0) { throw 'the real Core returned no assistants.' }
-    $agentId = [string](Get-Value $members[0] 'agentId')
-    $profile = Invoke-CoreRequest 'members.get' ([ordered]@{ agentId = $agentId })
-    $runtimeConfiguration = Get-Value $profile 'runtimeConfiguration'
-    $adapterKind = [string](Get-Value $runtimeConfiguration 'adapterKind')
-    $currentModel = [string](Get-Value (Get-Value $runtimeConfiguration 'model') 'modelId')
+# --------------------------------------------------------------------------------------
+# Pi-only member selection: the personal roster starts with a codex-cli assistant, which
+# a personal Codex user does not have, and Claude Code is disabled for this acceptance.
+# --------------------------------------------------------------------------------------
 
-    if (-not $adapterKind) {
-        $installations = @(Invoke-CoreRequest 'runtime.installations.list' ([ordered]@{}))
-        $adapterKind = [string](Get-Value $installations[0] 'adapterKind')
+function ConvertTo-OrderedMap($Value) {
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $map = [ordered]@{}
+        foreach ($key in @($Value.Keys)) { $map[[string]$key] = ConvertTo-OrderedMap ($Value[$key]) }
+        return $map
     }
-    if (-not $adapterKind) { throw 'the member has no configured runtime adapter.' }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $map = [ordered]@{}
+        foreach ($property in @($Value.PSObject.Properties)) {
+            $map[$property.Name] = ConvertTo-OrderedMap ($property.Value)
+        }
+        return $map
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $items = @()
+        foreach ($item in $Value) { $items += , (ConvertTo-OrderedMap $item) }
+        return $items
+    }
+    return $Value
+}
 
-    if ($currentModel -ne $ModelId) {
-        [void](Invoke-CoreRequest 'runtime.product.check' ([ordered]@{ runtimeKind = $adapterKind }))
-        $installation = Wait-Until -TimeoutSeconds 120 -IntervalMilliseconds 1000 -Probe {
-            $list = @(Invoke-CoreRequest 'runtime.installations.list' ([ordered]@{}))
-            foreach ($item in $list) {
-                if ([string](Get-Value $item 'adapterKind') -ne $adapterKind) { continue }
-                if ([string](Get-Value (Get-Value $item 'snapshot') 'probeStatus') -ne 'ready') { continue }
-                return $item
+function New-PiModelEntry {
+    return [ordered]@{
+        id = $ModelId
+        name = $ModelId
+        reasoning = $false
+        input = @('text')
+        contextWindow = 131072
+        maxTokens = 16384
+    }
+}
+
+function New-PiProviderEntry {
+    return [ordered]@{
+        name = 'oct-chat gateway'
+        baseUrl = 'https://oct.agent-ai.vip/v1'
+        # Environment reference only: Pi resolves $OCT_API_KEY from its own process
+        # environment, so the literal key never lands in a file
+        # (scripts/accept-loom-live-lead.mjs:578,598; scripts/loom-v2-core-native-pi.mjs:559).
+        apiKey = '$OCT_API_KEY'
+        api = 'openai-completions'
+        models = @((New-PiModelEntry))
+    }
+}
+
+function Set-PiOctChatGateway {
+    # Pi reads its provider catalog from PI_CODING_AGENT_DIR. The personal install exports
+    # that directory as <data>\runtime-home\pi before rovai-server.exe starts
+    # (scripts/manage-loom-personal.ps1:276). Core keeps its own private Pi session root at
+    # <data>\runtime\pi-windows-private-v1 (crates/rovai-core/src/pi/host.rs:3168-3179); that
+    # root is not Pi's config root, so models.json belongs to the agent directory above.
+    $key = $env:OCT_API_KEY
+    if (-not $key -or $key.Trim().Length -eq 0) {
+        throw 'FAIL_FAST: OCT_API_KEY is missing; the oct-chat provider key cannot be referenced.'
+    }
+    $key = $null
+    if (-not $script:DataDirectory) { throw 'the personal data directory is unknown before Pi is configured.' }
+    $agentDirectory = New-Directory (Join-Path $script:DataDirectory 'runtime-home\pi')
+
+    $modelsPath = Join-Path $agentDirectory 'models.json'
+    $document = [ordered]@{ providers = [ordered]@{} }
+    if (Test-Path -LiteralPath $modelsPath -PathType Leaf) {
+        $existingModels = [IO.File]::ReadAllText($modelsPath)
+        if ($existingModels.Trim().Length -gt 0) {
+            try { $document = ConvertTo-OrderedMap ($existingModels | ConvertFrom-Json) }
+            catch { throw "models.json in the Pi agent directory is not valid JSON: $modelsPath" }
+            if (-not ($document -is [System.Collections.IDictionary])) {
+                throw "models.json in the Pi agent directory is not a JSON object: $modelsPath"
             }
-            return $null
         }
-        if (-not $installation) { throw "runtime $adapterKind did not become ready." }
-        $models = @(Get-Value (Get-Value $installation 'snapshot') 'models')
-        $offered = $false
-        foreach ($model in $models) { if ([string](Get-Value $model 'id') -eq $ModelId) { $offered = $true } }
-        if (-not $offered) {
-            throw "model $ModelId is not offered by $adapterKind; no other model is substituted."
+    }
+    if (-not $document.Contains('providers') -or -not ($document['providers'] -is [System.Collections.IDictionary])) {
+        $document['providers'] = [ordered]@{}
+    }
+    $written = $false
+    $provider = $document['providers']['oct-chat']
+    if (-not ($provider -is [System.Collections.IDictionary])) {
+        $document['providers']['oct-chat'] = New-PiProviderEntry
+        $provider = $document['providers']['oct-chat']
+        $written = $true
+    }
+    $reference = [string]($provider['apiKey'])
+    if (-not $reference) {
+        $provider['apiKey'] = '$OCT_API_KEY'
+        $written = $true
+    }
+    $offers = @()
+    foreach ($entry in @($provider['models'])) {
+        if ($entry -is [System.Collections.IDictionary]) { $offers += [string]($entry['id']) }
+    }
+    if ($offers -notcontains $ModelId) {
+        $models = @()
+        foreach ($entry in @($provider['models'])) { if ($null -ne $entry) { $models += , $entry } }
+        $models += , (New-PiModelEntry)
+        $provider['models'] = $models
+        $written = $true
+    }
+    if ($written) {
+        Write-TextFile $modelsPath (($document | ConvertTo-Json -Depth 12) + "`r`n")
+    }
+
+    # Pi needs one default provider/model to open its probe Session; existing user
+    # defaults are kept byte-identical.
+    $settingsPath = Join-Path $agentDirectory 'settings.json'
+    $settings = [ordered]@{}
+    if (Test-Path -LiteralPath $settingsPath -PathType Leaf) {
+        $existingSettings = [IO.File]::ReadAllText($settingsPath)
+        if ($existingSettings.Trim().Length -gt 0) {
+            try { $settings = ConvertTo-OrderedMap ($existingSettings | ConvertFrom-Json) }
+            catch { throw "settings.json in the Pi agent directory is not valid JSON: $settingsPath" }
+            if (-not ($settings -is [System.Collections.IDictionary])) {
+                throw "settings.json in the Pi agent directory is not a JSON object: $settingsPath"
+            }
         }
-        $permissions = Get-Value (Get-Value $installation 'memberRuntimeDefaults') 'permissions'
+    }
+    $settingsChanged = $false
+    if (-not $settings.Contains('defaultProvider') -or -not $settings['defaultProvider']) {
+        $settings['defaultProvider'] = 'oct-chat'
+        $settingsChanged = $true
+    }
+    if (-not $settings.Contains('defaultModel') -or -not $settings['defaultModel']) {
+        $settings['defaultModel'] = $ModelId
+        $settingsChanged = $true
+    }
+    if ($settingsChanged) {
+        Write-TextFile $settingsPath (($settings | ConvertTo-Json -Depth 12) + "`r`n")
+    }
+
+    $script:Evidence['piGateway'] = [ordered]@{
+        agentDirectory = $agentDirectory
+        modelsPath = $modelsPath
+        settingsPath = $settingsPath
+        provider = 'oct-chat'
+        modelId = $ModelId
+        apiKeyReference = 'OCT_API_KEY (value never recorded)'
+        modelsRewritten = $written
+        settingsRewritten = $settingsChanged
+    }
+}
+
+function Get-PiModelParts([string]$Value) {
+    # Pi explicit identity: pi://model?provider=<provider>&id=<id>
+    # (crates/rovai-core/src/pi/host.rs:2198-2205 builds it, :3149-3162 parses it).
+    if ($Value -match '^pi://model\?(.+)$') {
+        $provider = $null
+        $identifier = $null
+        foreach ($pair in ($matches[1] -split '&')) {
+            $name, $raw = $pair -split '=', 2
+            if (-not $raw) { continue }
+            $decoded = [Uri]::UnescapeDataString($raw)
+            if ($name -eq 'provider') { $provider = $decoded }
+            if ($name -eq 'id') { $identifier = $decoded }
+        }
+        return @{ Provider = $provider; Id = $identifier }
+    }
+    return @{ Provider = $null; Id = $Value }
+}
+
+function Test-PiModelId([string]$Value) {
+    if (-not $Value) { return $false }
+    # PowerShell variable names and -eq are case-insensitive; compare the parsed id as one
+    # trimmed scalar with -ceq so an array-valued part can never turn this into a mismatch.
+    $actual = [string](@((Get-PiModelParts $Value).Id)[0])
+    $expected = [string](@($ModelId)[0])
+    return ($actual.Trim() -ceq $expected.Trim())
+}
+
+function Resolve-PiModelId($Installation) {
+    # Prefer the identity the Pi snapshot actually reports; Pi models carry the provider
+    # inside a pi:// id, with a provider field tolerated for a future snapshot shape.
+    foreach ($model in @(Get-Value (Get-Value $Installation 'snapshot') 'models')) {
+        if (-not $model) { continue }
+        $id = [string](Get-Value $model 'id')
+        if (-not $id) { continue }
+        $provider = [string](Get-Value $model 'provider')
+        $parts = Get-PiModelParts $id
+        if (-not $provider) { $provider = $parts.Provider }
+        if ($provider -eq 'oct-chat' -and $parts.Id -eq $ModelId) { return $id }
+    }
+    $encoded = [Uri]::EscapeDataString($ModelId)
+    return "pi://model?provider=oct-chat&id=$encoded"
+}
+
+function Find-PiAssistantId {
+    # Startup seeds the Pi 主助手 and binds it to Pi in the background task that runs after
+    # runtime discovery, i.e. after the Host already answers requests
+    # (crates/rovai-core/src/application.rs:21905-21913, :3717-3789). members.list only
+    # reports already bound members (:3797-3808), so one read is a race: poll until the
+    # binding lands, and only then fall back to creating a member.
+    $found = Wait-Until -TimeoutSeconds 90 -IntervalMilliseconds 1500 -Probe {
+        try { $members = @(Invoke-CoreRequest 'members.list' ([ordered]@{})) }
+        catch { $members = @() }
+        foreach ($member in $members) {
+            if (-not $member) { continue }
+            $configuration = Get-Value $member 'runtimeConfiguration'
+            if ([string](Get-Value $configuration 'adapterKind') -ne 'pi') { continue }
+            return [string](Get-Value $member 'agentId')
+        }
+        return $null
+    }
+    return $found
+}
+
+function New-PiAssistant {
+    # The personal onboarding/assistant editor creates a profile with members.create and the
+    # plain CreateAgentProfileCommand shape, then configures the runtime separately
+    # (apps/desktop/src/renderer/src/loom-native/assistant-service.ts:526-562;
+    # apps/desktop/src/renderer/src/onboarding-provisioning.ts:132-142;
+    # crates/rovai-core/src/agent_profile.rs:978-990, :2835-2941).
+    $created = Invoke-CoreRequest 'members.create' ([ordered]@{
+            commandId = (New-CommandId)
+            command = [ordered]@{
+                displayName = 'LOOM Windows acceptance Pi assistant'
+                avatarRef = $null
+                teamRole = 'Windows real-install acceptance runner'
+                professionalResponsibilities = 'Run the real-install acceptance conversation on the oct-chat Pi model only.'
+                personalityTraits = @('precise', 'concise')
+                workingPrinciples = 'Answer only what is asked and never claim unverified results.'
+                growthTopic = ''
+            }
+        })
+    $status = [string](Get-Value $created 'status')
+    $agentId = [string](Get-Value (Get-Value $created 'payload') 'agentId')
+    if ($status -ne 'applied' -or -not $agentId) {
+        throw "members.create for the Pi assistant was not applied: $status"
+    }
+    return $agentId
+}
+
+function Find-RuntimeInstallation([string]$AdapterKind, [switch]$ReadyOnly) {
+    foreach ($item in @(Invoke-CoreRequest 'runtime.installations.list' ([ordered]@{}))) {
+        if ([string](Get-Value $item 'adapterKind') -ne $AdapterKind) { continue }
+        if ($ReadyOnly -and [string](Get-Value (Get-Value $item 'snapshot') 'probeStatus') -ne 'ready') { continue }
+        return $item
+    }
+    return $null
+}
+
+function Select-MemberAndModel {
+    # Fail fast on the credential and write the oct-chat provider catalog before any Pi
+    # probe runs, so the runtime snapshot can report the model this acceptance needs. The
+    # catalog is written after start: <data> only exists once the Host created it with its
+    # protected DACL.
+    [void](Set-PiOctChatGateway)
+    $agentId = Find-PiAssistantId
+    if (-not $agentId) {
+        $agentId = New-PiAssistant
+        Add-Result 'MEMBER_CREATE' 'PASS' "members.create created the Pi assistant $agentId"
+    }
+    $adapterKind = 'pi'
+
+    # Freeze the member runtime BEFORE waiting for a probe. The startup binding and every
+    # members.runtime.set are configuration changes, and a runtime check that finishes
+    # afterwards is reported as Superseded: it publishes no ready installation snapshot
+    # (crates/rovai-core/src/application.rs:2324-2342, :28570-28582). A wait that starts
+    # before the set therefore never observes ready. The explicit model also replaces the
+    # startup binding's runtime_default, so the conversation runs on oct-chat.
+    $installation = Find-RuntimeInstallation $adapterKind
+    if (-not $installation) {
+        throw "runtime $adapterKind is not installed; the member runtime cannot be configured."
+    }
+    $permissions = Get-Value (Get-Value $installation 'memberRuntimeDefaults') 'permissions'
+    if (-not $permissions) {
+        throw "runtime $adapterKind reports no member runtime defaults; its permissions are unknown."
+    }
+    # Not $modelId: PowerShell variable names are case-insensitive, so that name would
+    # overwrite the script-level $ModelId parameter and Test-PiModelId would compare the
+    # bare model id against the full pi:// identity.
+    $piExplicitModelId = Resolve-PiModelId $installation
+
+    $profile = $null
+    $configured = $null
+    foreach ($attempt in 1..3) {
+        $profile = Invoke-CoreRequest 'members.get' ([ordered]@{ agentId = $agentId })
         $configured = Invoke-CoreRequest 'members.runtime.set' ([ordered]@{
-                commandId = New-CommandId
+                commandId = (New-CommandId)
                 command = [ordered]@{
                     agentId = $agentId
-                    expectedVersion = Get-Value $profile 'version'
+                    expectedVersion = (Get-Value $profile 'version')
                     adapterKind = $adapterKind
-                    model = [ordered]@{ mode = 'explicit'; modelId = $ModelId; options = [ordered]@{} }
+                    model = [ordered]@{ mode = 'explicit'; modelId = $piExplicitModelId; options = [ordered]@{} }
                     permissions = $permissions
                 }
             })
-        if ([string](Get-Value $configured 'status') -ne 'applied') {
-            throw "members.runtime.set for $ModelId was not applied."
+        if ([string](Get-Value $configured 'status') -eq 'applied') { break }
+        $code = [string](Get-Value $configured 'code')
+        if ($code -ne 'version_conflict' -or $attempt -eq 3) {
+            throw "members.runtime.set for $piExplicitModelId was not applied: $code"
         }
-        $profile = Invoke-CoreRequest 'members.get' ([ordered]@{ agentId = $agentId })
-        $runtimeConfiguration = Get-Value $profile 'runtimeConfiguration'
+        # A concurrent writer bumped the profile version; re-read and retry.
+        Start-Sleep -Milliseconds 500
     }
 
+    # runtime.product.check blocks until this round's probe finishes
+    # (crates/rovai-core/src/application.rs:4821-4868), but its reply is not evidence: a
+    # superseded or deferred attempt completes the operation without publishing a ready
+    # snapshot, so only runtime.installations.list decides and every round is retried.
+    $deadline = (Get-Date).AddSeconds($ReadyTimeoutSeconds)
+    $probeFailure = $null
+    $installation = Find-RuntimeInstallation $adapterKind -ReadyOnly
+    while (-not $installation -and (Get-Date) -lt $deadline) {
+        try {
+            [void](Invoke-CoreRequest 'runtime.product.check' ([ordered]@{ runtimeKind = $adapterKind }))
+            $probeFailure = $null
+        } catch {
+            $probeFailure = $_.Exception.Message
+        }
+        $installation = Find-RuntimeInstallation $adapterKind -ReadyOnly
+        if ($installation) { break }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $installation) {
+        $detail = if ($probeFailure) { ": $probeFailure" } else { '.' }
+        throw "runtime $adapterKind did not become ready $ReadyTimeoutSeconds s after members.runtime.set$detail"
+    }
+
+    $profile = Invoke-CoreRequest 'members.get' ([ordered]@{ agentId = $agentId })
+    $runtimeConfiguration = Get-Value $profile 'runtimeConfiguration'
     $resolvedModel = [string](Get-Value (Get-Value $runtimeConfiguration 'model') 'modelId')
     $readiness = [string](Get-Value (Get-Value $profile 'runtimeReadiness') 'status')
-    if ($resolvedModel -ne $ModelId) { throw "the member frozen model is $resolvedModel, not $ModelId." }
-    if ($readiness -ne 'ready') { throw "member runtime readiness is $readiness, not ready." }
+    if ([string](Get-Value $runtimeConfiguration 'adapterKind') -ne $adapterKind) {
+        throw "the member runtime adapter is not $adapterKind after members.runtime.set."
+    }
+    if (-not (Test-PiModelId $resolvedModel)) { throw "the member frozen model is $resolvedModel, not $ModelId." }
+    # A configured member profile stops at installed_unverified
+    # (crates/rovai-core/src/agent_profile.rs:5650-5701); ready, light_ready and
+    # installed_unverified are the launch-eligible states
+    # (crates/rovai-core/src/member_execution_availability.rs:38-46). The ready Pi snapshot
+    # above is the proof that the runtime itself is verified.
+    if (@('ready', 'light_ready', 'installed_unverified') -notcontains $readiness) {
+        throw "member runtime readiness is $readiness, not launch-eligible."
+    }
     $script:Evidence['member'] = [ordered]@{
         agentId = $agentId
         adapterKind = $adapterKind
         modelId = $resolvedModel
         readiness = $readiness
+        installationId = [string](Get-Value $installation 'id')
+        probeStatus = [string](Get-Value (Get-Value $installation 'snapshot') 'probeStatus')
     }
     Add-Result 'MEMBER_MODEL' 'PASS' "$agentId uses $adapterKind / $resolvedModel"
     return $agentId
@@ -722,7 +1070,9 @@ function Invoke-RealModelTurn([string]$ThreadId, [string]$AgentId) {
     $observedModel = Get-Value $run 'runtimeModel'
     if (-not $observedModel) { $observedModel = Get-Value $reply 'runtimeModel' }
     $observedModelId = [string](Get-Value $observedModel 'modelId')
-    if ($observedModelId -and $observedModelId -ne $ModelId) {
+    # The Run reports the explicit pi:// identity (crates/rovai-core/src/pi/host.rs:2198-2205),
+    # so compare through Test-PiModelId instead of the bare id.
+    if ($observedModelId -and -not (Test-PiModelId $observedModelId)) {
         throw "the run reported model $observedModelId, not $ModelId."
     }
     if (-not $observedModelId) {
@@ -778,47 +1128,127 @@ function Invoke-DocxCheck([string]$ThreadId, [string]$AgentId) {
     Add-Result 'DOCX_MARKER' 'PASS' "assistant quoted $marker from the uploaded docx"
 }
 
-function Test-PptxPreviewInterface([string]$ThreadId) {
+function Test-PptxPreviewInterface([string]$ThreadId, [string]$AgentId) {
     $marker = 'LOOM-PPTX-MARKER-' + (Get-Random -Minimum 100000 -Maximum 999999)
     $path = Join-Path $script:Paths['files'] 'acceptance.pptx'
     [void](New-PptxFile $path ("$marker slide one."))
+    $expectedSlides = Get-PptxSlideCount $path
     $draft = Invoke-Upload $ThreadId $path 'acceptance.pptx'
     $sourcePath = [string](Get-Value $draft 'sourcePath')
     if (-not $sourcePath) { throw 'the pptx upload returned no source path.' }
-    Add-Result 'PPTX_UPLOAD' 'PASS' "uploaded acceptance.pptx as $([string](Get-Value $draft 'id'))"
+    Add-Result 'PPTX_UPLOAD' 'PASS' "uploaded acceptance.pptx as $([string](Get-Value $draft 'id')) with $expectedSlides slide(s)"
 
-    $soffice = Get-Command 'soffice' -ErrorAction SilentlyContinue
-    $pdftoppm = Get-Command 'pdftoppm' -ErrorAction SilentlyContinue
+    # The quick_chat Mission workspace is <data>\quick-chat
+    # (scripts/accept-live-device-workspace.mjs:152), so the already uploaded file is copied
+    # there BEFORE the Mission starts and the agent registers that exact file.
+    $workspacePptx = Join-Path (New-Directory (Join-Path $script:DataDirectory 'quick-chat')) 'acceptance.pptx'
+    Copy-Item -LiteralPath $path -Destination $workspacePptx -Force
+    if (-not [IO.File]::Exists($workspacePptx)) { throw 'acceptance.pptx was not copied into the Mission workspace.' }
+
+    # Registration, claims and task release are not Web capabilities
+    # (crates/rovai-web/src/operations.rs:39-43): the bundled agent reaches them through
+    # rovai_loom -> the rovai CLI (crates/rovai-core/src/pi/managed-workflow-tool.ts:33-54),
+    # so the Mission goal is the chain from scripts/lib/loom-pi-purge-production-ui.test.mjs:460-467
+    # with "write the file" replaced by "register the file already in the workspace".
+    $goal = @(
+        'Windows real-install acceptance: register the pptx already in the workspace and submit the candidate, do not rewrite the file.'
+        "You are the Default Lead and the only executor; member ID is $AgentId."
+        'acceptance.pptx is already in this Mission workspace; do not rewrite, regenerate or rename it.'
+        "Use rovai_loom in order: loom.status -> loom.plan (exactly 1 task, assigneeAgentId set to $AgentId) -> loom.release -> loom.claim."
+        "Then use loom.evidence with relativePath='acceptance.pptx' to register that file and bind it to that task, and loom.submit to submit the returned artifactId."
+        'Then stop: the candidate stays pending; do not review, do not accept, do not use bash/shell/MCP, and write no other files.'
+    ) -join "`r`n"
+
+    $created = Invoke-CoreRequest 'missions.create' ([ordered]@{
+            commandId = New-CommandId
+            command = [ordered]@{
+                title = "LOOM Windows acceptance pptx preview $((Get-Date).ToString('yyyyMMdd-HHmmss'))"
+                description = $goal
+                projectPath = ''
+                projectBindingKind = 'quick_chat'
+                memberAgentIds = @($AgentId)
+                defaultLeadAgentId = $AgentId
+                tags = @('windows-acceptance', 'pptx-preview')
+            }
+        })
+    $createdStatus = [string](Get-Value $created 'status')
+    $missionId = [string](Get-Value (Get-Value $created 'payload') 'missionId')
+    $missionThreadId = [string](Get-Value (Get-Value $created 'payload') 'threadId')
+    if ($createdStatus -cne 'applied' -or -not $missionId -or -not $missionThreadId) {
+        throw ("missions.create was not applied: {0}" -f $createdStatus)
+    }
+
+    $started = Invoke-CoreRequest 'missions.start' ([ordered]@{
+            commandId = New-CommandId
+            command = [ordered]@{ missionId = $missionId }
+        })
+    $startedStatus = [string](Get-Value $started 'status')
+    if (@('applied', 'accepted') -notcontains $startedStatus) {
+        throw ("missions.start was not accepted for {0}: {1}" -f $missionId, $startedStatus)
+    }
+
+    # Poll the artifacts of THIS Mission until the agent has registered acceptance.pptx. No
+    # placeholder artifact is ever previewed: only the row Core lists for this Mission counts.
+    $deadline = (Get-Date).AddSeconds($RunTimeoutSeconds)
+    $artifact = $null
+    $runNote = 'no AgentRun reported yet'
+    while (-not $artifact -and (Get-Date) -lt $deadline) {
+        $listed = Try-CoreRequest 'loom.artifacts.list' ([ordered]@{ missionId = $missionId })
+        if ($listed.Ok) {
+            $rows = @()
+            $nested = Get-Value $listed.Result 'artifacts'
+            if ($nested) { $rows = @($nested) }
+            elseif ($listed.Result -is [System.Collections.IEnumerable] -and $listed.Result -isnot [string]) { $rows = @($listed.Result) }
+            foreach ($row in $rows) {
+                if (-not $row) { continue }
+                if ([string](Get-Value $row 'relativePath').Trim() -ceq 'acceptance.pptx') { $artifact = $row; break }
+            }
+        }
+        if ($artifact) { break }
+        try { $snapshot = Get-CampSnapshot $missionThreadId } catch { $snapshot = $null }
+        foreach ($run in @(Get-Value $snapshot 'agentRuns')) {
+            if (-not $run) { continue }
+            $runStatus = [string](Get-Value $run 'status')
+            $runNote = "agentRun $([string](Get-Value $run 'id')) is $runStatus"
+            if ($runStatus -ceq 'failed' -or $runStatus -ceq 'cancelled') {
+                throw ("the Mission Run {0} ended {1} (reason {2}) without registering acceptance.pptx" -f `
+                        [string](Get-Value $run 'id'), $runStatus, [string](Get-Value $run 'terminalReasonCode'))
+            }
+        }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $artifact) { throw ("no acceptance.pptx artifact was registered within {0} s ({1})." -f $RunTimeoutSeconds, $runNote) }
+    $artifactId = [string](Get-Value $artifact 'artifactId')
+    if (-not $artifactId) { throw 'loom.artifacts.list reported acceptance.pptx without an artifactId.' }
+
+    # loom.artifact.preview renders the ARCHIVED bytes on demand
+    # (crates/rovai-core/src/loom.rs:1236-1245, 3689-3696).
+    $preview = Invoke-CoreRequest 'loom.artifact.preview' ([ordered]@{ missionId = $missionId; artifactId = $artifactId })
+    $pptxPreview = Get-Value $preview 'pptxPreview'
+    if (-not $pptxPreview) { throw "loom.artifact.preview returned no pptxPreview for $artifactId." }
+    $previewStatus = [string](Get-Value $pptxPreview 'status')
+    $previewSlides = @()
+    foreach ($slide in @(Get-Value $pptxPreview 'slides')) { if ($null -ne $slide) { $previewSlides += $slide } }
+    if ($previewStatus -cne 'ready') {
+        throw ("pptxPreview.status is {0} (missingDependency={1} error={2})." -f $previewStatus, `
+                [string](Get-Value $pptxPreview 'missingDependency'), [string](Get-Value $pptxPreview 'error'))
+    }
+    if ($previewSlides.Count -ne $expectedSlides) {
+        throw ("pptxPreview.slides.Count is {0} but the uploaded acceptance.pptx declares {1} slide(s)." -f `
+                $previewSlides.Count, $expectedSlides)
+    }
+
     $script:Evidence['pptx'] = [ordered]@{
         attachmentId = [string](Get-Value $draft 'id')
         sourcePath = $sourcePath
-        soffice = [bool]$soffice
-        pdftoppm = [bool]$pdftoppm
+        missionId = $missionId
+        artifactId = $artifactId
+        sha256 = (Get-FileSha256 $path)
+        expectedSlides = $expectedSlides
+        previewStatus = $previewStatus
+        previewSlides = $previewSlides.Count
     }
-
-    # The page-preview path is loom.artifact.preview over a registered Loom artifact
-    # (crates/rovai-core/src/loom.rs:1216-1219). This acceptance run creates no Loom Mission,
-    # so only the interface admission is asserted here.
-    $probe = Try-CoreRequest 'loom.artifact.preview' ([ordered]@{
-            missionId = 'loom-acc-no-mission'
-            artifactId = 'loom-acc-no-artifact'
-        })
-    # Only an answered call or the "artifact does not belong to this Mission" rejection proves the
-    # operation is routed and admitted (loom.rs:3638-3643); any other code or a transport error fails.
-    if ($probe.Ok) {
-        Add-Result 'PPTX_PREVIEW_INTERFACE' 'PASS' 'loom.artifact.preview answered with a preview result'
-    } elseif ([string]$probe.Code -eq 'LOOM_EVIDENCE_NOT_FOUND') {
-        Add-Result 'PPTX_PREVIEW_INTERFACE' 'PASS' "loom.artifact.preview is routed and admitted the call; Core rejected the placeholder artifact with $($probe.Code)"
-    } else {
-        Add-Result 'PPTX_PREVIEW_INTERFACE' 'FAIL' ("loom.artifact.preview was not routed/admitted: status={0} code={1} message={2}" -f $probe.Status, $probe.Code, $probe.Message)
-    }
-
-    if (-not $soffice -or -not $pdftoppm) {
-        # Same pair the Core probes before rendering (crates/rovai-core/src/loom/pptx_preview.rs:234-247).
-        Add-Result 'PPTX_PREVIEW' 'SKIP_LIBREOFFICE' 'soffice/pdftoppm are not installed; page preview is not exercised and is not a product failure'
-        return
-    }
-    Add-Result 'PPTX_PREVIEW' 'TODO_VERIFY_API' 'page preview needs a registered Loom artifact (missionId/artifactId); LibreOffice present, full path not exercised here'
+    Add-Result 'PPTX_PREVIEW' 'PASS' "pptxPreview.status is ready with $($previewSlides.Count) slide(s) for $artifactId, equal to the $expectedSlides slide(s) in the uploaded acceptance.pptx"
 }
 
 function Invoke-StopCheck([string]$ThreadId, [string]$AgentId) {
@@ -927,7 +1357,7 @@ function Write-AcceptanceArtifacts {
     $lines.Add("data:    $($script:DataDirectory)")
     $lines.Add("port:    $Port   model: $ModelId")
     $lines.Add('')
-    foreach ($status in @('PASS', 'FAIL', 'SKIP', 'SKIP_LIBREOFFICE', 'SKIP_STOP_WINDOW', 'TODO_VERIFY_API')) {
+    foreach ($status in @('PASS', 'FAIL', 'SKIP', 'SKIP_STOP_WINDOW')) {
         foreach ($entry in @($script:Results | Where-Object { $_.status -eq $status })) {
             $lines.Add(('{0,-18} {1}: {2}' -f $entry.status, $entry.id, $entry.detail))
         }
@@ -979,7 +1409,7 @@ try {
 
     Invoke-RealModelTurn $threadId $agentId
     Invoke-DocxCheck $threadId $agentId
-    Test-PptxPreviewInterface $threadId
+    Test-PptxPreviewInterface $threadId $agentId
     Invoke-StopCheck $threadId $agentId
 } catch {
     Add-Result 'ACCEPTANCE' 'FAIL' (Hide-Secrets $_.Exception.Message)
@@ -997,7 +1427,7 @@ try {
 }
 
 $passed = @($script:Results | Where-Object { $_.status -eq 'PASS' }).Count
-$skipped = @($script:Results | Where-Object { $_.status -like 'SKIP*' -or $_.status -eq 'TODO_VERIFY_API' }).Count
+$skipped = @($script:Results | Where-Object { $_.status -like 'SKIP*' }).Count
 $failed = @($script:Results | Where-Object { $_.status -eq 'FAIL' }).Count
 Write-Host ''
 Write-Host ("acceptance: {0} PASS / {1} SKIP / {2} FAIL; logs in {3}" -f $passed, $skipped, $failed, $script:Paths['logs'])
