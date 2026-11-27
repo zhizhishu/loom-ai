@@ -2233,12 +2233,15 @@ pub(crate) struct PrepareRemoteWorkspaceRequest {
 
 /// One prepare request, whichever admission produced it. The HTTP route and the
 /// Web operation both end in [`prepare_workspace_record`]; there is one prepare
-/// implementation and this is only its input.
+/// implementation and this is only its input. `remote_only` is the one thing the
+/// two admissions do not share: the operation may only ever prepare a row on a
+/// remote node.
 pub(crate) struct PrepareWorkspace {
     mission_id: String,
     camp_id: String,
     node_id: String,
     source: String,
+    remote_only: bool,
 }
 
 impl From<PrepareWorkspaceRequest> for PrepareWorkspace {
@@ -2248,6 +2251,7 @@ impl From<PrepareWorkspaceRequest> for PrepareWorkspace {
             camp_id: request.camp_id,
             node_id: request.node_id,
             source: request.source,
+            remote_only: false,
         }
     }
 }
@@ -2262,8 +2266,9 @@ fn valid_workspace_source(source: &str, local: bool) -> bool {
 }
 
 /// Admit one prepare against this Host's node registry. `role` is what the
-/// registry says about `node_id`; `None` means this Host never paired that node,
-/// which is a refusal before any socket or Git work, never a local fallback.
+/// registry says about `node_id`; `None` means this Host never paired that node
+/// or has revoked it, which is a refusal before any socket or Git work, never a
+/// local fallback.
 fn admit_workspace_prepare(
     request: &PrepareWorkspace,
     role: Option<&str>,
@@ -2275,6 +2280,12 @@ fn admit_workspace_prepare(
         return Err((StatusCode::BAD_REQUEST, "invalid_workspace"));
     }
     let role = role.ok_or((StatusCode::NOT_FOUND, "node_not_found"))?;
+    // `missions.workspace.prepareRemote` has no local capability at all. A local
+    // node is not a degraded answer to it, so it gets the same closed refusal as
+    // a node this Host never paired.
+    if request.remote_only && role != "remote" {
+        return Err((StatusCode::NOT_FOUND, "node_not_found"));
+    }
     // Only the node's own role decides whether this Host can read the path.
     if !valid_workspace_source(&request.source, role == "local") {
         return Err((StatusCode::BAD_REQUEST, "invalid_workspace"));
@@ -2358,6 +2369,8 @@ pub(crate) async fn prepare_remote_workspace(state: &WebState, params: Value) ->
                 camp_id,
                 node_id: request.node_id,
                 source: request.source_root,
+                // The operation prepares on a remote node and nowhere else.
+                remote_only: true,
             },
         )
         .await
@@ -2380,12 +2393,19 @@ async fn prepare_workspace_record(
     state: &WebState,
     request: PrepareWorkspace,
 ) -> Result<Value, (StatusCode, &'static str)> {
-    let role = match state.nodes.store.node_role(&request.node_id) {
+    let role = match state.nodes.store.active_node_role(&request.node_id) {
         Ok(role) => role,
         Err(_) => return Err((StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable")),
     };
     let role = admit_workspace_prepare(&request, role.as_deref())?;
-    if let Ok(Some(existing)) = state.nodes.store.workspace_by_mission(&request.mission_id) {
+    // A row on another host is a different execution root. Only the same Mission
+    // on the same node is already prepared, so a local row neither answers a
+    // remote prepare nor suppresses creating the remote one.
+    if let Ok(Some(existing)) = state
+        .nodes
+        .store
+        .workspace_by_mission_and_host(&request.mission_id, &request.node_id)
+    {
         return Ok(workspace_json(&existing));
     }
     let branch = match loom_protocol::safe_branch(&request.mission_id) {
@@ -2472,7 +2492,7 @@ async fn prepare_workspace_record(
     let Some(saved) = state
         .nodes
         .store
-        .workspace_by_mission(&record.mission_id)
+        .workspace_by_mission_and_host(&record.mission_id, &record.execution_host_id)
         .ok()
         .flatten()
     else {
@@ -4239,6 +4259,7 @@ mod tests {
             camp_id: "thread_c".into(),
             node_id: "node_missing".into(),
             source: "relative/source".into(),
+            remote_only: false,
         };
         // The registry answers `None` for a node this Host never paired, and that is
         // exactly the answer the operation refuses instead of preparing anywhere.
@@ -4256,6 +4277,42 @@ mod tests {
         );
         request.source = std::env::temp_dir().to_string_lossy().into_owned();
         assert_eq!(admit_workspace_prepare(&request, Some("local")), Ok("local".into()));
+    }
+
+    /// `missions.workspace.prepareRemote` prepares a remote row and nothing else:
+    /// a local node, a node this Host never paired and a revoked node are all
+    /// refused before any Git work, never downgraded to a local prepare.
+    #[test]
+    fn prepare_remote_admits_only_a_live_remote_node() {
+        let store = NodeStore::open_ephemeral().unwrap();
+        store.insert_remote("node_b", "desk-b", &"ab".repeat(32)).unwrap();
+        let request = PrepareWorkspace {
+            mission_id: "mission_a".into(),
+            camp_id: "thread_c".into(),
+            node_id: "node_b".into(),
+            source: "/srv/fixture/source".into(),
+            remote_only: true,
+        };
+        let live = store.active_node_role(&request.node_id).unwrap();
+        assert_eq!(admit_workspace_prepare(&request, live.as_deref()), Ok("remote".into()));
+        // A local node is a refusal, not a local prepare of a remote root.
+        assert_eq!(
+            admit_workspace_prepare(&request, Some("local")),
+            Err((StatusCode::NOT_FOUND, "node_not_found"))
+        );
+        assert_eq!(
+            admit_workspace_prepare(&request, store.active_node_role("node_missing").unwrap().as_deref()),
+            Err((StatusCode::NOT_FOUND, "node_not_found"))
+        );
+        // Revocation removes the role the admission reads, so the same node stops
+        // answering even though the row and its role string remain stored.
+        assert!(matches!(store.revoke("node_b").unwrap(), RevokeResult::Revoked { .. }));
+        assert_eq!(store.node_role("node_b").unwrap().as_deref(), Some("remote"));
+        assert_eq!(store.active_node_role("node_b").unwrap(), None);
+        assert_eq!(
+            admit_workspace_prepare(&request, store.active_node_role(&request.node_id).unwrap().as_deref()),
+            Err((StatusCode::NOT_FOUND, "node_not_found"))
+        );
     }
 
     #[test]
