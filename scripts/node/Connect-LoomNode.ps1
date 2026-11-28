@@ -103,7 +103,10 @@ if (-not $hasCredential) {
     Write-Host "Reconnecting with the stored node credential: $credentialPath"
 }
 
-$commandLine = '"' + $nodePath + '" --data-dir "' + $dataDirPath + '" --server "' + $serverUrl + '"'
+# Arguments after the exe path; ProcessStartInfo takes these beside FileName,
+# while WScript.Shell Exec below takes the whole command line.
+$nodeArguments = '--data-dir "' + $dataDirPath + '" --server "' + $serverUrl + '"'
+$commandLine = '"' + $nodePath + '" ' + $nodeArguments
 if (-not $hasCredential) { $commandLine = $commandLine + ' --pair-code-stdin' }
 
 if (-not $hasCredential) {
@@ -137,7 +140,7 @@ if (-not $hasCredential) {
 # Reconnect: no stdin needed, so the node inherits this console directly.
 $startInfo = New-Object System.Diagnostics.ProcessStartInfo
 $startInfo.FileName = $nodePath
-$startInfo.Arguments = $commandLine
+$startInfo.Arguments = $nodeArguments
 $startInfo.UseShellExecute = $false
 
 $process = New-Object System.Diagnostics.Process
