@@ -282,6 +282,26 @@ function Get-FileSha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+# prepareRemote answers the node's canonicalized worktree, which on Windows is an
+# extended-length path (\\?\C:\..., fs::canonicalize: loom-protocol/src/workspace.rs:261).
+# .NET file APIs accept that form, but the PowerShell 5.1 provider cannot resolve a drive
+# from the \\?\ prefix, so Join-Path dies with "the value of parameter drive is null".
+# The node's own wire layer strips the same prefixes before invoking git
+# (loom-node/src/workspace_rpc_wire.rs:37-41); this helper mirrors it and is used ONLY for
+# local I/O (marker write, hash read): $script:WorktreePath and every evidence field keep
+# the raw answer the Host sent.
+function ConvertTo-PlainLocalPath([string]$Path) {
+    if (-not $Path) { return $Path }
+    # \\?\UNC\server\share -> \\server\share must be tried before the bare \\?\ strip.
+    if ($Path.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        return '\\' + $Path.Substring('\\?\UNC\'.Length)
+    }
+    if ($Path.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
+        return $Path.Substring('\\?\'.Length)
+    }
+    return $Path
+}
+
 function Get-Edge([string]$Value, [int]$Length) {
     if (-not $Value) { return '' }
     if ($Value.Length -le $Length) { return $Value }
@@ -1297,7 +1317,10 @@ function Write-RemoteMarker {
     # and only proves the workspace transport; Pi's own deliverable is checked separately.
     $script:MarkerRelative = 'probe/marker-' + $script:Nonce + '.docx'
     $relativeNative = $script:MarkerRelative.Replace('/', '\')
-    $target = Join-Path $script:WorktreePath $relativeNative
+    # $script:WorktreePath stays the raw (possibly extended) answer; only this local write
+    # and its hash read go through the plain form, or Join-Path on 5.1 fails to resolve a
+    # drive out of the \\?\ prefix.
+    $target = Join-Path (ConvertTo-PlainLocalPath $script:WorktreePath) $relativeNative
     try {
         [void](New-Directory ([IO.Path]::GetDirectoryName($target)))
         [IO.File]::WriteAllBytes($target, $script:MarkerBytes)
