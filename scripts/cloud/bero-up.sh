@@ -20,9 +20,12 @@
 #   * --upgrade leaves the running stack alone. It never runs the initial
 #     `docker compose up -d --wait`, never starts or restarts cloudflared, and
 #     never recreates the tunnel. It reads the CURRENT quick tunnel URL from
-#     `docker compose logs cloudflared`, refuses if that log holds none, and
-#     recreates ONLY core with the new image and that URL, via
-#     `--force-recreate --no-deps`. The live tunnel URL therefore keeps working.
+#     /opt/loom-cloud/url.txt (only a URL of the exact shape
+#     https://<name>.trycloudflare.com is accepted), falls back to
+#     `docker compose logs cloudflared` when that file is missing, unreadable
+#     or invalid, refuses if neither source holds a URL, and recreates ONLY core
+#     with the new image and that URL, via `--force-recreate --no-deps`. The live
+#     tunnel URL therefore keeps working.
 #     No volume is removed, `down` is never run and /data (rovai.sqlite,
 #     web-auth.json, skills, logs) is reused as-is, so the Owner token and all
 #     server state survive the upgrade.
@@ -53,9 +56,12 @@
 #     building the server package. This runner therefore uses the CI-produced
 #     binaries as delivered and makes no Gate A provenance claim; it rewrites no
 #     manifest and only warns.
-#   Only the allowlisted payload is copied, so the personal-package extras
-#   (runtime/, rovai-core, loom-node, *-Loom.sh, candidate-manifest.json) simply
-#   never reach the build context or the image.
+#   Only the allowlisted payload is copied. The embedded Pi runtime is part of
+#   that allowlist — runtime/pi and runtime/extensions are staged into the image
+#   so Core can configure Pi (members.runtime.set pi) — while the remaining
+#   personal-package extras (runtime/computer, runtime/office, rovai-core,
+#   loom-node, *-Loom.sh, candidate-manifest.json) never reach the build
+#   context or the image.
 set -Eeuo pipefail
 umask 022
 
@@ -86,6 +92,18 @@ cd "$repo_root"
 for required in docker-compose.yml docker/Dockerfile docker/entrypoint.sh docker/healthcheck.sh; do
   [ -f "$required" ] || die "$repo_root is not a LOOM checkout: missing $required"
 done
+
+# Pin the docker compose project for EVERY compose call in this script.
+# docker compose derives the default project name from the working directory:
+# run from the on-host checkout /opt/loom-cloud/src the default project would be
+# "src", but the running Bero stack (and cloud-real-acceptance.bero.sh) uses the
+# project "loomcloud". Unpinned, --upgrade would target the wrong namespace and
+# create a parallel src-core/src_loom-data stack with a fresh empty volume and
+# no cloudflared service, then fail. Exporting COMPOSE_PROJECT_NAME before the
+# first docker compose invocation below (the version check, then logs/up/ps)
+# makes loomcloud the project for all of them; set LOOM_COMPOSE_PROJECT to
+# override it when a host runs the stack under a different project name.
+export COMPOSE_PROJECT_NAME="${LOOM_COMPOSE_PROJECT:-loomcloud}"
 
 mode=normal
 if [ "${1:-}" = '--upgrade' ]; then
@@ -154,9 +172,11 @@ if [ -z "$source_commit" ]; then
 fi
 
 # ----------------------------------------- 3. stage the docker build context
-# Exactly what docker/Dockerfile copies: the server payload under package/ plus
-# the two container scripts. No source checkout, no .git, no credential, and no
-# personal-package extra can enter the context.
+# Exactly what docker/Dockerfile copies: the server payload under package/ —
+# including the embedded Pi runtime staged below as package/runtime/pi and
+# package/runtime/extensions — plus the two container scripts. No source
+# checkout, no .git, no credential, and no other personal-package extra can
+# enter the context.
 log 'staging the docker context from the personal package payload'
 context=$work/context
 package=$context/package
@@ -166,6 +186,24 @@ for item in "${payload[@]}"; do
   [ -e "$personal/$item" ] && [ ! -L "$personal/$item" ] ||
     die "the personal package has no regular $item; it is not a complete linux-x64 server package"
   cp -a -- "$personal/$item" "$package/$item"
+done
+# The personal package ships the embedded Pi runtime
+# (scripts/package-linux-personal.mjs REQUIRED: runtime/pi/pi-bundle.json,
+# runtime/pi/node/node, runtime/pi/pi and
+# runtime/extensions/pi-purge/upstream/extensions/pi-purge.ts). The server image
+# must carry it: without /opt/rovai/runtime/pi Core resolves no packaged Pi
+# bundle and members.runtime.set pi answers runtime_configuration_unavailable.
+# Stage exactly runtime/pi and runtime/extensions under package/runtime —
+# docker/Dockerfile's `COPY package/ /opt/rovai/` lands them at
+# /opt/rovai/runtime/… where ROVAI_EMBEDDED_PI_ROOT (docker-compose.yml) points
+# and crates/rovai-core/src/pi/host.rs finds the pinned pi-purge source. The
+# rest of runtime/ (computer, office) is deliberately left out, so runtime/ is
+# never copied whole.
+mkdir -p "$package/runtime"
+for runtime_item in pi extensions; do
+  [ -e "$personal/runtime/$runtime_item" ] && [ ! -L "$personal/runtime/$runtime_item" ] ||
+    die "the personal package has no regular runtime/$runtime_item; it is not a complete linux-x64 personal package with the embedded Pi runtime"
+  cp -a -- "$personal/runtime/$runtime_item" "$package/runtime/$runtime_item"
 done
 cp docker/Dockerfile docker/entrypoint.sh docker/healthcheck.sh "$context/"
 # smoke-linux-server.py is only used by the `verify` stage, which is not built
@@ -195,7 +233,9 @@ docker build --progress=plain --target runtime \
 export LOOM_IMAGE="$image"
 
 # The quick tunnel URL lives in cloudflared's own log and changes only when
-# cloudflared restarts, so the most recent URL there is the live one.
+# cloudflared restarts, so the most recent URL there is the live one. Normal
+# mode always reads it from there; upgrade mode reaches this scan only as the
+# fallback, after /opt/loom-cloud/url.txt fails to yield a valid URL.
 current_tunnel_url() {
   docker compose logs cloudflared 2>/dev/null |
     grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -n 1 || true
@@ -203,11 +243,30 @@ current_tunnel_url() {
 
 if [ "$mode" = upgrade ]; then
   # Upgrade never brings the stack up: cloudflared must already be running, and
-  # its current URL is reused verbatim so existing clients keep working.
-  log 'upgrade: reading the current cloudflared quick tunnel URL'
-  tunnel_url=$(current_tunnel_url)
+  # its current URL is reused verbatim so existing clients keep working. The
+  # URL is taken from /opt/loom-cloud/url.txt when that file holds a valid
+  # https://<name>.trycloudflare.com URL; only when it is missing, unreadable
+  # or invalid does the cloudflared log scan below run as the fallback.
+  log 'upgrade: reading the current quick tunnel URL (url.txt first, cloudflared logs as fallback)'
+  tunnel_url=''
+  url_file=/opt/loom-cloud/url.txt
+  if [ -f "$url_file" ] && [ -r "$url_file" ]; then
+    candidate=''
+    IFS= read -r candidate < "$url_file" || true
+    if [[ $candidate =~ ^https://[a-z0-9-]+\.trycloudflare\.com$ ]]; then
+      tunnel_url=$candidate
+      log "upgrade: using the current tunnel URL from $url_file"
+    else
+      log "upgrade: $url_file holds no https://<name>.trycloudflare.com URL; falling back to the cloudflared logs"
+    fi
+  else
+    log "upgrade: $url_file is missing or unreadable; falling back to the cloudflared logs"
+  fi
+  if [ -z "$tunnel_url" ]; then
+    tunnel_url=$(current_tunnel_url)
+  fi
   [ -n "$tunnel_url" ] ||
-    die 'upgrade refused: docker compose logs cloudflared shows no https://<name>.trycloudflare.com URL; start the stack first (normal mode, or docker compose up -d --wait) — core was not recreated'
+    die 'upgrade refused: neither /opt/loom-cloud/url.txt nor docker compose logs cloudflared shows a https://<name>.trycloudflare.com URL; start the stack first (normal mode, or docker compose up -d --wait) — core was not recreated'
 
   # --no-deps keeps cloudflared out of the recreation: it is neither started nor
   # restarted, so the tunnel URL stays valid. No volume is removed and no `down`

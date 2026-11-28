@@ -58,6 +58,15 @@ services:
       # entrypoint treats it as unset (no reverse-proxy origin, VERBOSE off).
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-}
       VERBOSE: ${VERBOSE:-}
+      # The embedded Pi runtime staged into the image by scripts/cloud/bero-up.sh
+      # from the CI Linux personal package (runtime/pi -> /opt/rovai/runtime/pi).
+      # Without it Core resolves no packaged Pi bundle and
+      # members.runtime.set pi answers runtime_configuration_unavailable.
+      ROVAI_EMBEDDED_PI_ROOT: /opt/rovai/runtime/pi
+      # Must match pi_provider_settings::runtime_home (<data>/runtime-home/pi)
+      # for this Core's data root; loom-pi-launcher refuses to run embedded Pi
+      # against the user's global Pi configuration.
+      PI_CODING_AGENT_DIR: /data/runtime-home/pi
     # The whole data root, not just the database: rovai.sqlite, mcp.json,
     # skills/, instances/, logs/ and web-auth.json. Back it up while stopped.
     volumes:
