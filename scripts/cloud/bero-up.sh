@@ -90,6 +90,18 @@ for required in docker-compose.yml docker/Dockerfile docker/entrypoint.sh docker
   [ -f "$required" ] || die "$repo_root is not a LOOM checkout: missing $required"
 done
 
+# Pin the docker compose project for EVERY compose call in this script.
+# docker compose derives the default project name from the working directory:
+# run from the on-host checkout /opt/loom-cloud/src the default project would be
+# "src", but the running Bero stack (and cloud-real-acceptance.bero.sh) uses the
+# project "loomcloud". Unpinned, --upgrade would target the wrong namespace and
+# create a parallel src-core/src_loom-data stack with a fresh empty volume and
+# no cloudflared service, then fail. Exporting COMPOSE_PROJECT_NAME before the
+# first docker compose invocation below (the version check, then logs/up/ps)
+# makes loomcloud the project for all of them; set LOOM_COMPOSE_PROJECT to
+# override it when a host runs the stack under a different project name.
+export COMPOSE_PROJECT_NAME="${LOOM_COMPOSE_PROJECT:-loomcloud}"
+
 mode=normal
 if [ "${1:-}" = '--upgrade' ]; then
   mode=upgrade
