@@ -343,7 +343,7 @@ jobs:
           # at commit aabb965fba31c7c90c334bc57fd6ba0e827c6d23 reports them. This is the aabb
           # final口径: PPTX_PREVIEW_INTERFACE is retired and is no longer a canonical row.
           # Infrastructure-only rows - STOP_CONSOLE, PROVIDER, PI_PROVIDER, PROVIDER_REQUESTS,
-          # ACCEPTANCE (and PPTX_PREVIEW_INTERFACE while the draft still emits it) - are
+          # ACCEPTANCE - are
           # reported afterwards as extra rows and are not part of the canonical set.
           # MEMBER_CREATE may be absent from summary.json when the seed member already exists;
           # it stays a canonical expectation on the table, and NOT_RUN here only means no

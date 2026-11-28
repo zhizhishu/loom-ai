@@ -1181,6 +1181,25 @@ function Select-MemberAndModel {
     if (-not $permissions) {
         throw "runtime $adapterKind reports no member runtime defaults; its permissions are unknown."
     }
+    # Pi reports memberRuntimeDefaults.permissions.values as an empty object, so a verbatim
+    # freeze would leave loom_file_access unset, every Run would fall back to Native
+    # execution (rovai_loom is not provided there) and PPTX_PREVIEW could not succeed.
+    # Force the workspace_workflow grant on a private copy and keep schemaVersion,
+    # adapterKind and every other reported value
+    # (scripts/acceptance/cloud-workspace-chain.mjs:162-164). values is read before the
+    # conversion: on a dictionary the key 'values' is ambiguous with .Values.
+    $permissionValues = ConvertTo-OrderedMap (Get-Value $permissions 'values')
+    if ($null -eq $permissionValues) {
+        $permissionValues = [ordered]@{}
+    } elseif ($permissionValues -isnot [System.Collections.IDictionary]) {
+        throw "runtime $adapterKind reports permissions.values that are not an object."
+    }
+    $permissionValues['loom_file_access'] = 'workspace_workflow'
+    $permissions = ConvertTo-OrderedMap $permissions
+    if ($permissions -isnot [System.Collections.IDictionary]) {
+        throw "runtime $adapterKind reports permissions that are not an object."
+    }
+    $permissions['values'] = $permissionValues
     # Not $modelId: PowerShell variable names are case-insensitive, so that name would
     # overwrite the script-level $ModelId parameter and Test-PiModelId would compare the
     # bare model id against the full pi:// identity.
