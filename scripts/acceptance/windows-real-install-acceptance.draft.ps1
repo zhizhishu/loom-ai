@@ -512,9 +512,11 @@ function Assert-ShortWorkRoot {
     if ($root.Length -gt 40) { throw "WorkRoot must stay short for Expand-Archive: $($root.Length) characters" }
     if ($root -match '(^|\\)\.\.?(\\|$)') { throw 'WorkRoot must not contain . or .. segments.' }
     $script:Paths['work'] = New-Directory $root
-    foreach ($name in @('pkg', 'inst', 'data', 'logs', 'files')) {
+    foreach ($name in @('pkg', 'logs', 'files')) {
         $script:Paths[$name] = New-Directory (Join-Path $root $name)
     }
+    $script:Paths['inst'] = Join-Path $root 'inst'
+    $script:Paths['data'] = Join-Path $root 'data'
     $script:InstallDirectory = $script:Paths['inst']
     $script:DataDirectory = $script:Paths['data']
 }
