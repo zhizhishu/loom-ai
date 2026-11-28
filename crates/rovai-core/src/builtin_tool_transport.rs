@@ -19,6 +19,12 @@ pub const BUILTIN_TOOL_RUNTIME_CAPABILITY: &str = "builtin_cli.transport.v46";
 pub const ROVAI_AGENT_CLI_ENV: &str = "ROVAI_AGENT_CLI";
 pub const ROVAI_CLI_CONTEXT_ENV: &str = "ROVAI_CLI_CONTEXT";
 pub const ROVAI_RUN_TMP_ENV: &str = "ROVAI_RUN_TMP";
+/// This Run's durable Camp attachment output root (`attachment_authorization.output_root`).
+///
+/// Core sets it on a Pi Host launch so the managed bridge can materialize generated copies where
+/// they outlive the Run. It carries no new authority: it is the same directory `RUN_FACTS` already
+/// publishes to the Run as `attachmentOutputRoot`.
+pub const ROVAI_ATTACHMENT_OUTPUT_DIR_ENV: &str = "ROVAI_ATTACHMENT_OUTPUT_DIR";
 /// Per-invocation request identity for the managed LOOM workflow tool.
 ///
 /// The Pi managed bridge sets this on the exact child process it spawns, derived from the provider

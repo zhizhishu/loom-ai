@@ -6,6 +6,7 @@ import path from "node:path";
 // nothing by itself; the child process module is loaded lazily on first use so a legacy Host keeps
 // exactly today's capability surface.
 import {
+  ATTACHMENT_OUTPUT_DIR_ENV,
   CLI_ENV,
   LOOM_TOOL_NAME,
   WORKFLOW_CONTRACT_FILE,
@@ -335,6 +336,15 @@ function loomRegistration(pi: any): void {
     return;
   }
   const cliPath = resolved.cliPath;
+  // The files THIS extension process materialized, per Run attachment output root. It is the whole
+  // absolute-path allow-list for a send: an entry that is not in here was never written by the
+  // bridge, even when it lives in the same directory. Nothing about it comes from the model.
+  const materializedByRoot = new Map<string, Set<string>>();
+  const recordMaterialized = (root: string, file: string): void => {
+    const known = materializedByRoot.get(root) ?? new Set<string>();
+    known.add(file);
+    materializedByRoot.set(root, known);
+  };
   // This adjacent file contains only Core's public input schemas, not binding credentials.
   const bindingFile = process.env.ROVAI_PI_HOST_BINDING_FILE;
   if (!bindingFile || !path.isAbsolute(bindingFile)) throw new Error("loom_contract_path_invalid");
@@ -357,6 +367,7 @@ function loomRegistration(pi: any): void {
       } catch (error: unknown) {
         return toolFailure(`LOOM tool refused: ${errorMessage(error)}`);
       }
+      const outputRoot = process.env[ATTACHMENT_OUTPUT_DIR_ENV];
       const planned = planInvocation({
         toolCallId,
         params,
@@ -366,6 +377,9 @@ function loomRegistration(pi: any): void {
         nowMs: Date.now(),
         cliPath,
         baseEnv: process.env,
+        materialized: typeof outputRoot === "string" && outputRoot.length > 0
+          ? { root: outputRoot, files: materializedByRoot.get(outputRoot) ?? new Set<string>() }
+          : null,
       });
       if (!planned.ok) return toolFailure(`LOOM tool refused: ${planned.code}`);
       let spawnFn;
@@ -380,14 +394,16 @@ function loomRegistration(pi: any): void {
         plan: planned.plan,
         signal,
       });
-      // A whole-file read is the one result whose bytes must become a local file: Pi's own `write`
-      // is text-only, so only this bridge can hand the model a real `.docx` to attach. The step is
-      // inert for every other operation and for any truncated/unknown outcome.
+      // A whole-file read is the one result whose bytes must become a durable local file: Pi's own
+      // `write` is text-only, so only this bridge can hand the model a real `.docx` to attach. It
+      // writes under this Run's attachment output root (never run-tmp, which is retired with the Run)
+      // and records the canonical result as the only absolute path a later send may name.
       const delivered = applyReadbackForCall({
         operation: planned.plan.operation,
         result,
         params,
         env: process.env,
+        recordMaterialized,
       });
       // Pi marks a fulfilled handler successful. Preserve Core rejection/unknown state by throwing;
       // this conversion never retries the child or changes its request identity.
