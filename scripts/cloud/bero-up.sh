@@ -20,9 +20,12 @@
 #   * --upgrade leaves the running stack alone. It never runs the initial
 #     `docker compose up -d --wait`, never starts or restarts cloudflared, and
 #     never recreates the tunnel. It reads the CURRENT quick tunnel URL from
-#     `docker compose logs cloudflared`, refuses if that log holds none, and
-#     recreates ONLY core with the new image and that URL, via
-#     `--force-recreate --no-deps`. The live tunnel URL therefore keeps working.
+#     /opt/loom-cloud/url.txt (only a URL of the exact shape
+#     https://<name>.trycloudflare.com is accepted), falls back to
+#     `docker compose logs cloudflared` when that file is missing, unreadable
+#     or invalid, refuses if neither source holds a URL, and recreates ONLY core
+#     with the new image and that URL, via `--force-recreate --no-deps`. The live
+#     tunnel URL therefore keeps working.
 #     No volume is removed, `down` is never run and /data (rovai.sqlite,
 #     web-auth.json, skills, logs) is reused as-is, so the Owner token and all
 #     server state survive the upgrade.
@@ -195,7 +198,9 @@ docker build --progress=plain --target runtime \
 export LOOM_IMAGE="$image"
 
 # The quick tunnel URL lives in cloudflared's own log and changes only when
-# cloudflared restarts, so the most recent URL there is the live one.
+# cloudflared restarts, so the most recent URL there is the live one. Normal
+# mode always reads it from there; upgrade mode reaches this scan only as the
+# fallback, after /opt/loom-cloud/url.txt fails to yield a valid URL.
 current_tunnel_url() {
   docker compose logs cloudflared 2>/dev/null |
     grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -n 1 || true
@@ -203,11 +208,30 @@ current_tunnel_url() {
 
 if [ "$mode" = upgrade ]; then
   # Upgrade never brings the stack up: cloudflared must already be running, and
-  # its current URL is reused verbatim so existing clients keep working.
-  log 'upgrade: reading the current cloudflared quick tunnel URL'
-  tunnel_url=$(current_tunnel_url)
+  # its current URL is reused verbatim so existing clients keep working. The
+  # URL is taken from /opt/loom-cloud/url.txt when that file holds a valid
+  # https://<name>.trycloudflare.com URL; only when it is missing, unreadable
+  # or invalid does the cloudflared log scan below run as the fallback.
+  log 'upgrade: reading the current quick tunnel URL (url.txt first, cloudflared logs as fallback)'
+  tunnel_url=''
+  url_file=/opt/loom-cloud/url.txt
+  if [ -f "$url_file" ] && [ -r "$url_file" ]; then
+    candidate=''
+    IFS= read -r candidate < "$url_file" || true
+    if [[ $candidate =~ ^https://[a-z0-9-]+\.trycloudflare\.com$ ]]; then
+      tunnel_url=$candidate
+      log "upgrade: using the current tunnel URL from $url_file"
+    else
+      log "upgrade: $url_file holds no https://<name>.trycloudflare.com URL; falling back to the cloudflared logs"
+    fi
+  else
+    log "upgrade: $url_file is missing or unreadable; falling back to the cloudflared logs"
+  fi
+  if [ -z "$tunnel_url" ]; then
+    tunnel_url=$(current_tunnel_url)
+  fi
   [ -n "$tunnel_url" ] ||
-    die 'upgrade refused: docker compose logs cloudflared shows no https://<name>.trycloudflare.com URL; start the stack first (normal mode, or docker compose up -d --wait) — core was not recreated'
+    die 'upgrade refused: neither /opt/loom-cloud/url.txt nor docker compose logs cloudflared shows a https://<name>.trycloudflare.com URL; start the stack first (normal mode, or docker compose up -d --wait) — core was not recreated'
 
   # --no-deps keeps cloudflared out of the recreation: it is neither started nor
   # restarted, so the tunnel URL stays valid. No volume is removed and no `down`
