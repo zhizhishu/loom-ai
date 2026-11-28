@@ -65,7 +65,10 @@
         and is never written to a log, command line, report or exception;
       * every path stays under a short work root (default C:\loomacc);
       * default port 18990, never 64851/64852;
-      * a missing LibreOffice only records SKIP_LIBREOFFICE, never a product failure.
+      * a missing LibreOffice only records SKIP_LIBREOFFICE, never a product failure;
+      * -SimulatedProvider is a CI-only mode: the Pi provider section points at a loopback
+        scripted Node provider, no commercial model is contacted, and every model step is
+        reported as SIMULATED instead of PASS. Without the switch nothing below changes.
 #>
 [CmdletBinding()]
 param(
@@ -75,7 +78,12 @@ param(
     [string]$ModelId = 'deepseek-v4.1-flash',
     [int]$ReadyTimeoutSeconds = 180,
     [int]$RunTimeoutSeconds = 420,
-    [int]$StopTimeoutSeconds = 120
+    [int]$StopTimeoutSeconds = 120,
+    # CI simulation only. Absent (the real-machine default) nothing else in this draft moves.
+    [switch]$SimulatedProvider,
+    [string]$ProviderListenHostPort = '127.0.0.1:0',
+    [string]$ProviderModelId = 'loom-acc-scripted',
+    [string]$ProviderScriptPath = ''
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -94,6 +102,16 @@ $script:Paths = [ordered]@{ logs = [IO.Path]::GetTempPath() }
 $script:Launcher = $null
 $script:InstallDirectory = $null
 $script:DataDirectory = $null
+$script:Simulated = [bool]$SimulatedProvider
+# -ModelId keeps its real-machine default. Under -SimulatedProvider an unbound -ModelId is
+# replaced with the Pi explicit identity of the scripted provider (see main).
+$script:ModelIdBound = $PSBoundParameters.ContainsKey('ModelId')
+$script:CredentialSimulated = $false
+$script:Provider = $null
+$script:ProviderPort = 0
+$script:ProviderBaseUrl = $null
+$script:ProviderScript = $null
+$script:ProviderRequestsFile = $null
 
 # --------------------------------------------------------------------------------------
 # reporting, redaction, tiny helpers
@@ -122,6 +140,17 @@ function Add-Result([string]$Id, [string]$Status, [string]$Detail) {
     }
     [void]$script:Results.Add($entry)
     Write-Host ('[{0}] {1}: {2}' -f $entry.status, $entry.id, $entry.detail)
+}
+
+# A step that needs a model is PASS only when a commercial model answered. Under
+# -SimulatedProvider the same step runs against the loopback scripted provider and is
+# reported as SIMULATED, which the report and summary count separately from PASS.
+function Add-ModelResult([string]$Id, [string]$Detail) {
+    if ($script:Simulated) {
+        Add-Result $Id 'SIMULATED' ('SCRIPTED provider, no commercial model: ' + $Detail)
+    } else {
+        Add-Result $Id 'PASS' $Detail
+    }
 }
 
 function Get-Value($Object, [string]$Name) {
@@ -628,6 +657,230 @@ function Stop-LoomConsole {
 }
 
 # --------------------------------------------------------------------------------------
+# scripted Pi provider (CI simulation only, -SimulatedProvider)
+#
+# The switch moves one thing: the model endpoint. The product's own Web operation
+# pi.modelProvider.save writes the single "loom" provider section of models.json with a
+# loopback baseUrl (crates/rovai-core/src/pi_provider_settings.rs:21,23,36-44,173,236,269,339;
+# crates/rovai-web/src/operations.rs:395-398,553-568) and a Node script answers the
+# OpenAI-compatible calls, so no commercial model is contacted and no real key is used.
+# --------------------------------------------------------------------------------------
+
+function ConvertTo-FormUrlEncoded([string]$Value) {
+    # form_urlencoded::Serializer::append_pair: the encoder the explicit identity is built with
+    # (crates/rovai-core/src/agent_runtime_adapter.rs:1462-1500) and parsed with
+    # (crates/rovai-core/src/pi/host.rs:3149-3164).
+    $builder = New-Object Text.StringBuilder
+    foreach ($byte in $script:Utf8.GetBytes($Value)) {
+        if (($byte -ge 48 -and $byte -le 57) -or ($byte -ge 65 -and $byte -le 90) -or
+            ($byte -ge 97 -and $byte -le 122) -or $byte -eq 42 -or $byte -eq 45 -or
+            $byte -eq 46 -or $byte -eq 95) {
+            [void]$builder.Append([char]$byte)
+        } elseif ($byte -eq 32) {
+            [void]$builder.Append('+')
+        } else {
+            [void]$builder.Append('%' + $byte.ToString('X2'))
+        }
+    }
+    return $builder.ToString()
+}
+
+function New-PiExplicitModelId([string]$PiModelId) {
+    # "pi://runtime-default" is the runtime default; an explicit identity names the provider
+    # section key (PROVIDER_ID "loom") and one model id of that section.
+    return ('pi://model?provider={0}&id={1}' -f (ConvertTo-FormUrlEncoded 'loom'), (ConvertTo-FormUrlEncoded $PiModelId))
+}
+
+function Get-ProviderListenHost([string]$Listen) {
+    $hostPart = '127.0.0.1'
+    if ($Listen -match '^\s*\[([^\]]+)\]\s*:\s*(\d+)\s*$') { $hostPart = $Matches[1] }
+    elseif ($Listen -match '^\s*([^:]+)\s*:\s*(\d+)\s*$') { $hostPart = $Matches[1].Trim() }
+    if ($hostPart -eq '0.0.0.0' -or $hostPart -eq '*' -or $hostPart -eq '::') { $hostPart = '127.0.0.1' }
+    if ($hostPart.Contains(':') -and -not $hostPart.StartsWith('[')) { $hostPart = '[' + $hostPart + ']' }
+    return $hostPart
+}
+
+function Read-ScriptedProviderPort([string]$Path) {
+    # The provider owns the port-file schema, so only the port is read and every shape that
+    # carries a port is accepted: {"port":N}, "host:port", or a bare number.
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try { $text = [IO.File]::ReadAllText($Path) } catch { return $null }
+    if (-not $text.Trim()) { return $null }
+    $port = 0
+    $parsed = $null
+    try { $parsed = $text | ConvertFrom-Json } catch { $parsed = $null }
+    foreach ($name in @('port', 'hostPort', 'listen', 'address')) {
+        $value = Get-Value $parsed $name
+        if ($null -eq $value) { continue }
+        if ($value -is [int] -or $value -is [long] -or $value -is [double]) { $port = [int]$value }
+        elseif ([string]$value -match '(\d{2,5})\s*$') { $port = [int]$Matches[1] }
+        if ($port -gt 0) { break }
+    }
+    if ($port -le 0 -and $text -match ':(\d{2,5})') { $port = [int]$Matches[1] }
+    if ($port -le 0 -and $text -match '(\d{2,5})') { $port = [int]$Matches[1] }
+    if ($port -lt 1 -or $port -gt 65535) { return $null }
+    return $port
+}
+
+function Start-ScriptedProvider {
+    $node = Get-Command 'node' -ErrorAction SilentlyContinue
+    if (-not $node) {
+        Add-Result 'PROVIDER' 'FAIL' 'node is not on PATH; -SimulatedProvider needs Node for the loopback scripted provider'
+        throw 'FAIL_FAST: node is missing for -SimulatedProvider.'
+    }
+    $nodePath = [string]$node.Source
+    if (-not $nodePath) { $nodePath = [string]$node.Path }
+    if (-not $nodePath) {
+        Add-Result 'PROVIDER' 'FAIL' 'node was found on PATH but its executable path is unavailable'
+        throw 'FAIL_FAST: node cannot be launched for -SimulatedProvider.'
+    }
+    $script:ProviderScript = $ProviderScriptPath
+    if (-not $script:ProviderScript -and $PSScriptRoot) {
+        $script:ProviderScript = Join-Path $PSScriptRoot 'windows-acceptance-scripted-provider.mjs'
+    }
+    if (-not $script:ProviderScript) {
+        $script:ProviderScript = Join-Path (Get-Location).Path 'scripts/acceptance/windows-acceptance-scripted-provider.mjs'
+    }
+    if (-not (Test-Path -LiteralPath $script:ProviderScript -PathType Leaf)) {
+        Add-Result 'PROVIDER' 'FAIL' "the scripted provider script is missing: $($script:ProviderScript)"
+        throw 'FAIL_FAST: the scripted provider script was not found.'
+    }
+    $portFile = Join-Path $script:Paths['logs'] 'provider-port.json'
+    $script:ProviderRequestsFile = Join-Path $script:Paths['logs'] 'provider-requests.json'
+    if (Test-Path -LiteralPath $portFile -PathType Leaf) { Remove-Item -LiteralPath $portFile -Force }
+    $out = Join-Path $script:Paths['logs'] 'provider.out.txt'
+    $err = Join-Path $script:Paths['logs'] 'provider.err.txt'
+    $script:Provider = Start-Process -FilePath $nodePath -PassThru -WindowStyle Hidden `
+        -ArgumentList @(
+            ('"' + $script:ProviderScript + '"'),
+            '--listen', $ProviderListenHostPort,
+            '--port-file', ('"' + $portFile + '"'),
+            '--requests-file', ('"' + $script:ProviderRequestsFile + '"')
+        ) -RedirectStandardOutput $out -RedirectStandardError $err
+    $deadline = (Get-Date).AddSeconds(60)
+    $port = 0
+    while ((Get-Date) -lt $deadline) {
+        $port = Read-ScriptedProviderPort $portFile
+        if ($port -gt 0) { break }
+        if ($script:Provider.HasExited) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    if ($port -le 0) {
+        $tail = ''
+        if (Test-Path -LiteralPath $err -PathType Leaf) {
+            $tail = (@(Get-Content -LiteralPath $err -Tail 5 -ErrorAction SilentlyContinue) -join ' | ')
+        }
+        $state = if ($script:Provider.HasExited) { "exit $($script:Provider.ExitCode)" } else { 'still starting' }
+        Add-Result 'PROVIDER' 'FAIL' ("the scripted provider published no port in $portFile ({0}) {1}" -f $state, (Hide-Secrets $tail))
+        throw 'FAIL_FAST: the scripted provider did not start.'
+    }
+    $script:ProviderPort = $port
+    $script:ProviderBaseUrl = 'http://' + (Get-ProviderListenHost $ProviderListenHostPort) + ':' + $port + '/v1'
+    $script:Evidence['scriptedProvider'] = [ordered]@{
+        kind = 'loopback scripted provider (SCRIPTED/SIMULATED, no commercial model)'
+        script = $script:ProviderScript
+        listen = $ProviderListenHostPort
+        boundPort = $port
+        baseUrl = $script:ProviderBaseUrl
+        modelId = $ProviderModelId
+        requestsFile = $script:ProviderRequestsFile
+    }
+    Add-Result 'PROVIDER' 'SIMULATED' ("node scripted provider on {0} (pid {1}); OpenAI-compatible base {2}" -f $ProviderListenHostPort, $script:Provider.Id, $script:ProviderBaseUrl)
+}
+
+function Update-ScriptedProviderEvidence {
+    $path = $script:ProviderRequestsFile
+    if (-not $path) { return }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return }
+    $count = 0
+    try {
+        $text = [IO.File]::ReadAllText($path)
+        if ($text.Trim()) {
+            $parsed = $null
+            try { $parsed = $text | ConvertFrom-Json } catch { $parsed = $null }
+            if ($null -eq $parsed) {
+                $count = @([IO.File]::ReadAllLines($path) | Where-Object { $_.Trim().Length -gt 0 }).Count
+            } else {
+                # The provider publishes totals.requests and a requests[] record list.
+                $total = Get-Value (Get-Value $parsed 'totals') 'requests'
+                if ($null -ne $total) {
+                    $count = [int]$total
+                } else {
+                    $items = Get-Value $parsed 'requests'
+                    if ($null -eq $items) { $items = $parsed }
+                    $count = @($items).Count
+                }
+            }
+        }
+    } catch { return }
+    if ($script:Evidence['scriptedProvider']) {
+        $script:Evidence['scriptedProvider']['requestCount'] = $count
+    }
+    Add-Result 'PROVIDER_REQUESTS' 'SIMULATED' "the loopback scripted provider recorded $count OpenAI request(s); see logs\provider-requests.json"
+}
+
+function Set-ScriptedPiProvider([string]$BaseUrl) {
+    # The product's own editor path: read the shared-key revision, then save the one Pi
+    # provider section (apps/desktop/src/renderer/src/PiModelProviderSection.tsx:24-30,
+    # crates/rovai-core/src/pi_provider_settings.rs:36-44,173,236,269-296). The key argument is
+    # the single-line value; models.json keeps "$OCT_API_KEY" (pi_provider_settings.rs:339) and
+    # the value only reaches the encrypted shared environment. It is never logged or recorded.
+    $current = Invoke-CoreRequest 'pi.modelProvider.get' ([ordered]@{})
+    $revision = Get-Value $current 'keyRevision'
+    if ($null -eq $revision) { throw 'pi.modelProvider.get returned no keyRevision; the Pi provider was not saved.' }
+    $apiKey = $env:OCT_API_KEY
+    if (-not $apiKey) { throw 'the Pi provider save has no OCT_API_KEY in this process.' }
+    try {
+        $saved = Invoke-CoreRequest 'pi.modelProvider.save' ([ordered]@{
+                baseUrl = $BaseUrl
+                modelId = $ProviderModelId
+                apiKey = $apiKey
+                keyRevision = [int64]$revision
+            })
+    } finally { $apiKey = $null }
+    $savedBaseUrl = [string](Get-Value $saved 'baseUrl')
+    $savedModelId = [string](Get-Value $saved 'modelId')
+    $savedModels = @(Get-Value $saved 'modelIds')
+    $keyConfigured = [bool](Get-Value $saved 'keyConfigured')
+    if ([string](Get-Value $saved 'providerId') -ne 'loom') { throw 'pi.modelProvider.save did not answer with the loom provider section.' }
+    if ($savedBaseUrl.TrimEnd('/') -ne $BaseUrl.TrimEnd('/')) { throw "the Pi provider baseUrl is $savedBaseUrl, not $BaseUrl." }
+    if ($savedModelId -ne $ProviderModelId) { throw "the Pi provider default model is $savedModelId, not $ProviderModelId." }
+    if ($savedModels -notcontains $ProviderModelId) { throw "the Pi provider section does not list $ProviderModelId." }
+    if ([string](Get-Value $saved 'apiKeyEnv') -ne 'OCT_API_KEY') { throw "the Pi provider key environment is $([string](Get-Value $saved 'apiKeyEnv')), not OCT_API_KEY." }
+    if (-not $keyConfigured) { throw 'the Pi provider reports no configured key after the save.' }
+    $script:Evidence['piProvider'] = [ordered]@{
+        providerId = 'loom'
+        baseUrl = $savedBaseUrl
+        api = [string](Get-Value $saved 'api')
+        modelId = $savedModelId
+        apiKeyEnv = 'OCT_API_KEY'
+        keyConfigured = $keyConfigured
+        keyRevision = Get-Value $saved 'keyRevision'
+        apiKey = 'held in the encrypted shared environment; the value is never recorded'
+    }
+    Add-Result 'PI_PROVIDER' 'SIMULATED' ("pi.modelProvider.save pointed provider 'loom' at {0} model {1} (apiKeyEnv OCT_API_KEY, value never recorded)" -f $savedBaseUrl, $savedModelId)
+}
+
+function Stop-ScriptedProvider {
+    $provider = $script:Provider
+    if (-not $provider) { return }
+    $script:Provider = $null
+    try {
+        if (-not $provider.HasExited) { & taskkill.exe /PID $provider.Id /T /F | Out-Null }
+    } catch { }
+    try {
+        if (-not $provider.HasExited) { Stop-Process -Id $provider.Id -Force -ErrorAction SilentlyContinue }
+        if (-not $provider.HasExited) {
+            [void](Wait-Until -TimeoutSeconds 30 -IntervalMilliseconds 200 -Probe {
+                    if ($provider.HasExited) { return $true }
+                    return $null
+                })
+        }
+    } catch { }
+    Update-ScriptedProviderEvidence
+}
+
+# --------------------------------------------------------------------------------------
 # acceptance steps
 # --------------------------------------------------------------------------------------
 
@@ -637,7 +890,8 @@ function Select-MemberAndModel {
     $agentId = [string](Get-Value $members[0] 'agentId')
     $profile = Invoke-CoreRequest 'members.get' ([ordered]@{ agentId = $agentId })
     $runtimeConfiguration = Get-Value $profile 'runtimeConfiguration'
-    $adapterKind = [string](Get-Value $runtimeConfiguration 'adapterKind')
+    $currentAdapter = [string](Get-Value $runtimeConfiguration 'adapterKind')
+    $adapterKind = $currentAdapter
     $currentModel = [string](Get-Value (Get-Value $runtimeConfiguration 'model') 'modelId')
 
     if (-not $adapterKind) {
@@ -645,8 +899,12 @@ function Select-MemberAndModel {
         $adapterKind = [string](Get-Value $installations[0] 'adapterKind')
     }
     if (-not $adapterKind) { throw 'the member has no configured runtime adapter.' }
+    if ($script:Simulated) {
+        # The scripted provider is the single Pi provider section, so the member runs Pi.
+        $adapterKind = 'pi'
+    }
 
-    if ($currentModel -ne $ModelId) {
+    if ($currentModel -ne $ModelId -or ($script:Simulated -and $currentAdapter -ne 'pi')) {
         [void](Invoke-CoreRequest 'runtime.product.check' ([ordered]@{ runtimeKind = $adapterKind }))
         $installation = Wait-Until -TimeoutSeconds 120 -IntervalMilliseconds 1000 -Probe {
             $list = @(Invoke-CoreRequest 'runtime.installations.list' ([ordered]@{}))
@@ -685,14 +943,22 @@ function Select-MemberAndModel {
     $resolvedModel = [string](Get-Value (Get-Value $runtimeConfiguration 'model') 'modelId')
     $readiness = [string](Get-Value (Get-Value $profile 'runtimeReadiness') 'status')
     if ($resolvedModel -ne $ModelId) { throw "the member frozen model is $resolvedModel, not $ModelId." }
-    if ($readiness -ne 'ready') { throw "member runtime readiness is $readiness, not ready." }
+    # A configured member profile stops at installed_unverified
+    # (crates/rovai-core/src/agent_profile.rs:5650-5701); ready, light_ready and
+    # installed_unverified are the launch-eligible states
+    # (crates/rovai-core/src/member_execution_availability.rs:44-51). The ready Pi snapshot
+    # above is the proof that the runtime itself is verified.
+    if (@('ready', 'light_ready', 'installed_unverified') -notcontains $readiness) {
+        throw "member runtime readiness is $readiness, not launch-eligible."
+    }
     $script:Evidence['member'] = [ordered]@{
         agentId = $agentId
         adapterKind = $adapterKind
         modelId = $resolvedModel
         readiness = $readiness
+        simulated = [bool]$script:Simulated
     }
-    Add-Result 'MEMBER_MODEL' 'PASS' "$agentId uses $adapterKind / $resolvedModel"
+    Add-ModelResult 'MEMBER_MODEL' "$agentId uses $adapterKind / $resolvedModel"
     return $agentId
 }
 
@@ -728,7 +994,7 @@ function Invoke-RealModelTurn([string]$ThreadId, [string]$AgentId) {
     if (-not $observedModelId) {
         Add-Result 'REAL_MODEL_IDENTITY' 'SKIP' 'the Run and the reply reported no runtimeModel.modelId'
     } else {
-        Add-Result 'REAL_MODEL_IDENTITY' 'PASS' "run reported $observedModelId"
+        Add-ModelResult 'REAL_MODEL_IDENTITY' "run reported $observedModelId"
     }
     $script:Evidence['realModel'] = [ordered]@{
         threadId = $ThreadId
@@ -738,7 +1004,8 @@ function Invoke-RealModelTurn([string]$ThreadId, [string]$AgentId) {
         observedModelId = $observedModelId
         replyPreview = $body.Substring(0, [Math]::Min(200, $body.Length))
     }
-    Add-Result 'REAL_MODEL' 'PASS' "real reply received for $nonce"
+    $replyDetail = if ($script:Simulated) { "scripted reply received for $nonce" } else { "real reply received for $nonce" }
+    Add-ModelResult 'REAL_MODEL' $replyDetail
 }
 
 function Invoke-DocxCheck([string]$ThreadId, [string]$AgentId) {
@@ -775,7 +1042,7 @@ function Invoke-DocxCheck([string]$ThreadId, [string]$AgentId) {
         agentRunId = [string](Get-Value $run 'id')
         replyPreview = $body.Substring(0, [Math]::Min(200, $body.Length))
     }
-    Add-Result 'DOCX_MARKER' 'PASS' "assistant quoted $marker from the uploaded docx"
+    Add-ModelResult 'DOCX_MARKER' "assistant quoted $marker from the uploaded docx"
 }
 
 function Test-PptxPreviewInterface([string]$ThreadId) {
@@ -870,7 +1137,7 @@ function Invoke-StopCheck([string]$ThreadId, [string]$AgentId) {
         finalStatus = $status
         cancelAcknowledgedAt = Get-Value $settled 'cancelAcknowledgedAt'
     }
-    Add-Result 'STOP' 'PASS' "agentRuns.cancel settled the Run as cancelled"
+    Add-ModelResult 'STOP' "agentRuns.cancel settled the Run as cancelled"
 }
 
 # --------------------------------------------------------------------------------------
@@ -886,7 +1153,7 @@ function Clear-SecretFromFile([string]$Path) {
 
 function Write-AcceptanceArtifacts {
     $logRoot = $script:Paths['logs']
-    foreach ($name in @('install.out.txt', 'install.err.txt', 'server.out.txt', 'server.err.txt')) {
+    foreach ($name in @('install.out.txt', 'install.err.txt', 'server.out.txt', 'server.err.txt', 'provider.out.txt', 'provider.err.txt')) {
         Clear-SecretFromFile (Join-Path $logRoot $name)
     }
     if ($script:InstallDirectory -and (Test-Path -LiteralPath $script:InstallDirectory)) {
@@ -906,16 +1173,32 @@ function Write-AcceptanceArtifacts {
             Set-Content -LiteralPath (Join-Path $logRoot 'data-dir.txt') -Encoding UTF8
     }
     $failed = @($script:Results | Where-Object { $_.status -eq 'FAIL' }).Count -gt 0
+    # SIMULATED is its own status: a step that ran and passed without a commercial model.
+    $statusCounts = [ordered]@{}
+    foreach ($entry in $script:Results) {
+        $name = [string]$entry.status
+        if ($statusCounts.Contains($name)) { $statusCounts[$name] = [int]$statusCounts[$name] + 1 }
+        else { $statusCounts[$name] = 1 }
+    }
+    $credentialSource = if ($script:CredentialSimulated) {
+        'SIMULATED: no real OCT key; a loopback scripted provider answered; no commercial model was contacted; no credential value is recorded'
+    } else {
+        'OCT_API_KEY (value never recorded)'
+    }
     $summary = [ordered]@{
         kind = 'loom-windows-real-install-acceptance'
+        mode = if ($script:Simulated) { 'simulated' } else { 'real' }
         status = if ($failed) { 'FAIL' } else { 'PASS' }
         finishedAt = (Get-Date).ToString('o')
         port = $Port
         modelId = $ModelId
+        simulatedProvider = [bool]$script:Simulated
+        providerModelId = if ($script:Simulated) { $ProviderModelId } else { $null }
         installDirectory = $script:InstallDirectory
         dataDirectory = $script:DataDirectory
         packageRoot = $packageRoot
-        credentialSource = 'OCT_API_KEY (value never recorded)'
+        credentialSource = $credentialSource
+        statusCounts = $statusCounts
         evidence = $script:Evidence
         results = $script:Results
     }
@@ -926,8 +1209,11 @@ function Write-AcceptanceArtifacts {
     $lines.Add("install: $($script:InstallDirectory)")
     $lines.Add("data:    $($script:DataDirectory)")
     $lines.Add("port:    $Port   model: $ModelId")
+    if ($script:Simulated) {
+        $lines.Add('mode:    SIMULATED - loopback scripted provider; no commercial model was contacted')
+    }
     $lines.Add('')
-    foreach ($status in @('PASS', 'FAIL', 'SKIP', 'SKIP_LIBREOFFICE', 'SKIP_STOP_WINDOW', 'TODO_VERIFY_API')) {
+    foreach ($status in @('PASS', 'SIMULATED', 'FAIL', 'SKIP', 'SKIP_LIBREOFFICE', 'SKIP_STOP_WINDOW', 'TODO_VERIFY_API')) {
         foreach ($entry in @($script:Results | Where-Object { $_.status -eq $status })) {
             $lines.Add(('{0,-18} {1}: {2}' -f $entry.status, $entry.id, $entry.detail))
         }
@@ -948,16 +1234,37 @@ try {
     Assert-ShortWorkRoot
     Set-Content -LiteralPath (Join-Path $script:Paths['logs'] 'report.txt') -Value 'acceptance started' -Encoding UTF8
 
+    if ($script:Simulated -and -not $script:ModelIdBound) {
+        # The scripted provider is only reachable through Pi's explicit identity, so the
+        # real-machine -ModelId default cannot apply; -ModelId still wins when bound.
+        $ModelId = New-PiExplicitModelId $ProviderModelId
+        Write-Host ("model:   $ModelId (simulated -ModelId default)")
+    }
+
     # FAIL_FAST: the credential is read from the environment only and never echoed.
+    # -SimulatedProvider is the one exception: with no OCT_API_KEY in this process a
+    # non-credential placeholder is set in-process for the Pi provider editor, the loopback
+    # scripted provider ignores it, and CREDENTIAL is reported as SIMULATED, never PASS.
     $credential = $env:OCT_API_KEY
     if (-not $credential -or $credential.Trim().Length -eq 0) {
-        Add-Result 'CREDENTIAL' 'FAIL' 'OCT_API_KEY is not set in this process; FAIL_FAST before install'
-        $exitCode = 2
-        throw 'FAIL_FAST: OCT_API_KEY is missing.'
+        if (-not $script:Simulated) {
+            Add-Result 'CREDENTIAL' 'FAIL' 'OCT_API_KEY is not set in this process; FAIL_FAST before install'
+            $exitCode = 2
+            throw 'FAIL_FAST: OCT_API_KEY is missing.'
+        }
+        $script:CredentialSimulated = $true
+        $env:OCT_API_KEY = 'ci-scripted-not-a-secret'
+        $credential = $env:OCT_API_KEY
     }
     Add-Secret $credential
     $credential = $null
-    Add-Result 'CREDENTIAL' 'PASS' 'OCT_API_KEY present and held only in the process environment'
+    if ($script:CredentialSimulated) {
+        Add-Result 'CREDENTIAL' 'SIMULATED' 'no real OCT key: loopback scripted provider only; no commercial model is contacted; the in-process placeholder is not a credential and never reaches evidence'
+    } else {
+        Add-Result 'CREDENTIAL' 'PASS' 'OCT_API_KEY present and held only in the process environment'
+    }
+
+    if ($script:Simulated) { Start-ScriptedProvider }
 
     $packageRoot = Expand-Package
     Add-Result 'EXTRACT' 'PASS' "package extracted under $($script:Paths['work'])"
@@ -973,6 +1280,8 @@ try {
     Connect-Administrator
     Add-Result 'LOGIN' 'PASS' 'administrator token accepted by /api/v1/login'
 
+    if ($script:Simulated) { Set-ScriptedPiProvider $script:ProviderBaseUrl }
+
     $agentId = Select-MemberAndModel
     $threadId = New-Camp $agentId "Windows real install acceptance $((Get-Date).ToString('yyyyMMdd-HHmmss'))"
     Add-Result 'CAMP' 'PASS' "created thread $threadId"
@@ -987,6 +1296,10 @@ try {
     try { if ($script:Launcher) { [void](Stop-LoomConsole) } } catch {
         Add-Result 'STOP_CONSOLE' 'FAIL' (Hide-Secrets $_.Exception.Message)
     }
+    # The scripted provider is this script's own child process; it is always reaped.
+    try { Stop-ScriptedProvider } catch {
+        Add-Result 'PROVIDER_STOP' 'FAIL' (Hide-Secrets $_.Exception.Message)
+    }
     try {
         $failed = Write-AcceptanceArtifacts
         if ($failed -and $exitCode -eq 0) { $exitCode = 1 }
@@ -997,8 +1310,9 @@ try {
 }
 
 $passed = @($script:Results | Where-Object { $_.status -eq 'PASS' }).Count
+$simulated = @($script:Results | Where-Object { $_.status -eq 'SIMULATED' }).Count
 $skipped = @($script:Results | Where-Object { $_.status -like 'SKIP*' -or $_.status -eq 'TODO_VERIFY_API' }).Count
 $failed = @($script:Results | Where-Object { $_.status -eq 'FAIL' }).Count
 Write-Host ''
-Write-Host ("acceptance: {0} PASS / {1} SKIP / {2} FAIL; logs in {3}" -f $passed, $skipped, $failed, $script:Paths['logs'])
+Write-Host ("acceptance: {0} PASS / {1} SIMULATED / {2} SKIP / {3} FAIL; logs in {4}" -f $passed, $simulated, $skipped, $failed, $script:Paths['logs'])
 exit $exitCode

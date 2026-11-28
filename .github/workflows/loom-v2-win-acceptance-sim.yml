@@ -1,0 +1,388 @@
+# SIMULATED acceptance replay of the LOOM Windows real-install acceptance.
+#
+# This workflow re-runs scripts/acceptance/windows-real-install-acceptance.draft.ps1 on a
+# GitHub Actions windows-2022 runner against the personal preview artifact of one existing
+# candidate run. The model lane is driven by the scripted loopback provider started by the
+# acceptance script's -SimulatedProvider switch: no real model is called, no real provider
+# credential is read, and nothing here is a real-machine or Owner acceptance.
+#
+# It never publishes, releases, deploys or promotes a channel. Inputs name an existing run
+# and its commit; the artifact id is resolved read-only from that run's artifact metadata.
+name: LOOM V2 Windows acceptance simulation (scripted provider)
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_commit:
+        description: Candidate commit embedded in loom-personal-preview-windows-<commit>
+        type: string
+        required: true
+        default: '864537843aefe88b45b677a50841e776d397ad00'
+      source_run_id:
+        description: Existing Actions run that uploaded that personal preview artifact
+        type: string
+        required: true
+        default: '46141704596'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: loom-win-acceptance-sim-${{ inputs.package_commit }}-${{ inputs.source_run_id }}
+  cancel-in-progress: false
+
+jobs:
+  windows-acceptance-sim:
+    name: Windows 2022 simulated real-install acceptance (scripted provider)
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      LOOM_PACKAGE_COMMIT: ${{ inputs.package_commit }}
+      LOOM_SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      LOOM_WORK_ROOT: 'C:\loomacc'
+      LOOM_ACCEPTANCE_PORT: '18990'
+    steps:
+      - name: Check out the dispatched commit without retained credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up pinned Node 24 for the scripted provider runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.14.1
+
+      - name: Preflight the source run artifact (fail fast)
+        id: preflight
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $commit = $env:LOOM_PACKAGE_COMMIT
+          if ($commit -cnotmatch '^[0-9a-f]{40}$') { throw "package_commit must be a 40-character lowercase commit: $commit" }
+          $runId = $env:LOOM_SOURCE_RUN_ID
+          if ($runId -notmatch '^[1-9][0-9]*$') { throw "source_run_id must be a numeric run id: $runId" }
+          if (-not (Test-Path -LiteralPath 'scripts/acceptance/windows-real-install-acceptance.draft.ps1' -PathType Leaf)) {
+            throw 'the dispatched commit does not carry the acceptance draft script'
+          }
+          $expectedName = "loom-personal-preview-windows-$commit"
+
+          $runRaw = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$runId" 2>&1
+          if ($LASTEXITCODE -ne 0) { throw ('source run lookup failed: ' + ($runRaw -join ' ')) }
+          $run = ($runRaw -join "`n") | ConvertFrom-Json
+          if ([string]$run.status -ne 'completed') { throw "source run $runId is still $($run.status); only a completed run has a stable artifact list" }
+          if ([string]$run.head_sha -ne $commit) { throw "source run head $($run.head_sha) is not the package commit $commit" }
+
+          # List the exact run's artifacts with bounded pagination; never select another run.
+          $artifacts = @()
+          for ($page = 1; $page -le 10; $page++) {
+            $raw = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$runId/artifacts?per_page=100&page=$page" 2>&1
+            if ($LASTEXITCODE -ne 0) { throw ('artifact listing failed: ' + ($raw -join ' ')) }
+            $batch = @((($raw -join "`n") | ConvertFrom-Json).artifacts)
+            $artifacts += $batch
+            if ($batch.Count -lt 100) { break }
+          }
+          $selected = @($artifacts | Where-Object { $_.name -eq $expectedName })
+          if ($selected.Count -ne 1) { throw "run $runId must hold exactly one artifact named $expectedName; found $($selected.Count)" }
+          $artifact = $selected[0]
+          if ($artifact.expired -ne $false) { throw "artifact $($artifact.id) is expired; a live preview is required" }
+          if ([string]$artifact.workflow_run.id -ne $runId) { throw "artifact $($artifact.id) belongs to run $($artifact.workflow_run.id), not $runId" }
+          $artifactId = [string]$artifact.id
+          if ($artifactId -notmatch '^[1-9][0-9]*$') { throw "artifact id is not numeric: $artifactId" }
+
+          $zipPath = Join-Path $env:RUNNER_TEMP "loom-personal-preview-$commit.zip"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "artifact_id=$artifactId"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "artifact_digest=$([string]$artifact.digest)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "source_run_head_sha=$([string]$run.head_sha)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "source_run_conclusion=$([string]$run.conclusion)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "package_zip=$zipPath"
+          Write-Host "resolved live artifact $artifactId ($expectedName) in run $runId"
+
+      - name: Download the preview artifact zip with gh api (byte preserving)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOOM_ARTIFACT_ID: ${{ steps.preflight.outputs.artifact_id }}
+          LOOM_ARTIFACT_DIGEST: ${{ steps.preflight.outputs.artifact_digest }}
+          LOOM_PACKAGE_ZIP: ${{ steps.preflight.outputs.package_zip }}
+        run: |
+          set -euo pipefail
+          # Git Bash redirects native stdout byte for byte; PowerShell text redirection
+          # would corrupt the archive. Both shells point at the same RUNNER_TEMP file.
+          zip_path="$(cygpath -u "$LOOM_PACKAGE_ZIP")"
+          rm -f "$zip_path"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$LOOM_ARTIFACT_ID/zip" > "$zip_path"
+          test -s "$zip_path"
+          signature="$(od -An -tx1 -N4 "$zip_path" | tr -d ' \n')"
+          if [ "$signature" != "504b0304" ]; then
+            echo "::error::gh api returned a non-zip payload (signature $signature)"
+            exit 1
+          fi
+          if [ -n "${LOOM_ARTIFACT_DIGEST:-}" ]; then
+            digest="$(printf '%s' "$LOOM_ARTIFACT_DIGEST" | tr 'A-F' 'a-f')"
+            if printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+              actual="sha256:$(sha256sum "$zip_path" | cut -d' ' -f1)"
+              if [ "$actual" != "$digest" ]; then
+                echo "::error::downloaded zip $actual does not match artifact digest $digest"
+                exit 1
+              fi
+            fi
+          fi
+          stat -c '%s bytes %n' "$zip_path"
+
+      - name: Verify the zip candidate manifest before the acceptance EXTRACT
+        id: inspect
+        shell: pwsh
+        env:
+          LOOM_PACKAGE_ZIP: ${{ steps.preflight.outputs.package_zip }}
+          LOOM_ARTIFACT_ID: ${{ steps.preflight.outputs.artifact_id }}
+          LOOM_ARTIFACT_DIGEST: ${{ steps.preflight.outputs.artifact_digest }}
+          LOOM_SOURCE_RUN_HEAD_SHA: ${{ steps.preflight.outputs.source_run_head_sha }}
+          LOOM_SOURCE_RUN_CONCLUSION: ${{ steps.preflight.outputs.source_run_conclusion }}
+          LOOM_EVIDENCE_DIR: ${{ runner.temp }}/loom-win-acceptance-sim
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zipPath = $env:LOOM_PACKAGE_ZIP
+          if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf)) { throw "preview zip was not downloaded: $zipPath" }
+          $sha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $digest = ([string]$env:LOOM_ARTIFACT_DIGEST).ToLowerInvariant()
+          if ($digest -match '^sha256:([0-9a-f]{64})$' -and $Matches[1] -ne $sha256) {
+            throw "downloaded zip sha256 $sha256 does not match the artifact digest $digest"
+          }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+          $archive = [IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            $manifests = @($archive.Entries | Where-Object { $_.FullName -eq 'candidate-manifest.json' })
+            if ($manifests.Count -ne 1) { throw "the artifact zip must hold exactly one root candidate-manifest.json; found $($manifests.Count)" }
+            $stream = $manifests[0].Open()
+            $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8)
+            try { $manifest = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose(); $stream.Dispose() }
+            $names = @($archive.Entries | ForEach-Object { $_.FullName })
+            foreach ($required in @('candidate-manifest.json', 'Manage-Loom.ps1', 'Start-Loom.cmd')) {
+              if ($names -notcontains $required) { throw "the preview zip is missing $required" }
+            }
+            $entryCount = $archive.Entries.Count
+          } finally { $archive.Dispose() }
+          if ([string]$manifest.commit -ne $env:LOOM_PACKAGE_COMMIT) { throw "candidate-manifest commit $($manifest.commit) is not $($env:LOOM_PACKAGE_COMMIT)" }
+          if ([string]$manifest.qualification -ne 'isolated-personal-development-preview') { throw "unexpected candidate qualification: $($manifest.qualification)" }
+          if ($manifest.dailyDataIncluded -ne $false) { throw 'the preview carries daily data; refusing to simulate acceptance' }
+          if ($manifest.realProviderVerified -ne $false -or $manifest.ownerAccepted -ne $false) { throw 'the preview claims provider or Owner acceptance; refusing to simulate acceptance' }
+          $null = New-Item -ItemType Directory -Path $env:LOOM_EVIDENCE_DIR -Force
+          [ordered]@{
+            kind = 'loom-windows-acceptance-simulation'
+            scope = 'SIMULATED - not a real-machine acceptance'
+            packageCommit = $env:LOOM_PACKAGE_COMMIT
+            sourceRunId = $env:LOOM_SOURCE_RUN_ID
+            sourceRunHeadSha = $env:LOOM_SOURCE_RUN_HEAD_SHA
+            sourceRunConclusion = $env:LOOM_SOURCE_RUN_CONCLUSION
+            artifactId = $env:LOOM_ARTIFACT_ID
+            candidateZipSha256 = $sha256
+            candidateZipEntries = $entryCount
+            candidateVersion = [string]$manifest.version
+            candidateQualification = [string]$manifest.qualification
+            dailyDataIncluded = [bool]$manifest.dailyDataIncluded
+            realModelUsed = $false
+            providerMode = 'scripted-loopback'
+            credential = 'SIMULATED/SCRIPTED - no real provider credential is read or stored'
+            ownerAccepted = $false
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:LOOM_EVIDENCE_DIR 'simulation.json') -Encoding utf8
+
+      - name: Run the real-install acceptance with the scripted provider
+        id: acceptance
+        shell: pwsh
+        # The script keeps its own internal timeouts; this bound only guarantees that the
+        # evidence steps below still run (with if: always()) if the script ever wedges.
+        timeout-minutes: 100
+        env:
+          LOOM_PACKAGE_ZIP: ${{ steps.preflight.outputs.package_zip }}
+          LOOM_EVIDENCE_DIR: ${{ runner.temp }}/loom-win-acceptance-sim
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $invocation = @(
+            '-NoProfile',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', 'scripts/acceptance/windows-real-install-acceptance.draft.ps1',
+            '-PackageZip', $env:LOOM_PACKAGE_ZIP,
+            '-WorkRoot', $env:LOOM_WORK_ROOT,
+            '-Port', $env:LOOM_ACCEPTANCE_PORT,
+            '-SimulatedProvider'
+          )
+          Write-Host ('acceptance: powershell.exe ' + ($invocation -join ' '))
+          # The acceptance script owns its own timeouts; no extra timeout argument is passed.
+          & powershell.exe @invocation
+          $exitCode = $LASTEXITCODE
+          [ordered]@{
+            exitCode = $exitCode
+            finishedAt = (Get-Date).ToString('o')
+            command = 'powershell.exe ' + ($invocation -join ' ')
+            workRoot = $env:LOOM_WORK_ROOT
+            port = [int]$env:LOOM_ACCEPTANCE_PORT
+            simulatedProvider = $true
+            realModelUsed = $false
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:LOOM_EVIDENCE_DIR 'acceptance-run.json') -Encoding utf8
+          Write-Host "acceptance exit code: $exitCode"
+          exit $exitCode
+
+      - name: Stage acceptance logs and scripted provider requests
+        id: stage
+        if: always()
+        shell: pwsh
+        env:
+          LOOM_EVIDENCE_DIR: ${{ runner.temp }}/loom-win-acceptance-sim
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stageLogs = (New-Item -ItemType Directory -Path (Join-Path $env:LOOM_EVIDENCE_DIR 'logs') -Force).FullName
+          $sourceLogs = Join-Path $env:LOOM_WORK_ROOT 'logs'
+          if (Test-Path -LiteralPath $sourceLogs -PathType Container) {
+            Copy-Item -Path (Join-Path $sourceLogs '*') -Destination $stageLogs -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          $requestCount = 0
+          if (Test-Path -LiteralPath $env:LOOM_WORK_ROOT -PathType Container) {
+            $requests = @(Get-ChildItem -LiteralPath $env:LOOM_WORK_ROOT -File -Recurse -Depth 3 -Force -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '(?i)provider[-_]?requests?' -and -not $_.FullName.StartsWith($sourceLogs, [StringComparison]::OrdinalIgnoreCase) })
+            foreach ($request in $requests) {
+              $relative = [IO.Path]::GetRelativePath($env:LOOM_WORK_ROOT, $request.FullName).Replace('\', '/')
+              $target = Join-Path $stageLogs ('provider-requests/' + $relative.Replace('/', '_'))
+              $null = New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($target)) -Force
+              Copy-Item -LiteralPath $request.FullName -Destination $target -Force
+              $requestCount++
+            }
+          }
+          $logCount = @(Get-ChildItem -LiteralPath $stageLogs -File -Recurse -Force -ErrorAction SilentlyContinue).Count
+          [ordered]@{
+            stagedLogFiles = $logCount
+            stagedProviderRequestFiles = $requestCount
+            stagedAt = (Get-Date).ToString('o')
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:LOOM_EVIDENCE_DIR 'staged.json') -Encoding utf8
+          Write-Host "staged $logCount log file(s) and $requestCount provider request file(s)"
+
+      - name: Refuse credential-shaped evidence before any upload
+        id: scan
+        if: always()
+        shell: pwsh
+        env:
+          LOOM_EVIDENCE_DIR: ${{ runner.temp }}/loom-win-acceptance-sim
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Same credential-shaped shapes the repository already rejects:
+          #   .github/workflows/loom-v2-e3-windows.yml:358
+          #   scripts/lib/qualification-semantic-judge.mjs:1107,1121
+          #   scripts/loom-v2-core-native-pi.mjs:63
+          # The bare word CREDENTIAL is only matched when it carries a token-shaped value,
+          # so the acceptance's own "CREDENTIAL: <sentence>" result row is not a false hit.
+          $patterns = @(
+            '(?im)authorization:\s*bearer\s+\S+',
+            '(?im)(?:api[_-]?key|access[_-]?token|token|secret|password)\s*[:=]\s*\S+',
+            '(?im)credential\s*[:=]\s*[A-Za-z0-9._~+/$=-]{16,}'
+          )
+          $files = @()
+          if (Test-Path -LiteralPath $env:LOOM_EVIDENCE_DIR -PathType Container) {
+            $files = @(Get-ChildItem -LiteralPath $env:LOOM_EVIDENCE_DIR -File -Recurse -Force -ErrorAction SilentlyContinue)
+          }
+          $hits = New-Object 'Collections.Generic.List[string]'
+          foreach ($file in $files) {
+            $text = [IO.File]::ReadAllText($file.FullName)
+            foreach ($pattern in $patterns) {
+              if ($text -match $pattern) { $hits.Add([IO.Path]::GetFileName($file.FullName)); break }
+            }
+          }
+          if ($hits.Count -gt 0) {
+            Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'clean=false'
+            throw ('credential-shaped evidence in ' + $hits.Count + ' file(s); upload refused: ' + ($hits -join ', '))
+          }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'clean=true'
+          Write-Host "credential scan clean across $($files.Count) evidence file(s)"
+
+      - name: Upload the scanned simulation evidence
+        id: upload
+        if: always() && steps.scan.outputs.clean == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: loom-win-acceptance-sim-${{ inputs.package_commit }}
+          path: ${{ runner.temp }}/loom-win-acceptance-sim/
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Summarize the simulated acceptance
+        if: always()
+        shell: pwsh
+        env:
+          LOOM_EVIDENCE_DIR: ${{ runner.temp }}/loom-win-acceptance-sim
+          LOOM_ARTIFACT_ID: ${{ steps.preflight.outputs.artifact_id }}
+          LOOM_SOURCE_RUN_HEAD_SHA: ${{ steps.preflight.outputs.source_run_head_sha }}
+          LOOM_EVIDENCE_CLEAN: ${{ steps.scan.outputs.clean }}
+          LOOM_UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidenceDir = $env:LOOM_EVIDENCE_DIR
+          $json = @{}
+          foreach ($name in @('simulation', 'acceptance-run', 'staged')) {
+            $path = Join-Path $evidenceDir ($name + '.json')
+            if (Test-Path -LiteralPath $path -PathType Leaf) { $json[$name] = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json }
+          }
+          $summary = $null
+          $summaryPath = Join-Path (Join-Path $evidenceDir 'logs') 'summary.json'
+          if (Test-Path -LiteralPath $summaryPath -PathType Leaf) { $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json }
+
+          # Canonical 14 acceptance ids. Infrastructure-only rows such as STOP_CONSOLE are
+          # reported afterwards as extra rows and are not part of the canonical set.
+          $expected = @(
+            'CREDENTIAL', 'EXTRACT', 'INSTALL', 'START', 'LOGIN', 'MEMBER_MODEL', 'CAMP',
+            'REAL_MODEL_IDENTITY', 'REAL_MODEL', 'DOCX_MARKER', 'PPTX_UPLOAD',
+            'PPTX_PREVIEW_INTERFACE', 'PPTX_PREVIEW', 'STOP'
+          )
+          $rows = [ordered]@{}
+          if ($summary) { foreach ($result in @($summary.results)) { if ($result) { $rows[[string]$result.id] = $result } } }
+          $truncate = { param([string]$Text) $clean = ($Text -replace '\r?\n', ' ') -replace '\|', '\|'; if ($clean.Length -gt 240) { $clean.Substring(0, 240) + '...' } else { $clean } }
+
+          $exitCode = if ($json.ContainsKey('acceptance-run')) { [string]$json['acceptance-run'].exitCode } else { 'not-run' }
+          $lines = New-Object 'Collections.Generic.List[string]'
+          $lines.Add('## LOOM Windows real-install acceptance - SIMULATED replay')
+          $lines.Add('')
+          $lines.Add('This is a **scripted simulation** on a GitHub-hosted windows-2022 runner. It is **not** a real-machine acceptance and implies no Owner acceptance or release.')
+          $lines.Add('')
+          $artifactId = if ([string]::IsNullOrEmpty($env:LOOM_ARTIFACT_ID)) { 'unresolved' } else { $env:LOOM_ARTIFACT_ID }
+          $headSha = if ([string]::IsNullOrEmpty($env:LOOM_SOURCE_RUN_HEAD_SHA)) { 'unresolved' } else { $env:LOOM_SOURCE_RUN_HEAD_SHA }
+          $lines.Add('- package commit: `' + $env:LOOM_PACKAGE_COMMIT + '`')
+          $lines.Add('- source run: `' + $env:LOOM_SOURCE_RUN_ID + '` (head `' + $headSha + '`)')
+          $lines.Add('- preview artifact id: `' + $artifactId + '` (`loom-personal-preview-windows-' + $env:LOOM_PACKAGE_COMMIT + '`)')
+          if ($json.ContainsKey('simulation')) {
+            $lines.Add('- candidate zip sha256: `' + [string]$json['simulation'].candidateZipSha256 + '` (' + [string]$json['simulation'].candidateZipEntries + ' entries)')
+            $lines.Add('- candidate qualification: `' + [string]$json['simulation'].candidateQualification + '`')
+          }
+          $lines.Add('- acceptance exit code: `' + $exitCode + '`')
+          $lines.Add('- **realModelUsed: false** - model lane served by a scripted loopback provider (`-SimulatedProvider`)')
+          $lines.Add('- **CREDENTIAL row is SIMULATED/SCRIPTED**: no real provider key exists in this repository or this run; the credential check exercises the simulated path only.')
+          $uploadLine = if ($env:LOOM_UPLOAD_OUTCOME -eq 'success') {
+            'scanned clean and uploaded as `loom-win-acceptance-sim-' + $env:LOOM_PACKAGE_COMMIT + '`'
+          } elseif ($env:LOOM_EVIDENCE_CLEAN -eq 'false') {
+            '**REFUSED** (credential-shaped evidence)'
+          } elseif ($env:LOOM_UPLOAD_OUTCOME) {
+            'not uploaded (' + $env:LOOM_UPLOAD_OUTCOME + ')'
+          } else {
+            'not attempted'
+          }
+          $lines.Add('- evidence upload: ' + $uploadLine)
+          $lines.Add('')
+          $lines.Add('| id | status | detail |')
+          $lines.Add('| --- | --- | --- |')
+          foreach ($id in $expected) {
+            if ($rows.Contains($id)) {
+              $lines.Add('| ' + $id + ' | ' + [string]$rows[$id].status + ' | ' + (& $truncate ([string]$rows[$id].detail)) + ' |')
+            } else {
+              $lines.Add('| ' + $id + ' | NOT_RUN | no result recorded |')
+            }
+          }
+          foreach ($id in @($rows.Keys | Where-Object { $expected -notcontains $_ })) {
+            $lines.Add('| ' + $id + ' | ' + [string]$rows[$id].status + ' | ' + (& $truncate ([string]$rows[$id].detail)) + ' |')
+          }
+          if (-not $summary) {
+            $lines.Add('')
+            $lines.Add('No `summary.json` was produced, so the acceptance did not reach its reporting stage; every row above is NOT_RUN rather than inferred.')
+          }
+          $lines.Add('')
+          $lines.Add('SIMULATED: SCRIPTED/SIMULATED provider output only; `realModelUsed=false`.')
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($lines.ToArray()) -Encoding utf8
