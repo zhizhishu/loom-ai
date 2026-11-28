@@ -11,6 +11,13 @@
 name: LOOM V2 Windows acceptance simulation (scripted provider)
 
 on:
+  # workflow_dispatch needs the workflow on the default branch, so a trial branch
+  # could never be dispatched. A push to loom/trial-* runs the same simulation;
+  # push carries no inputs, so every inputs.* use below falls back to the
+  # workflow_dispatch defaults.
+  push:
+    branches:
+      - 'loom/trial-*'
   workflow_dispatch:
     inputs:
       package_commit:
@@ -29,17 +36,18 @@ permissions:
   actions: read
 
 concurrency:
-  group: loom-win-acceptance-sim-${{ inputs.package_commit }}-${{ inputs.source_run_id }}
+  group: loom-win-acceptance-sim-${{ inputs.package_commit || '864537843aefe88b45b677a50841e776d397ad00' }}-${{ inputs.source_run_id || '46141704596' }}
   cancel-in-progress: false
 
 jobs:
   windows-acceptance-sim:
     name: Windows 2022 simulated real-install acceptance (scripted provider)
+    if: github.event_name != 'push' || !github.event.deleted
     runs-on: windows-2022
     timeout-minutes: 120
     env:
-      LOOM_PACKAGE_COMMIT: ${{ inputs.package_commit }}
-      LOOM_SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      LOOM_PACKAGE_COMMIT: ${{ inputs.package_commit || '864537843aefe88b45b677a50841e776d397ad00' }}
+      LOOM_SOURCE_RUN_ID: ${{ inputs.source_run_id || '46141704596' }}
       LOOM_WORK_ROOT: 'C:\loomacc'
       LOOM_ACCEPTANCE_PORT: '18990'
     steps:
@@ -301,7 +309,7 @@ jobs:
         if: always() && steps.scan.outputs.clean == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: loom-win-acceptance-sim-${{ inputs.package_commit }}
+          name: loom-win-acceptance-sim-${{ inputs.package_commit || '864537843aefe88b45b677a50841e776d397ad00' }}
           path: ${{ runner.temp }}/loom-win-acceptance-sim/
           if-no-files-found: warn
           retention-days: 3
