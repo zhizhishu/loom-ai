@@ -1355,7 +1355,7 @@ function Select-InstallOnlyMember {
     # roster stays empty. A pi-adapted member is preferred because it is the member the
     # real-machine run configures, but any mentionable member is enough here: install-only
     # mode configures no model, so members.runtime.set is never sent.
-    $selected = Wait-Until -TimeoutSeconds 45 -IntervalMilliseconds 1500 -Probe {
+    $selected = Wait-Until -TimeoutSeconds 90 -IntervalMilliseconds 1500 -Probe {
         try { $members = @(Invoke-CoreRequest 'members.list' ([ordered]@{})) }
         catch { $members = @() }
         $fallback = $null
@@ -1435,11 +1435,14 @@ function Invoke-PptxUploadInstallOnly([string]$ThreadId) {
 }
 
 function Invoke-StopCheckInstallOnly([string]$ThreadId, [string]$AgentId) {
-    # No provider credential exists in install-only mode, so the Run this message creates is
-    # expected to stay queued/waiting (it never has to reach running). thread.messages.send
-    # and agentRuns.cancel are still the real Web/API control path: a Run that is never
-    # created, a cancel that is rejected or a Run that does not end cancelled is a FAIL, and
-    # no PASS is ever recorded without observing the cancelled Run.
+    # No provider credential exists in install-only mode, so the Run this message creates
+    # may have no worker to start it and can sit queued/waiting. That is a race, not a
+    # guarantee: the Host can move the Run to a terminal state, or a concurrent writer can
+    # bump its version, before agentRuns.cancel lands, so the first observed status is
+    # checked as well. thread.messages.send and agentRuns.cancel are still the real Web/API
+    # control path: a Run that is never created, a cancel whose result status is 'rejected'
+    # or a Run that does not end cancelled is a FAIL, and no PASS is ever recorded without
+    # observing the cancelled Run after an accepted (result status 'applied') cancel.
     $terminal = @('succeeded', 'failed', 'cancelled')
     $before = Get-CampSnapshot $ThreadId
     $excluded = New-Object 'Collections.Generic.HashSet[string]'
@@ -1468,9 +1471,12 @@ function Invoke-StopCheckInstallOnly([string]$ThreadId, [string]$AgentId) {
     $status = [string](Get-Value $run 'status')
     $observed = New-Object 'Collections.Generic.List[string]'
     [void]$observed.Add($status)
+    # $cancelCommands counts only the cancels the Host accepted (command result status
+    # 'applied'); the PASS branch requires at least one. $cancelAttempts only bounds the loop.
     $cancelCommands = 0
-    while ($terminal -notcontains $status -and $cancelCommands -lt 5 -and (Get-Date) -lt $deadline) {
-        $cancelCommands++
+    $cancelAttempts = 0
+    while ($terminal -notcontains $status -and $cancelAttempts -lt 5 -and (Get-Date) -lt $deadline) {
+        $cancelAttempts++
         $reply = Try-CoreRequest 'agentRuns.cancel' ([ordered]@{
                 commandId = New-CommandId
                 command = [ordered]@{
@@ -1491,15 +1497,37 @@ function Invoke-StopCheckInstallOnly([string]$ThreadId, [string]$AgentId) {
             }
             $run = $current
         } else {
-            $settled = Wait-Until -TimeoutSeconds 30 -IntervalMilliseconds 200 -Probe {
-                $candidate = Get-RunById $ThreadId $runId
-                if ($candidate -and $terminal -contains [string](Get-Value $candidate 'status')) { return $candidate }
-                return $null
-            }
-            if ($settled) { $run = $settled } else { $run = Get-RunById $ThreadId $runId }
-            if (-not $run) {
-                Add-Result 'STOP' 'FAIL' ("AgentRun {0} disappeared from camps.open after agentRuns.cancel" -f $runId)
+            # A command rejection is HTTP 200 with result status 'rejected' (for example
+            # command.version_conflict), so $reply.Ok alone does not mean the cancel was taken.
+            $outcome = [string](Get-Value $reply.Result 'status')
+            $code = [string](Get-Value $reply.Result 'code')
+            if (-not $code) { $code = 'no code' }
+            if ($outcome -eq 'rejected') {
+                # A concurrent status/version bump is not a rejection of the control path:
+                # the Run is re-read and cancelled again with its current version.
+                $current = Get-RunById $ThreadId $runId
+                if ($code -notlike '*version_conflict*' -or -not $current) {
+                    Add-Result 'STOP' 'FAIL' ("agentRuns.cancel was rejected for run {0}: {1}" -f $runId, (Hide-Secrets $code))
+                    return
+                }
+                Start-Sleep -Milliseconds 200
+                $run = $current
+            } elseif ($outcome -ne 'applied') {
+                Add-Result 'STOP' 'FAIL' ("agentRuns.cancel for run {0} returned result status '{1}' (code {2}) instead of applied" -f `
+                        $runId, (Hide-Secrets $outcome), (Hide-Secrets $code))
                 return
+            } else {
+                $cancelCommands++
+                $settled = Wait-Until -TimeoutSeconds 30 -IntervalMilliseconds 200 -Probe {
+                    $candidate = Get-RunById $ThreadId $runId
+                    if ($candidate -and $terminal -contains [string](Get-Value $candidate 'status')) { return $candidate }
+                    return $null
+                }
+                if ($settled) { $run = $settled } else { $run = Get-RunById $ThreadId $runId }
+                if (-not $run) {
+                    Add-Result 'STOP' 'FAIL' ("AgentRun {0} disappeared from camps.open after agentRuns.cancel" -f $runId)
+                    return
+                }
             }
         }
         $status = [string](Get-Value $run 'status')
@@ -1508,23 +1536,24 @@ function Invoke-StopCheckInstallOnly([string]$ThreadId, [string]$AgentId) {
 
     $firstStatus = [string]$observed[0]
     $current = Get-RunById $ThreadId $runId
-    if ($status -eq 'cancelled') {
+    if ($status -eq 'cancelled' -and $cancelCommands -ge 1) {
         $script:Evidence['stop'] = [ordered]@{
             threadId = $ThreadId
             agentRunId = $runId
             observedStatuses = @($observed)
             finalStatus = $status
             cancelCommands = $cancelCommands
+            cancelAttempts = $cancelAttempts
             cancelAcknowledgedAt = Get-Value $current 'cancelAcknowledgedAt'
             mode = 'install-only (model-free queued/nonterminal cancel control path)'
         }
-        Add-Result 'STOP' 'PASS' ("model-free queued/nonterminal cancel control path: thread.messages.send created Run {0} ({1}) and agentRuns.cancel settled it cancelled after {2} cancel command(s)" -f `
+        Add-Result 'STOP' 'PASS' ("model-free queued/nonterminal cancel control path: thread.messages.send created Run {0} ({1}) and an accepted agentRuns.cancel settled it cancelled after {2} accepted cancel command(s)" -f `
                 $runId, $firstStatus, $cancelCommands)
         return
     }
     if ($cancelCommands -eq 0 -and $terminal -contains $status) {
-        Add-Result 'STOP' 'FAIL' ("the AgentRun {0} was already {1} when it was first observed, so agentRuns.cancel could not cancel it and the cancel control path is unproven" -f `
-                $runId, $status)
+        Add-Result 'STOP' 'FAIL' ("the AgentRun {0} ended {1} (first observed {2}) without an accepted agentRuns.cancel, so the cancel control path is unproven" -f `
+                $runId, $status, $firstStatus)
         return
     }
     if ($terminal -contains $status) {
