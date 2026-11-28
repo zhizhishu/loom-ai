@@ -23,9 +23,12 @@ on:
       - scripts/fixtures/host-web-parity/**
       - scripts/fixtures/loom-*/**
       - scripts/package-embedded-pi.mjs
+      - scripts/package-dsh-runtime.mjs
       - scripts/package-dsh-hook-executor.mjs
       - scripts/accept-local-hook-executor.mjs
       - resources/dsh-hook-executor/**
+      - resources/dsh-runtime/**
+      - scripts/lib/dsh-runtime-package.test.mjs
       - scripts/runtime/pi-source/**
       - scripts/start-loom-personal.cmd
       - scripts/install-loom-personal.cmd
@@ -321,6 +324,18 @@ jobs:
           node scripts/package-embedded-pi.mjs --verify --destination resources/runtime/pi
           if ($LASTEXITCODE -ne 0) { throw 'Pi manifest verification failed' }
 
+      - name: Stage the self-contained Windows DSH runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path resources/runtime/dsh) { Remove-Item resources/runtime/dsh -Recurse -Force }
+          node scripts/package-dsh-runtime.mjs --destination resources/runtime/dsh
+          if ($LASTEXITCODE -ne 0) { throw 'Self-contained DSH runtime staging failed' }
+          node scripts/package-dsh-runtime.mjs --verify --destination resources/runtime/dsh
+          if ($LASTEXITCODE -ne 0) { throw 'Self-contained DSH runtime closure verification failed' }
+          $dshVersion = (& (Resolve-Path 'resources/runtime/dsh/dsh.cmd') --version) -join ''
+          if ($LASTEXITCODE -ne 0 -or $dshVersion.Trim() -cne '0.2.0-rc.2') { throw 'Bundled DSH launcher did not report 0.2.0-rc.2' }
+
       - name: Stage the fixed private DSH Hook executor
         shell: pwsh
         run: |
@@ -428,6 +443,12 @@ jobs:
           Copy-Item skills (Join-Path $kit 'skills') -Recurse
           New-Item -ItemType Directory -Path (Join-Path $kit 'runtime') | Out-Null
           Copy-Item resources/runtime/pi (Join-Path $kit 'runtime/pi') -Recurse
+          Copy-Item resources/runtime/dsh (Join-Path $kit 'runtime/dsh') -Recurse
+          node scripts/package-dsh-runtime.mjs --verify --destination (Join-Path $kit 'runtime/dsh')
+          if ($LASTEXITCODE -ne 0) { throw 'Copied candidate DSH runtime failed verification' }
+          $dshManifestPath = Join-Path $kit 'runtime/dsh/dsh-runtime-bundle.json'
+          $dshBundle = Get-Content -LiteralPath $dshManifestPath -Raw | ConvertFrom-Json
+          $dshManifestSha = (Get-FileHash -LiteralPath $dshManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
           Copy-Item resources/runtime/dsh-hook-executor (Join-Path $kit 'runtime/dsh-hook-executor') -Recurse
           node scripts/package-dsh-hook-executor.mjs --verify --destination (Join-Path $kit 'runtime/dsh-hook-executor')
           if ($LASTEXITCODE -ne 0) { throw 'Copied candidate DSH Hook executor failed verification' }
@@ -483,6 +504,7 @@ jobs:
             ownerAccepted = $false
             dailyDataIncluded = $false
             computerRuntime = [ordered]@{ python = $computerBundle.pythonVersion; pillow = $computerBundle.pillowVersion }
+            dshRuntime = [ordered]@{ rootVersion = $dshBundle.rootVersion; platform = $dshBundle.platform; arch = $dshBundle.arch; nodeVersion = $dshBundle.nodeVersion; manifestSha256 = $dshManifestSha; treeSha256 = $dshBundle.treeSha256; lockSha256 = $dshBundle.lockSha256; fileCount = $dshBundle.files.Count }
             dshHookExecutor = [ordered]@{ dshVersion = $hookBundle.dshVersion; manifestSha256 = $hookManifestSha; treeSha256 = $hookBundle.treeSha256; lockSha256 = $hookBundle.lockSha256; packageCount = $hookBundle.packages.Count }
             embeddedPiVersion = '0.85.1'
             optionalPiPurgeVersion = '0.3.0'
@@ -568,6 +590,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Delivered Pi closed manifest verification failed' }
           node scripts/package-dsh-hook-executor.mjs --verify --destination (Join-Path $kit 'runtime/dsh-hook-executor')
           if ($LASTEXITCODE -ne 0) { throw 'Delivered DSH Hook executor closed manifest verification failed' }
+          node scripts/package-dsh-runtime.mjs --verify --destination (Join-Path $kit 'runtime/dsh')
+          if ($LASTEXITCODE -ne 0) { throw 'Delivered DSH runtime closed manifest verification failed' }
+          $dshPath = Join-Path $kit 'runtime/dsh/dsh-runtime-bundle.json'
+          $deliveredDsh = Get-Content -LiteralPath $dshPath -Raw | ConvertFrom-Json
+          $deliveredDshSha = (Get-FileHash -LiteralPath $dshPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($manifest.dshRuntime.manifestSha256 -cne $deliveredDshSha -or
+              $manifest.dshRuntime.treeSha256 -cne $deliveredDsh.treeSha256 -or
+              $manifest.dshRuntime.lockSha256 -cne $deliveredDsh.lockSha256 -or
+              $manifest.dshRuntime.platform -cne 'windows' -or $manifest.dshRuntime.arch -cne 'x86_64' -or
+              $manifest.dshRuntime.fileCount -ne $deliveredDsh.files.Count) {
+            throw 'Delivered DSH runtime provenance does not match the candidate manifest'
+          }
           $hookPath = Join-Path $kit 'runtime/dsh-hook-executor/hook-executor-bundle.json'
           $deliveredHook = Get-Content -LiteralPath $hookPath -Raw | ConvertFrom-Json
           $deliveredHookSha = (Get-FileHash -LiteralPath $hookPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -583,7 +617,7 @@ jobs:
             if (!(Test-Path -LiteralPath (Join-Path $kit $relative) -PathType Leaf)) { throw "Delivered computer file missing: $relative" }
           }
           $deliveredManager = Get-Content -LiteralPath (Join-Path $kit 'Manage-Loom.ps1') -Raw
-          foreach ($requiredEnv in @('LOOM_COMPUTER_PYTHON', 'LOOM_COMPUTER_HELPER', 'LOOM_COMPUTER_AGENT_PYTHON', 'LOOM_COMPUTER_AGENT_BRIDGE', 'LOOM_COMPUTER_AGENT_PI_MCP')) {
+          foreach ($requiredEnv in @('LOOM_COMPUTER_PYTHON', 'LOOM_COMPUTER_HELPER', 'LOOM_COMPUTER_AGENT_PYTHON', 'LOOM_COMPUTER_AGENT_BRIDGE', 'LOOM_COMPUTER_AGENT_PI_MCP', 'ROVAI_EMBEDDED_DSH_ROOT')) {
             if ($deliveredManager -cnotmatch [regex]::Escape('$env:' + $requiredEnv)) { throw "Delivered launcher does not configure $requiredEnv" }
           }
           node scripts/loom-v2-pi-purge-stage.mjs --verify (Join-Path $kit 'runtime/extensions/pi-purge/upstream')

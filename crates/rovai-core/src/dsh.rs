@@ -12,7 +12,10 @@ use crate::{
     command::canonical_json_digest,
 };
 
-pub const MINIMUM_VERSION: &str = "0.1.5-rc.2";
+pub const MINIMUM_VERSION: &str = "0.2.0-rc.2";
+/// The private Hook executor keeps its own upstream dependency closure. It is
+/// not the embedded DSH runtime version and must not follow it.
+const LOCAL_HOOK_DSH_VERSION: &str = "0.1.5-rc.2";
 pub const BOOTSTRAP_REVISION: &str = "dsh-local-hook-private-executor-v9";
 const BOOTSTRAP_PLUGIN: &str = include_str!("dsh/bootstrap.mjs");
 const MODEL_PLUGIN: &str = include_str!("dsh/models.mjs");
@@ -56,8 +59,8 @@ pub fn supported_version(version: Option<&str>) -> bool {
         return false;
     }
     let numbers = [numbers[0], numbers[1], numbers[2]];
-    numbers > [0, 1, 5]
-        || (numbers == [0, 1, 5]
+    numbers > [0, 2, 0]
+        || (numbers == [0, 2, 0]
             && (suffix.is_empty()
                 || suffix
                     .strip_prefix("rc.")
@@ -334,8 +337,7 @@ impl FrozenSkillRoots {
     }
 
     pub fn decode(payload: &str) -> Result<Self> {
-        let roots: Self = serde_json::from_str(payload)
-            .context("dsh_skill_roots_invalid")?;
+        let roots: Self = serde_json::from_str(payload).context("dsh_skill_roots_invalid")?;
         roots.validate()?;
         Ok(roots)
     }
@@ -347,22 +349,15 @@ impl FrozenSkillRoots {
         );
         anyhow::ensure!(self.custom_skill_dirs.len() <= 1, "dsh_skill_roots_invalid");
         for root in &self.custom_skill_dirs {
-            anyhow::ensure!(
-                Path::new(root).is_absolute(),
-                "dsh_skill_roots_invalid"
-            );
+            anyhow::ensure!(Path::new(root).is_absolute(), "dsh_skill_roots_invalid");
         }
         match self.identity_digest.as_deref() {
-            None => anyhow::ensure!(
-                self.custom_skill_dirs.is_empty(),
-                "dsh_skill_roots_invalid"
-            ),
+            None => anyhow::ensure!(self.custom_skill_dirs.is_empty(), "dsh_skill_roots_invalid"),
             Some(digest) => anyhow::ensure!(
                 !self.custom_skill_dirs.is_empty()
                     && digest.len() == 64
-                    && digest
-                        .chars()
-                        .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase()),
+                    && digest.chars().all(|character| character.is_ascii_hexdigit()
+                        && !character.is_ascii_uppercase()),
                 "dsh_skill_roots_invalid"
             ),
         }
@@ -420,8 +415,8 @@ pub fn resolve_frozen_skill_roots(
         "dsh_skill_material_content_invalid"
     );
     let manifest_path = run_root.join(SKILL_MATERIAL_MANIFEST);
-    let manifest_metadata = fs::symlink_metadata(&manifest_path)
-        .context("dsh_skill_material_manifest_missing")?;
+    let manifest_metadata =
+        fs::symlink_metadata(&manifest_path).context("dsh_skill_material_manifest_missing")?;
     anyhow::ensure!(
         manifest_metadata.is_file()
             && !manifest_metadata.file_type().is_symlink()
@@ -461,9 +456,7 @@ pub fn configure_skill_roots(root: &Path, bootstrap: Option<&str>) -> Result<()>
     let roots = FrozenSkillRoots::decode(payload)?;
     let path = root.join("rovai.patch.json");
     let mut patches: Value = serde_json::from_slice(&fs::read(&path)?)?;
-    let patches = patches
-        .as_array_mut()
-        .context("dsh_skill_patch_invalid")?;
+    let patches = patches.as_array_mut().context("dsh_skill_patch_invalid")?;
     anyhow::ensure!(
         !patches
             .iter()
@@ -763,7 +756,7 @@ fn local_hook_executor_configuration(launch_path: &Path, launch_bytes: &[u8]) ->
     let expected = &candidate["dshHookExecutor"];
     let manifest_digest = format!("{:x}", Sha256::digest(&bytes));
     anyhow::ensure!(
-        expected["dshVersion"] == MINIMUM_VERSION
+        expected["dshVersion"] == LOCAL_HOOK_DSH_VERSION
             && expected["manifestSha256"] == manifest_digest
             && candidate["files"]["runtime/dsh-hook-executor/hook-executor-bundle.json"]
                 == manifest_digest
@@ -780,7 +773,7 @@ fn local_hook_executor_configuration(launch_path: &Path, launch_bytes: &[u8]) ->
             && manifest["kind"] == "loom-local-hook-executor"
             && manifest["platform"] == "win32"
             && manifest["arch"] == "x64"
-            && manifest["dshVersion"] == MINIMUM_VERSION
+            && manifest["dshVersion"] == LOCAL_HOOK_DSH_VERSION
             && manifest["closureComplete"] == true
             && manifest["entry"] == "executor.mjs",
         "local_hook_bundle_manifest_invalid"
@@ -1156,23 +1149,27 @@ mod tests {
     }
 
     #[test]
-    fn dsh_version_requires_the_first_acp_release() {
+    fn dsh_version_requires_the_embedded_runtime_release() {
         for value in [
             None,
             Some("0.1.0-rc.5"),
-            Some("0.1.5-rc.1"),
-            Some("0.1.5-beta.8"),
+            Some("0.1.5-rc.2"),
+            Some("0.1.5"),
+            Some("0.1.9"),
+            Some("0.2.0-rc.1"),
+            Some("0.2.0-beta.8"),
             Some("0.0.1"),
             Some("invalid"),
         ] {
             assert!(!supported_version(value), "{value:?}");
         }
         for value in [
-            "0.1.5-rc.2",
-            "0.1.5-rc.10",
-            "0.1.5-rc.2+build.1",
-            "0.1.5",
-            "0.1.6",
+            "0.2.0-rc.2",
+            "0.2.0-rc.10",
+            "0.2.0-rc.2+build.1",
+            "0.2.0",
+            "0.2.1",
+            "0.3.0-beta.1",
         ] {
             assert!(supported_version(Some(value)), "{value}");
         }

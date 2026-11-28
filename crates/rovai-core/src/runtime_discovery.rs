@@ -621,11 +621,12 @@ impl RuntimeSearchEnvironment {
         manual_candidates: impl IntoIterator<Item = PathBuf>,
         override_path: Option<PathBuf>,
     ) -> Vec<RuntimeExecutableCandidate> {
-        self.candidates_with_override_and_embedded_pi(
+        self.candidates_with_override_and_embedded_runtimes(
             kind,
             manual_candidates,
             override_path,
             env::var_os(crate::embedded_pi::EMBEDDED_PI_ROOT_ENV).as_deref(),
+            env::var_os(crate::embedded_dsh::EMBEDDED_DSH_ROOT_ENV).as_deref(),
         )
     }
 
@@ -635,6 +636,23 @@ impl RuntimeSearchEnvironment {
         manual_candidates: impl IntoIterator<Item = PathBuf>,
         override_path: Option<PathBuf>,
         embedded_pi_root: Option<&OsStr>,
+    ) -> Vec<RuntimeExecutableCandidate> {
+        self.candidates_with_override_and_embedded_runtimes(
+            kind,
+            manual_candidates,
+            override_path,
+            embedded_pi_root,
+            env::var_os(crate::embedded_dsh::EMBEDDED_DSH_ROOT_ENV).as_deref(),
+        )
+    }
+
+    fn candidates_with_override_and_embedded_runtimes(
+        &self,
+        kind: AdapterKind,
+        manual_candidates: impl IntoIterator<Item = PathBuf>,
+        override_path: Option<PathBuf>,
+        embedded_pi_root: Option<&OsStr>,
+        embedded_dsh_root: Option<&OsStr>,
     ) -> Vec<RuntimeExecutableCandidate> {
         let mut candidates = Vec::new();
         let manual_candidates = manual_candidates.into_iter().collect::<Vec<_>>();
@@ -678,6 +696,15 @@ impl RuntimeSearchEnvironment {
             ExplicitEmbeddedPiLead::Unset => {}
             ExplicitEmbeddedPiLead::Refused => return Vec::new(),
             ExplicitEmbeddedPiLead::Lead(candidate) => candidates.push(candidate),
+        }
+        // The embedded DSH runtime follows the same explicit-selection rule:
+        // a verified package leads so a saved PATH entry or a stale system
+        // install cannot displace it, while a configured root that no longer
+        // verifies refuses every candidate. Native DSH remains behind it.
+        match explicit_embedded_dsh_lead(kind, embedded_dsh_root, &self.executable_suffixes) {
+            ExplicitEmbeddedDshLead::Unset => {}
+            ExplicitEmbeddedDshLead::Refused => return Vec::new(),
+            ExplicitEmbeddedDshLead::Lead(candidate) => candidates.push(candidate),
         }
         #[cfg(windows)]
         {
@@ -1142,6 +1169,7 @@ pub fn discover_runtime_entry_from_candidates(
                 missing_diagnostic_code(
                     kind,
                     env::var_os(crate::embedded_pi::EMBEDDED_PI_ROOT_ENV).as_deref(),
+                    env::var_os(crate::embedded_dsh::EMBEDDED_DSH_ROOT_ENV).as_deref(),
                 )
                 .to_string(),
             ),
@@ -1151,11 +1179,18 @@ pub fn discover_runtime_entry_from_candidates(
     )
 }
 
-/// A configured-but-refused packaged Pi root must be attributable: reporting a
-/// generic `runtime_not_found` would hide an operator configuration error.
-fn missing_diagnostic_code(kind: AdapterKind, embedded_pi_root: Option<&OsStr>) -> &'static str {
+/// A configured-but-refused packaged runtime root must be attributable:
+/// reporting a generic `runtime_not_found` would hide an operator configuration
+/// error.
+fn missing_diagnostic_code(
+    kind: AdapterKind,
+    embedded_pi_root: Option<&OsStr>,
+    embedded_dsh_root: Option<&OsStr>,
+) -> &'static str {
     if explicit_embedded_pi_refused(kind, embedded_pi_root) {
         "runtime_embedded_pi_override_refused"
+    } else if explicit_embedded_dsh_refused(kind, embedded_dsh_root) {
+        "runtime_embedded_dsh_override_refused"
     } else {
         "runtime_not_found"
     }
@@ -1206,6 +1241,54 @@ fn explicit_embedded_pi_refused(kind: AdapterKind, embedded_pi_root: Option<&OsS
         && matches!(
             crate::embedded_pi::explicit_embedded_pi(embedded_pi_root),
             crate::embedded_pi::ExplicitEmbeddedPi::Refused(_)
+        )
+}
+
+/// How an explicit packaged DSH bundle participates in candidate order.
+enum ExplicitEmbeddedDshLead {
+    Unset,
+    Lead(RuntimeExecutableCandidate),
+    Refused,
+}
+
+fn explicit_embedded_dsh_lead(
+    kind: AdapterKind,
+    embedded_dsh_root: Option<&OsStr>,
+    executable_suffixes: &[OsString],
+) -> ExplicitEmbeddedDshLead {
+    if kind != AdapterKind::DeepseekHarness {
+        return ExplicitEmbeddedDshLead::Unset;
+    }
+    match crate::embedded_dsh::explicit_embedded_dsh(embedded_dsh_root) {
+        crate::embedded_dsh::ExplicitEmbeddedDsh::Unset => ExplicitEmbeddedDshLead::Unset,
+        crate::embedded_dsh::ExplicitEmbeddedDsh::Refused(_) => ExplicitEmbeddedDshLead::Refused,
+        crate::embedded_dsh::ExplicitEmbeddedDsh::Verified(bundle) => {
+            // The launcher comes from the verified manifest, never from the
+            // caller's spelling of the root.
+            if !is_runtime_entrypoint_file(&bundle.launcher) {
+                return ExplicitEmbeddedDshLead::Refused;
+            }
+            let mut candidates = Vec::new();
+            push_candidate_for_kind(
+                &mut candidates,
+                bundle.launcher,
+                InstallationSource::Env,
+                None,
+                kind,
+            );
+            match candidates.into_iter().next() {
+                Some(candidate) => ExplicitEmbeddedDshLead::Lead(candidate),
+                None => ExplicitEmbeddedDshLead::Refused,
+            }
+        }
+    }
+}
+
+fn explicit_embedded_dsh_refused(kind: AdapterKind, embedded_dsh_root: Option<&OsStr>) -> bool {
+    kind == AdapterKind::DeepseekHarness
+        && matches!(
+            crate::embedded_dsh::explicit_embedded_dsh(embedded_dsh_root),
+            crate::embedded_dsh::ExplicitEmbeddedDsh::Refused(_)
         )
 }
 
@@ -2262,7 +2345,11 @@ mod tests {
         );
         assert_eq!(candidates[0].path, launcher);
         assert_eq!(candidates[0].source, InstallationSource::Env);
-        assert!(candidates.iter().any(|candidate| candidate.path == native_pi));
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.path == native_pi)
+        );
 
         // A previously saved PATH-derived entry passed as a manual hint cannot
         // displace the explicit package.
@@ -2290,15 +2377,15 @@ mod tests {
 
         // The refusal is attributable instead of a generic not-found.
         assert_eq!(
-            missing_diagnostic_code(AdapterKind::Pi, Some(refused_root.as_os_str())),
+            missing_diagnostic_code(AdapterKind::Pi, Some(refused_root.as_os_str()), None),
             "runtime_embedded_pi_override_refused"
         );
         assert_eq!(
-            missing_diagnostic_code(AdapterKind::Pi, None),
+            missing_diagnostic_code(AdapterKind::Pi, None, None),
             "runtime_not_found"
         );
         assert_eq!(
-            missing_diagnostic_code(AdapterKind::CodexCli, Some(refused_root.as_os_str())),
+            missing_diagnostic_code(AdapterKind::CodexCli, Some(refused_root.as_os_str()), None),
             "runtime_not_found"
         );
 
@@ -2306,6 +2393,113 @@ mod tests {
         let candidates = search.candidates_with_override_and_embedded_pi(
             AdapterKind::CodexCli,
             std::iter::empty(),
+            None,
+            Some(bundle_root.as_os_str()),
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.source != InstallationSource::Env)
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_explicit_embedded_dsh_leads_and_refusal_yields_no_candidates() {
+        let root = env::temp_dir().join(format!("rovai-explicit-embedded-dsh-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let bundle_root = root.join("bundle");
+        fs::create_dir_all(&bundle_root).unwrap();
+        let launcher = crate::embedded_dsh::write_verified_test_bundle(&bundle_root);
+
+        // A native DSH earlier in the search path would otherwise win.
+        let native = root.join("native");
+        fs::create_dir_all(&native).unwrap();
+        executable(&native.join("dsh"), "#!/bin/sh\nprintf '0.2.0-rc.2\\n'\n");
+        let native_dsh = native.join("dsh").canonicalize().unwrap();
+        let search = test_search(vec![SearchPathEntry {
+            path: native.clone(),
+            sources: vec![SearchPathSource::InheritedPath],
+        }]);
+
+        // No explicit root: existing source priority and native behavior.
+        let candidates = search.candidates_with_override_and_embedded_runtimes(
+            AdapterKind::DeepseekHarness,
+            std::iter::empty(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, native_dsh);
+        assert_eq!(candidates[0].source, InstallationSource::InheritedPath);
+
+        // Verified explicit bundle leads, and native DSH stays available behind it.
+        let candidates = search.candidates_with_override_and_embedded_runtimes(
+            AdapterKind::DeepseekHarness,
+            std::iter::empty(),
+            None,
+            None,
+            Some(bundle_root.as_os_str()),
+        );
+        assert_eq!(candidates[0].path, launcher);
+        assert_eq!(candidates[0].source, InstallationSource::Env);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.path == native_dsh)
+        );
+
+        // A previously saved PATH-derived entry passed as a manual hint cannot
+        // displace the explicit package.
+        let candidates = search.candidates_with_override_and_embedded_runtimes(
+            AdapterKind::DeepseekHarness,
+            [native.join("dsh")],
+            None,
+            None,
+            Some(bundle_root.as_os_str()),
+        );
+        assert_eq!(candidates[0].path, launcher);
+
+        // A configured root that no longer verifies yields no candidates at all,
+        // so no unverified command is silently selected.
+        let refused_root = root.join("tampered");
+        fs::create_dir_all(&refused_root).unwrap();
+        crate::embedded_dsh::write_verified_test_bundle(&refused_root);
+        fs::write(refused_root.join("node").join("node"), b"tampered").unwrap();
+        let candidates = search.candidates_with_override_and_embedded_runtimes(
+            AdapterKind::DeepseekHarness,
+            std::iter::empty(),
+            None,
+            None,
+            Some(refused_root.as_os_str()),
+        );
+        assert!(candidates.is_empty());
+
+        // The refusal is attributable instead of a generic not-found.
+        assert_eq!(
+            missing_diagnostic_code(
+                AdapterKind::DeepseekHarness,
+                None,
+                Some(refused_root.as_os_str())
+            ),
+            "runtime_embedded_dsh_override_refused"
+        );
+        assert_eq!(
+            missing_diagnostic_code(AdapterKind::DeepseekHarness, None, None),
+            "runtime_not_found"
+        );
+        assert_eq!(
+            missing_diagnostic_code(AdapterKind::Pi, None, Some(refused_root.as_os_str())),
+            "runtime_not_found"
+        );
+
+        // No other Runtime gains an embedded DSH candidate.
+        let candidates = search.candidates_with_override_and_embedded_runtimes(
+            AdapterKind::CodexCli,
+            std::iter::empty(),
+            None,
             None,
             Some(bundle_root.as_os_str()),
         );

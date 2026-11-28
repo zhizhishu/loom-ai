@@ -10,6 +10,9 @@ on:
       - 'crates/loom-node/**'
       - 'crates/loom-pi-launcher/**'
       - 'resources/computer/**'
+      - 'resources/dsh-runtime/**'
+      - 'scripts/package-dsh-runtime.mjs'
+      - 'scripts/lib/dsh-runtime-package.test.mjs'
       - 'scripts/package-linux-personal.mjs'
       - 'scripts/package-computer-runtime-linux.mjs'
       - 'scripts/package-office-runtime-linux.sh'
@@ -64,7 +67,7 @@ jobs:
       - name: Install locked dependencies
         run: pnpm install --frozen-lockfile
       - name: Verify Linux personal packaging contract
-        run: node --test scripts/lib/linux-personal.test.mjs
+        run: node --test scripts/lib/linux-personal.test.mjs scripts/lib/dsh-runtime-package.test.mjs
       - name: Install poppler tools for bundled office preview
         run: |
           sudo apt-get update
@@ -142,12 +145,19 @@ jobs:
           rm -rf resources/runtime/computer-linux
           node scripts/package-computer-runtime-linux.mjs --destination resources/runtime/computer-linux
           node scripts/package-computer-runtime-linux.mjs --verify --destination resources/runtime/computer-linux
+      - name: Stage and verify the self-contained Linux DSH runtime
+        run: |
+          rm -rf resources/runtime/dsh
+          node scripts/package-dsh-runtime.mjs --destination resources/runtime/dsh
+          node scripts/package-dsh-runtime.mjs --verify --destination resources/runtime/dsh
+          resources/runtime/dsh/dsh --version | grep -qx '0.2.0-rc.2'
       - name: Assemble Linux personal package
         run: |
           mkdir -p out/linux-personal
           node scripts/package-linux-personal.mjs \
             --server-dir out/server/linux-x64 \
             --pi-dir resources/runtime/pi \
+            --dsh-dir resources/runtime/dsh \
             --computer-dir resources/runtime/computer-linux \
             --office-dir resources/runtime/office-linux \
             --pi-purge-file _artifacts/reference-repos/pi-purge-current/extensions/pi-purge.ts \
@@ -191,6 +201,11 @@ jobs:
           grep -q 'LOOM_COMPUTER_HELPER=' out/linux-personal-verify/loom-personal-linux-x64/Manage-Loom.sh
           grep -q 'LOOM_COMPUTER_AGENT_PYTHON=' out/linux-personal-verify/loom-personal-linux-x64/Manage-Loom.sh
           grep -q 'LOOM_COMPUTER_AGENT_BRIDGE=' out/linux-personal-verify/loom-personal-linux-x64/Manage-Loom.sh
+          grep -q 'ROVAI_EMBEDDED_DSH_ROOT' out/linux-personal-verify/loom-personal-linux-x64/Manage-Loom.sh
+          test -x out/linux-personal-verify/loom-personal-linux-x64/runtime/dsh/dsh
+          test -f out/linux-personal-verify/loom-personal-linux-x64/runtime/dsh/dsh-runtime-bundle.json
+          test -x out/linux-personal-verify/loom-personal-linux-x64/runtime/dsh/node/node
+          test "$(out/linux-personal-verify/loom-personal-linux-x64/runtime/dsh/dsh --version)" = '0.2.0-rc.2'
           test -x out/linux-personal-verify/loom-personal-linux-x64/runtime/computer/python
           test -f out/linux-personal-verify/loom-personal-linux-x64/runtime/computer/host_desktop.py
           test -f out/linux-personal-verify/loom-personal-linux-x64/runtime/computer/mcp_bridge.py
