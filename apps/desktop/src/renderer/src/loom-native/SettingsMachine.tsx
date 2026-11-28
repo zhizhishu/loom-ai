@@ -12,6 +12,7 @@ import { RuntimeConnectionSettings } from './RuntimeConnectionSettings'
 import { sourceStateLabel, sourceExplanation } from './native-source-presentation'
 import { hostFeatureError, type NativeCapability, type NativeCatalog, type NativeKind, type NativePreview } from './host-services'
 import { WorkspaceManager } from './WorkspaceManager'
+import { runtimeLogoFor } from './runtime-logo'
 
 /** The four engines LOOM drives, in the order the rail and the wizard list them. */
 export const RUNTIMES = [{ value: 'claude-code-cli', label: 'Claude Code', mark: 'C' }, { value: 'codex-cli', label: 'Codex', mark: '▧' }, { value: 'deepseek-harness', label: 'DSH', mark: 'D' }, { value: 'pi', label: 'Pi', mark: 'π' }] as const
@@ -96,7 +97,7 @@ export function RuntimeSection({ environment, theme, threadId, onChanged, onConn
       const ready = card?.setupState === 'verified'
       const resources = catalog?.items.filter(row => row.runtime === entry.value).length
       return <article className={`ln-runtime-card${ready ? ' is-ready' : ''}`} key={entry.value}>
-        <div className="ln-runtime-card-top"><span className={`ln-runtime-mark is-${entry.value}`}>{entry.mark}</span><div><h3>{entry.label}</h3><span className="ln-runtime-state">{loading && !card ? '正在读取…' : card ? STATUS[card.setupState] : detected ? '已发现 · 待检查' : '尚未确认'}</span></div>{ready && <Icon name="check" size={17}/>}</div>
+        <div className="ln-runtime-card-top"><span className={`ln-runtime-mark is-${entry.value}`}>{runtimeLogoFor(entry.value)?<img className="ln-runtime-mark-logo" src={runtimeLogoFor(entry.value)!} alt="" aria-hidden="true" draggable={false}/>:entry.mark}</span><div><h3>{entry.label}</h3><span className="ln-runtime-state">{loading && !card ? '正在读取…' : card ? STATUS[card.setupState] : detected ? '已发现 · 待检查' : '尚未确认'}</span></div>{ready && <Icon name="check" size={17}/>}</div>
         <p>{entry.value === 'pi' ? '可使用内置 Pi，也保留原生 Pi 接入。' : '使用当前主机的原生客户端，不修改全局模型设置。'}</p>
         <div className="ln-runtime-facts"><span>版本 <b>{card?.reportedVersion || '尚未核验'}</b></span><span>模型 <b>{card?.modelCatalog.modelCount ?? '—'}</b></span><span>能力 <b>{resources ?? '—'}</b></span></div>
         <details className="ln-native-source"><summary>安装与检查详情</summary><p>{card?.discovery.executablePath || program?.executablePath || '暂无可确认的程序路径'}</p><p>{card?.check.failure?.summary || card?.discovery.diagnosticCode || '发现到程序并不代表账号、模型和执行权限已经就绪。'}</p></details>

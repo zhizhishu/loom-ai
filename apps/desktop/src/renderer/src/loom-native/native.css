@@ -41,10 +41,11 @@
 .ln-row-copy{display:flex;flex-direction:column;min-width:0;flex:1;gap:2px}.ln-row-copy strong{font-size:14px;line-height:19px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ln-row-copy>span{font-size:13px;line-height:18px;color:#646464;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .ln-app[data-theme=night] .ln-row-copy>span{color:var(--ln-muted)}
 .ln-unread-dot{width:7px;height:7px;flex:0 0 7px;border-radius:50%;background:var(--ln-blue);position:absolute;right:9px;top:24px}.ln-conversation-row:has(.ln-unread-dot){padding-right:24px!important}
-.ln-avatar{display:inline-flex;align-items:center;justify-content:center;flex:0 0 var(--ln-avatar-size);width:var(--ln-avatar-size);height:var(--ln-avatar-size);vertical-align:middle;isolation:isolate}
+.ln-avatar{position:relative;display:inline-flex;align-items:center;justify-content:center;flex:0 0 var(--ln-avatar-size);width:var(--ln-avatar-size);height:var(--ln-avatar-size);vertical-align:middle;isolation:isolate}
 .ln-avatar .member-avatar{width:100%;height:100%;min-width:0;display:inline-flex;align-items:center;justify-content:center;border:0;background:none;padding:0;box-shadow:none;border-radius:0;overflow:visible}
 .ln-avatar .open-bot-avatar,.ln-avatar .member-avatar-bot,.ln-avatar .open-bot-avatar canvas,.ln-avatar .open-bot-avatar svg{display:block;width:100%;height:100%;background:none}.ln-avatar .member-avatar-image{display:block;width:100%;height:100%;object-fit:cover;border-radius:30%}
 .ln-avatar-fallback,.ln-avatar .member-avatar-fallback{width:100%;height:100%;display:flex;align-items:center;justify-content:center;border-radius:50%;background:#252525;color:#fff;font-size:calc(var(--ln-avatar-size)*.39);font-weight:600}
+.ln-avatar-runtime{position:absolute;inset:0;width:100%;height:100%;padding:calc(var(--ln-avatar-size)*.16);box-sizing:border-box;object-fit:contain;background:var(--ln-bg);border-radius:30%;pointer-events:none}
 .ln-conversation{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0;position:relative;background:var(--ln-bg);overflow:hidden}
 .ln-chat-header{position:relative;display:flex;align-items:center;justify-content:center;height:60px;flex:0 0 60px;padding:0 56px;z-index:3}
 .ln-identity-pill{display:inline-flex;align-items:center;gap:7px;padding:4px 13px 4px 7px!important;max-width:min(100%,340px);height:36px;min-height:36px;border-radius:22px!important;background:var(--ln-bg)!important;box-shadow:0 1px 4px #00000023!important;border:1px solid #00000005!important;white-space:nowrap}
