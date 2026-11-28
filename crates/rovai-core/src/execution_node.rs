@@ -780,7 +780,7 @@ impl NodeStore {
              FROM mission_workspace w
              JOIN execution_node n ON n.node_id = w.execution_host_id
              WHERE {clause} AND w.state='ready' AND n.revoked_at IS NULL
-             ORDER BY w.created_at DESC LIMIT 1"
+             ORDER BY CASE WHEN n.role='remote' THEN 0 ELSE 1 END, w.created_at DESC LIMIT 1"
         );
         connection
             .query_row(
@@ -1712,6 +1712,98 @@ mod tests {
                 .workspace_by_mission_and_host("mission_a", "node_b")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// One Mission with a ready row on the local node and one on a remote node
+    /// must answer the remote row even when the local row is newer: a scoped
+    /// lookup reads through whichever execution root actually holds the work.
+    #[test]
+    fn a_ready_remote_row_outranks_a_newer_local_row() {
+        let store = NodeStore::open_ephemeral().unwrap();
+        let now = now_stamp();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO execution_node(
+                    node_id, display_name, role, os, arch, token_digest, paired_at, revoked_at, last_heartbeat
+                 ) VALUES('host', '本机', 'local', NULL, NULL, NULL, ?1, NULL, NULL)",
+                [&now],
+            )
+            .unwrap();
+        store
+            .insert_remote("node_b", "desk-b", &"ab".repeat(32))
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE mission_workspace (
+                    id TEXT PRIMARY KEY NOT NULL, mission_id TEXT NOT NULL, camp_id TEXT NOT NULL,
+                    execution_host_id TEXT NOT NULL, source_directory TEXT NOT NULL,
+                    repository_root TEXT NOT NULL, git_common_dir TEXT NOT NULL,
+                    worktree_path TEXT NOT NULL, working_directory TEXT NOT NULL, base_branch TEXT,
+                    branch TEXT NOT NULL, base_sha TEXT NOT NULL, preparation_token TEXT NOT NULL,
+                    preparation_kind TEXT NOT NULL, generation INTEGER NOT NULL, state TEXT NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    UNIQUE(mission_id,execution_host_id,git_common_dir))",
+            )
+            .unwrap();
+        let row = |id: &str, host: &str, sha: &str| WorkspaceRecord {
+            id: id.into(),
+            mission_id: "mission_a".into(),
+            camp_id: "camp_a".into(),
+            execution_host_id: host.into(),
+            source_directory: "/srv/source".into(),
+            repository_root: "/srv/source".into(),
+            git_common_dir: format!("/srv/source/{id}"),
+            worktree_path: format!("/srv/worktree-{id}"),
+            branch: "loom/mission_a".into(),
+            base_sha: sha.into(),
+            owner_name: String::new(),
+            owner_role: String::new(),
+            last_heartbeat: None,
+        };
+        store
+            .save_workspace(&row("ws_remote", "node_b", "remote"))
+            .unwrap();
+        store.save_workspace(&row("ws_local", "host", "local")).unwrap();
+        // The local row is the newest, so only the remote preference can pick it.
+        for (id, created_at) in [
+            ("ws_remote", "2026-01-01T00:00:01Z"),
+            ("ws_local", "2026-01-01T00:00:02Z"),
+        ] {
+            store
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE mission_workspace SET created_at=?1 WHERE id=?2",
+                    rusqlite::params![created_at, id],
+                )
+                .unwrap();
+        }
+        let mission = store.workspace_by_mission("mission_a").unwrap().unwrap();
+        assert_eq!(mission.id, "ws_remote");
+        assert_eq!(mission.owner_role, "remote");
+        assert_eq!(mission.base_sha, "remote");
+        assert_eq!(
+            store.workspace_by_camp("camp_a").unwrap().unwrap().id,
+            "ws_remote"
+        );
+        // With no remote row left the local one answers exactly as before.
+        store
+            .lock()
+            .unwrap()
+            .execute("UPDATE mission_workspace SET state='cleanup_pending' WHERE id='ws_remote'", [])
+            .unwrap();
+        assert_eq!(
+            store.workspace_by_mission("mission_a").unwrap().unwrap().id,
+            "ws_local"
+        );
+        assert_eq!(
+            store.workspace_by_camp("camp_a").unwrap().unwrap().id,
+            "ws_local"
         );
     }
 
