@@ -482,7 +482,7 @@
           "offset": {
             "type": "integer",
             "minimum": 0,
-            "maximum": 18446744073709552000,
+            "maximum": 18446744073709551615,
             "default": 0
           },
           "maxBytes": {
