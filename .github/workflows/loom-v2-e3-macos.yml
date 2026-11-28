@@ -1,0 +1,237 @@
+# Candidate-only macOS Node kit. One native runner builds the four-file kit,
+# uploads it, then proves pairing, offline presence, and reconnect on one nodeId.
+name: LOOM V2 macOS standalone Node kit
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'scripts/node/Connect-LoomNode-macOS.sh'
+      - 'scripts/node/README-macos.md'
+      - '.github/workflows/loom-v2-e3-macos.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: loom-v2-e3-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos-node-kit:
+    name: LOOM macOS arm64 standalone Node kit
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CI: true
+      LOOM_SOURCE_COMMIT: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.LOOM_SOURCE_COMMIT }}
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          rustup default 1.97.1
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: macos-node-kit-e3
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.14.1
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.20.0
+          run_install: false
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build native macOS Server package
+        run: node scripts/build-server.mjs --debug
+      - name: Build the LOOM Node binary
+        run: cargo +1.97.1 build --locked -p loom-node --bins
+      - name: Package the standalone macOS Node kit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(/bin/bash -c 'printf %s "${BASH_VERSINFO[0]}"')" -eq 3
+          /bin/bash -n scripts/node/Connect-LoomNode-macOS.sh
+          staging="$RUNNER_TEMP/loom-node-kit"
+          if [ -e "$staging" ]; then
+            echo "Refusing to replace an existing Node kit staging directory: $staging"
+            exit 1
+          fi
+          mkdir -p "$staging"
+          cp target/debug/loom-node "$staging/loom-node"
+          cp target/debug/rovai "$staging/rovai"
+          cp scripts/node/Connect-LoomNode-macOS.sh "$staging/Connect-LoomNode.sh"
+          cp scripts/node/README-macos.md "$staging/README.md"
+          chmod +x "$staging/loom-node" "$staging/rovai" "$staging/Connect-LoomNode.sh"
+          test "$(ls -A "$staging" | wc -l | tr -d ' ')" -eq 4
+          mkdir -p out
+          archive="out/loom-node-macos-${LOOM_SOURCE_COMMIT}.tar.gz"
+          rm -f "$archive"
+          tar -czf "$archive" -C "$staging" .
+          test -f "$archive"
+          listing=$(tar -tzf "$archive")
+          printf '%s\n' "$listing"
+          test "$(printf '%s\n' "$listing" | grep -c '/[^/]')" -eq 4
+          shasum -a 256 "$archive"
+      - name: Upload the standalone macOS Node kit
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: loom-node-macos-${{ env.LOOM_SOURCE_COMMIT }}
+          path: out/loom-node-macos-${{ env.LOOM_SOURCE_COMMIT }}.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+      - name: 'Runner smoke: pair, online, kill offline, reconnect same nodeId'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRV_BIN="$PWD/out/server/macos-arm64/rovai-server"
+          test -x "$SRV_BIN"
+          SRV="$RUNNER_TEMP/loom-smoke"
+          SRV_DATA="$SRV/server"
+          NODE_DATA="$SRV/node"
+          KIT="$RUNNER_TEMP/loom-node-kit"
+          SRV_PID=''
+          trap 'pkill -f "loom-node --data-dir $NODE_DATA" || true; if [ -n "$SRV_PID" ]; then kill "$SRV_PID" 2>/dev/null || true; fi' EXIT
+          rm -rf "$SRV"
+          mkdir -p "$SRV_DATA" "$NODE_DATA"
+
+          # One parser for every observation: only remote nodes matter here.
+          remote_state() {
+            "$SRV_BIN" --data-dir "$SRV_DATA" node-list | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const j=JSON.parse(d);const r=(j.nodes||[]).filter(n=>n.role==="remote");console.log(r.length+" "+r.map(n=>n.nodeId+"="+n.status).join(","))})'
+          }
+
+          "$SRV_BIN" --data-dir "$SRV_DATA" --listen 127.0.0.1:18767 >"$SRV/server.log" 2>&1 &
+          SRV_PID=$!
+          ready=0
+          for _ in $(seq 1 60); do
+            if "$SRV_BIN" --data-dir "$SRV_DATA" node-list >"$SRV/list.json" 2>"$SRV/list.err"; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "$SRV_PID" 2>/dev/null; then
+              cat "$SRV/server.log"
+              echo 'Server exited before answering node-list'
+              exit 1
+            fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then
+            cat "$SRV/server.log"
+            echo 'Server did not answer node-list within 120s'
+            exit 1
+          fi
+
+          baseline=$(remote_state)
+          test "${baseline%% *}" -eq 0
+          printf 'baseline remote nodes: %s\n' "$baseline"
+
+          pair_code=$("$SRV_BIN" --data-dir "$SRV_DATA" node-pair 2>"$SRV/pair.err")
+          test -n "$pair_code"
+          connect=$(sed -n 's/^connect: //p' "$SRV/pair.err" | head -n 1)
+          test -n "$connect"
+          case "$connect" in
+            */api/v1/nodes/connect) ;;
+            *)
+              echo 'node-pair did not print an outbound connect URL'
+              exit 1
+              ;;
+          esac
+          sed -n '1,2p' "$SRV/pair.err"
+
+          printf '%s\n' "$pair_code" | "$KIT/Connect-LoomNode.sh" -s "$connect" -d "$NODE_DATA" >"$SRV/node1.log" 2>&1 &
+          PAIR_RUN_PID=$!
+          unset pair_code
+
+          paired=0
+          for _ in $(seq 1 60); do
+            if [ -f "$NODE_DATA/node.json" ]; then
+              paired=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$paired" -ne 1 ]; then
+            cat "$SRV/node1.log"
+            echo 'loom-node did not write node.json'
+            exit 1
+          fi
+
+          NODE_ID=''
+          online=0
+          for _ in $(seq 1 80); do
+            state=$(remote_state)
+            if [ "${state%% *}" -eq 1 ]; then
+              entry=${state#* }
+              case "$entry" in
+                *=online)
+                  NODE_ID=${entry%%=*}
+                  online=1
+                  break
+                  ;;
+              esac
+            fi
+            sleep 3
+          done
+          if [ "$online" -ne 1 ]; then
+            remote_state || true
+            cat "$SRV/node1.log"
+            echo 'paired node did not report online'
+            exit 1
+          fi
+          printf 'pair online: %s\n' "$state"
+
+          NODE_PIDS=$(pgrep -f "loom-node --data-dir $NODE_DATA" || true)
+          NODE_COUNT=$(printf '%s\n' "$NODE_PIDS" | grep -c . || true)
+          if [ "$NODE_COUNT" -ne 1 ]; then
+            echo "Expected exactly one loom-node process, found $NODE_COUNT"
+            exit 1
+          fi
+          kill "$NODE_PIDS"
+          wait "$PAIR_RUN_PID" || true
+
+          offline=0
+          for _ in $(seq 1 40); do
+            state=$(remote_state)
+            case "$state" in
+              "1 $NODE_ID=offline")
+                offline=1
+                break
+                ;;
+            esac
+            sleep 3
+          done
+          if [ "$offline" -ne 1 ]; then
+            remote_state || true
+            echo "node $NODE_ID did not turn offline"
+            exit 1
+          fi
+
+          "$KIT/Connect-LoomNode.sh" -s "$connect" -d "$NODE_DATA" >"$SRV/node2.log" 2>&1 &
+          back=0
+          for _ in $(seq 1 80); do
+            state=$(remote_state)
+            case "$state" in
+              "1 $NODE_ID=online")
+                back=1
+                break
+                ;;
+            esac
+            sleep 3
+          done
+          if [ "$back" -ne 1 ]; then
+            remote_state || true
+            cat "$SRV/node2.log"
+            echo "reconnect did not restore node $NODE_ID online"
+            exit 1
+          fi
+
+          printf 'SMOKE PASS nodeId=%s pair=online kill=offline reconnect=same-nodeId-online\n' "$NODE_ID"
