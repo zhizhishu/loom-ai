@@ -2026,13 +2026,43 @@ async fn cleanup_mcp(mcp: &Arc<dyn McpOps>, grant: &Grant) -> Result<(), &'stati
 /// keeps showing it and `retire_due` retries it. Forgetting it would erase the only record
 /// of a server that may still exist.
 async fn try_retire(state: &WebState, grant: &Arc<Grant>) -> Result<(), &'static str> {
-    match retire(&grant.target, &state.agents.mcp, grant).await {
+    try_retire_on(&grant.target, &state.agents, grant).await
+}
+
+/// [`try_retire`] against the device the caller actually drove, so a node that reconnected
+/// since the consent is fenced on its current connection generation.
+async fn try_retire_on(
+    computer: &Arc<Computer>,
+    agents: &AgentGrants,
+    grant: &Arc<Grant>,
+) -> Result<(), &'static str> {
+    match retire(computer, &agents.mcp, grant).await {
         Ok(()) => {
-            state.agents.forget(&grant.digest);
+            agents.forget(&grant.digest);
             Ok(())
         }
         Err(code) => Err(code),
     }
+}
+
+/// Apply one tool failure to the grant.
+///
+/// Only an unaccounted OS outcome retires the grant. An unconfirmed input does not: the
+/// physical lease is already fenced inside [`Computer::input_guarded`], which expires the
+/// control and burns the sequence, so nothing can be replayed and nothing is left to tear
+/// down. Retiring here would also disable and delete the grant's MCP server, which takes
+/// the computer tools away from every later run in the same thread long before the grant
+/// itself expires.
+async fn settle_tool_failure(
+    computer: &Arc<Computer>,
+    agents: &AgentGrants,
+    grant: &Arc<Grant>,
+    failure: &Failure,
+) -> Result<(), &'static str> {
+    if !failure.revoke {
+        return Ok(());
+    }
+    try_retire_on(computer, agents, grant).await
 }
 
 fn run_view(grant: &Grant) -> Option<String> {
@@ -2144,6 +2174,67 @@ fn node_key(node_id: &str) -> Result<&str, &'static str> {
         return Err("computer_agent_device_unavailable");
     }
     Ok(trimmed)
+}
+
+/// The device a call must drive **now**.
+///
+/// The consent resolved one [`Computer`] at grant time, but a paired node's device is tied
+/// to one connection generation: after a reconnect the stored instance is retired and every
+/// call against it fails closed. A node grant is therefore re-bound to the node's current
+/// generation on each call, through the same registry lookup `resolve_target` used. The node
+/// id is the one recorded at consent — never one a request body could supply — and the
+/// current connection must still advertise the reviewed desktop, so this can never move a
+/// grant to another node or another machine. A node with no current generation keeps the
+/// stored instance, whose fence reports the loss instead of admitting anything.
+async fn current_target(state: &WebState, grant: &Grant) -> Result<Arc<Computer>, &'static str> {
+    let Some(node_id) = grant.node_id.as_deref() else {
+        return Ok(grant.target.clone());
+    };
+    let Ok(current) = state.node_computers.for_node(&state.nodes, node_id).await else {
+        return Ok(grant.target.clone());
+    };
+    if Arc::ptr_eq(&current, &grant.target) {
+        // The generation the consent resolved: already the reviewed device.
+        return Ok(current);
+    }
+    // A new connection generation for this node. It must still be the reviewed desktop
+    // before anything is admitted through it.
+    let seen = Arc::clone(&current);
+    let sessions = grant.sessions.clone();
+    let session = grant.session.clone();
+    let status = computer::blocking(&current, move || seen.status(&sessions, &session))
+        .await
+        .map_err(|_| "computer_agent_device_unavailable")?;
+    let advertised = status["device"]["deviceId"].as_str().unwrap_or_default();
+    scope_holds(grant, node_id, advertised)?;
+    Ok(rebind(grant, current))
+}
+
+/// Admit a resolved device for this grant.
+///
+/// The view and the control lease the grant holds belong to the instance it resolved at
+/// consent time, and a node's replacement never inherits them: the old instance was retired
+/// with them, so a grant that moves onto its node's current connection starts from a fresh
+/// lease instead of replaying ids the new connection never issued.
+fn rebind(grant: &Grant, current: Arc<Computer>) -> Arc<Computer> {
+    if !Arc::ptr_eq(&current, &grant.target) {
+        if let Ok(mut run) = grant.run.lock() {
+            *run = RunState::default();
+        }
+    }
+    current
+}
+
+/// Whether a node's current connection generation may serve this grant.
+///
+/// The consent is bound to one node and to the one desktop the user reviewed. A current
+/// generation is usable only while both still match: any other node id, or a node that came
+/// back as another machine, is refused rather than silently switched onto.
+fn scope_holds(grant: &Grant, node_id: &str, device_id: &str) -> Result<(), &'static str> {
+    if grant.node_id.as_deref() != Some(node_id) || grant.authority.device_id != device_id {
+        return Err("computer_agent_device_mismatch");
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ handlers
@@ -2686,24 +2777,31 @@ pub(crate) async fn rpc(
         Err(code) => return rpc_error(&body.request_id, code),
     }
 
-    let computer = grant.target.clone();
+    // The device this call drives now: a node grant is re-bound to its node's current
+    // connection generation, so a desktop that reconnected since the consent still serves
+    // the same grant. Nothing here can move it to another node or machine.
+    let computer = match current_target(&state, &grant).await {
+        Ok(computer) => computer,
+        Err(code) => return rpc_error(&body.request_id, code),
+    };
     let browser = state.sessions.clone();
     let agents = state.agents.clone();
     let task = grant.clone();
     let request_id = body.request_id.clone();
     let call_id = request_id.clone();
     let arguments = body.arguments.clone();
-    let permit = match grant.target.try_job() {
+    let permit = match computer.try_job() {
         Ok(permit) => permit,
         Err(code) => return rpc_error(&request_id, code),
     };
+    let worker = Arc::clone(&computer);
     let outcome = tokio::time::timeout(
         RPC_DEADLINE,
         spawn_blocking(move || {
             // Bounded admission: a burst is refused instead of flooding the pool.
             let _permit = permit;
             run_tool(
-                &computer,
+                &worker,
                 &browser,
                 Some(agents.as_ref()),
                 &task,
@@ -2729,13 +2827,15 @@ pub(crate) async fn rpc(
         // A timeout or a panicking worker leaves an OS call we cannot account for.
         Ok(Err(_)) | Err(_) => Failure::fatal("computer_agent_input_unknown"),
     };
-    if failure.revoke {
-        // Fence and forget BEFORE answering, so a queued worker cannot survive this
-        // response: the admission closure now refuses it and the session is invalidated.
-        // An unconfirmed cleanup keeps the row, and the caller is told so.
-        if try_retire(&state, &grant).await.is_err() {
-            return rpc_error(&request_id, "computer_agent_cleanup_unconfirmed");
-        }
+    // Fence and forget BEFORE answering, so a queued worker cannot survive this response:
+    // the admission closure now refuses it and the session is invalidated. An unconfirmed
+    // cleanup keeps the row, and the caller is told so; a failure that does not revoke (an
+    // unconfirmed input) leaves the grant and its MCP entry alone.
+    if settle_tool_failure(&computer, &state.agents, &grant, &failure)
+        .await
+        .is_err()
+    {
+        return rpc_error(&request_id, "computer_agent_cleanup_unconfirmed");
     }
     rpc_error(&request_id, failure.code)
 }
@@ -2792,7 +2892,10 @@ fn map_computer(code: &'static str) -> Failure {
         | "computer_view_unknown"
         | "computer_view_limit" => Failure::code("computer_agent_view_unavailable"),
         "computer_device_mismatch" => Failure::code("computer_agent_device_mismatch"),
-        "computer_input_unknown" => Failure::fatal("computer_agent_input_unknown"),
+        // An unconfirmed input is not a revocation: the physical lease was already fenced
+        // inside `Computer::input_guarded` (expired control, burnt sequence, no replay),
+        // and the grant with its MCP server stays for the next call.
+        "computer_input_unknown" => Failure::code("computer_agent_input_unknown"),
         "computer_input_not_sent" | "node_offline" => {
             Failure::code("computer_agent_node_offline")
         }
@@ -3419,6 +3522,20 @@ mod tests {
             BlockingProvider::new(entered, proceed),
             clock,
         ))
+    }
+
+    /// One device id as a node offers it: a fresh `Computer` per connection generation.
+    fn node_computer(id: &str) -> (Arc<Computer>, Arc<BlockingProvider>) {
+        let (entered, _entered_rx) = mpsc::channel();
+        let (_proceed_tx, proceed) = mpsc::channel::<()>();
+        let mut provider = BlockingProvider::new(entered, proceed);
+        Arc::get_mut(&mut provider).unwrap().device.id = id.to_owned();
+        let clock = Arc::new(AtomicU64::new(1_800_000_000_000));
+        let computer = Arc::new(Computer::with_test_provider(provider.clone(), {
+            let clock = clock.clone();
+            Arc::new(move || clock.load(Ordering::SeqCst))
+        }));
+        (computer, provider)
     }
 
     fn approval_event() -> EventBody {
@@ -4073,9 +4190,21 @@ mod tests {
         let not_sent = map_computer("computer_input_not_sent");
         assert_eq!(not_sent.code, "computer_agent_node_offline");
         assert!(!not_sent.revoke);
+        // A node that went away before the frame was queued is the same non-fatal answer.
+        assert_eq!(
+            map_computer("node_offline").code,
+            "computer_agent_node_offline"
+        );
+        assert!(!map_computer("node_offline").revoke);
         let unconfirmed = map_computer("computer_input_unknown");
         assert_eq!(unconfirmed.code, "computer_agent_input_unknown");
-        assert!(unconfirmed.revoke);
+        assert!(
+            !unconfirmed.revoke,
+            "the physical lease is fenced inside the Computer; the grant and its MCP entry stay"
+        );
+        // Only the unaccounted-OS path (a timed-out or panicking worker around the tool call)
+        // still retires the whole grant.
+        assert!(Failure::fatal("computer_agent_input_unknown").revoke);
     }
 
     #[test]
@@ -5018,6 +5147,207 @@ mod tests {
             json!("sha256:local-screen"),
             "the local screen keeps its own identity"
         );
+    }
+
+    /// An unconfirmed input is not a revocation: the grant, its private session (the bridge
+    /// token) and its MCP server all stay, and the same grant still serves the next call.
+    /// The no-replay fence lives one layer down, in the `Computer` that burnt the sequence.
+    #[test]
+    fn an_unconfirmed_input_keeps_the_grant_and_its_mcp_entry() {
+        let fake = FakeMcp::new();
+        // The grant's server exists and is enabled in Core.
+        fake.present(true, &["assistant-1"], "");
+        let grants = AgentGrants::for_test(fake.clone());
+        let (sessions, owner, _token) = browser();
+        let grant = grant_for(&sessions, &owner, wall_clock() + 300_000, false);
+        grants.publish(grant.clone());
+        let computer = idle_computer();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        run_tool(
+            &computer,
+            &sessions,
+            None,
+            &grant,
+            Tool::Screenshot,
+            "unconfirmed-shot-1",
+            json!({}),
+        )
+        .ok()
+        .expect("the grant must capture before any failure");
+
+        // The node died in flight: the `Computer` fenced the lease and the result is
+        // unknown, which is exactly the failure the bridge reports as UNCONFIRMED.
+        let failure = map_computer("computer_input_unknown");
+        runtime
+            .block_on(async { settle_tool_failure(&computer, &grants, &grant, &failure).await })
+            .expect("an unconfirmed input must not retire the grant");
+
+        // Nothing was torn down: the grant is still standing, the bridge token still
+        // authenticates, and the MCP server was never disabled or deleted.
+        assert!(!grant.revoked.load(Ordering::Acquire));
+        assert!(!grant.closed.load(Ordering::Acquire));
+        assert!(grant.sessions.is_live(&grant.session));
+        assert!(
+            grants
+                .owned(&owner.client_id, wall_clock())
+                .iter()
+                .any(|owned| owned.id == grant.id),
+            "the grant stays in the registry"
+        );
+        assert!(!fake.names().contains(&"set_enabled"), "{:?}", fake.names());
+        assert!(!fake.names().contains(&"delete"), "{:?}", fake.names());
+
+        // And the same grant serves the next call.
+        run_tool(
+            &computer,
+            &sessions,
+            None,
+            &grant,
+            Tool::Text,
+            "unconfirmed-text-2",
+            json!({"text": "hello", "step": "输入问候"}),
+        )
+        .ok()
+        .expect("an unconfirmed input must leave the grant serving");
+    }
+
+    /// The other half of the same contract: an unaccounted OS outcome still retires the
+    /// grant and its MCP server, so the non-fatal input path relaxed no revocation.
+    #[test]
+    fn an_unaccounted_outcome_still_retires_the_grant_and_its_mcp_entry() {
+        let fake = FakeMcp::new();
+        fake.present(true, &["assistant-1"], "");
+        let grants = AgentGrants::for_test(fake.clone());
+        let (sessions, owner, _token) = browser();
+        let grant = grant_for(&sessions, &owner, wall_clock() + 300_000, false);
+        grants.publish(grant.clone());
+        let computer = idle_computer();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let fatal = Failure::fatal("computer_agent_input_unknown");
+        runtime
+            .block_on(async { settle_tool_failure(&computer, &grants, &grant, &fatal).await })
+            .expect("the unaccounted path must retire cleanly");
+        assert!(grant.revoked.load(Ordering::Acquire));
+        assert!(grant.closed.load(Ordering::Acquire));
+        assert!(!grant.sessions.is_live(&grant.session));
+        assert!(fake.names().contains(&"set_enabled"), "{:?}", fake.names());
+        assert!(fake.names().contains(&"delete"), "{:?}", fake.names());
+        assert!(
+            grants.owned(&owner.client_id, wall_clock()).is_empty(),
+            "a retired grant is forgotten"
+        );
+    }
+
+    /// A desktop that reconnects comes back as a new `Computer` for the same node, and the
+    /// old instance is retired (this is what `NodeComputers::install` does). The grant must
+    /// be driven through the current generation, because the stored one is fenced.
+    #[test]
+    fn a_reconnected_node_serves_through_its_current_generation() {
+        let (resolved, resolved_provider) = node_computer("sha256:node-screen");
+        let (current, current_provider) = node_computer("sha256:node-screen");
+        let (sessions, owner, _token) = browser();
+        let mut grant = grant_for(&sessions, &owner, wall_clock() + 60_000, false);
+        {
+            let fixture = Arc::get_mut(&mut grant).unwrap();
+            fixture.target = resolved.clone();
+            fixture.node_id = Some("node-a".to_owned());
+            fixture.authority.device_id = "sha256:node-screen".to_owned();
+        }
+        let key = || json!({"key": "enter", "step": "按回车"});
+        run_tool(
+            &grant.target,
+            &sessions,
+            None,
+            &grant,
+            Tool::Key,
+            "node-key-1",
+            key(),
+        )
+        .ok()
+        .expect("the generation the consent resolved must type");
+        assert_eq!(resolved_provider.inputs.load(Ordering::SeqCst), 1);
+
+        // The node reconnects. The instance the grant stored is retired and fenced: it can
+        // never type again, and nothing reaches the connection it belonged to.
+        let _ = grant.target.retire();
+        let stale = run_tool(
+            &grant.target,
+            &sessions,
+            None,
+            &grant,
+            Tool::Key,
+            "node-key-2",
+            key(),
+        )
+        .err()
+        .expect("a retired generation must not type");
+        assert!(!stale.revoke, "a retired generation is not a revocation");
+        assert_eq!(resolved_provider.inputs.load(Ordering::SeqCst), 1);
+
+        // The current generation is admitted: same node, same reviewed desktop.
+        assert!(scope_holds(&grant, "node-a", "sha256:node-screen").is_ok());
+        let current = rebind(&grant, current);
+        run_tool(
+            &current,
+            &sessions,
+            None,
+            &grant,
+            Tool::Key,
+            "node-key-3",
+            key(),
+        )
+        .ok()
+        .expect("the reconnected node must still type");
+        assert_eq!(current_provider.inputs.load(Ordering::SeqCst), 1);
+        assert_eq!(resolved_provider.inputs.load(Ordering::SeqCst), 1);
+    }
+
+    /// The consent names one node and one desktop. A current connection that is another
+    /// node, or that comes back as another machine, is refused — never switched onto.
+    #[test]
+    fn a_different_node_or_device_never_inherits_the_grant() {
+        let (sessions, owner, _token) = browser();
+        let mut grant = grant_for(&sessions, &owner, wall_clock() + 60_000, false);
+        {
+            let fixture = Arc::get_mut(&mut grant).unwrap();
+            fixture.node_id = Some("node-a".to_owned());
+            fixture.authority.device_id = "sha256:node-screen".to_owned();
+        }
+        assert!(scope_holds(&grant, "node-a", "sha256:node-screen").is_ok());
+        for (node, device) in [
+            ("node-b", "sha256:node-screen"),
+            ("node-a", "sha256:other-screen"),
+        ] {
+            assert_eq!(
+                scope_holds(&grant, node, device).err(),
+                Some("computer_agent_device_mismatch"),
+                "{node}/{device} is not the reviewed scope"
+            );
+        }
+        // The physical boundary enforces the same scope: a desktop that is not the one the
+        // user reviewed is refused before any capture.
+        let (other, other_provider) = node_computer("sha256:other-screen");
+        let refused = run_tool(
+            &other,
+            &sessions,
+            None,
+            &grant,
+            Tool::Screenshot,
+            "other-shot-1",
+            json!({}),
+        )
+        .err()
+        .expect("another device must not serve this grant");
+        assert_eq!(refused.code, "computer_agent_device_mismatch");
+        assert!(!refused.revoke);
+        assert_eq!(other_provider.captures.load(Ordering::SeqCst), 0);
     }
 
     #[test]
