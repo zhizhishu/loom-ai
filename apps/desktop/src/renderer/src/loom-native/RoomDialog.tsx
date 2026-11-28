@@ -1,6 +1,6 @@
 import { createTrackedWork, newWorkAttempt, WorkCommandUnknown, WorkCommandRejected, WorkStartFailed, type ResumableWorkAttempt, type TrackedWorkDraft } from './work-service'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { BusinessEnvironment } from '../business-environment'
+import type { BusinessEnvironment, CloudUser } from '../business-environment'
 import type { AgentProfile, ThreadSnapshot } from './types'
 import type { NavigationSnapshot, ThreadCreationPreflight, WorkspaceSelection } from '@contracts'
 import { Avatar } from './Avatar'
@@ -206,6 +206,33 @@ export function RoomDialog({ open, environment, agents, initialAgentId, initialM
   </SurfaceDialog>
 }
 
+export type CloudPeopleRow = { user: CloudUser; inCamp: boolean }
+
+/** Web 边界模拟多租户：把 Host 声明的云用户按群成员关系分「已在群 / 可拉入」两区，纯函数便于测试。 */
+export function cloudPeopleRows(users: readonly CloudUser[], memberUserIds: readonly string[]): CloudPeopleRow[] {
+  const members = new Set(memberUserIds)
+  return users.map(user => ({ user, inCamp: members.has(user.id) }))
+}
+
+/** 人类成员区：与「添加协作助手」分区分文案；成员关系只按服务端返回显示，拉入也由服务端裁决。 */
+export function CloudPeopleSection({ users, memberUserIds, busyUserId, disabled, error, onPullIn }: {
+  users: readonly CloudUser[]; memberUserIds: readonly string[]; busyUserId: string | null
+  disabled?: boolean; error?: string; onPullIn(userId: string): void
+}) {
+  const rows = cloudPeopleRows(users, memberUserIds)
+  return <section className="ln-cloud-people" aria-label="人员">
+    <div className="ln-panel-title"><h3>人员</h3><small>来自服务端，不参与助手分工</small></div>
+    <div className="ln-room-people">
+      {rows.map(({ user, inCamp }) => <div className="ln-room-person" key={user.id}>
+        <Avatar name={user.displayName} size={28}/>
+        <span><strong>{user.displayName}</strong><small>{inCamp ? '已在群聊' : user.role === 'owner' ? '所有者' : '成员'}</small></span>
+        {!inCamp && <button type="button" className="ln-action" disabled={disabled || busyUserId !== null} onClick={() => onPullIn(user.id)}>{busyUserId === user.id ? '拉入中…' : '拉入群聊'}</button>}
+      </div>)}
+    </div>
+    {error && <FormMessage error>{error}</FormMessage>}
+  </section>
+}
+
 export function RoomMembersDialog({ open, environment, agents, snapshot, theme = 'day', onClose, onRefresh }: {
   open: boolean; environment: BusinessEnvironment; agents: AgentProfile[]; snapshot: ThreadSnapshot | null
   theme?: 'day' | 'night'; onClose(): void; onRefresh(): Promise<void>
@@ -219,6 +246,26 @@ export function RoomMembersDialog({ open, environment, agents, snapshot, theme =
   const [removing, setRemoving] = useState<string | null>(null)
   const [hiding, setHiding] = useState(false)
   useEffect(() => { setSelected([]); setError(''); setNotice(''); setRemoving(null); setHiding(false) }, [open, snapshot?.thread.id])
+  /** 人员区只在 Host 声明当前用户是 owner 且接口可用时出现；拉取失败就静默不显示。 */
+  const cloud = environment.cloudPeople ?? null
+  const cloudOwner = cloud?.current?.role === 'owner'
+  const [cloudPeople, setCloudPeople] = useState<CloudUser[] | null>(null)
+  const [cloudMemberIds, setCloudMemberIds] = useState<string[] | null>(null)
+  const [cloudBusy, setCloudBusy] = useState<string | null>(null)
+  const [cloudError, setCloudError] = useState('')
+  const cloudTicket = useRef(0)
+  useEffect(() => {
+    if (!open || !cloudOwner || !cloud) return
+    const generation = ++cloudTicket.current
+    setCloudPeople(null); setCloudMemberIds(null); setCloudBusy(null); setCloudError('')
+    const campId = snapshot?.thread.id
+    if (!campId) return
+    void Promise.all([cloud.users(), cloud.campMembers(campId)]).then(([users, memberIds]) => {
+      if (generation !== cloudTicket.current) return
+      setCloudPeople(users); setCloudMemberIds(memberIds)
+    }).catch(() => { if (generation === cloudTicket.current) { setCloudPeople(null); setCloudMemberIds(null) } })
+    return () => { cloudTicket.current++ }
+  }, [open, cloudOwner, cloud, snapshot?.thread.id])
   if (!snapshot) return null
   const active = snapshot.members.filter(member => member.membershipStatus === 'active')
   const available = agents.filter(agent => !agent.removedAt && agent.presence !== 'removed' && !active.some(member => member.agentId === agent.agentId))
@@ -259,11 +306,20 @@ export function RoomMembersDialog({ open, environment, agents, snapshot, theme =
       onClose()
     } catch (cause) { setError(cause instanceof Error ? cause.message : '隐藏未完成，会话列表尚未更新。') } finally { setBusy(false) }
   }
+  /** Owner 直接拉人：不加邀请、不做移除；结果只按服务端返回的成员列表刷新。 */
+  const pullInCloudUser = async (userId: string) => {
+    if (!cloud || !snapshot || busy || cloudBusy !== null) return
+    setCloudBusy(userId); setCloudError('')
+    try { setCloudMemberIds(await cloud.addCampMember(snapshot.thread.id, userId)) }
+    catch (cause) { setCloudError(cause instanceof Error ? cause.message : '拉入未完成，请重试。') }
+    finally { setCloudBusy(null) }
+  }
   const removingName = removing === null ? '' : active.find(member => member.agentId === removing)?.displayName || removing
   return <SurfaceDialog open={open} title="群聊成员" description="协调助手协调当前群聊，其他助手是独立参与者。" theme={theme} onClose={() => { if (!busy) onClose() }} className="ln-room-dialog"><div className="ln-room-content">
     <div className="ln-room-summary">{active.map(member => { const agent = agents.find(row => row.agentId === member.agentId); return <div key={member.agentId}><Avatar agent={agent} name={member.displayName} size={28}/><strong>{member.displayName}</strong><small>{member.agentId === snapshot.thread.defaultLeadAgentId ? '协调助手' : '协作助手'}</small>{member.agentId !== snapshot.thread.defaultLeadAgentId && <button type="button" className="ln-action" disabled={busy} onClick={() => { void lead(member.agentId) }}>设为协调助手</button>}<button type="button" className="ln-text-action" disabled={busy} onClick={() => { setRemoving(member.agentId); setError(''); setNotice('') }}>移出</button></div> })}</div>
     <div className="ln-workspace-choice"><Icon name="files" size={22}/><span><strong>当前工作区域</strong><small>{snapshot.thread.projectPath || '主机快速对话目录'}</small></span></div>
     {available.length > 0 && <><div className="ln-panel-title"><h3>添加协作助手</h3><small>不会自动发送消息</small></div><div className="ln-room-people">{available.map(agent => <label className="ln-room-person" key={agent.agentId}><input type="checkbox" checked={selected.includes(agent.agentId)} disabled={busy} onChange={() => setSelected(current => current.includes(agent.agentId) ? current.filter(id => id !== agent.agentId) : [...current, agent.agentId])}/><Avatar agent={agent} size={28}/><span><strong>{agent.displayName}</strong><small>{agent.teamRole}</small></span></label>)}</div></>}
+    {cloudOwner && cloudPeople !== null && cloudMemberIds !== null && <CloudPeopleSection users={cloudPeople} memberUserIds={cloudMemberIds} busyUserId={cloudBusy} disabled={busy} error={cloudError} onPullIn={userId => { void pullInCloudUser(userId) }}/>}
     {removing !== null && <div className="ln-unsaved-notice" role="alertdialog" aria-label="移出成员"><span>把「{removingName}」移出群聊？移出后 Ta 不再收到群里的消息，需要时可以重新邀请。</span><button type="button" disabled={busy} onClick={() => setRemoving(null)}>取消</button><button type="button" disabled={busy} onClick={() => { void remove(removing) }}>确认移出</button></div>}
     {hiding && <div className="ln-unsaved-notice" role="alertdialog" aria-label="隐藏群聊"><span>把「{snapshot.thread.title}」从会话列表隐藏？群里的助手、消息和历史全部保留，可以在「已隐藏」里恢复。</span><button type="button" disabled={busy} onClick={() => setHiding(false)}>取消</button><button type="button" disabled={busy} onClick={() => { void hide() }}>确认隐藏</button></div>}
     {notice && <FormMessage>{notice}</FormMessage>}

@@ -1,5 +1,6 @@
 // rakazo@51ff52e infra/updater/src/updater-logic.ts:106-119 (default-off interval), structural comparison; PiBot@6741737 web/src/ClientUpdateSection.tsx:105,218 / ClientUpdateProvider.tsx:134,147-155, structural comparison; label 「自动检查更新」: 无参考，按用户定.
 import type { HostWorkbench, ComputerPort, ComputerFrame, NativeCatalog, NativePreview } from '../../desktop/src/renderer/src/loom-native/host-services'
+import type { CloudUser } from '../../desktop/src/renderer/src/business-environment'
 import { TAB_AUTH_KEY, type AuthStorage, type BrowserSession } from './auth-storage'
 import { browserEditingRecovery } from './editing-recovery'
 import { RECOVERY_KEY, type RecoveryStorage } from './tab-recovery'
@@ -370,7 +371,15 @@ export class InvalidationDecoder {
   }
 }
 
-type SessionResponse = { protocolVersion?: unknown; token?: unknown; clientId?: unknown; editorProof?: unknown; ownerId?: unknown; channels?: unknown; fileTransfers?: { uploadMaxBytes?: unknown; nativeDownload?: unknown }; expiresAt?: unknown; serverTime?: unknown; renewalWindowSeconds?: unknown }
+type SessionResponse = { protocolVersion?: unknown; token?: unknown; clientId?: unknown; editorProof?: unknown; ownerId?: unknown; channels?: unknown; fileTransfers?: { uploadMaxBytes?: unknown; nativeDownload?: unknown }; expiresAt?: unknown; serverTime?: unknown; renewalWindowSeconds?: unknown; cloudUser?: unknown }
+
+/** Host-declared cloud identity; an absent or malformed value stays single-user. */
+function readCloudUser(value: unknown): CloudUser | null {
+  if (!value || typeof value !== 'object') return null
+  const user = value as { id?: unknown; displayName?: unknown; role?: unknown }
+  return typeof user.id === 'string' && typeof user.displayName === 'string' && typeof user.role === 'string'
+    ? { id: user.id, displayName: user.displayName, role: user.role } : null
+}
 
 type RemoteComputerPath = `computer/nodes/${string}`
 type WorkbenchPath = RemoteComputerPath | 'computer/agents/list' | 'computer/agents/grant' | 'computer/agents/revoke' | 'computer/agents/mode' | 'computer/agents/mode/status' | 'computer/agents/approvals/list' | 'computer/agents/approvals/decide' | 'native-discovery' | 'native-discovery/preview' | 'native-discovery/import-mcp' | 'computer/status' | 'computer/view' | 'computer/frame' | 'computer/control' | 'computer/control/heartbeat' | 'computer/control/release' | 'computer/view/stop' | 'computer/input'
@@ -395,6 +404,9 @@ export class ConsoleClient {
   #fetch: typeof fetch
   #editor: { clientId: string; proof: string } | null = null
   #ownerId: string | null = null
+  #cloudUser: CloudUser | null = null
+  /** Host-declared signed-in cloud identity; null on single-user Hosts. */
+  get cloudUser(): CloudUser | null { return this.#cloudUser }
   #authListeners = new Set<() => void>()
 
   #pending = new Map<string, PendingCommand>()
@@ -550,6 +562,7 @@ export class ConsoleClient {
     const generation = this.#generation
     const newEditor = fork || !saved
     this.#token = source.token
+    this.#cloudUser = readCloudUser(source.cloudUser)
     try {
       const resume = async (forkEditor: boolean) => await this.#json<SessionResponse>('session', { method: 'POST', body: JSON.stringify({ ...(saved && !forkEditor ? { editor: saved.editor } : {}), fork: forkEditor }) })
       let editorForked = newEditor
@@ -654,6 +667,8 @@ export class ConsoleClient {
     this.#acceptTiming(session)
     this.#editor = { clientId: session.clientId, proof: session.editorProof }
     this.#ownerId = session.ownerId
+    // A session reply may omit the cloud identity (older Host); the last Host-declared value stays.
+    if (session.cloudUser !== undefined) this.#cloudUser = readCloudUser(session.cloudUser)
     this.#channels = session.channels === 'desktop' ? 'desktop' : 'unsupported'
     this.#uploadMaxBytes = typeof session.fileTransfers?.uploadMaxBytes === 'number' && Number.isSafeInteger(session.fileTransfers.uploadMaxBytes) && session.fileTransfers.uploadMaxBytes >= 0
       ? Math.min(30 * 1024 * 1024, session.fileTransfers.uploadMaxBytes) : 20 * 1024 * 1024
@@ -682,7 +697,7 @@ export class ConsoleClient {
   }
 
   #authentication(): BrowserSession | null {
-    return this.#token && this.#ownerId ? { version: 1, origin: this.origin, token: this.#token, ownerId: this.#ownerId, expiresAt: this.#expiresAt } : null
+    return this.#token && this.#ownerId ? { version: 1, origin: this.origin, token: this.#token, ownerId: this.#ownerId, expiresAt: this.#expiresAt, ...(this.#cloudUser ? { cloudUser: this.#cloudUser } : {}) } : null
   }
   #persistTabAuthentication(): void { this.#storage?.setItem(TAB_AUTH_KEY, JSON.stringify(this.#authentication())) }
   async #saveAuthentication(expectedToken?: string): Promise<void> {
@@ -697,6 +712,7 @@ export class ConsoleClient {
   }
   clear(): void {
     this.#token = null
+    this.#cloudUser = null
     this.#expiresAt = this.#localExpiry = null
     this.#retryRenewalAt = 0
     this.#renewal = null
@@ -1172,6 +1188,45 @@ export class ConsoleClient {
     const payload = await response.json().catch(() => ({})) as { error?: { code?: string; message?: string } }
     if (!response.ok) throw new HttpRequestError(response.status, payload.error?.code ?? 'nodes_unavailable', payload.error?.message || sessionStorageMessage(payload))
     return payload as T
+  }
+
+  /** Cloud people live only in the Host's web boundary (simulated tenancy). These
+   * fixed routes share the ordinary Bearer session; the Host stays the sole authority. */
+  async #cloud<T>(path: 'cloud/users' | `cloud/camp-members/${string}` | 'cloud/camp-members', method: 'GET' | 'POST', body?: { campId: string; userId: string }): Promise<T> {
+    if (!this.#token) throw new SessionRequired()
+    this.#assertConnected(true)
+    if (this.#localExpiry !== null && this.#localExpiry - this.#now() <= this.#renewalWindow) await this.renewIfNeeded()
+    let response: Response
+    try {
+      response = await this.#fetch(`${this.origin}/api/v1/${path}`, {
+        method, credentials: 'omit', redirect: 'error', cache: 'no-store',
+        headers: { Accept: 'application/json', ...(method === 'POST' ? { 'Content-Type': 'application/json' } : {}), Authorization: `Bearer ${this.#token}` },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: this.#lifetime.signal
+      })
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') throw error
+      throw new HttpRequestError(0, 'cloud_unavailable')
+    }
+    if (response.status === 401) { await this.#forgetAuthentication(); throw new SessionRequired() }
+    const payload = await response.json().catch(() => ({})) as { error?: { code?: string; message?: string } }
+    if (!response.ok) throw new HttpRequestError(response.status, payload.error?.code ?? 'cloud_unavailable', payload.error?.message || sessionStorageMessage(payload))
+    return payload as T
+  }
+
+  async cloudUsers(): Promise<CloudUser[]> {
+    const body = await this.#cloud<{ users?: unknown }>('cloud/users', 'GET')
+    return Array.isArray(body.users) ? body.users.map(readCloudUser).filter((user): user is CloudUser => user !== null) : []
+  }
+
+  async cloudCampMembers(campId: string): Promise<string[]> {
+    const body = await this.#cloud<{ memberUserIds?: unknown }>(`cloud/camp-members/${encodeURIComponent(campId)}`, 'GET')
+    return Array.isArray(body.memberUserIds) ? body.memberUserIds.filter((id): id is string => typeof id === 'string') : []
+  }
+
+  async addCloudCampMember(campId: string, userId: string): Promise<string[]> {
+    const body = await this.#cloud<{ memberUserIds?: unknown }>('cloud/camp-members', 'POST', { campId, userId })
+    return Array.isArray(body.memberUserIds) ? body.memberUserIds.filter((id): id is string => typeof id === 'string') : []
   }
 
   /** Fixed-route Host adapters share the existing authenticated transport. */

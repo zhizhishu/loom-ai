@@ -1,12 +1,13 @@
+mod auth;
+mod channels;
 mod computer;
 mod computer_agent;
 mod native_discovery;
-mod auth;
-mod channels;
 mod nodes;
 pub use channels::{ChannelFuture, ChannelHost, ChannelReply, ChannelRequest};
 mod avatars;
 mod downloads;
+mod multiuser;
 mod network;
 mod operations;
 mod resources;
@@ -75,6 +76,7 @@ struct WebState {
     files: Arc<resources::Handles>,
     downloads: Arc<downloads::Downloads>,
     nodes: Arc<nodes::Hub>,
+    multiuser: Arc<multiuser::Multiuser>,
 }
 
 /// Owns only a network listener and its credentials. Stopping or dropping it
@@ -153,6 +155,12 @@ impl WebServer {
         let network = Arc::new(network::Network::new(address, config.public_origin)?);
         let cached_assets = Arc::new(load_asset_cache(&assets).await);
         let nodes = nodes::Hub::for_core(&core, sessions.clone(), data_dir)?;
+        // Boundary multi-user simulation owns a private sidecar next to the
+        // credentials; a damaged sidecar fails closed instead of guessing.
+        let multiuser = Arc::new(multiuser::Multiuser::open(
+            data_dir,
+            sessions.cloud_users().len(),
+        )?);
         let state = WebState {
             agents: computer_agent::AgentGrants::with_core(data_dir, address.port(), core.clone()),
             computer: Arc::new(computer::Computer::from_env()),
@@ -172,6 +180,7 @@ impl WebServer {
             files: Arc::new(resources::Handles::default()),
             downloads: Arc::new(downloads::Downloads::new()?),
             nodes,
+            multiuser,
         };
         sessions.enable();
         let app = routes(state);
@@ -244,11 +253,17 @@ fn routes(state: WebState) -> Router {
     let api = Router::new()
         .route("/native-discovery", post(native_discovery::catalog))
         .route("/native-discovery/preview", post(native_discovery::preview))
-        .route("/native-discovery/import-mcp", post(native_discovery::import_mcp))
+        .route(
+            "/native-discovery/import-mcp",
+            post(native_discovery::import_mcp),
+        )
         .route("/computer/agents/grant", post(computer_agent::grant))
         .route("/computer/agents/list", post(computer_agent::list))
         .route("/computer/agents/revoke", post(computer_agent::revoke))
-        .route("/computer/agents/mode", post(computer_agent::set_control_mode))
+        .route(
+            "/computer/agents/mode",
+            post(computer_agent::set_control_mode),
+        )
         .route(
             "/computer/agents/mode/status",
             post(computer_agent::control_mode_status),
@@ -274,10 +289,19 @@ fn routes(state: WebState) -> Router {
         // routes above; only the device behind them is remote. A node id is
         // resolved against the authenticated node registry, never a URL.
         .route("/computer/nodes/{node_id}", post(computer::node_status))
-        .route("/computer/nodes/{node_id}/preview", post(computer::node_preview))
+        .route(
+            "/computer/nodes/{node_id}/preview",
+            post(computer::node_preview),
+        )
         .route("/computer/nodes/{node_id}/view", post(computer::node_view))
-        .route("/computer/nodes/{node_id}/frame", post(computer::node_frame))
-        .route("/computer/nodes/{node_id}/control", post(computer::node_control))
+        .route(
+            "/computer/nodes/{node_id}/frame",
+            post(computer::node_frame),
+        )
+        .route(
+            "/computer/nodes/{node_id}/control",
+            post(computer::node_control),
+        )
         .route(
             "/computer/nodes/{node_id}/control/heartbeat",
             post(computer::node_heartbeat),
@@ -286,8 +310,14 @@ fn routes(state: WebState) -> Router {
             "/computer/nodes/{node_id}/control/release",
             post(computer::node_release),
         )
-        .route("/computer/nodes/{node_id}/input", post(computer::node_input))
-        .route("/computer/nodes/{node_id}/view/stop", post(computer::node_stop))
+        .route(
+            "/computer/nodes/{node_id}/input",
+            post(computer::node_input),
+        )
+        .route(
+            "/computer/nodes/{node_id}/view/stop",
+            post(computer::node_stop),
+        )
         .route("/capabilities", get(capabilities))
         .route("/channels", post(channels::request))
         .route("/updates", post(updates::request))
@@ -318,6 +348,9 @@ fn routes(state: WebState) -> Router {
         .route("/nodes/workspaces/files", post(nodes::workspace_files))
         .route("/nodes/runs/{run_id}/output/{from}", get(nodes::output))
         .route("/nodes/{node_id}/revoke", post(nodes::revoke))
+        .route("/cloud/users", get(cloud_users))
+        .route("/cloud/camp-members/{camp_id}", get(cloud_camp_members))
+        .route("/cloud/camp-members", post(cloud_add_camp_member))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
         .nest("/api/v1", api)
@@ -441,7 +474,9 @@ fn is_settings_deep_link(method: &Method, path: &str, query: &str) -> bool {
         return false;
     }
     // `%`, `&`, `+`, `=`, `#`, `.`, `/` and non-ASCII never match: no encoded delimiter.
-    section.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    section
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 async fn authenticate(State(state): State<WebState>, mut req: Request, next: Next) -> Response {
@@ -483,11 +518,14 @@ async fn login(
     if body.protocol_version != HOST_WEB_PROTOCOL_VERSION {
         return error(StatusCode::CONFLICT, "protocol_incompatible");
     }
-    let generation = match state.sessions.authorize_login(&body.administrator_token) {
-        Ok(generation) => generation,
+    let grant = match state
+        .sessions
+        .authorize_cloud_login(&body.administrator_token)
+    {
+        Ok(grant) => grant,
         Err(failure) => return login_failure(failure),
     };
-    finish_login(state, body.editor, LoginGrant::Administrator(generation)).await
+    finish_login(state, body.editor, LoginGrant::Password(grant)).await
 }
 
 #[derive(Deserialize)]
@@ -500,7 +538,7 @@ struct TicketLogin {
 }
 
 enum LoginGrant {
-    Administrator(u64),
+    Password(auth::CloudLogin),
     Ticket(TicketGrant),
 }
 
@@ -539,15 +577,17 @@ async fn finish_login(
     };
     let ticket = matches!(grant, LoginGrant::Ticket(_));
     let result = match grant {
-        LoginGrant::Administrator(generation) => {
-            state.sessions.issue(generation, client_id.to_owned())
+        LoginGrant::Password(login) => {
+            state
+                .sessions
+                .issue_cloud(login.generation, client_id.to_owned(), &login.user)
         }
         LoginGrant::Ticket(grant) => state.sessions.issue_ticket(grant, client_id.to_owned()),
     };
     match result {
         Ok((token, session)) => {
             let mut response = state.sessions.timing(&session);
-            response.as_object_mut().expect("session timing").extend(json!({"protocolVersion":HOST_WEB_PROTOCOL_VERSION,"token":token,"clientId":session.client_id,"editorProof":identity["proof"],"ownerId":identity["ownerId"],"epoch":state.epoch,"fileTransfers":downloads::capabilities(&state),"channels":if state.channels.is_some() { "desktop" } else { "unsupported" }}).as_object().expect("session response").clone());
+            response.as_object_mut().expect("session timing").extend(json!({"protocolVersion":HOST_WEB_PROTOCOL_VERSION,"token":token,"clientId":session.client_id,"cloudUser":state.sessions.cloud_user(&session),"editorProof":identity["proof"],"ownerId":identity["ownerId"],"epoch":state.epoch,"fileTransfers":downloads::capabilities(&state),"channels":if state.channels.is_some() { "desktop" } else { "unsupported" }}).as_object().expect("session response").clone());
             Json(response).into_response()
         }
         Err(failure) if ticket => ticket_failure(failure),
@@ -688,6 +728,69 @@ async fn renew_session(
     }
 }
 
+// Boundary multi-user simulation endpoints. The read-only roster never carries
+// tokens; camp membership is managed by the Owner alone.
+async fn cloud_users(
+    State(state): State<WebState>,
+    Extension(_session): Extension<Arc<Session>>,
+) -> Response {
+    Json(json!({"users": state.sessions.cloud_users()})).into_response()
+}
+
+async fn cloud_camp_members(
+    State(state): State<WebState>,
+    Extension(session): Extension<Arc<Session>>,
+    Path(camp_id): Path<String>,
+) -> Response {
+    match state
+        .multiuser
+        .visible_camp_members(&session.cloud_user_id, &camp_id)
+    {
+        Some(member_user_ids) => {
+            Json(json!({"campId": camp_id, "memberUserIds": member_user_ids})).into_response()
+        }
+        // Unknown and forbidden are indistinguishable; existence stays small.
+        None => error(StatusCode::NOT_FOUND, "resource_not_found"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CampMemberAdd {
+    camp_id: String,
+    user_id: String,
+}
+
+async fn cloud_add_camp_member(
+    State(state): State<WebState>,
+    Extension(session): Extension<Arc<Session>>,
+    body: std::result::Result<Json<CampMemberAdd>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_camp_member");
+    };
+    // Only the Owner may extend a camp's member list, and only with a known
+    // cloud user; every refusal is the same small denial.
+    if !session.is_cloud_owner() || state.sessions.find_cloud_user(&body.user_id).is_none() {
+        return error(StatusCode::NOT_FOUND, "resource_not_found");
+    }
+    match state
+        .multiuser
+        .add_camp_member(&body.camp_id, &session.cloud_user_id, &body.user_id)
+    {
+        Ok(multiuser::AddMember::Added { member_user_ids }) => Json(
+            json!({"ok": true, "campId": body.camp_id, "userId": body.user_id,
+                "memberUserIds": member_user_ids}),
+        )
+        .into_response(),
+        Ok(_) => error(StatusCode::NOT_FOUND, "resource_not_found"),
+        Err(_) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "multiuser_store_unavailable",
+        ),
+    }
+}
+
 async fn capabilities(State(state): State<WebState>) -> Json<Value> {
     Json(
         json!({"protocolVersion":HOST_WEB_PROTOCOL_VERSION,"epoch":state.epoch,"read":true,"composer":true,"uploads":true,"approval":true,"nativeFilePicker":false,"desktopWindow":false,"releaseQualified":false,"fileTransfers":downloads::capabilities(&state),"channels":if state.channels.is_some() { "desktop" } else { "unsupported" }}),
@@ -722,6 +825,20 @@ async fn request(
     ) {
         return nodes::prepare_remote_workspace(&state, body.params).await;
     }
+    // Boundary multi-user simulation: admission runs before Core sees the
+    // request, and is skipped entirely in single-user mode.
+    if state.multiuser.enabled() {
+        match state
+            .multiuser
+            .gate(&session.cloud_user_id, &body.operation, &body.params)
+        {
+            multiuser::Gate::Allow => {}
+            multiuser::Gate::Deny => return error(StatusCode::NOT_FOUND, "resource_not_found"),
+            multiuser::Gate::Respond(value) => {
+                return Json(json!({"result": value, "error": null})).into_response();
+            }
+        }
+    }
     let preview_release_camp_id = matches!(
         body.operation,
         operations::Operation::CampDelete | operations::Operation::CampDiscardPending
@@ -754,7 +871,34 @@ async fn request(
             if accepted && let Some(camp_id) = preview_release_camp_id.as_deref() {
                 state.files.release_camp(camp_id);
             }
-            Json(json!({"result":reply.result.map(|value| body.operation.project(value)),"error":reply.error})).into_response()
+            let mut result = reply.result;
+            if state.multiuser.enabled() {
+                if accepted {
+                    if let Err(failure) = state.multiuser.record_creations(
+                        &session.cloud_user_id,
+                        &body.operation,
+                        result.as_ref(),
+                    ) {
+                        // Core already committed the create; the boundary keeps
+                        // failing closed while the ownership write is broken.
+                        eprintln!("cloud multi-user ownership write failed: {failure:#}");
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "multiuser_store_unavailable",
+                        );
+                    }
+                }
+                if let Some(value) = result.as_mut() {
+                    if !state.multiuser.filter_response(
+                        &session.cloud_user_id,
+                        &body.operation,
+                        value,
+                    ) {
+                        return error(StatusCode::NOT_FOUND, "resource_not_found");
+                    }
+                }
+            }
+            Json(json!({"result":result.map(|value| body.operation.project(value)),"error":reply.error})).into_response()
         }
         Ok(Err(_)) => error(StatusCode::SERVICE_UNAVAILABLE, "core_unavailable"),
         Err(_) => error(StatusCode::GATEWAY_TIMEOUT, "result_unavailable"),
@@ -808,6 +952,28 @@ async fn events(
                                     "indexChanged":index_changed,"throughGlobalSequence":through,
                                     "unavailableMessageIds":params["unavailableMessageIds"].as_array()
                                         .map(|ids| ids.iter().filter_map(|id| id.as_str()).collect::<Vec<_>>()).unwrap_or_default()}]);
+                            }
+                        }
+                        // Multi-user boundary: drop message invalidations for
+                        // camps this user cannot see; the thread id never leaks.
+                        if state.multiuser.enabled() {
+                            if let Some(messages) =
+                                payload.get_mut("messages").and_then(Value::as_array_mut)
+                            {
+                                messages.retain(|message| {
+                                    message["threadId"].as_str().is_some_and(|thread_id| {
+                                        state.multiuser.camp_visible(
+                                            &session.cloud_user_id,
+                                            thread_id,
+                                        )
+                                    })
+                                });
+                                if messages.is_empty() {
+                                    payload
+                                        .as_object_mut()
+                                        .expect("SSE payload")
+                                        .remove("messages");
+                                }
                             }
                         }
                     }
@@ -1019,10 +1185,26 @@ mod tests {
             assert!(!get(query), "{query}");
         }
         // Only the entry document carries the link: not another path, not another method.
-        assert!(!is_settings_deep_link(&Method::POST, "/", "section=account"));
+        assert!(!is_settings_deep_link(
+            &Method::POST,
+            "/",
+            "section=account"
+        ));
         assert!(!is_settings_deep_link(&Method::GET, "", "section=account"));
-        assert!(!is_settings_deep_link(&Method::GET, "/preview.html", "section=account"));
-        assert!(!is_settings_deep_link(&Method::GET, "/api/v1/capabilities", "section=account"));
-        assert!(!is_settings_deep_link(&Method::GET, "/assets/index.js", "section=account"));
+        assert!(!is_settings_deep_link(
+            &Method::GET,
+            "/preview.html",
+            "section=account"
+        ));
+        assert!(!is_settings_deep_link(
+            &Method::GET,
+            "/api/v1/capabilities",
+            "section=account"
+        ));
+        assert!(!is_settings_deep_link(
+            &Method::GET,
+            "/assets/index.js",
+            "section=account"
+        ));
     }
 }

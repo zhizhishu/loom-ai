@@ -1,7 +1,7 @@
 import { createBrowserHtmlPreview } from './html-preview'
 import { browserMemberAvatars } from './member-avatars'
 import type { ThreadClient } from '../../desktop/src/renderer/src/camp-client'
-import type { BusinessEnvironment } from '../../desktop/src/renderer/src/business-environment'
+import type { BusinessEnvironment, CloudPeopleApi } from '../../desktop/src/renderer/src/business-environment'
 import type { NodeApi } from '../../desktop/src/renderer/src/nodes-api'
 import type { ThreadReadInvalidation, SingleChatSnapshot, CoreMethod, FilePreviewApi, FilePreviewExternalUpdateEvent, FilePreviewOperationResult, OpenFilePreviewResult, RestoreFilePreviewRequest, LocalAttachmentSourceView } from '@contracts'
 import { ConsoleClient, HttpRequestError, WEB_OPERATIONS, type WebOperation } from './client'
@@ -230,7 +230,13 @@ export function createThreadAdapter(transport: ConsoleClient, selectWorkspaceDir
     revoke: nodeId => transport.revokeNode(nodeId),
     output: (runId, from) => transport.nodeOutput(runId, from)
   }
-  const environment: BusinessEnvironment = { workbench: transport.workbench, navigationHistory: createBrowserNavigationHistory(transport.editingScope), client, preferences, files, selectWorkspaceDirectory, nodes,
+  const cloudPeople: CloudPeopleApi = {
+    current: transport.cloudUser,
+    users: () => transport.cloudUsers(),
+    campMembers: campId => transport.cloudCampMembers(campId),
+    addCampMember: (campId, userId) => transport.addCloudCampMember(campId, userId)
+  }
+  const environment: BusinessEnvironment = { workbench: transport.workbench, navigationHistory: createBrowserNavigationHistory(transport.editingScope), client, preferences, files, selectWorkspaceDirectory, nodes, cloudPeople,
     serverUpdates: transport.channels === 'desktop' ? undefined : createServerUpdates(transport) }
   return { environment, profile, invalidate: (change: ThreadReadInvalidation = { resync: true }) => { for (const listener of listeners) listener(change); void refreshUpdates() } }
 }

@@ -830,3 +830,71 @@ describe('renewable browser authentication', () => {
     expect(client.authenticated).toBe(false); expect(await auth.read()).toBeNull()
   })
 })
+
+describe('web boundary cloud people', () => {
+  const origin = 'http://localhost:4317'
+  const identity = { protocolVersion: 5, token: 'a'.repeat(64), clientId: 'b'.repeat(64), editorProof: 'c'.repeat(64), ownerId: 'owner' }
+  const memory = () => {
+    const values = new Map<string, string>()
+    return { getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => { values.set(key, value) }, removeItem: (key: string) => { values.delete(key) } }
+  }
+  const durable = () => {
+    let value: import('./auth-storage').BrowserSession | null = null
+    return {
+      read: async () => value && structuredClone(value),
+      async write(next: import('./auth-storage').BrowserSession, expected?: string, current = () => true) { if (current() && (expected === undefined || value === null || value.token === expected)) value = structuredClone(next) },
+      async remove(token: string) { if (value?.token === token) value = null }
+    }
+  }
+  it('keeps the Host-declared cloud identity and signs the fixed cloud routes with the Bearer session', async () => {
+    const calls: Array<{ url: string; method: string; body?: unknown; headers: Headers }> = []
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (url, init) => {
+      calls.push({ url: String(url), method: init?.method ?? 'GET', body: init?.body === undefined ? undefined : JSON.parse(String(init.body)), headers: new Headers(init?.headers) })
+      if (String(url).endsWith('/login')) return Response.json({ ...identity, cloudUser: { id: 'u1', displayName: '宝宝', role: 'owner' } })
+      if (String(url).endsWith('/cloud/users')) return Response.json({ users: [{ id: 'u1', displayName: '宝宝', role: 'owner' }, { id: 'u2', displayName: '阿明', role: 'member' }] })
+      if (String(url).endsWith('/cloud/camp-members/camp-9')) return Response.json({ campId: 'camp-9', memberUserIds: ['u1'] })
+      if (String(url).endsWith('/cloud/camp-members')) return Response.json({ ok: true, campId: 'camp-9', userId: 'u2', memberUserIds: ['u1', 'u2'] })
+      return Response.json({ result: {} })
+    })
+    const auth = durable()
+    const client = new ConsoleClient(origin, fetcher, memory(), auth)
+    await client.login('d'.repeat(64))
+    expect(client.cloudUser).toEqual({ id: 'u1', displayName: '宝宝', role: 'owner' })
+    expect(await auth.read()).toMatchObject({ cloudUser: { id: 'u1', displayName: '宝宝', role: 'owner' } })
+    await expect(client.cloudUsers()).resolves.toEqual([{ id: 'u1', displayName: '宝宝', role: 'owner' }, { id: 'u2', displayName: '阿明', role: 'member' }])
+    await expect(client.cloudCampMembers('camp-9')).resolves.toEqual(['u1'])
+    await expect(client.addCloudCampMember('camp-9', 'u2')).resolves.toEqual(['u1', 'u2'])
+    const cloud = calls.filter(call => call.url.includes('/cloud/'))
+    expect(cloud.map(({ url, method }) => `${method} ${url}`)).toEqual([
+      `GET ${origin}/api/v1/cloud/users`,
+      `GET ${origin}/api/v1/cloud/camp-members/camp-9`,
+      `POST ${origin}/api/v1/cloud/camp-members`
+    ])
+    expect(cloud.at(-1)?.body).toEqual({ campId: 'camp-9', userId: 'u2' })
+    for (const call of cloud) expect(call.headers.get('Authorization')).toBe(`Bearer ${identity.token}`)
+    // Cloud identities never survive logout; a single-user Host stays null.
+    await client.logout()
+    expect(client.cloudUser).toBeNull()
+  })
+  it('restores the cloud identity from durable auth and keeps single-user sessions unchanged', async () => {
+    const cloudUser = { id: 'u1', displayName: '宝宝', role: 'owner' }
+    const fetcher = vi.fn<typeof fetch>(async url =>
+      String(url).endsWith('/session') ? Response.json(identity) : Response.json({ result: {} }))
+    const restored = durable()
+    await restored.write({ version: 1, origin, token: identity.token, ownerId: 'owner', expiresAt: null, cloudUser })
+    const withCloud = new ConsoleClient(origin, fetcher, memory(), restored)
+    await expect(withCloud.restore()).resolves.toBe(true)
+    expect(withCloud.cloudUser).toEqual(cloudUser)
+    const legacy = durable()
+    await legacy.write({ version: 1, origin, token: identity.token, ownerId: 'owner', expiresAt: null })
+    const withoutCloud = new ConsoleClient(origin, fetcher, memory(), legacy)
+    await expect(withoutCloud.restore()).resolves.toBe(true)
+    expect(withoutCloud.cloudUser).toBeNull()
+    // An invalid stored shape never blocks the ordinary Bearer restore.
+    const malformed = durable()
+    await malformed.write({ version: 1, origin, token: identity.token, ownerId: 'owner', expiresAt: null, cloudUser: { id: 7 } as never })
+    const lenient = new ConsoleClient(origin, fetcher, memory(), malformed)
+    await expect(lenient.restore()).resolves.toBe(true)
+    expect(lenient.cloudUser).toBeNull()
+  })
+})

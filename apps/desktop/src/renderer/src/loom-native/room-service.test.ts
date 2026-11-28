@@ -38,7 +38,7 @@ import {
   type RoomDraft,
   type RoomPort
 } from './room-service'
-import { GROUP_NAME_LIMIT_NOTICE, GroupNameField, groupNameCounter } from './RoomDialog'
+import { CloudPeopleSection, GROUP_NAME_LIMIT_NOTICE, GroupNameField, cloudPeopleRows, groupNameCounter } from './RoomDialog'
 
 type RecordedCall = { method: string; params: Record<string, unknown> | undefined }
 
@@ -741,5 +741,40 @@ describe('RoomDialog group-name counter (B5)', () => {
   it('GroupNameField renders only the group-name input', () => {
     const field = renderField('任何名字')
     expect(field.split('<input').length - 1).toBe(1)
+  })
+})
+
+describe('web boundary cloud people section', () => {
+  const owner = { id: 'u1', displayName: '宝宝', role: 'owner' }
+  const member = { id: 'u2', displayName: '阿明', role: 'member' }
+  const renderSection = (props: Partial<Parameters<typeof CloudPeopleSection>[0]> = {}) =>
+    renderToStaticMarkup(createElement(CloudPeopleSection, { users: [owner, member], memberUserIds: ['u1'], busyUserId: null, onPullIn: () => {}, ...props }))
+
+  it('splits host-declared people into in-camp and pullable rows', () => {
+    expect(cloudPeopleRows([owner, member], ['u1'])).toEqual([
+      { user: owner, inCamp: true },
+      { user: member, inCamp: false }
+    ])
+    expect(cloudPeopleRows([], [])).toEqual([])
+  })
+
+  it('renders people apart from assistants and only offers pull-in for non-members', () => {
+    const markup = renderSection()
+    expect(markup).toContain('人员')
+    expect(markup).toContain('来自服务端，不参与助手分工')
+    expect(markup).toContain('宝宝')
+    expect(markup).toContain('已在群聊')
+    // 只有未入群的阿明有一个拉入按钮；已在群的宝宝不再重复拉入。
+    expect(markup.split('拉入群聊').length - 1).toBe(1)
+    const allMembers = renderSection({ memberUserIds: ['u1', 'u2'] })
+    expect(allMembers.split('拉入群聊').length - 1).toBe(0)
+  })
+
+  it('disables pull-in while one request is in flight and shows its failure', () => {
+    const busy = renderSection({ busyUserId: 'u2' })
+    expect(busy).toContain('拉入中…')
+    expect(busy).toContain('disabled')
+    const failed = renderSection({ error: '拉入未完成，请重试。' })
+    expect(failed).toContain('拉入未完成，请重试。')
   })
 })

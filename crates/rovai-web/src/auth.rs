@@ -23,6 +23,12 @@ const MAX_SESSIONS: usize = 32;
 const LOGIN_ATTEMPTS: usize = 12;
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 const STORE_FILE: &str = "web-auth.json";
+/// Additional fixed member identities for boundary multi-user simulation are
+/// read from this environment variable as `userId=token,userId=token`.
+pub const CLOUD_USERS_ENV: &str = "LOOM_CLOUD_USERS";
+/// The administrator Token is always the fixed Owner identity of this boundary.
+pub const CLOUD_OWNER_ID: &str = "owner";
+const CLOUD_USER_ID_LIMIT: usize = 64;
 
 type Registry = HashMap<[u8; 32], Arc<Session>>;
 // Credentials deliberately have no Debug implementation. Host owns the private
@@ -40,6 +46,7 @@ struct SessionState {
     attempts: VecDeque<Instant>,
     generation: u64,
     ticket: Option<LoginTicket>,
+    cloud_users: CloudUsers,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -56,6 +63,14 @@ struct StoredSession {
     expires_at: u64,
     #[serde(default)]
     last_used_at: u64,
+    /// Cloud identity of the credential. Stores written before multi-user
+    /// simulation carry no field and reopen as the Owner.
+    #[serde(default = "default_cloud_user_id")]
+    cloud_user_id: String,
+}
+
+fn default_cloud_user_id() -> String {
+    CLOUD_OWNER_ID.to_owned()
 }
 struct LoginTicket {
     digest: [u8; 32],
@@ -65,8 +80,108 @@ pub struct TicketGrant {
     generation: u64,
     digest: [u8; 32],
 }
+/// Role of a fixed cloud identity on this Web boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CloudRole {
+    Owner,
+    Member,
+}
+
+/// Read-only projection of one cloud identity. Tokens never appear here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudUser {
+    pub id: String,
+    pub display_name: String,
+    pub role: CloudRole,
+}
+
+pub(crate) fn valid_cloud_user_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= CLOUD_USER_ID_LIMIT
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// Fixed cloud identities for boundary multi-user simulation: the Host Token
+/// is the Owner, and `LOOM_CLOUD_USERS` entries (`userId=token,userId=token`)
+/// are additional member Tokens. Malformed or reserved entries are skipped, so
+/// a broken specification fails closed instead of admitting strangers.
+#[derive(Debug, Default, Clone)]
+pub struct CloudUsers {
+    members: Vec<CloudUser>,
+    digests: HashMap<[u8; 32], String>,
+}
+
+impl CloudUsers {
+    /// The fixed Owner identity behind the administrator Token.
+    pub fn owner() -> CloudUser {
+        CloudUser {
+            id: CLOUD_OWNER_ID.to_owned(),
+            display_name: CLOUD_OWNER_ID.to_owned(),
+            role: CloudRole::Owner,
+        }
+    }
+    /// Pure parser, so tests and embedders never depend on the process
+    /// environment.
+    pub fn parse(spec: &str) -> Self {
+        let mut users = Self::default();
+        let mut identifiers = std::collections::HashSet::new();
+        let mut digests = std::collections::HashSet::new();
+        for entry in spec.split(',') {
+            let Some((identifier, token)) = entry.split_once('=') else {
+                continue;
+            };
+            let identifier = identifier.trim();
+            let token = token.trim();
+            if !valid_cloud_user_id(identifier)
+                || identifier == CLOUD_OWNER_ID
+                || !valid_token(token)
+                || !identifiers.insert(identifier.to_owned())
+            {
+                continue;
+            }
+            let digest = digest(b"rovai-cloud-user-v1\0", token);
+            if !digests.insert(digest) {
+                continue;
+            }
+            users.digests.insert(digest, identifier.to_owned());
+            users.members.push(CloudUser {
+                id: identifier.to_owned(),
+                display_name: identifier.to_owned(),
+                role: CloudRole::Member,
+            });
+        }
+        users
+    }
+    pub fn from_env() -> Self {
+        std::env::var(CLOUD_USERS_ENV)
+            .map(|spec| Self::parse(&spec))
+            .unwrap_or_default()
+    }
+    fn resolve_token(&self, token: &str) -> Option<CloudUser> {
+        if !valid_token(token) {
+            return None;
+        }
+        let identifier = self.digests.get(&digest(b"rovai-cloud-user-v1\0", token))?;
+        self.find(identifier)
+    }
+    fn find(&self, id: &str) -> Option<CloudUser> {
+        self.members.iter().find(|user| user.id == id).cloned()
+    }
+}
+
+/// One admitted Token-to-identity binding for login.
+pub struct CloudLogin {
+    pub generation: u64,
+    pub user: CloudUser,
+}
 pub struct Session {
     pub client_id: String,
+    /// Cloud identity bound to this credential (`owner` for the Host Token).
+    pub cloud_user_id: String,
     pub expires_at: watch::Sender<u64>,
     pub revoked: watch::Sender<bool>,
     pub streams: Arc<Semaphore>,
@@ -74,15 +189,24 @@ pub struct Session {
     last_used_at: AtomicU64,
 }
 impl Session {
-    fn new(client_id: String, expires_at: u64, last_used_at: u64) -> Arc<Self> {
+    fn new(
+        client_id: String,
+        cloud_user_id: String,
+        expires_at: u64,
+        last_used_at: u64,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client_id,
+            cloud_user_id,
             expires_at: watch::channel(expires_at).0,
             revoked: watch::channel(false).0,
             streams: Arc::new(Semaphore::new(2)),
             downloads: Arc::new(Semaphore::new(2)),
             last_used_at: AtomicU64::new(last_used_at),
         })
+    }
+    pub fn is_cloud_owner(&self) -> bool {
+        self.cloud_user_id == CLOUD_OWNER_ID
     }
     pub fn expiry(&self) -> u64 {
         *self.expires_at.borrow()
@@ -245,10 +369,11 @@ fn read_store(path: &Path) -> Result<Option<StoredAuth>> {
         stored.version == 1
             && valid_token(&stored.administrator_token)
             && stored.sessions.len() <= MAX_SESSIONS
-            && stored
-                .sessions
-                .iter()
-                .all(|session| valid_token(&session.client_id) && session.expires_at > 0),
+            && stored.sessions.iter().all(|session| {
+                valid_token(&session.client_id)
+                    && session.expires_at > 0
+                    && valid_cloud_user_id(&session.cloud_user_id)
+            }),
         AuthStoreFailure::Content
     );
     let mut digests = std::collections::HashSet::new();
@@ -270,6 +395,12 @@ pub fn stored_administrator_token(data_dir: &Path) -> Result<Option<String>> {
 
 impl Sessions {
     pub fn new(administrator: &str) -> Result<Self> {
+        Self::new_with_cloud_users(administrator, CloudUsers::default())
+    }
+
+    /// Test-injectable constructor: the fixed cloud roster is provided
+    /// directly, so no test or embedder depends on process environment.
+    pub fn new_with_cloud_users(administrator: &str, cloud_users: CloudUsers) -> Result<Self> {
         ensure!(
             valid_token(administrator),
             "administrator token must be 32 random bytes encoded as 64 hexadecimal characters"
@@ -283,6 +414,7 @@ impl Sessions {
                 attempts: VecDeque::new(),
                 generation: 0,
                 ticket: None,
+                cloud_users,
             }),
             path: None,
             clock: Arc::new(wall_clock),
@@ -291,11 +423,28 @@ impl Sessions {
     /// Called only after Core admits the data-dir lease. Invalid or unreadable
     /// state fails closed; ordinary restart never generates replacement credentials.
     pub fn open(data_dir: &Path, bootstrap: Option<&str>) -> Result<Self> {
-        Self::open_with_clock(data_dir, bootstrap, Arc::new(wall_clock))
+        Self::open_with_cloud_users(data_dir, bootstrap, CloudUsers::from_env())
     }
+    /// Same durable open with an injectable cloud roster.
+    pub fn open_with_cloud_users(
+        data_dir: &Path,
+        bootstrap: Option<&str>,
+        cloud_users: CloudUsers,
+    ) -> Result<Self> {
+        Self::open_inner(data_dir, bootstrap, cloud_users, Arc::new(wall_clock))
+    }
+    #[cfg(test)]
     fn open_with_clock(
         data_dir: &Path,
         bootstrap: Option<&str>,
+        clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Result<Self> {
+        Self::open_inner(data_dir, bootstrap, CloudUsers::default(), clock)
+    }
+    fn open_inner(
+        data_dir: &Path,
+        bootstrap: Option<&str>,
+        cloud_users: CloudUsers,
         clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     ) -> Result<Self> {
         let path = data_dir.join(STORE_FILE);
@@ -313,7 +462,7 @@ impl Sessions {
                 "A different login Token is already stored; use the existing Token or explicitly reset it"
             );
         }
-        let mut result = Self::new(&token)?;
+        let mut result = Self::new_with_cloud_users(&token, cloud_users)?;
         result.path = Some(path);
         result.clock = clock;
         let mut state = result.state.lock().expect("session registry poisoned");
@@ -322,7 +471,12 @@ impl Sessions {
                 if entry.expires_at > result.now() {
                     state.sessions.insert(
                         entry.digest,
-                        Session::new(entry.client_id, entry.expires_at, entry.last_used_at),
+                        Session::new(
+                            entry.client_id,
+                            entry.cloud_user_id,
+                            entry.expires_at,
+                            entry.last_used_at,
+                        ),
                     );
                 }
             }
@@ -363,6 +517,7 @@ impl Sessions {
                         .filter(|(renewed, _)| std::ptr::eq(*renewed, session.as_ref()))
                         .map_or_else(|| session.expiry(), |(_, expiry)| expiry),
                     last_used_at: session.last_used_at.load(Ordering::Relaxed),
+                    cloud_user_id: session.cloud_user_id.clone(),
                 })
                 .collect(),
         };
@@ -401,6 +556,29 @@ impl Sessions {
             return Err(LoginFailure::Unauthorized);
         }
         Ok(state.generation)
+    }
+    /// One login Token resolves to exactly one cloud identity: the Host Token
+    /// to the fixed Owner, a configured `LOOM_CLOUD_USERS` Token to its member.
+    /// Any other Token is unauthorized.
+    pub fn authorize_cloud_login(
+        &self,
+        token: &str,
+    ) -> std::result::Result<CloudLogin, LoginFailure> {
+        let mut state = self.state.lock().expect("session registry poisoned");
+        Self::admit_login(&mut state, Instant::now())?;
+        let candidate = digest(b"rovai-administrator-v1\0", token);
+        let user = if valid_token(token) && bool::from(state.administrator.ct_eq(&candidate)) {
+            CloudUsers::owner()
+        } else {
+            state
+                .cloud_users
+                .resolve_token(token)
+                .ok_or(LoginFailure::Unauthorized)?
+        };
+        Ok(CloudLogin {
+            generation: state.generation,
+            user,
+        })
     }
     fn admit_login(
         state: &mut SessionState,
@@ -460,7 +638,13 @@ impl Sessions {
         }) {
             return Err(LoginFailure::Unauthorized);
         }
-        let result = self.issue_locked(&mut state, grant.generation, client_id)?;
+        // Ticket login stays the fixed Owner identity.
+        let result = self.issue_locked(
+            &mut state,
+            grant.generation,
+            client_id,
+            CLOUD_OWNER_ID.to_owned(),
+        )?;
         state.ticket = None;
         Ok(result)
     }
@@ -470,13 +654,25 @@ impl Sessions {
         client_id: String,
     ) -> std::result::Result<(String, Arc<Session>), LoginFailure> {
         let mut state = self.state.lock().expect("session registry poisoned");
-        self.issue_locked(&mut state, generation, client_id)
+        self.issue_locked(&mut state, generation, client_id, CLOUD_OWNER_ID.to_owned())
+    }
+    /// Issues a Session bound to one cloud identity. The identity persists with
+    /// the Session, so reopens and forks keep it.
+    pub fn issue_cloud(
+        &self,
+        generation: u64,
+        client_id: String,
+        user: &CloudUser,
+    ) -> std::result::Result<(String, Arc<Session>), LoginFailure> {
+        let mut state = self.state.lock().expect("session registry poisoned");
+        self.issue_locked(&mut state, generation, client_id, user.id.clone())
     }
     fn issue_locked(
         &self,
         state: &mut SessionState,
         generation: u64,
         client_id: String,
+        cloud_user_id: String,
     ) -> std::result::Result<(String, Arc<Session>), LoginFailure> {
         if !state.enabled || state.generation != generation || !valid_token(&client_id) {
             return Err(LoginFailure::Unauthorized);
@@ -484,6 +680,7 @@ impl Sessions {
         self.insert(
             state,
             client_id,
+            cloud_user_id,
             self.now() + milliseconds(SESSION_LIFETIME),
         )
     }
@@ -491,6 +688,7 @@ impl Sessions {
         &self,
         state: &mut SessionState,
         client_id: String,
+        cloud_user_id: String,
         expiry: u64,
     ) -> std::result::Result<(String, Arc<Session>), LoginFailure> {
         let now = self.now();
@@ -517,7 +715,7 @@ impl Sessions {
             next.remove(&oldest_idle);
         }
         let token = new_token().map_err(|_| LoginFailure::Capacity)?;
-        let session = Session::new(client_id, expiry, now);
+        let session = Session::new(client_id, cloud_user_id, expiry, now);
         next.insert(digest(b"rovai-session-v1\0", &token), session.clone());
         self.replace(state, &state.administrator_plaintext.clone(), next)
             .map_err(|error| LoginFailure::Storage(AuthStoreFailure::saving(error)))?;
@@ -550,7 +748,12 @@ impl Sessions {
         if !self.live(&state, parent) || !valid_token(&client_id) || client_id == parent.client_id {
             return Err(LoginFailure::Unauthorized);
         }
-        self.insert(&mut state, client_id, parent.expiry())
+        self.insert(
+            &mut state,
+            client_id,
+            parent.cloud_user_id.clone(),
+            parent.expiry(),
+        )
     }
     pub fn renew(&self, session: &Session) -> std::result::Result<serde_json::Value, LoginFailure> {
         let state = self.state.lock().expect("session registry poisoned");
@@ -576,6 +779,49 @@ impl Sessions {
             .expect("session registry poisoned")
             .administrator_plaintext
             .clone()
+    }
+
+    /// Read-only cloud roster: the Owner plus every configured member. Tokens
+    /// are never part of this projection.
+    pub fn cloud_users(&self) -> Vec<CloudUser> {
+        let mut users = vec![CloudUsers::owner()];
+        users.extend(
+            self.state
+                .lock()
+                .expect("session registry poisoned")
+                .cloud_users
+                .members
+                .clone(),
+        );
+        users
+    }
+
+    pub fn find_cloud_user(&self, id: &str) -> Option<CloudUser> {
+        if id == CLOUD_OWNER_ID {
+            return Some(CloudUsers::owner());
+        }
+        self.state
+            .lock()
+            .expect("session registry poisoned")
+            .cloud_users
+            .find(id)
+    }
+
+    /// Projection of the identity bound to one live Session.
+    pub fn cloud_user(&self, session: &Session) -> CloudUser {
+        if session.is_cloud_owner() {
+            return CloudUsers::owner();
+        }
+        self.state
+            .lock()
+            .expect("session registry poisoned")
+            .cloud_users
+            .find(&session.cloud_user_id)
+            .unwrap_or_else(|| CloudUser {
+                id: session.cloud_user_id.clone(),
+                display_name: session.cloud_user_id.clone(),
+                role: CloudRole::Member,
+            })
     }
 
     /// Constant-time check that does not record a login attempt.
@@ -1090,5 +1336,131 @@ mod tests {
         assert_eq!(sessions.count(), MAX_SESSIONS);
         assert_eq!(replacement.client_id, first.client_id);
         assert!(sessions.authenticate(&replacement_token).is_some());
+    }
+
+    // Owns the fixed cloud roster admission: only bounded, distinct member
+    // entries from the LOOM_CLOUD_USERS shape are ever usable.
+    #[test]
+    fn cloud_users_parse_admits_only_bounded_member_entries() {
+        let token = "c".repeat(64);
+        let users = CloudUsers::parse(&format!(
+            "boba={token},owner={token},bad id={token},no-token,short={}",
+            "a".repeat(63)
+        ));
+        assert_eq!(users.members.len(), 1);
+        assert_eq!(users.members[0].id, "boba");
+        assert_eq!(users.members[0].display_name, "boba");
+        assert_eq!(users.members[0].role, CloudRole::Member);
+        assert!(
+            users
+                .resolve_token(&token)
+                .is_some_and(|user| user.id == "boba")
+        );
+        assert!(users.resolve_token(&new_token().unwrap()).is_none());
+        assert!(users.resolve_token(&"z".repeat(63)).is_none());
+        assert!(users.find("boba").is_some());
+        assert!(users.find(CLOUD_OWNER_ID).is_none());
+        // Duplicate identifiers keep the first entry; the roster stays small.
+        let duplicates = CloudUsers::parse(&format!("boba={token},boba={token}"));
+        assert_eq!(duplicates.members.len(), 1);
+        assert_eq!(CloudUsers::parse("").members.len(), 0);
+    }
+
+    // Owns the Token-to-identity mapping of the login boundary.
+    #[test]
+    fn cloud_login_maps_tokens_to_identities_and_forks_preserve_them() {
+        let administrator = new_token().unwrap();
+        let member_token = new_token().unwrap();
+        let cloud = CloudUsers::parse(&format!("boba={member_token}"));
+        let sessions = Sessions::new_with_cloud_users(&administrator, cloud).unwrap();
+        let owner = sessions.authorize_cloud_login(&administrator).ok().unwrap();
+        assert_eq!(owner.user, CloudUsers::owner());
+        let member = sessions.authorize_cloud_login(&member_token).ok().unwrap();
+        assert_eq!(member.user.id, "boba");
+        assert_eq!(member.user.role, CloudRole::Member);
+        assert!(
+            sessions
+                .authorize_cloud_login(&new_token().unwrap())
+                .is_err()
+        );
+        let (_, owner_session) = sessions
+            .issue_cloud(owner.generation, new_token().unwrap(), &owner.user)
+            .ok()
+            .unwrap();
+        assert_eq!(owner_session.cloud_user_id, CLOUD_OWNER_ID);
+        assert!(owner_session.is_cloud_owner());
+        let (member_bearer, member_session) = sessions
+            .issue_cloud(member.generation, new_token().unwrap(), &member.user)
+            .ok()
+            .unwrap();
+        assert_eq!(member_session.cloud_user_id, "boba");
+        assert!(!member_session.is_cloud_owner());
+        assert_eq!(sessions.cloud_user(&member_session).id, "boba");
+        let roster = sessions.cloud_users();
+        assert_eq!(roster.len(), 2);
+        assert_eq!(roster[0], CloudUsers::owner());
+        assert_eq!(roster[1].id, "boba");
+        assert_eq!(
+            sessions.find_cloud_user("boba").unwrap().role,
+            CloudRole::Member
+        );
+        assert_eq!(
+            sessions.find_cloud_user(CLOUD_OWNER_ID).unwrap(),
+            CloudUsers::owner()
+        );
+        assert!(sessions.find_cloud_user("ghost").is_none());
+        let (_, fork) = sessions
+            .fork(&member_session, new_token().unwrap())
+            .ok()
+            .unwrap();
+        assert_eq!(fork.cloud_user_id, "boba");
+        assert!(sessions.authenticate(&member_bearer).is_some());
+    }
+
+    // Owns the durability of the cloud identity: persisted Sessions reopen
+    // with it, and stores written before multi-user simulation reopen as Owner.
+    #[test]
+    fn stored_sessions_reopen_with_cloud_identity_and_legacy_as_owner() {
+        let parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = parent.join(format!("rovai-auth-cloud-{}", new_token().unwrap()));
+        rovai_core::platform::prepare_private_directory(&root).unwrap();
+        let member_token = new_token().unwrap();
+        let cloud = CloudUsers::parse(&format!("boba={member_token}"));
+        let registry = Sessions::open_with_cloud_users(&root, None, cloud.clone()).unwrap();
+        let administrator = registry.administrator_token();
+        let (owner_bearer, _) = registry.login(&administrator).ok().unwrap();
+        let member = registry.authorize_cloud_login(&member_token).ok().unwrap();
+        let (member_bearer, _) = registry
+            .issue_cloud(member.generation, new_token().unwrap(), &member.user)
+            .ok()
+            .unwrap();
+        drop(registry);
+        let reopened = Sessions::open_with_cloud_users(&root, None, cloud).unwrap();
+        let restored = reopened.authenticate(&member_bearer).unwrap();
+        assert_eq!(restored.cloud_user_id, "boba");
+        assert_eq!(reopened.cloud_user(&restored).id, "boba");
+        // A store written before the cloud identity existed reopens as Owner.
+        let path = root.join(STORE_FILE);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for entry in legacy["sessions"].as_array_mut().unwrap() {
+            assert!(
+                entry
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("cloudUserId")
+                    .is_some()
+            );
+        }
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let reopened = Sessions::open_with_cloud_users(&root, None, CloudUsers::default()).unwrap();
+        let restored = reopened.authenticate(&member_bearer).unwrap();
+        assert_eq!(restored.cloud_user_id, CLOUD_OWNER_ID);
+        assert!(restored.is_cloud_owner());
+        drop(restored);
+        let restored = reopened.authenticate(&owner_bearer).unwrap();
+        assert_eq!(restored.cloud_user_id, CLOUD_OWNER_ID);
+        assert!(reopened.find_cloud_user("boba").is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

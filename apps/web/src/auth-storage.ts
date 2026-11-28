@@ -6,6 +6,8 @@ export interface BrowserSession {
   token: string
   ownerId: string
   expiresAt: number | null
+  /** Host-declared cloud identity (web boundary simulated tenancy); absent on single-user Hosts. */
+  cloudUser?: import('../../desktop/src/renderer/src/business-environment').CloudUser | null
 }
 export interface AuthStorage {
   read(): Promise<BrowserSession | null>
