@@ -5,7 +5,12 @@ param(
     [string]$PackageDirectory = $PSScriptRoot,
     [string]$InstallDirectory = (Join-Path $env:LOCALAPPDATA 'Programs\LOOM-Personal'),
     [string]$DataDirectory,
-    [ValidateRange(1024, 65535)][int]$Port = 64852
+    [ValidateRange(1024, 65535)][int]$Port = 64852,
+    # Comma-separated runtimes for this personal installation. Short names
+    # (codex, pi, dsh, claude) and canonical AdapterKind ids are both accepted.
+    # Empty means "not chosen yet": install keeps the saved selection, the first
+    # interactive install asks, and every non-interactive path defaults to all.
+    [string]$Runtimes
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -13,6 +18,160 @@ if ([Environment]::OSVersion.Platform -ne 'Win32NT' -or -not [Environment]::Is64
     throw 'LOOM requires Windows x64.'
 }
 $utf8 = New-Object Text.UTF8Encoding($false)
+
+# Installation-time runtime selection (light edition). Every runtime is always
+# copied; this only decides which ones the launcher advertises to LOOM through
+# LOOM_ENABLED_RUNTIMES. Canonical order is the AdapterKind order used by the
+# product catalog, so the exported list is stable across platforms.
+$runtimeAliases = [ordered]@{
+    'codex-cli' = @('codex', 'codex-cli')
+    'pi' = @('pi')
+    'deepseek-harness' = @('dsh', 'deepseek-harness', 'deepseek', 'harness')
+    'claude-code-cli' = @('claude', 'claude-code', 'claude-code-cli')
+}
+$defaultRuntimes = @('codex-cli', 'pi', 'deepseek-harness', 'claude-code-cli')
+
+function ConvertFrom-RuntimeSelection([string]$Value) {
+    # Returns $null for an empty value so the caller keeps the saved selection
+    # or the all-four default; a name that is not a known runtime is rejected
+    # instead of silently narrowing the installation.
+    foreach ($token in ($Value -split '[,;\s]+')) {
+        if ($token.Trim()) {
+            $known = $false
+            foreach ($entry in $runtimeAliases.GetEnumerator()) {
+                if ($entry.Value -contains $token.Trim().ToLowerInvariant()) { $known = $true; break }
+            }
+            if (-not $known) { throw "Unknown LOOM runtime: $($token.Trim()). Use codex, pi, dsh or claude." }
+        }
+    }
+    $chosen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($part in ($Value -split '[,;\s]+')) {
+        $token = $part.Trim().ToLowerInvariant()
+        if (-not $token) { continue }
+        $canonical = $null
+        foreach ($entry in $runtimeAliases.GetEnumerator()) {
+            foreach ($alias in $entry.Value) {
+                if ($alias -eq $token) { $canonical = $entry.Key; break }
+            }
+            if ($canonical) { break }
+        }
+        if (-not $canonical) { continue }
+        [void]$chosen.Add($canonical)
+    }
+    if ($chosen.Count -eq 0) { return $null }
+    return @($defaultRuntimes | Where-Object { $chosen.Contains($_) })
+}
+
+function Get-CanonicalRuntimes($Selection) {
+    # canonical string[] (AdapterKind order), the only shape written to
+    # installation.json. Accepts a real array, a comma/semicolon/space string,
+    # or a mixture of both, because older managers stored either form.
+    $set = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($value in @($Selection)) {
+        if ($null -eq $value) { continue }
+        foreach ($token in ([string]$value -split '[,;\s]+')) {
+            if (-not $token.Trim()) { continue }
+            $token = $token.Trim().ToLowerInvariant()
+            $canonical = $null
+            foreach ($entry in $runtimeAliases.GetEnumerator()) {
+                if ($entry.Value -contains $token) { $canonical = $entry.Key; break }
+            }
+            if ($canonical) { [void]$set.Add($canonical) }
+            elseif (-not $set.Contains($token)) { [void]$set.Add($token) }
+        }
+    }
+    if ($set.Count -eq 0) { return $defaultRuntimes }
+    return @($defaultRuntimes | Where-Object { $set.Contains($_) })
+}
+
+function Format-RuntimeSelection($Selection) {
+    # Canonical comma list for LOOM_ENABLED_RUNTIMES. The comma is emitted as a
+    # single-element array so PowerShell does not unroll the result into a plain
+    # string; callers that write JSON must pass it through Get-CanonicalRuntimes.
+    $canonical = @(Get-CanonicalRuntimes $Selection)
+    if ($canonical.Count -eq 0) { $canonical = @($defaultRuntimes) }
+    return (,$(($canonical) -join ','))
+}
+
+function Select-RuntimesInteractively([string]$DefaultList) {
+    if (-not [Environment]::UserInteractive -or [Console]::IsInputRedirected) { return $null }
+    Write-Host ''
+    Write-Host 'Light edition: choose the runtimes to enable at launch.'
+    for ($i = 0; $i -lt $runtimeAliases.Count; $i++) {
+        $canonical = @($runtimeAliases.Keys)[$i]
+        $alias = $runtimeAliases[$canonical][0]
+        $label = "$alias / $canonical"
+        Write-Host "  $($i + 1). $label"
+    }
+    Write-Host 'Enter numbers separated by commas, or press Enter to enable all four.'
+    $answer = $null
+    try { $answer = Read-Host 'Runtimes' } catch { return $null }
+    if (-not $answer -or -not $answer.Trim()) { return (ConvertFrom-RuntimeSelection $DefaultList) }
+    $names = New-Object 'Collections.Generic.List[string]'
+    foreach ($token in ($answer -split '[,;\s]+')) {
+        $token = $token.Trim()
+        if (-not $token) { continue }
+        if ($token -match '^\d+$') {
+            $index = [int]$token - 1
+            if ($index -ge 0 -and $index -lt $runtimeAliases.Count) { $names.Add(@($runtimeAliases.Keys)[$index]) }
+        } else { $names.Add($token) }
+    }
+    return (ConvertFrom-RuntimeSelection ($names -join ','))
+}
+
+function Test-StateKey($State, [string]$Name) {
+    # Key lookup that works for every dictionary shape Read-Json can return:
+    # PowerShell 5.1's JavaScriptSerializer dictionary (Dictionary[string,object])
+    # exposes ContainsKey but not Contains, Hashtable/OrderedDictionary expose
+    # both, and PS 6+ -AsHashtable is a plain Hashtable. Scan Keys so no single
+    # method name is assumed.
+    foreach ($key in @($State.Keys)) {
+        if ([string]::Equals([string]$key, $Name, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Get-SavedRuntimes($State) {
+    # StrictMode-safe read of the optional installation.json runtime selection.
+    if (-not $State) { return $null }
+    if ($State -is [Collections.IDictionary]) {
+        if (Test-StateKey $State 'runtimes') { return $State['runtimes'] }
+        return $null
+    }
+    $property = $State.PSObject.Properties['runtimes']
+    if ($property) { return $property.Value }
+    return $null
+}
+
+function Set-SavedRuntimes($State, $Selection) {
+    # installation.json always stores the selection as a canonical JSON array
+    # (["codex-cli","pi"]), never a single comma-joined string, so upgrades and
+    # Start can read it back without guessing.
+    # A state file written before the light edition has no runtimes property:
+    # adding it through the ordered-dictionary route works for every shape
+    # Read-Json can produce (hashtable, generic dictionary, PSCustomObject).
+    $canonical = @(Get-CanonicalRuntimes $Selection)
+    if ($State -is [Collections.IDictionary]) { $State['runtimes'] = $canonical }
+    elseif ($State.PSObject.Properties['runtimes']) { $State.runtimes = $canonical }
+    else {
+        $null = $State.PSObject.Properties.Add([Management.Automation.PSNoteProperty]::new('runtimes', $canonical))
+    }
+}
+
+function Set-SavedValue($State, [string]$Name, $Value) {
+    # StrictMode/legacy-safe property write for installation.json. PowerShell 5.1
+    # Read-Json returns a JavaScriptSerializer dictionary, where `$State.x = v`
+    # fails outright when x is absent; an ordered dictionary accepts assignments
+    # that insert the new key.
+    $entries = New-Object 'Collections.Specialized.OrderedDictionary' ([StringComparer]::OrdinalIgnoreCase)
+    if ($State -is [Collections.IDictionary]) {
+        foreach ($key in @($State.Keys)) { $entries[$key] = $State[$key] }
+    } else {
+        foreach ($property in $State.PSObject.Properties) { $entries[$property.Name] = $property.Value }
+    }
+    $entries[$Name] = $Value
+    return $entries
+}
 
 function Resolve-Directory([string]$Value) {
     if (-not [IO.Path]::IsPathRooted($Value) -or $Value -match '(^|[\\/])\.\.?([\\/]|$)') {
@@ -270,8 +429,11 @@ function Data-Contract($Manifest) {
     return "$($value.version):$($value.projectionSchema)"
 }
 
-function Run-Loom([string]$Root, [string]$DataRoot, [int]$ListenPort, $Manifest) {
+function Run-Loom([string]$Root, [string]$DataRoot, [int]$ListenPort, $Manifest, $EnabledRuntimes) {
     Assert-DataSeparate $DataRoot $Root
+    # Every packaged runtime stays installed; this list only tells LOOM which
+    # ones this installation advertises to the Host and the web UI.
+    $env:LOOM_ENABLED_RUNTIMES = Format-RuntimeSelection $EnabledRuntimes
     $env:ROVAI_EMBEDDED_PI_ROOT = Join-Path $Root 'runtime\pi'
     $env:PI_CODING_AGENT_DIR = Join-Path $DataRoot 'runtime-home\pi'
     $env:CODEX_HOME = Join-Path $DataRoot 'runtime-home\codex'
@@ -290,6 +452,7 @@ function Run-Loom([string]$Root, [string]$DataRoot, [int]$ListenPort, $Manifest)
     Write-Host "LOOM: http://127.0.0.1:$ListenPort/"
     Write-Host 'Keep this window open. Press Ctrl+C to stop.'
     Write-Host "Personal data: $DataRoot"
+    Write-Host "Enabled runtimes: $($env:LOOM_ENABLED_RUNTIMES)"
     # The native Server prepares its private data root, Skill library and MCP
     # path. Never create this directory with inherited ACLs in the launcher.
     & (Join-Path $Root 'rovai-server.exe') --data-dir $DataRoot --listen "127.0.0.1:$ListenPort"
@@ -307,7 +470,10 @@ try {
     if ($Action -eq 'Portable') {
         $manifest = Verify-Package $PackageDirectory
         if (-not $DataDirectory) { $DataDirectory = Join-Path $env:LOCALAPPDATA 'LOOM\personal-preview-20261116' }
-        Run-Loom $PackageDirectory (Resolve-Directory $DataDirectory) $Port $manifest
+        # Portable has no installation.json. Use the explicit -Runtimes value
+        # when one was accepted and otherwise the same default of all runtimes.
+        $portableRuntimes = ConvertFrom-RuntimeSelection $Runtimes
+        Run-Loom $PackageDirectory (Resolve-Directory $DataDirectory) $Port $manifest $portableRuntimes
         return
     }
     $manifest = if ($Action -eq 'Install') { Verify-Package $PackageDirectory } else { $null }
@@ -333,6 +499,17 @@ try {
             $DataDirectory = $state.dataDirectory
             $Port = $state.port
         } elseif (-not $DataDirectory) { $DataDirectory = Join-Path $env:LOCALAPPDATA 'LOOM\personal-preview-20261116' }
+        # Runtime selection: an explicit -Runtimes wins, an upgrade keeps what
+        # the owner saved, and only a first interactive install asks. Anything
+        # unanswered, redirected or invalid stays on the safe four-runtime
+        # default so unattended installs can never block or fail here.
+        $requestedRuntimes = ConvertFrom-RuntimeSelection $Runtimes
+        if ($requestedRuntimes) { $selectedRuntimes = $requestedRuntimes }
+        elseif ($state) { $selectedRuntimes = @(Get-CanonicalRuntimes (Get-SavedRuntimes $state)) }
+        elseif ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+            $picked = Select-RuntimesInteractively ($defaultRuntimes -join ',')
+            $selectedRuntimes = if ($picked) { $picked } else { $defaultRuntimes }
+        } else { $selectedRuntimes = $defaultRuntimes }
         $DataDirectory = Resolve-Directory $DataDirectory
         Assert-DataSeparate $DataDirectory $InstallDirectory
         Assert-DataSeparate $DataDirectory $PackageDirectory
@@ -366,12 +543,20 @@ try {
         [IO.File]::WriteAllText((Join-Path $InstallDirectory 'Open-Loom.url'), "[InternetShortcut]`r`nURL=http://127.0.0.1:$Port/`r`n", $utf8)
         $previous = if ($state -and $state.current -ne $manifest.commit) { $state.current } elseif ($state) { $state.previous } else { $null }
         $lastStarted = if ($state) { $state.lastStarted } else { $null }
-        $state = [ordered]@{ schema = 1; current = $manifest.commit; previous = $previous; dataDirectory = $DataDirectory; port = $Port; lastStarted = $lastStarted }
+        # schema stays 1: this is an added JSON property, not a data-contract
+        # change, and older managers simply ignore it.
+        $state = [ordered]@{ schema = 1; current = $manifest.commit; previous = $previous; dataDirectory = $DataDirectory
+            port = $Port; lastStarted = $lastStarted; runtimes = $defaultRuntimes }
+        Set-SavedRuntimes $state $selectedRuntimes
         Write-AtomicJson $statePath $state
         Write-Host "LOOM installed. Open: $(Join-Path $InstallDirectory 'Start-Loom.cmd')"
         Write-Host "Personal data: $DataDirectory"
+        Write-Host "Enabled runtimes: $($state.runtimes -join ',')"
     } elseif ($Action -eq 'Status') {
         if (-not $state) { throw 'LOOM installation did not finish. Run Install-Loom.cmd again.' }
+        # Older installations predate the runtime selection; report the default
+        # the launcher would actually export instead of a missing property.
+        Set-SavedRuntimes $state (Get-SavedRuntimes $state)
         $state | ConvertTo-Json -Depth 4
     } elseif ($Action -eq 'Rollback') {
         if (-not $state -or -not $state.previous) { throw 'There is no previous version to switch to.' }
@@ -388,8 +573,10 @@ try {
             }
         }
         $from = $state.current
-        $state.current = $state.previous
-        $state.previous = $from
+        # Rebuild instead of assigning: a legacy state may lack these properties
+        # and PowerShell 5.1 dictionary state rejects writes to absent keys.
+        $state = Set-SavedValue $state 'current' $state.previous
+        $state = Set-SavedValue $state 'previous' $from
         Write-AtomicJson $statePath $state
         Write-Host 'Previous program version selected. Personal data was kept. Open Start-Loom.cmd to continue.'
     } elseif ($Action -eq 'Start') {
@@ -408,9 +595,18 @@ try {
                 }
             }
         }
-        $state.lastStarted = $state.current
+        $state = Set-SavedValue $state 'lastStarted' $state.current
+        # An explicit -Runtimes on Start changes the saved choice; otherwise the
+        # installation keeps the selection recorded at install time. Either way
+        # the value is normalized and persisted here: a state file written
+        # before the light edition has no runtimes property, and Start is the
+        # first write path that upgrades it (schema stays 1). An absent or
+        # unusable saved selection normalizes to the all-four default.
+        $startRuntimes = ConvertFrom-RuntimeSelection $Runtimes
+        if ($startRuntimes) { Set-SavedRuntimes $state $startRuntimes }
+        else { Set-SavedRuntimes $state (Get-SavedRuntimes $state) }
         Write-AtomicJson $statePath $state
-        Run-Loom $release $state.dataDirectory $state.port $selected
+        Run-Loom $release $state.dataDirectory $state.port $selected (Format-RuntimeSelection (Get-SavedRuntimes $state))
     }
 } finally {
     if ($incoming -and (Test-Path -LiteralPath $incoming)) {

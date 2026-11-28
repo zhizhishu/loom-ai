@@ -2619,9 +2619,23 @@ fn runtime_platform_admission_matrix() -> Vec<RuntimePlatformAdmission> {
         .collect()
 }
 
+/// The Runtimes this process offers, read once from the process environment.
+///
+/// Everything below has an explicit-selection twin so tests can exercise the
+/// behavior without mutating shared process state.
 fn current_platform_enabled_runtime_kinds() -> Vec<AdapterKind> {
+    current_platform_enabled_runtime_kinds_with_enabled(
+        &crate::runtime_selection::enabled_runtimes_from_process(),
+    )
+}
+
+/// [`current_platform_enabled_runtime_kinds`] against an explicit selection.
+fn current_platform_enabled_runtime_kinds_with_enabled(
+    enabled: &BTreeSet<AdapterKind>,
+) -> Vec<AdapterKind> {
     AdapterKind::ALL
         .into_iter()
+        .filter(|kind| runtime_selection_blocker_with_enabled(enabled, *kind).is_none())
         .filter(|kind| {
             windows_runtime_qualification_allows(*kind)
                 || current_runtime_platform_admission(*kind)
@@ -2631,7 +2645,66 @@ fn current_platform_enabled_runtime_kinds() -> Vec<AdapterKind> {
         .collect()
 }
 
+/// The deployment selection refusal, checked ahead of every platform rule.
+///
+/// Keeping it inside `current_runtime_platform_blocker` means the existing
+/// command, refresh and dispatch call sites inherit it without new branches.
+///
+/// Pure with respect to process state: the caller decides which Runtimes are
+/// enabled, so tests never need `set_var`/`remove_var`. Production reads the
+/// variable in `current_runtime_platform_blocker` and passes the result here.
+fn runtime_selection_blocker_with_enabled(
+    enabled: &BTreeSet<AdapterKind>,
+    runtime_kind: AdapterKind,
+) -> Option<CommandHandlerResult> {
+    if crate::runtime_selection::runtime_enabled_by_selection(enabled, runtime_kind) {
+        return None;
+    }
+    Some(CommandHandlerResult::rejected(
+        crate::runtime_selection::RUNTIME_NOT_ENABLED_BLOCKER_CODE,
+        json!({
+            "field": "runtime",
+            "runtimeKind": runtime_kind,
+            "reasonCode": "runtime_selection.not_enabled",
+            "selectionVariable": crate::runtime_selection::ENABLED_RUNTIMES_ENV,
+        }),
+    ))
+}
+
+/// The single filter `runtime.installations.list` applies.
+///
+/// The handler and the selection tests call this same function, so a test can
+/// never pass against a copy of the rule that drifted from the wire behavior.
+fn runtime_installations_visible_under_selection(
+    installations: Vec<AdapterInstallationView>,
+    enabled: &BTreeSet<AdapterKind>,
+) -> Vec<AdapterInstallationView> {
+    installations
+        .into_iter()
+        .filter(|installation| {
+            crate::runtime_selection::runtime_enabled_by_selection(
+                enabled,
+                installation.adapter_kind,
+            )
+        })
+        .collect()
+}
+
 fn current_runtime_platform_blocker(runtime_kind: AdapterKind) -> Option<CommandHandlerResult> {
+    current_runtime_platform_blocker_with_enabled(
+        &crate::runtime_selection::enabled_runtimes_from_process(),
+        runtime_kind,
+    )
+}
+
+/// [`current_runtime_platform_blocker`] against an explicit selection.
+fn current_runtime_platform_blocker_with_enabled(
+    enabled: &BTreeSet<AdapterKind>,
+    runtime_kind: AdapterKind,
+) -> Option<CommandHandlerResult> {
+    if let Some(blocker) = runtime_selection_blocker_with_enabled(enabled, runtime_kind) {
+        return Some(blocker);
+    }
     if windows_runtime_qualification_allows(runtime_kind) {
         return None;
     }
@@ -10905,9 +10978,12 @@ impl Core {
             }
             "runtime.installations.list" => {
                 let database = self.database.lock().await;
-                Ok(serde_json::to_value(
+                let enabled_runtimes = crate::runtime_selection::enabled_runtimes_from_process();
+                let installations = runtime_installations_visible_under_selection(
                     AgentProfileService::default().list_installations(&database)?,
-                )?)
+                    &enabled_runtimes,
+                );
+                Ok(serde_json::to_value(installations)?)
             }
             "runtime.installations.create" => {
                 let params: UserCommandParams<CreateAdapterInstallationCommand> =
@@ -30475,6 +30551,61 @@ mod tests {
         )
     }
 
+    /// `LOOM_ENABLED_RUNTIMES` is a Core process allow list: the fixtures below
+    /// seed one Installation for each of the four Runtimes the variable scopes.
+    #[cfg(test)]
+    fn seed_runtimes_for_selection_tests(database: &Database) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let executable_path = std::env::current_exe()
+            .expect("test executable path should be available")
+            .to_string_lossy()
+            .to_string();
+        for kind in crate::runtime_selection::SELECTABLE_RUNTIMES {
+            database
+                .connection()
+                .execute(
+                    r#"
+                    INSERT OR IGNORE INTO adapter_installation(
+                        id, adapter_kind, executable_path, command_name,
+                        installation_class, source, auth_scope,
+                        enabled, version, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, 'managed_default', 'custom',
+                              'default', 1, 1, ?5, ?5)
+                    "#,
+                    rusqlite::params![
+                        format!("adapter-selection-{}", kind.as_str()),
+                        kind.as_str(),
+                        executable_path,
+                        kind.command_name(),
+                        now,
+                    ],
+                )
+                .expect("selection test Installation should be inserted");
+        }
+    }
+
+    /// The same filter `runtime.installations.list` applies, over a plain database.
+    ///
+    /// Deliberately calls the production helper rather than re-implementing the
+    /// predicate: a test that duplicated the rule could stay green while the
+    /// wire behavior drifted.
+    #[cfg(test)]
+    fn installations_seen_by_selection(
+        database: &Database,
+        selection: Option<&str>,
+    ) -> Vec<String> {
+        let enabled_runtimes = crate::runtime_selection::parse_enabled_runtimes(selection);
+        runtime_installations_visible_under_selection(
+            AgentProfileService::default()
+                .list_installations(database)
+                .unwrap(),
+            &enabled_runtimes,
+        )
+        .into_iter()
+        .map(|installation| installation.adapter_kind.as_str().to_string())
+        .collect()
+    }
+
     // Owns launch-time version completion from Core's cache to the frozen
     // config. Discovery probes alone cannot cover stale cache reuse here.
     #[cfg(all(target_os = "macos", feature = "slow-tests"))]
@@ -39117,5 +39248,125 @@ for line in sys.stdin:
 
         drop(core);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `LOOM_ENABLED_RUNTIMES=pi` must make the four scoped Runtimes behave as
+    /// if only Pi existed: the Installation list drops the other three, and the
+    /// central admission gate refuses to configure or launch them.
+    #[test]
+    fn enabled_runtimes_selection_hides_and_refuses_unselected_runtimes() {
+        let (database, root) = rovai_core::test_support::seeded_runtime_database();
+        seed_runtimes_for_selection_tests(&database);
+
+        // Unset: every seeded Runtime is listed (the default deployment is unchanged).
+        let all = installations_seen_by_selection(&database, None);
+        for kind in crate::runtime_selection::SELECTABLE_RUNTIMES {
+            assert!(all.contains(&kind.as_str().to_string()), "{kind:?}: {all:?}");
+        }
+
+        let only_pi = installations_seen_by_selection(&database, Some("pi"));
+        assert_eq!(only_pi, vec!["pi".to_string()]);
+        // The other three are filtered out of the list itself, so no view of them
+        // (even the seeded Codex Installation) survives the selection.
+        for kind in [
+            AdapterKind::CodexCli,
+            AdapterKind::DeepseekHarness,
+            AdapterKind::ClaudeCodeCli,
+        ] {
+            assert!(!only_pi.contains(&kind.as_str().to_string()), "{kind:?}");
+        }
+
+        // The short alias and the canonical id select the same Runtime.
+        assert!(!installations_seen_by_selection(&database, Some("codex")).is_empty());
+        assert!(
+            installations_seen_by_selection(&database, Some("codex"))
+                .iter()
+                .all(|kind| kind == "codex-cli")
+        );
+        let three = installations_seen_by_selection(&database, Some("codex-cli,dsh,claude"));
+        assert_eq!(
+            three.iter().collect::<BTreeSet<_>>().len(),
+            3,
+            "{three:?}"
+        );
+        assert!(
+            three
+                .iter()
+                .all(|kind| kind != "pi"),
+            "a selected set never widens to an unlisted Runtime: {three:?}"
+        );
+        // An unparseable item fails only itself closed.
+        let partial = installations_seen_by_selection(&database, Some("pi,nonsense,dsh"));
+        assert_eq!(
+            partial.iter().collect::<BTreeSet<_>>().len(),
+            2,
+            "{partial:?}"
+        );
+        assert!(
+            partial.iter().all(|kind| kind != "codex-cli"),
+            "{partial:?}"
+        );
+
+        // The same selection must be refused through the central blocker the
+        // command layer (`members.runtime.set`, create/update/refresh) consults.
+        assert!(!crate::runtime_selection::runtime_enabled_by_selection(
+            &crate::runtime_selection::parse_enabled_runtimes(Some("pi")),
+            AdapterKind::CodexCli,
+        ));
+
+        drop(database);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The four scoped Runtimes refuse configuration and launch through the
+    /// blocker every existing command/refresh/dispatch call site already reads.
+    ///
+    /// Every assertion drives the explicit-selection helpers: the shared process
+    /// environment is read by other tests in this binary in parallel, so setting
+    /// `LOOM_ENABLED_RUNTIMES` here would both flake those tests and leak on a
+    /// panic.
+    #[test]
+    fn unselected_runtimes_are_refused_by_every_central_admission_path() {
+        let only_pi = crate::runtime_selection::parse_enabled_runtimes(Some("pi"));
+
+        let enabled = current_platform_enabled_runtime_kinds_with_enabled(&only_pi);
+        for kind in [
+            AdapterKind::CodexCli,
+            AdapterKind::DeepseekHarness,
+            AdapterKind::ClaudeCodeCli,
+        ] {
+            assert!(!enabled.contains(&kind), "{kind:?} must leave discovery");
+            let blocker = current_runtime_platform_blocker_with_enabled(&only_pi, kind)
+                .expect("an unselected Runtime is refused before platform rules");
+            assert_eq!(
+                blocker.code,
+                crate::runtime_selection::RUNTIME_NOT_ENABLED_BLOCKER_CODE
+            );
+            // The launch policy is the single gate for process spawning.
+            assert!(!crate::runtime_discovery::runtime_launch_allowed_with_selection(
+                &only_pi,
+                kind,
+                RuntimeLaunchPurpose::AgentExecution,
+            ));
+            assert!(!crate::runtime_discovery::runtime_launch_allowed_with_selection(
+                &only_pi,
+                kind,
+                RuntimeLaunchPurpose::DispatchPreflight,
+            ));
+        }
+        // Pi itself survives the same selection on the same helpers.
+        assert!(current_runtime_platform_blocker_with_enabled(&only_pi, AdapterKind::Pi).is_none());
+        assert!(crate::runtime_discovery::runtime_launch_allowed_with_selection(
+            &only_pi,
+            AdapterKind::Pi,
+            RuntimeLaunchPurpose::AgentExecution,
+        ));
+
+        // A Runtime outside the four is never restricted by the variable.
+        assert!(crate::runtime_discovery::runtime_launch_allowed_with_selection(
+            &only_pi,
+            AdapterKind::OpencodeCli,
+            RuntimeLaunchPurpose::AgentExecution,
+        ));
     }
 }

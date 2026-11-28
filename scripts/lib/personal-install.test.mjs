@@ -82,6 +82,15 @@ function installPackage(pkg, fixture_) {
 }
 
 function state(install) { return JSON.parse(readFileSync(join(install, 'installation.json'), 'utf8')) }
+// Rewrite the recorded selection without touching anything else, so a test can
+// exercise the upgrade/start rules even when this host cannot launch a Server.
+function savedRuntimes(install, runtimes) {
+  const current = state(install)
+  if (runtimes === null) delete current.runtimes
+  else current.runtimes = runtimes
+  writeFileSync(join(install, 'installation.json'), JSON.stringify(current))
+}
+const ALL_RUNTIMES = ['codex-cli', 'pi', 'deepseek-harness', 'claude-code-cli']
 function markStarted(install) {
   const current = state(install)
   current.lastStarted = current.current
@@ -102,6 +111,77 @@ test('portable launcher rejects a missing manager before attempting to start any
   assert.match(result.stdout, /LOOM is incomplete: Manage-Loom\.ps1 is missing/)
   assert.match(result.stdout, /Extract the full ZIP again/)
   assert.equal(existsSync(join(f.root, 'isolated-local-data')), false)
+})
+
+// The shipped .cmd wrappers must forward the owner's extra arguments to the
+// manager: -Runtimes is unusable from the documented entry point otherwise.
+// A stand-in manager records the argv it received, so the assertion is about
+// real cmd.exe expansion, not just the wrapper's text. The recording location
+// comes from the environment because the test owns the wrapper copy's folder.
+const wrapperManager = `$argv = [Environment]::GetCommandLineArgs() | Select-Object -Skip 1
+$argv | Set-Content -LiteralPath $env:LOOM_WRAPPER_ARGV -Encoding UTF8
+`
+const wrapperCases = [
+  { name: 'install', cmd: 'install-loom-personal.cmd', copy: 'Install-Loom.cmd', action: 'Install' },
+  { name: 'start', cmd: 'start-loom-personal.cmd', copy: 'Start-Loom.cmd', action: 'Portable' },
+]
+
+function runWrapper(t, { cmd, copy }, args) {
+  const f = fixture(t)
+  const source = fileURLToPath(new URL('../' + cmd, import.meta.url))
+  copyFileSync(source, join(f.root, copy))
+  writeFileSync(join(f.root, 'Manage-Loom.ps1'), wrapperManager)
+  const receivedPath = join(f.root, 'received-argv.txt')
+  // Keep the pass-through observable without changing either wrapper's own
+  // error handling: a silent stdin satisfies `pause` on both branches.
+  const result = spawnSync('cmd.exe', ['/d', '/c', copy, ...args], {
+    cwd: f.root, encoding: 'utf8', input: '\r\n', windowsHide: true, timeout: 120_000,
+    env: { ...process.env, LOCALAPPDATA: join(f.root, 'isolated-local-data'), LOOM_WRAPPER_ARGV: receivedPath }
+  })
+  assert.equal(existsSync(receivedPath), true, result.stderr || result.stdout)
+  // Windows PowerShell 5 Set-Content -Encoding UTF8 writes a BOM; it is an
+  // artefact of the test's own recorder, not part of the forwarded token.
+  return readFileSync(receivedPath, 'utf8').replace(/^\uFEFF/, '').split(/\r?\n/).filter(Boolean)
+}
+
+for (const wrapper of wrapperCases) {
+  test(`${wrapper.cmd} forwards extra arguments such as -Runtimes to the manager`, { skip: !windows }, t => {
+    const received = runWrapper(t, wrapper, ['-Runtimes', 'pi'])
+    // The fixed wrapper prefix is still there, so the action is unchanged.
+    assert.deepEqual(received.slice(0, 3), ['-NoLogo', '-NoProfile', '-File'])
+    assert.ok(received.includes('-Action'), received.join(' '))
+    assert.equal(received[received.indexOf('-Action') + 1], wrapper.action)
+    // The user-supplied switch reaches PowerShell as its own token and value.
+    const index = received.indexOf('-Runtimes')
+    assert.notEqual(index, -1, 'the wrapper dropped -Runtimes: ' + received.join(' '))
+    assert.equal(received[index + 1], 'pi')
+    // The forwarded arguments come after the wrapper's own fixed parameters.
+    assert.ok(index > received.indexOf('-PackageDirectory'), received.join(' '))
+  })
+
+  test(`${wrapper.cmd} still rejects an unknown runtime through the forwarded switch`, { skip: !windows }, t => {
+    // The real fail-fast path is the manager's ValidateSet-free parser, so a
+    // bogus -Runtimes value must reach it instead of being silently ignored.
+    const received = runWrapper(t, wrapper, ['-Runtimes', 'pi,turbo'])
+    assert.equal(received[received.indexOf('-Runtimes') + 1], 'pi,turbo')
+  })
+}
+
+test('both cmd wrappers forward %* and keep their existing error handling', () => {
+  for (const wrapper of wrapperCases) {
+    const text = readFileSync(fileURLToPath(new URL('../' + wrapper.cmd, import.meta.url)), 'utf8')
+    const call = text.split(/\r?\n/).find(line => line.startsWith('powershell.exe '))
+    assert.ok(call, wrapper.cmd + ' has no powershell.exe call')
+    assert.ok(call.endsWith('-PackageDirectory "%~dp0\\" %*'), wrapper.cmd + ' must end with %*: ' + call)
+    assert.match(call, new RegExp('-Action ' + wrapper.action + '\\b'))
+    // The pause/exit contract the owner relies on is untouched.
+    assert.match(text, /if errorlevel 1 \(/)
+    assert.match(text, /\bpause\b/)
+  }
+  // The start wrapper still refuses an incomplete package before PowerShell.
+  const start = readFileSync(fileURLToPath(new URL('../start-loom-personal.cmd', import.meta.url)), 'utf8')
+  assert.match(start, /if not exist "%~dp0Manage-Loom\.ps1" \(/)
+  assert.match(start, /exit \/b 1/)
 })
 
 test('declared Hook runtime is complete, bound to its manifest, and checked before startup', { skip: !windows }, t => {
@@ -160,6 +240,267 @@ test('install, upgrade and compatible rollback keep data and both program versio
   assert.equal(existsSync(join(f.install, 'Start-Loom.cmd')), true)
   installPackage(a, f)
   assert.equal(state(f.install).previous, 'b'.repeat(40), 'same-version repair keeps rollback target')
+})
+
+test('install without -Runtimes records all four runtimes and schema stays 1', { skip: !windows }, t => {
+  const f = fixture(t)
+  installPackage(makePackage(f.root, 'a'), f)
+  const recorded = state(f.install)
+  // The default light build enables every packaged runtime, in the canonical
+  // AdapterKind order the launcher exports as LOOM_ENABLED_RUNTIMES.
+  assert.deepEqual(recorded.runtimes, ALL_RUNTIMES)
+  assert.equal(recorded.schema, 1)
+  // The selection is launcher metadata only; every runtime file stays copied.
+  assert.equal(existsSync(join(f.install, 'versions', 'a'.repeat(40), 'runtime/pi/.runtime-marker')), true)
+  assert.equal(existsSync(join(f.install, 'versions', 'a'.repeat(40), 'runtime/pi/node/node.exe')), true)
+})
+
+test('installing only pi writes just pi to installation.json and keeps every packaged file', { skip: !windows }, t => {
+  const f = fixture(t)
+  const pkg = makePackage(f.root, 'a')
+  const result = run('Install', f.install, ['-PackageDirectory', pkg, '-DataDirectory', f.data, '-Runtimes', 'pi'])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const recorded = state(f.install)
+  assert.deepEqual(recorded.runtimes, ['pi'])
+  assert.equal(recorded.schema, 1, 'the runtime selection is an added JSON property, not a schema change')
+  assert.equal(recorded.current, 'a'.repeat(40))
+  // "pi only" is an enable list, not a copy list: the whole closure is installed.
+  const version = join(f.install, 'versions', 'a'.repeat(40))
+  for (const relative of ['runtime/pi/.runtime-marker', 'runtime/pi/node/node.exe', 'rovai-server.exe', 'web-ui/index.html']) {
+    assert.equal(existsSync(join(version, relative)), true, relative)
+  }
+  assert.match(result.stdout, /Enabled runtimes: pi/)
+})
+
+test('short runtime names expand to the canonical adapter ids', { skip: !windows }, t => {
+  // Each case is one flat triple: the package/fixture letter, the -Runtimes
+  // value typed by the owner, and the canonical list that must be recorded.
+  const cases = [
+    { letter: 'a', value: 'codex, dsh , claude', runtimes: ['codex-cli', 'deepseek-harness', 'claude-code-cli'] },
+    { letter: 'b', value: 'Pi', runtimes: ['pi'] },
+    { letter: 'c', value: 'claude,pi', runtimes: ['pi', 'claude-code-cli'] },
+    { letter: 'd', value: 'codex,pi,dsh,claude', runtimes: ALL_RUNTIMES },
+  ]
+  for (const { letter, value, runtimes } of cases) {
+    assert.equal(typeof letter, 'string')
+    assert.equal(typeof value, 'string')
+    assert.ok(Array.isArray(runtimes) && runtimes.every(item => typeof item === 'string'))
+    const f = fixture(t)
+    const install = join(f.root, 'programs-' + letter)
+    // spawnSync only accepts strings in argv; check before handing it to Windows.
+    const args = ['-PackageDirectory', makePackage(f.root, letter),
+      '-DataDirectory', join(f.root, 'data-' + letter), '-Runtimes', value]
+    assert.ok(args.every(arg => typeof arg === 'string'), 'launcher argv must be strings: ' + JSON.stringify(args))
+    const result = run('Install', install, args)
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+    // The stored list is always canonical AdapterKind order, never the input order.
+    assert.deepEqual(state(install).runtimes, runtimes, value)
+  }
+})
+
+test('canonical adapter ids select the same runtimes as the short names', { skip: !windows }, t => {
+  const f = fixture(t)
+  installPackage(makePackage(f.root, 'a'), f)
+  const saved = readFileSync(join(f.install, 'installation.json'), 'utf8')
+  const upgrade = run('Install', f.install, ['-PackageDirectory', makePackage(f.root, 'b'),
+    '-Runtimes', 'claude-code-cli,codex-cli'])
+  assert.equal(upgrade.status, 0, upgrade.stderr || upgrade.stdout)
+  assert.deepEqual(state(f.install).runtimes, ['codex-cli', 'claude-code-cli'])
+  assert.equal(state(f.install).schema, 1)
+  assert.notEqual(readFileSync(join(f.install, 'installation.json'), 'utf8'), saved)
+})
+
+test('an upgrade and a start without -Runtimes keep the saved selection', { skip: !windows }, t => {
+  const f = fixture(t)
+  installPackage(makePackage(f.root, 'a'), f)
+  const pkg = makePackage(f.root, 'b')
+  const first = run('Install', f.install, ['-PackageDirectory', pkg, '-Runtimes', 'pi'])
+  assert.equal(first.status, 0, first.stderr || first.stdout)
+  assert.deepEqual(state(f.install).runtimes, ['pi'])
+  installPackage(makePackage(f.root, 'c'), f)
+  assert.deepEqual(state(f.install).runtimes, ['pi'], 'an upgrade must keep the owner selection')
+  // The synthetic package has no runnable Server, so Start itself cannot be
+  // observed here. Exercise the other state-rewriting path instead: rollback
+  // must not drop the owner selection.
+  markStarted(f.install)
+  assert.equal(run('Rollback', f.install).status, 0)
+  assert.deepEqual(state(f.install).runtimes, ['pi'], 'a version switch must keep the owner selection')
+})
+
+test('an installation without a saved selection reports the default instead of failing', { skip: !windows }, t => {
+  const f = fixture(t)
+  installPackage(makePackage(f.root, 'a'), f)
+  savedRuntimes(f.install, null)
+  const status = run('Status', f.install)
+  assert.equal(status.status, 0, status.stderr || status.stdout)
+  assert.deepEqual(JSON.parse(status.stdout).runtimes, ALL_RUNTIMES)
+  // Status reports the default; it must not rewrite the file it just read.
+  assert.equal(Object.hasOwn(state(f.install), 'runtimes'), false)
+})
+
+// A pre-selection installation.json has no "runtimes" property at all. On
+// Windows PowerShell 5.1 Read-Json returns a JavaScriptSerializer dictionary, so
+// the shipped `$State.runtimes = ...` / `$State.lastStarted = ...` property sets
+// fail there and Status/Start abort on a legacy install. Exercise the real
+// manager against such a file instead of trusting the helpers in isolation.
+test('a legacy state without a runtimes property still answers Status and Start', { skip: !windows }, t => {
+  const f = fixture(t)
+  installPackage(makePackage(f.root, 'a'), f)
+  // Remove the added property entirely, exactly like a state file written by a
+  // manager that predates the light-edition runtime selection.
+  const legacy = state(f.install)
+  delete legacy.runtimes
+  writeFileSync(join(f.install, 'installation.json'), JSON.stringify(legacy))
+  const status = run('Status', f.install)
+  assert.equal(status.status, 0, 'Status must not fail on a missing runtimes property: ' + (status.stderr || status.stdout))
+  assert.deepEqual(JSON.parse(status.stdout).runtimes, ALL_RUNTIMES, 'a missing selection falls back to all four')
+  assert.equal(Object.hasOwn(state(f.install), 'runtimes'), false, 'Status must not rewrite installation.json')
+  // Start reaches the same state-rewriting path (lastStarted + saved runtimes)
+  // before handing control to the Server. The synthetic package has no runnable
+  // Server, so only the pre-launch failure is expected: never a property-set
+  // error, and the state file must gain the default selection, not an empty one.
+  const started = run('Start', f.install)
+  assert.doesNotMatch(started.stderr, /The property 'runtimes' cannot be found|SetValueInvocationException/,
+    'Start must not fail while writing a missing runtimes property')
+  assert.deepEqual(state(f.install).runtimes, ALL_RUNTIMES,
+    'Start records the default selection instead of an empty one')
+})
+
+test('an unknown runtime name is rejected instead of silently narrowing', { skip: !windows }, t => {
+  const f = fixture(t)
+  const result = run('Install', f.install, ['-PackageDirectory', makePackage(f.root, 'a'), '-Runtimes', 'pi,turbo'])
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /Unknown LOOM runtime: turbo/)
+})
+
+test('launcher exports LOOM_ENABLED_RUNTIMES as the canonical comma list', () => {
+  const managerText = readFileSync(manager, 'utf8')
+  assert.match(managerText, /\$env:LOOM_ENABLED_RUNTIMES = Format-RuntimeSelection \$EnabledRuntimes/)
+  assert.match(managerText, /\$defaultRuntimes = @\('codex-cli', 'pi', 'deepseek-harness', 'claude-code-cli'\)/)
+  // Start passes the saved selection, so an installed launch exports it.
+  assert.match(managerText, /Run-Loom \$release \$state\.dataDirectory \$state\.port \$selected \(Format-RuntimeSelection \(Get-SavedRuntimes \$state\)\)/)
+  // An unattended first install never prompts: the prompt is fenced by an
+  // interactive console check and falls back to all four.
+  assert.match(managerText, /elseif \(\[Environment\]::UserInteractive -and -not \[Console\]::IsInputRedirected\)/)
+})
+
+test('Start persists a normalized runtimes selection even without -Runtimes', () => {
+  // The Windows-only legacy-state test covers the behaviour; this mirrors the
+  // shipped source so a regression is caught on every host. A state file from
+  // before the light edition has no runtimes property, so Start must always
+  // write one: an explicit -Runtimes wins, otherwise the saved/default value is
+  // normalized and stored before the Server starts.
+  const managerText = readFileSync(manager, 'utf8')
+  const start = managerText.slice(managerText.indexOf("$Action -eq 'Start'"))
+  const explicit = start.indexOf('if ($startRuntimes) { Set-SavedRuntimes $state $startRuntimes }')
+  const fallback = start.indexOf('else { Set-SavedRuntimes $state (Get-SavedRuntimes $state) }')
+  assert.notEqual(explicit, -1, 'Start must persist an explicit -Runtimes selection')
+  assert.notEqual(fallback, -1, 'Start must persist a normalized selection without -Runtimes')
+  assert.ok(fallback > explicit, 'the default branch must follow the explicit one')
+  assert.ok(start.indexOf('Write-AtomicJson $statePath $state') > fallback,
+    'the selection must be normalized before the state file is written')
+})
+
+// Run an expression against the manager's real selection helpers without
+// executing the installer body. The helper block is extracted from the shipped
+// script so the test can never drift onto a copy of the code.
+function runSelectionHelpers(expression) {
+  const managerText = readFileSync(manager, 'utf8')
+  // Split on the first statement of the installer instead of matching the
+  // helper body: the helpers must be exercised exactly as shipped.
+  const start = managerText.indexOf('$runtimeAliases = [ordered]@{')
+  const end = managerText.indexOf('function Resolve-Directory')
+  assert.ok(start > 0 && end > start, 'the runtime selection helper block moved; update this test')
+  const helpers = managerText.slice(start, end)
+  const script = helpers + '\n' + expression
+  return spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
+    { encoding: 'utf8', timeout: 60_000, windowsHide: true })
+}
+
+test('selection helpers always produce a canonical string array, never a comma string', { skip: !windows }, () => {
+  const result = runSelectionHelpers(`
+$cases = @(
+  @{ in = @('pi', 'deepseek-harness'); want = @('pi', 'deepseek-harness') },
+  @{ in = 'pi,dsh'; want = @('pi', 'deepseek-harness') },
+  @{ in = @('codex-cli,pi'); want = @('codex-cli', 'pi') },
+  @{ in = @('pi', 'codex-cli, dsh'); want = @('codex-cli', 'pi', 'deepseek-harness') },
+  @{ in = @('claude', 'PI'); want = @('pi', 'claude-code-cli') },
+  @{ in = $null; want = $defaultRuntimes }
+)
+foreach ($case in $cases) {
+  $got = @(Get-CanonicalRuntimes $case.in)
+  if (($got -join ',') -ne ($case.want -join ',')) { throw "canonical mismatch: $($got -join ',') vs $($case.want -join ',')" }
+  foreach ($name in $got) { if ($name -isnot [string]) { throw 'canonical item is not a string' } }
+}
+# Format-RuntimeSelection stays a single comma string for the environment export.
+$csv = Format-RuntimeSelection @('pi', 'dsh')
+if ($csv -ne 'pi,deepseek-harness') { throw "export mismatch: $csv" }
+if (@($csv).Count -ne 1) { throw 'the export must stay one scalar string' }
+# A state object written through the setter must serialize as a JSON array.
+$state = [ordered]@{ schema = 1; runtimes = @($csv) }
+Set-SavedRuntimes $state $csv
+$json = $state | ConvertTo-Json -Compress
+# A literal substring check keeps the regex character-class range syntax
+# ('[x-y]', which PowerShell 5.1 rejects as a reversed range) out of the assertion.
+if (-not $json.Contains('"runtimes":["pi","deepseek-harness"]')) { throw "json mismatch: $json" }
+# The setter must also work when the state object predates the property: both
+# the PSCustomObject (ConvertFrom-Json) and dictionary (Read-Json) shapes.
+$legacyObject = '{"schema":1}' | ConvertFrom-Json
+Set-SavedRuntimes $legacyObject 'pi'
+if (($legacyObject.runtimes -join ',') -ne 'pi') { throw "legacy object mismatch: $($legacyObject.runtimes -join ',')" }
+$legacyDict = New-Object 'Collections.Generic.Dictionary[string,object]'
+Set-SavedRuntimes $legacyDict 'pi'
+if (($legacyDict['runtimes'] -join ',') -ne 'pi') { throw "legacy dictionary mismatch: $($legacyDict['runtimes'] -join ',')" }
+if (((Get-SavedRuntimes $legacyObject) -join ',') -ne 'pi') { throw 'legacy object read-back failed' }
+if (((Get-SavedRuntimes $legacyDict) -join ',') -ne 'pi') { throw 'legacy dictionary read-back failed' }
+'pi,deepseek-harness,codex-cli,claude-code-cli'`)
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+})
+
+test('an unknown runtime token still fails fast in the shared helpers', { skip: !windows }, () => {
+  const result = runSelectionHelpers(`
+try { ConvertFrom-RuntimeSelection 'pi,turbo' | Out-Null; throw 'accepted an unknown runtime' }
+catch { if ($_.Exception.Message -notmatch 'Unknown LOOM runtime: turbo') { throw $_ } }
+'ok'`)
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+})
+
+test('a multi-select install keeps both entries in installation.json across an upgrade', { skip: !windows }, t => {
+  const f = fixture(t)
+  const first = run('Install', f.install, ['-PackageDirectory', makePackage(f.root, 'a'),
+    '-DataDirectory', f.data, '-Runtimes', 'pi,dsh'])
+  assert.equal(first.status, 0, first.stderr || first.stdout)
+  // The shipped defect stored @('pi,deepseek-harness') as one element.
+  assert.deepEqual(state(f.install).runtimes, ['pi', 'deepseek-harness'])
+  assert.match(first.stdout, /Enabled runtimes: pi,deepseek-harness/)
+  // Replacing the program version must preserve the owner selection verbatim.
+  installPackage(makePackage(f.root, 'b'), f)
+  const upgraded = state(f.install)
+  assert.equal(upgraded.current, 'b'.repeat(40))
+  assert.deepEqual(upgraded.runtimes, ['pi', 'deepseek-harness'],
+    'an upgrade must not collapse the selection back to all four')
+  assert.ok(!upgraded.runtimes.some(entry => entry.includes(',')),
+    'installation.json must not contain a comma-joined runtime string')
+  // Rollback and Status read the same array back as two runtimes.
+  markStarted(f.install)
+  assert.equal(run('Rollback', f.install).status, 0)
+  assert.deepEqual(state(f.install).runtimes, ['pi', 'deepseek-harness'])
+  const status = run('Status', f.install)
+  assert.equal(status.status, 0, status.stderr || status.stdout)
+  assert.deepEqual(JSON.parse(status.stdout).runtimes, ['pi', 'deepseek-harness'])
+})
+
+test('a legacy comma-string selection is still read as its individual runtimes', { skip: !windows }, t => {
+  const f = fixture(t)
+  installPackage(makePackage(f.root, 'a'), f)
+  // Reproduce a state file written by the previous manager, then upgrade.
+  savedRuntimes(f.install, 'pi,deepseek-harness')
+  installPackage(makePackage(f.root, 'b'), f)
+  assert.deepEqual(state(f.install).runtimes, ['pi', 'deepseek-harness'])
+  savedRuntimes(f.install, ['pi,deepseek-harness'])
+  const status = run('Status', f.install)
+  assert.equal(status.status, 0, status.stderr || status.stdout)
+  assert.deepEqual(JSON.parse(status.stdout).runtimes, ['pi', 'deepseek-harness'])
 })
 
 test('damaged upgrade and reused commit cannot replace the active installation', { skip: !windows }, t => {

@@ -7,7 +7,7 @@ if not exist "%~dp0Manage-Loom.ps1" (
   pause
   exit /b 1
 )
-powershell.exe -NoLogo -NoProfile -File "%~dp0Manage-Loom.ps1" -Action Portable -PackageDirectory "%~dp0\"
+powershell.exe -NoLogo -NoProfile -File "%~dp0Manage-Loom.ps1" -Action Portable -PackageDirectory "%~dp0\" %*
 if errorlevel 1 (
   pause
   exit /b 1
