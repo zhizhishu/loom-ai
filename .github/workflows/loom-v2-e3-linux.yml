@@ -21,6 +21,8 @@ on:
       - '.github/workflows/loom-v2-e3-linux.yml'
       - 'scripts/lib/linux-personal.test.mjs'
       - 'scripts/lib/dsh-runtime-package.test.mjs'
+      - 'scripts/node/Connect-LoomNode.sh'
+      - 'scripts/node/README-linux.md'
 
 permissions:
   contents: read
