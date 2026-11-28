@@ -92,6 +92,29 @@ runtimes_export() {
   if [ -n "$runtimes_canonical" ]; then printf '%s' "$runtimes_canonical";
   else printf '%s' "$runtimes_all"; fi
 }
+# Claude Code is disabled by product policy inside LOOM unless the process is
+# explicitly opted in through LOOM_CLAUDE_RUNTIME_ENABLED=1. The installer is
+# the only place that decides this for an installed launch: the flag is derived
+# from the same effective selection that produces LOOM_ENABLED_RUNTIMES, so
+# ticking Claude at install time opts in and unticking it does not. It is never
+# persisted in a file and never widens the selection.
+claude_runtime_canonical='claude-code-cli'
+claude_runtime_env='LOOM_CLAUDE_RUNTIME_ENABLED'
+# True when the canonical (already validated) selection contains Claude.
+runtimes_have_claude() {
+  case ",$1," in *",$claude_runtime_canonical,"*) return 0 ;; *) return 1 ;; esac
+}
+# Set or remove the opt-in in this shell so the child inherits exactly one
+# state. A value left in the parent environment must never leak into a launch
+# that did not select Claude, so the variable is unset rather than set to 0.
+apply_claude_runtime_env() {
+  # unset first: an inherited LOOM_CLAUDE_RUNTIME_ENABLED=<anything else> must
+  # not survive the export below on shells that keep the old value visible.
+  unset "$claude_runtime_env"
+  if runtimes_have_claude "$1"; then
+    export "$claude_runtime_env=1"
+  fi
+}
 # Read the saved selection from an installation directory. A saved file that
 # still holds an unknown token is an installation error rather than a silent
 # widening back to all four runtimes.
@@ -223,6 +246,10 @@ run_loom() {
   # ones this installation advertises to the Host and the web UI.
   export LOOM_ENABLED_RUNTIMES
   LOOM_ENABLED_RUNTIMES=$(runtimes_export "$enabled_runtimes")
+  # Claude is opt-in per launch and only from the effective selection: a launch
+  # that does not include claude-code-cli must not inherit an opt-in from the
+  # shell that started it.
+  apply_claude_runtime_env "$LOOM_ENABLED_RUNTIMES"
   export ROVAI_EMBEDDED_PI_ROOT="$root/runtime/pi"
   # Only fill the embedded DSH root when the user has not chosen one.
   ROVAI_EMBEDDED_DSH_ROOT=${ROVAI_EMBEDDED_DSH_ROOT:-"$root/runtime/dsh"}
@@ -241,6 +268,7 @@ run_loom() {
   echo 'Keep this terminal open. Press Ctrl+C to stop.'
   echo "Personal data: $data"
   echo "Enabled runtimes: $LOOM_ENABLED_RUNTIMES"
+  echo "Claude runtime: ${LOOM_CLAUDE_RUNTIME_ENABLED:-off}"
   exec "$root/rovai-server" --data-dir "$data" --listen "127.0.0.1:$listen_port"
 }
 

@@ -211,3 +211,63 @@ jobs:
           test -f out/linux-personal-verify/loom-personal-linux-x64/runtime/computer/mcp_bridge.py
           test -x out/linux-personal-verify/loom-personal-linux-x64/runtime/office/linux-x64/libreoffice/program/soffice
           test -x out/linux-personal-verify/loom-personal-linux-x64/runtime/office/linux-x64/poppler/bin/pdftoppm
+      # Install-only smoke for the delivered archive: unpack the downloaded
+      # tar.gz, install it non-interactively with an explicit runtime selection,
+      # then assert the recorded install state. Start is attempted once with a
+      # bounded wait and always stopped, so nothing keeps the port.
+      - name: Smoke install the delivered Linux package and start once
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke="$RUNNER_TEMP/loom-personal-install"
+          install_dir="$smoke/programs"
+          data_dir="$smoke/data"
+          port=18818
+          pid=''
+          cleanup() {
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi
+          }
+          trap cleanup EXIT
+          # True when something is listening on the loopback port; the fd lives in
+          # a subshell so the probe never leaks one into this script.
+          port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+          rm -rf "$smoke"
+          mkdir -p "$smoke/unpacked"
+          # Unpack the byte-for-byte downloaded archive, never the local build.
+          tar -xzf out/linux-personal-download/loom-personal-linux-x64.tar.gz -C "$smoke/unpacked"
+          package="$smoke/unpacked/loom-personal-linux-x64"
+          test -x "$package/Install-Loom.sh"
+          # Redirected stdin: the install must never block on the runtime prompt.
+          sh "$package/Install-Loom.sh" \
+            --install-dir "$install_dir" --data-dir "$data_dir" --port "$port" \
+            --runtimes pi,dsh </dev/null
+          # Recorded install state, not just stdout.
+          commit="$(cat "$install_dir/.loom-current")"
+          test "${#commit}" -eq 40
+          test -d "$install_dir/versions/$commit"
+          test "$(cat "$install_dir/.loom-runtimes")" = 'pi,deepseek-harness'
+          test "$(cat "$install_dir/.loom-data-dir")" = "$data_dir"
+          test "$(cat "$install_dir/.loom-port")" = "$port"
+          sh "$install_dir/Manage-Loom.sh" --action status --install-dir "$install_dir" | grep -qx 'runtimes=pi,deepseek-harness'
+          sh "$install_dir/Manage-Loom.sh" --action status --install-dir "$install_dir" | grep -qx "port=$port"
+          # Start once, wait a bounded time for the loopback port, then stop it.
+          sh "$install_dir/Start-Loom.sh" >"$smoke/start.log" 2>&1 &
+          pid=$!
+          ready=0
+          for _ in $(seq 1 60); do
+            if port_open "$port"; then ready=1; break; fi
+            if ! kill -0 "$pid" 2>/dev/null; then break; fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then cat "$smoke/start.log"; echo 'LOOM did not listen on its installed port'; exit 1; fi
+          grep -q 'Enabled runtimes: pi,deepseek-harness' "$smoke/start.log"
+          grep -q 'Claude runtime: off' "$smoke/start.log"
+          cleanup
+          pid=''
+          # The port must become free again: the smoke must not hold it for later steps.
+          released=0
+          for _ in $(seq 1 20); do
+            if ! port_open "$port"; then released=1; break; fi
+            sleep 0.5
+          done
+          if [ "$released" -ne 1 ]; then echo 'LOOM still holds its port after shutdown'; exit 1; fi

@@ -76,6 +76,12 @@ function makeFakePackage(root, commit = 'a'.repeat(40)) {
   write('runtime/pi/pi-bundle.json', '{}')
   write('runtime/pi/pi', '#!/bin/sh\n', true)
   write('runtime/pi/node/node', '#!/bin/sh\n', true)
+  // verify_package enumerates the packaged DSH runtime too, so the fixture must
+  // carry it (and the dsh.cmd the packager ships) or no install path can run.
+  write('runtime/dsh/dsh-runtime-bundle.json', '{}')
+  write('runtime/dsh/dsh', '#!/bin/sh\n', true)
+  write('runtime/dsh/dsh.cmd', '@echo off\n')
+  write('runtime/dsh/node/node', '#!/bin/sh\n', true)
   write('runtime/computer/computer-bundle.json', '{}')
   write('runtime/computer/python', '#!/bin/sh\n', true)
   write('runtime/computer/host_desktop.py', 'x')
@@ -83,10 +89,21 @@ function makeFakePackage(root, commit = 'a'.repeat(40)) {
   return dir
 }
 
-// A server stand-in that reports the environment the launcher exported.
+// A server stand-in that reports the environment the launcher exported. The
+// Claude opt-in is printed as "unset" when the variable is absent, so a test can
+// tell "not set" from "set to an empty/other value".
+const reportingServer = '#!/bin/sh\nprintf "ENABLED=%s\\n" "${LOOM_ENABLED_RUNTIMES-unset}"\n' +
+  'printf "CLAUDE=%s\\n" "${LOOM_CLAUDE_RUNTIME_ENABLED-unset}"\n'
 function recordEnabledRuntimes(packageDir) {
   const server = join(packageDir, 'rovai-server')
-  writeFileSync(server, '#!/bin/sh\nprintf "ENABLED=%s\\n" "${LOOM_ENABLED_RUNTIMES-unset}"\n')
+  writeFileSync(server, reportingServer)
+  chmodSync(server, 0o755)
+}
+// Same stand-in, but installed into the active release (what Start executes).
+function recordInstalledServer(release) {
+  const server = join(release, 'rovai-server')
+  chmodSync(server, 0o644)
+  writeFileSync(server, reportingServer)
   chmodSync(server, 0o755)
 }
 
@@ -239,9 +256,7 @@ test('start and portable export LOOM_ENABLED_RUNTIMES from the saved selection',
   manage(f, ['install', '--package-dir', f.pkg, '--data-dir', f.data, '--runtimes', 'pi,claude'])
   recordEnabledRuntimes(f.pkg)
   const release = join(f.install, 'versions', 'a'.repeat(40))
-  chmodSync(join(release, 'rovai-server'), 0o644)
-  writeFileSync(join(release, 'rovai-server'), '#!/bin/sh\nprintf "ENABLED=%s\\n" "${LOOM_ENABLED_RUNTIMES-unset}"\n')
-  chmodSync(join(release, 'rovai-server'), 0o755)
+  recordInstalledServer(release)
   // start reuses the saved install-time choice.
   assert.match(manage(f, ['start', '--port', '64999']).stdout, /^ENABLED=pi,claude-code-cli$/m)
   // an explicit --runtimes on start replaces it and is persisted.
@@ -299,4 +314,105 @@ test('installing a runtime subset still copies the whole package', t => {
     'runtime/computer/computer-bundle.json', 'runtime/computer/python', 'web-ui/index.html']) {
     assert.ok(existsSync(join(release, path)), path)
   }
+})
+
+// --- Claude opt-in derived from the effective runtime selection -------------
+// Selecting claude-code-cli must make the Server process inherit
+// LOOM_CLAUDE_RUNTIME_ENABLED=1; a selection without it must leave the variable
+// absent even when the launching shell exported it. Nothing may be written to a
+// file for this: the flag is derived on every launch.
+const claudeLine = output => (output.match(/^CLAUDE=(.*)$/m) || [, '<missing>'])[1]
+
+function startOutput(f, extra = [], options = {}) {
+  return manage(f, ['start', '--port', '64997', ...extra], options)
+}
+
+test('a selection with claude opts the Server in, a selection without it does not', t => {
+  const f = fixture(t)
+  manage(f, ['install', '--package-dir', f.pkg, '--data-dir', f.data, '--runtimes', 'claude,pi'])
+  assert.equal(savedRuntimes(f), 'pi,claude-code-cli')
+  recordInstalledServer(join(f.install, 'versions', 'a'.repeat(40)))
+  const withClaude = startOutput(f)
+  assert.equal(claudeLine(withClaude.stdout), '1')
+  assert.match(withClaude.stdout, /^Claude runtime: 1$/m)
+  // The flag is derived, never persisted.
+  assert.equal(existsSync(join(f.install, '.loom-claude-runtime')), false)
+  assert.doesNotMatch(readFileSync(join(f.install, '.loom-runtimes'), 'utf8'), /CLAUDE_RUNTIME_ENABLED/)
+
+  // Dropping Claude from the selection drops the opt-in on the next start.
+  manage(f, ['start', '--runtimes', 'pi'])
+  assert.equal(savedRuntimes(f), 'pi')
+  assert.equal(claudeLine(startOutput(f).stdout), 'unset')
+  assert.match(startOutput(f).stdout, /^Claude runtime: off$/m)
+})
+
+test('a launch without claude does not inherit LOOM_CLAUDE_RUNTIME_ENABLED from its shell', t => {
+  const f = fixture(t)
+  manage(f, ['install', '--package-dir', f.pkg, '--data-dir', f.data, '--runtimes', 'codex'])
+  recordInstalledServer(join(f.install, 'versions', 'a'.repeat(40)))
+  // The owner's shell (or a previous manual smoke) exported the opt-in: a
+  // non-Claude launch must clear it instead of leaking Claude into the Server.
+  const leaked = startOutput(f, [], { env: { ...process.env, HOME: f.root, LOOM_CLAUDE_RUNTIME_ENABLED: '1' } })
+  assert.equal(claudeLine(leaked.stdout), 'unset')
+  // Portable follows the same rule: default all four includes Claude, an
+  // explicit non-Claude selection clears an inherited value. Portable runs the
+  // Server straight out of the package directory, not an installed release.
+  recordEnabledRuntimes(f.pkg)
+  const portableDefault = manage(f, ['portable', '--package-dir', f.pkg, '--data-dir', join(f.root, 'portable-claude')],
+    { env: { ...process.env, HOME: f.root, LOOM_CLAUDE_RUNTIME_ENABLED: '0' } })
+  assert.equal(claudeLine(portableDefault.stdout), '1')
+  const portablePi = manage(f, ['portable', '--package-dir', f.pkg, '--data-dir', join(f.root, 'portable-pi'), '--runtimes', 'pi'],
+    { env: { ...process.env, HOME: f.root, LOOM_CLAUDE_RUNTIME_ENABLED: '1' } })
+  assert.equal(claudeLine(portablePi.stdout), 'unset')
+  assert.match(portablePi.stdout, /^ENABLED=pi$/m)
+})
+
+test('an upgrade keeps a previously selected Claude opt-in', t => {
+  const f = fixture(t)
+  manage(f, ['install', '--package-dir', f.pkg, '--data-dir', f.data, '--runtimes', 'dsh,claude'])
+  // Upgrading to the same commit without --runtimes keeps the saved selection,
+  // so the next start is still opted in.
+  manage(f, ['install', '--package-dir', f.pkg])
+  assert.equal(savedRuntimes(f), 'deepseek-harness,claude-code-cli')
+  recordInstalledServer(join(f.install, 'versions', 'a'.repeat(40)))
+  assert.equal(claudeLine(startOutput(f).stdout), '1')
+  // Upgrading with an explicit non-Claude selection removes the opt-in, and a
+  // later upgrade with no flag must not resurrect it.
+  manage(f, ['install', '--package-dir', f.pkg, '--runtimes', 'dsh'])
+  manage(f, ['install', '--package-dir', f.pkg])
+  assert.equal(savedRuntimes(f), 'deepseek-harness')
+  recordInstalledServer(join(f.install, 'versions', 'a'.repeat(40)))
+  assert.equal(claudeLine(startOutput(f).stdout), 'unset')
+})
+
+// --- delivered-archive install smoke ---------------------------------------
+// The workflow must not stop at verifying the archive bytes: it unpacks the
+// downloaded tar.gz, installs it non-interactively with an explicit runtime
+// selection and asserts the recorded install state. A start is optional, but
+// it must be bounded and always shut down instead of holding a port.
+test('the workflow smoke-installs the downloaded archive and asserts its recorded state', () => {
+  const workflow = read('.github/workflows/loom-v2-e3-linux.yml')
+  const start = workflow.indexOf('Smoke install the delivered Linux package')
+  assert.ok(start > 0, 'the install-only smoke step is missing')
+  // It runs after the closure check: bytes first, then installation.
+  assert.ok(start > workflow.indexOf('Verify delivered Linux package closure'))
+  const smoke = workflow.slice(start)
+  // Unpack the archive downloaded from the run, never the local build output.
+  assert.match(smoke, /tar -xzf out\/linux-personal-download\/loom-personal-linux-x64\.tar\.gz/)
+  // Non-interactive install with an explicit, testable runtime pair.
+  assert.match(smoke, /Install-Loom\.sh/)
+  assert.match(smoke, /--runtimes pi,dsh/)
+  assert.match(smoke, /<\/dev\/null/)
+  // The recorded install state, not just stdout.
+  assert.match(smoke, /\.loom-current/)
+  assert.match(smoke, /\.loom-runtimes"\)" = 'pi,deepseek-harness'/)
+  assert.match(smoke, /\.loom-data-dir/)
+  assert.match(smoke, /\.loom-port/)
+  assert.match(smoke, /--action status .*runtimes=pi,deepseek-harness/)
+  // A start must be cleaned up and its port waited for with a bound.
+  assert.match(smoke, /trap cleanup EXIT/)
+  assert.match(smoke, /seq 1 \d+/)
+  assert.match(smoke, /kill "\$pid"/)
+  // No unbounded waits and no long-lived port owner.
+  assert.doesNotMatch(smoke, /while true/)
 })

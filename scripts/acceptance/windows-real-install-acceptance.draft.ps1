@@ -82,17 +82,93 @@
       crates/rovai-web/src/operations.rs:58,270,342,376,386,392,419,615
                    Web boundary admits camps.open, runtime.installations.list,
                    thread.messages.send, agentRuns.cancel, threads.create,
-                   members.runtime.set, loom.artifacts.list, loom.artifact.preview
+                   members.runtime.set, loom.artifacts.list, loom.artifact.preview.
+                   `runtime.status.get` (:291-292,:792) and `runtime.product.check`
+                   (:450-451,:755) are the two read-backs group 3 judges the Claude
+                   admission with; both are ordinary admitted Operations.
+      crates/rovai-core/src/application.rs:4969-5035
+                   runtime.status.get payload: hostPlatform, runtimePlatformAdmission[],
+                   runtimeAvailability[], runtimeCatalog, searchEnvironment. The admission
+                   row for a Runtime is keyed by (runtimeKind, platform).
+      crates/rovai-core/src/application.rs:13460-13479
+                   runtime.product.check {runtimeKind} answers
+                   {scheduled, completed, ready, outcome, status, runtimeKind} and never
+                   schedules anything the caller has to clean up.
+      crates/rovai-core/src/runtime_platform_admission.rs:62-77,218-231
+                   LOOM_CLAUDE_RUNTIME_ENABLED is the ONLY Claude opt-in and only the
+                   literal '1' counts; without it the admission status is `disabled` with
+                   blocker code `runtime_disabled_by_policy`. qualified|preview are the
+                   only statuses that allow Runtime use.
+      crates/rovai-core/src/agent_runtime_adapter.rs:745-800
+                   platform_admission() answers `disabled` for claude-code-cli BEFORE any
+                   platform evidence or debug-Windows qualification override can admit it,
+                   so a Claude-only install that lists the Runtime but denies it here is a
+                   real policy regression, not a probe timing artefact.
+      scripts/manage-loom-personal.ps1 Set-ClaudeRuntimeEnvironment (工兵4)
+                   the INSTALLER derives LOOM_CLAUDE_RUNTIME_ENABLED from the same
+                   normalized selection it exports as LOOM_ENABLED_RUNTIMES: it sets '1'
+                   exactly when claude-code-cli is selected and removes it otherwise, so a
+                   polluted parent shell can never decide the outcome. The harness must
+                   never write the variable; it strips inherited copies before each child.
 
     Two modes, one script, and the default is the real machine:
       * real machine (no switch): every hard rule below applies unchanged - the credential
         is read from $env:OCT_API_KEY, the oct-chat Pi catalog is written, the member model
         is frozen explicitly and every model-driven step is PASS/FAIL;
-      * -InstallOnly (CI): EXTRACT, INSTALL, START, LOGIN, member, CAMP, PPTX_UPLOAD and STOP
-        only. No credential is read, required or set, no scripted/loopback provider is
-        started, no models.json/settings.json and no member model are written, the model
-        rows are reported N/A, and STOP proves the real Web/API cancel control path on a
-        model-free queued/nonterminal AgentRun.
+      * -InstallOnly (CI): EXTRACT, INSTALL, START, LOGIN, member, RUNTIME_SELECTION,
+        RUNTIME_SELECTION_PI_DSH, RUNTIME_SELECTION_CLAUDE, CAMP, PPTX_UPLOAD and STOP only.
+        No credential is read,
+        required or set, no scripted/loopback provider is started, no models.json/
+        settings.json and no member model are written, the model rows are reported N/A, and
+        STOP proves the real Web/API cancel control path on a model-free queued/nonterminal
+        AgentRun.
+
+    Runtime selection acceptance (both modes, always executed):
+      * RUNTIME_SELECTION is measured on the default install this run already started. The
+        installer writes no -Runtimes value there, so it records the all-four default; the
+        row then requires runtime.installations.list to report exactly codex-cli, pi,
+        deepseek-harness and claude-code-cli, compared as a set so the order is irrelevant.
+      * RUNTIME_SELECTION_PI_DSH is a second, fully isolated install made with
+        `-Runtimes pi,dsh` (the installer's own alias for pi + deepseek-harness) under
+        <workRoot>\sel, on its own port (default -RuntimeSelectionPort 18991) with its own
+        installation and data directories. It starts that instance through its own
+        Start-Loom.cmd, logs in with its own server-token and requires
+        runtime.installations.list to report exactly pi and deepseek-harness. It needs no
+        credential, no model and no member, and it is torn down through the same exact-tree
+        stop as the primary instance before the primary instance is stopped, so the two
+        listeners never overlap. A missing runtime, an extra runtime, a failed install or a
+        failed start is a FAIL, never a SKIP.
+      * RUNTIME_SELECTION_CLAUDE is a THIRD, equally isolated install made with
+        `-Runtimes claude` (the installer's alias for claude-code-cli) under
+        <workRoot>\selclaude, on its own port (default -ClaudeRuntimePort 18992) with its
+        own installation, data and log directories. It requires
+        runtime.installations.list to report exactly claude-code-cli AND requires the
+        Claude admission to be released, judged from two independent pieces of real
+        read-back evidence, never from this script's own assumptions:
+          - runtime.status.get reports a runtimePlatformAdmission row whose runtimeKind is
+            claude-code-cli, whose platform is the host platform the same answer reports,
+            and whose status allows Runtime use (`qualified`/`preview`); the
+            `disabled` + `runtime_disabled_by_policy` answer that the un-opted-in product
+            policy returns is a FAIL here;
+          - runtime.product.check {runtimeKind:'claude-code-cli'} answers completed with a
+            ready outcome, i.e. the Host really admitted and launched the product check.
+        Both reads are read-only observations of the instance: this harness never starts a
+        Claude probe itself, never writes probe state and never sets the policy switch.
+        LOOM_CLAUDE_RUNTIME_ENABLED is decided by the INSTALLER (工兵4): selecting
+        claude-code-cli at install time makes Start-Loom.cmd export it as 1, and a
+        selection without Claude removes it
+        (scripts/manage-loom-personal.ps1 Set-ClaudeRuntimeEnvironment). The harness must
+        therefore never write that variable, and it strips it from its own process
+        environment before every child (Manage-Loom.ps1 and Start-Loom.cmd) so a polluted
+        parent shell cannot smuggle an opt-in into a non-Claude instance or mask a missing
+        one. It needs no credential, no model and no member, and it is torn down through
+        the same exact-tree stop before the primary instance is stopped.
+      * The selection is also cross-checked against installation.json (the value the
+        launcher exports as LOOM_ENABLED_RUNTIMES) so a broken hidden instance cannot be
+        explained away by the catalog alone.
+      * Every runtime-selection group reuses one install -> start -> login -> measure ->
+        exact-tree stop + directory cleanup helper, so the three groups cannot drift and
+        an aborted group leaves no listener or directory behind.
 
     Hard rules encoded below:
       * in the default mode the model credential is read from $env:OCT_API_KEY only, fails
@@ -115,6 +191,13 @@ param(
     [int]$ReadyTimeoutSeconds = 180,
     [int]$RunTimeoutSeconds = 420,
     [int]$StopTimeoutSeconds = 120,
+    # Port of the isolated `-Runtimes pi,dsh` instance used by RUNTIME_SELECTION_PI_DSH.
+    # It must differ from -Port: the two listeners are checked side by side.
+    [int]$RuntimeSelectionPort = 18991,
+    # Port of the isolated `-Runtimes claude` instance used by RUNTIME_SELECTION_CLAUDE.
+    # It must differ from both other ports: an admission row must be measured on the
+    # instance that was installed with Claude selected, not on a neighbour.
+    [int]$ClaudeRuntimePort = 18992,
     # CI install-only mode. Absent (the real-machine default) every step runs unchanged.
     [switch]$InstallOnly
 )
@@ -122,8 +205,26 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 if ($Port -in @(64851, 64852)) { throw 'Port 64851/64852 belongs to the owner instances; choose 18990.' }
+if ($RuntimeSelectionPort -in @(64851, 64852)) { throw 'Port 64851/64852 belongs to the owner instances; choose 18991.' }
+if ($ClaudeRuntimePort -in @(64851, 64852)) { throw 'Port 64851/64852 belongs to the owner instances; choose 18992.' }
+if ($RuntimeSelectionPort -eq $Port) {
+    throw "-RuntimeSelectionPort must differ from -Port: the runtime-selection instance runs while port $Port is under test."
+}
+if ($ClaudeRuntimePort -eq $Port -or $ClaudeRuntimePort -eq $RuntimeSelectionPort) {
+    throw '-ClaudeRuntimePort must differ from -Port and -RuntimeSelectionPort: the Claude-only instance is measured on its own listener.'
+}
 
 $script:Origin = "http://127.0.0.1:$Port"
+$script:SelectionOrigin = "http://127.0.0.1:$RuntimeSelectionPort"
+# The product policy switch for Claude Code admission
+# (crates/rovai-core/src/runtime_platform_admission.rs:62). It is the INSTALLER's
+# decision (scripts/manage-loom-personal.ps1 Set-ClaudeRuntimeEnvironment); the harness
+# only strips inherited copies so no child inherits a parent-shell value.
+$script:ClaudeRuntimeEnvName = 'LOOM_CLAUDE_RUNTIME_ENABLED'
+# The instance every request helper talks to. It starts as the primary instance and is
+# switched to an isolated selection instance only while that group is measured, so the
+# existing login/request helpers measure the instance under test without a second copy.
+$script:RequestOrigin = $script:Origin
 $script:Results = New-Object 'Collections.Generic.List[object]'
 $script:Secrets = New-Object 'Collections.Generic.List[string]'
 $script:Utf8 = New-Object Text.UTF8Encoding($false)
@@ -131,11 +232,21 @@ $script:AdminToken = $null
 $script:SessionToken = $null
 $script:Evidence = [ordered]@{}
 # Fallback log location only; Assert-ShortWorkRoot replaces it with <workRoot>\logs.
-$script:Paths = [ordered]@{ logs = [IO.Path]::GetTempPath() }
+# selLogs, selRoot, selClaudeLogs and selClaudeRoot are pre-registered as $null so log
+# collection stays StrictMode-safe when Assert-ShortWorkRoot throws before the isolated
+# instance paths exist.
+$script:Paths = [ordered]@{ logs = [IO.Path]::GetTempPath(); selLogs = $null; selRoot = $null; selClaudeLogs = $null; selClaudeRoot = $null }
 $script:Launcher = $null
 $script:InstallDirectory = $null
 $script:DataDirectory = $null
 $script:InstallOnly = [bool]$InstallOnly
+# The isolated `-Runtimes pi,dsh` and `-Runtimes claude` instances live entirely beside
+# the primary one. Their launchers are local to Invoke-IsolatedRuntimeSelection, which
+# always stops and cleans its own instance, so no script-level handle can go stale.
+$script:SelectionInstallDirectory = $null
+$script:SelectionDataDirectory = $null
+$script:ClaudeInstallDirectory = $null
+$script:ClaudeDataDirectory = $null
 
 # --------------------------------------------------------------------------------------
 # reporting, redaction, tiny helpers
@@ -173,7 +284,9 @@ function Get-Value($Object, [string]$Name) {
     return $null
 }
 
-function New-CommandId { return [Guid]::NewGuid().ToString() }
+function Use-RequestOrigin([string]$Origin) {
+    $script:RequestOrigin = $Origin
+}
 
 function New-Directory([string]$Path) {
     if (-not [IO.Directory]::Exists($Path)) { [void][IO.Directory]::CreateDirectory($Path) }
@@ -233,7 +346,7 @@ function Invoke-JsonPost([string]$Url, $Body, [string]$Bearer, [int]$TimeoutSeco
 function Try-CoreRequest([string]$Operation, $Params, [int]$TimeoutSeconds = 120) {
     $body = [ordered]@{ operation = $Operation; params = $Params }
     try {
-        $response = Invoke-JsonPost -Url ($script:Origin + '/api/v1/request') -Body $body `
+        $response = Invoke-JsonPost -Url ($script:RequestOrigin + '/api/v1/request') -Body $body `
             -Bearer $script:SessionToken -TimeoutSeconds $TimeoutSeconds
     } catch {
         return @{ Ok = $false; Status = 'transport'; Code = 'transport'; Message = (Hide-Secrets $_.Exception.Message); Result = $null }
@@ -287,7 +400,7 @@ function Invoke-Upload([string]$ThreadId, [string]$FilePath, [string]$DisplayNam
         $payload = $stream.ToArray()
     } finally { $stream.Dispose() }
     try {
-        $response = Invoke-WebRequest -Uri ($script:Origin + '/api/v1/uploads') -Method Post -UseBasicParsing `
+        $response = Invoke-WebRequest -Uri ($script:RequestOrigin + '/api/v1/uploads') -Method Post -UseBasicParsing `
             -TimeoutSec 180 -Headers @{ Authorization = "Bearer $script:SessionToken" } `
             -ContentType "multipart/form-data; boundary=$boundary" -Body $payload
     } catch {
@@ -566,6 +679,27 @@ function Assert-ShortWorkRoot {
     $script:Paths['data'] = Join-Path $root 'data'
     $script:InstallDirectory = $script:Paths['inst']
     $script:DataDirectory = $script:Paths['data']
+    # The isolated -Runtimes pi,dsh instance: its own install, data and log directory,
+    # all reachable from the same short root so nothing long-path sensitive is added.
+    $script:Paths['selRoot'] = New-Directory (Join-Path $root 'sel')
+    $script:Paths['selLogs'] = New-Directory (Join-Path $script:Paths['selRoot'] 'logs')
+    $script:SelectionInstallDirectory = Join-Path $script:Paths['selRoot'] 'inst'
+    $script:SelectionDataDirectory = Join-Path $script:Paths['selRoot'] 'data'
+    # The isolated -Runtimes claude instance: again its own install, data and log
+    # directory under the same short root.
+    $script:Paths['selClaudeRoot'] = New-Directory (Join-Path $root 'selclaude')
+    $script:Paths['selClaudeLogs'] = New-Directory (Join-Path $script:Paths['selClaudeRoot'] 'logs')
+    $script:ClaudeInstallDirectory = Join-Path $script:Paths['selClaudeRoot'] 'inst'
+    $script:ClaudeDataDirectory = Join-Path $script:Paths['selClaudeRoot'] 'data'
+    foreach ($target in @($script:InstallDirectory, $script:DataDirectory,
+            $script:SelectionInstallDirectory, $script:SelectionDataDirectory,
+            $script:ClaudeInstallDirectory, $script:ClaudeDataDirectory)) {
+        if ([IO.Directory]::Exists($target)) {
+            # A listener left over from an aborted earlier run would make every readiness
+            # check pass against the wrong build, so only a clean root may proceed.
+            throw "$target already exists: stop the listeners on ports $Port/$RuntimeSelectionPort/$ClaudeRuntimePort and remove $root before a new acceptance."
+        }
+    }
 }
 
 function Expand-Package {
@@ -585,78 +719,114 @@ function Expand-Package {
     return $root
 }
 
-function Invoke-Manager([string[]]$Arguments, [string]$LogName) {
+function Clear-InheritedClaudeRuntimeEnvironment {
+    # The Claude opt-in belongs to the installer: selecting claude-code-cli makes
+    # Start-Loom.cmd export LOOM_CLAUDE_RUNTIME_ENABLED=1 and any other selection
+    # removes it (scripts/manage-loom-personal.ps1 Set-ClaudeRuntimeEnvironment). This
+    # harness therefore NEVER writes the variable - and it must not let a polluted parent
+    # shell decide the answer either: a leaked '1' would fake a Claude admission on the
+    # pi,dsh instance, and a leaked non-'1' would fake a policy denial on the claude one.
+    # Called once at startup (for the report) and again before every child is spawned, so
+    # every Manage-Loom.ps1 and Start-Loom.cmd inherits "unset" and nothing else.
+    $inherited = [Environment]::GetEnvironmentVariable($script:ClaudeRuntimeEnvName, 'Process')
+    Remove-Item ('Env:' + $script:ClaudeRuntimeEnvName) -ErrorAction SilentlyContinue
+    return $inherited
+}
+
+function Invoke-Manager([string[]]$Arguments, [string]$LogName, [string]$LogDirectory) {
     $manager = Join-Path $packageRoot 'Manage-Loom.ps1'
-    $out = Join-Path $script:Paths['logs'] ($LogName + '.out.txt')
-    $err = Join-Path $script:Paths['logs'] ($LogName + '.err.txt')
+    if (-not $LogDirectory) { $LogDirectory = $script:Paths['logs'] }
+    [void](New-Directory $LogDirectory)
+    $out = Join-Path $LogDirectory ($LogName + '.out.txt')
+    $err = Join-Path $LogDirectory ($LogName + '.err.txt')
+    [void](Clear-InheritedClaudeRuntimeEnvironment)
     $process = Start-Process -FilePath 'powershell.exe' -PassThru -Wait -WindowStyle Hidden `
         -ArgumentList (@('-NoLogo', '-NoProfile', '-NonInteractive', '-File', ('"' + $manager + '"')) + $Arguments) `
         -RedirectStandardOutput $out -RedirectStandardError $err
     return @{ ExitCode = $process.ExitCode; StdOut = $out; StdErr = $err }
 }
 
-function Install-Package {
-    $result = Invoke-Manager @(
+# One install = one (install directory, data directory, port, log directory, optional
+# -Runtimes) tuple. The same helper installs the default instance (no -Runtimes, exactly
+# what the owner's first click installs) and the isolated `-Runtimes pi,dsh` instance, so
+# the selection acceptance cannot drift from the documented install chain.
+function Install-Package([string]$InstallDirectory, [string]$DataDirectory, [int]$ListenPort,
+    [string]$LogDirectory, [string]$RuntimeSelection) {
+    $arguments = @(
         '-Action', 'Install',
         '-PackageDirectory', ('"' + $packageRoot + '"'),
-        '-InstallDirectory', ('"' + $script:InstallDirectory + '"'),
-        '-DataDirectory', ('"' + $script:DataDirectory + '"'),
-        '-Port', [string]$Port
-    ) 'install'
+        '-InstallDirectory', ('"' + $InstallDirectory + '"'),
+        '-DataDirectory', ('"' + $DataDirectory + '"'),
+        '-Port', [string]$ListenPort
+    )
+    if ($RuntimeSelection) { $arguments += @('-Runtimes', $RuntimeSelection) }
+    $result = Invoke-Manager $arguments 'install' $LogDirectory
     if ($result.ExitCode -ne 0) {
-        throw "Manage-Loom.ps1 -Action Install exited $($result.ExitCode); see logs\install.err.txt"
+        throw "Manage-Loom.ps1 -Action Install exited $($result.ExitCode); see $LogDirectory\install.err.txt"
     }
-    $statePath = Join-Path $script:InstallDirectory 'installation.json'
+    $statePath = Join-Path $InstallDirectory 'installation.json'
     if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) { throw 'installation.json was not written.' }
     $state = [IO.File]::ReadAllText($statePath) | ConvertFrom-Json
-    $script:Evidence['installation'] = [ordered]@{
+    $recordedPort = Get-Value $state 'port'
+    if ([int]$recordedPort -ne $ListenPort) { throw 'installation.json recorded a different port.' }
+    # installation.json is the exact value Start-Loom.cmd exports as
+    # LOOM_ENABLED_RUNTIMES (scripts/manage-loom-personal.ps1:519-567,:616-626), so this
+    # array is the selection the started instance must honour.
+    $saved = @(Get-Value $state 'runtimes')
+    return [ordered]@{
         current = Get-Value $state 'current'
-        port = Get-Value $state 'port'
+        port = $recordedPort
         dataDirectory = Get-Value $state 'dataDirectory'
-        installDirectory = $script:InstallDirectory
+        installDirectory = $InstallDirectory
+        runtimes = @($saved | Where-Object { $_ } | ForEach-Object { [string]$_ })
     }
-    if ([int](Get-Value $state 'port') -ne $Port) { throw 'installation.json recorded a different port.' }
 }
 
-function Start-LoomConsole {
-    # Start-Loom.cmd is the product entry point (personal-install.test.mjs:458).
-    $out = Join-Path $script:Paths['logs'] 'server.out.txt'
-    $err = Join-Path $script:Paths['logs'] 'server.err.txt'
-    $script:Launcher = Start-Process -FilePath 'cmd.exe' -ArgumentList '/d', '/c', 'Start-Loom.cmd' `
-        -WorkingDirectory $script:InstallDirectory -PassThru -WindowStyle Hidden `
-        -RedirectStandardOutput $out -RedirectStandardError $err
-    return $script:Launcher
+function Start-LoomConsole([string]$InstallDirectory, [string]$LogDirectory, [string]$LogPrefix) {
+    # Start-Loom.cmd is the product entry point (personal-install.test.mjs:458). It reads
+    # installation.json, so it launches the instance installed in $InstallDirectory with
+    # the runtimes recorded there and no extra argument. The inherited Claude opt-in is
+    # stripped first so only the installer's own Run-Loom decision can set it.
+    [void](New-Directory $LogDirectory)
+    if (-not $LogPrefix) { $LogPrefix = 'server' }
+    $out = Join-Path $LogDirectory ($LogPrefix + '.out.txt')
+    $err = Join-Path $LogDirectory ($LogPrefix + '.err.txt')
+    [void](Clear-InheritedClaudeRuntimeEnvironment)
+    return (Start-Process -FilePath 'cmd.exe' -ArgumentList '/d', '/c', 'Start-Loom.cmd' `
+        -WorkingDirectory $InstallDirectory -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $out -RedirectStandardError $err)
 }
 
-function Get-ListenerProcess {
-    $connection = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+function Get-ListenerProcess([int]$ListenPort) {
+    $connection = Get-NetTCPConnection -LocalPort $ListenPort -State Listen -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if (-not $connection) { return $null }
     return (Get-Process -Id $connection.OwningProcess -ErrorAction SilentlyContinue)
 }
 
-function Wait-ServerReady {
+function Wait-ServerReady($Launcher, [int]$ListenPort, [string]$InstallDirectory) {
+    $origin = "http://127.0.0.1:$ListenPort"
     $ready = Wait-Until -TimeoutSeconds $ReadyTimeoutSeconds -IntervalMilliseconds 500 -Probe {
-        if ($script:Launcher -and $script:Launcher.HasExited) { return $null }
+        if ($Launcher -and $Launcher.HasExited) { return $null }
         try {
-            $probe = Invoke-WebRequest -Uri ($script:Origin + '/') -UseBasicParsing -TimeoutSec 5
+            $probe = Invoke-WebRequest -Uri ($origin + '/') -UseBasicParsing -TimeoutSec 5
             if ($probe.StatusCode -eq 200 -and $probe.Content -match '<html') { return $true }
         } catch { return $null }
         return $null
     }
     if (-not $ready) { throw "the installed Server did not become healthy within $ReadyTimeoutSeconds s" }
-    $listener = Get-ListenerProcess
-    if (-not $listener) { throw "no process listens on port $Port" }
-    $installedRoot = [IO.Path]::GetFullPath($script:InstallDirectory).TrimEnd('\') + '\'
+    $listener = Get-ListenerProcess $ListenPort
+    if (-not $listener) { throw "no process listens on port $ListenPort" }
+    $installedRoot = [IO.Path]::GetFullPath($InstallDirectory).TrimEnd('\') + '\'
     $listenerPath = [string]$listener.Path
     if (-not $listenerPath.StartsWith($installedRoot, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "the listener on port $Port is not the installed version: $listenerPath"
+        throw "the listener on port $ListenPort is not the installed version: $listenerPath"
     }
-    $script:Evidence['listener'] = [ordered]@{ pid = $listener.Id; path = $listenerPath }
+    return [ordered]@{ pid = $listener.Id; path = $listenerPath }
 }
 
-function Get-AdministratorToken {
-    $tokenPath = Join-Path $script:DataDirectory 'server-token'
+function Get-AdministratorToken([string]$DataDirectory) {
+    $tokenPath = Join-Path $DataDirectory 'server-token'
     $token = Wait-Until -TimeoutSeconds 60 -IntervalMilliseconds 200 -Probe {
         if (Test-Path -LiteralPath $tokenPath -PathType Leaf) {
             return ([IO.File]::ReadAllText($tokenPath)).Trim()
@@ -664,44 +834,41 @@ function Get-AdministratorToken {
         return $null
     }
     if (-not $token) { throw 'the Server did not persist server-token in the data directory.' }
-    $script:AdminToken = $token
     Add-Secret $token
     return $token
 }
 
-function Connect-Administrator {
-    $reply = Invoke-JsonPost -Url ($script:Origin + '/api/v1/login') -Bearer $null -Body ([ordered]@{
+function Connect-Administrator([string]$Origin, [string]$AdministratorToken) {
+    $reply = Invoke-JsonPost -Url ($Origin + '/api/v1/login') -Bearer $null -Body ([ordered]@{
             protocolVersion = 5
-            administratorToken = $script:AdminToken
+            administratorToken = $AdministratorToken
         })
     $sessionToken = [string](Get-Value $reply 'token')
     if (-not $sessionToken) { throw 'administrator login returned no Bearer token.' }
-    $script:SessionToken = $sessionToken
     Add-Secret $sessionToken
-    $info = Invoke-CoreRequest 'app.info' ([ordered]@{})
-    $script:Evidence['app'] = [ordered]@{ name = [string](Get-Value $info 'name') }
+    return $sessionToken
 }
 
-function Stop-LoomConsole {
-    $launcher = $script:Launcher
-    if ($launcher -and -not $launcher.HasExited) {
+function Stop-LoomConsole($Launcher, [int]$ListenPort, [string]$ResultId) {
+    if ($Launcher -and -not $Launcher.HasExited) {
         # Same exact-tree stop as personal-install.test.mjs:299.
-        & taskkill.exe /PID $launcher.Id /T /F | Out-Null
-        try { Wait-Process -Id $launcher.Id -Timeout 30 -ErrorAction SilentlyContinue } catch { }
+        & taskkill.exe /PID $Launcher.Id /T /F | Out-Null
+        try { Wait-Process -Id $Launcher.Id -Timeout 30 -ErrorAction SilentlyContinue } catch { }
     }
-    $listener = Get-ListenerProcess
+    $listener = Get-ListenerProcess $ListenPort
     if ($listener) {
         Stop-Process -Id $listener.Id -Force -ErrorAction SilentlyContinue
         [void](Wait-Until -TimeoutSeconds 30 -IntervalMilliseconds 200 -Probe {
-                if (-not (Get-ListenerProcess)) { return $true }
+                if (-not (Get-ListenerProcess $ListenPort)) { return $true }
                 return $null
             })
     }
-    $gone = -not (Get-ListenerProcess)
+    $gone = -not (Get-ListenerProcess $ListenPort)
+    if (-not $ResultId) { $ResultId = 'STOP_CONSOLE' }
     if ($gone) {
-        Add-Result 'STOP_CONSOLE' 'PASS' "port $Port released after the console tree was stopped"
+        Add-Result $ResultId 'PASS' "port $ListenPort released after the console tree was stopped"
     } else {
-        Add-Result 'STOP_CONSOLE' 'FAIL' "port $Port is still listening after the stop attempt"
+        Add-Result $ResultId 'FAIL' "port $ListenPort is still listening after the stop attempt"
     }
     return $gone
 }
@@ -953,6 +1120,467 @@ function Find-RuntimeInstallation([string]$AdapterKind, [switch]$ReadyOnly) {
         return $item
     }
     return $null
+}
+
+# --------------------------------------------------------------------------------------
+# runtime selection acceptance
+# (RUNTIME_SELECTION / RUNTIME_SELECTION_PI_DSH / RUNTIME_SELECTION_CLAUDE
+#  + RUNTIME_SELECTION_CLAUDE_ADMISSION / RUNTIME_SELECTION_CLAUDE_PRODUCT_CHECK)
+#
+# `runtime.installations.list` is not an adapter list: it only holds installations the
+# Runtime search environment discovered (crates/rovai-core/src/application.rs:10979-10987),
+# and the whole list is filtered by this process's LOOM_ENABLED_RUNTIMES allow list
+# (crates/rovai-core/src/runtime_selection.rs:82-141,
+# crates/rovai-core/src/application.rs:2674-2691). So a selected Runtime that no probe found
+# is simply absent, which is exactly what the two rows below assert: the set of adapterKind
+# ids is compared, never the order and never a minimal subset.
+# --------------------------------------------------------------------------------------
+
+function Get-AdListView($Items) {
+    # One adapterKind string per installation, in list order, for report/evidence. The list
+    # endpoint may answer a bare array or an envelope; both shapes are accepted so the row
+    # never passes or fails on the transport shape instead of on the content.
+    $raw = $Items
+    if ($null -eq $raw) { return @() }
+    $wrapped = Get-Value $raw 'installations'
+    if ($null -ne $wrapped) { $raw = $wrapped }
+    $kinds = New-Object 'Collections.Generic.List[string]'
+    foreach ($item in @($raw)) {
+        if (-not $item) { continue }
+        $kind = [string](Get-Value $item 'adapterKind')
+        if ($kind) { $kinds.Add($kind) }
+    }
+    return , $kinds.ToArray()
+}
+
+function Format-KindSet($Kinds) {
+    $sorted = @($Kinds | Where-Object { $_ } | Sort-Object)
+    if ($sorted.Count -eq 0) { return '<empty>' }
+    return ($sorted -join ', ')
+}
+
+function Test-SameKindSet($Expected, $Actual) {
+    # Set equality, order-insensitive and duplicate-sensitive: a repeated adapterKind is a
+    # defect the list must never report, so it is reported as a difference. Both sides are
+    # materialized into arrays first: a single-element pipeline result would otherwise come
+    # back as a scalar and .Count would be missing under StrictMode.
+    $expectedList = @($Expected | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $actualList = @($Actual | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $expectedSet = @($expectedList | Sort-Object -Unique)
+    $actualSet = @($actualList | Sort-Object -Unique)
+    if ($expectedSet.Count -ne $actualSet.Count) { return $false }
+    if ($actualList.Count -ne $actualSet.Count) { return $false }
+    for ($index = 0; $index -lt $expectedSet.Count; $index++) {
+        if ($expectedSet[$index] -cne $actualSet[$index]) { return $false }
+    }
+    return $true
+}
+
+function Get-SavedRuntimeSelection([string]$InstallDirectory) {
+    # The normalized array the installer wrote; the launcher exports it as
+    # LOOM_ENABLED_RUNTIMES on every Start (scripts/manage-loom-personal.ps1:134-161,
+    # :519-529, :616-626).
+    $statePath = Join-Path $InstallDirectory 'installation.json'
+    if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+        throw "installation.json is missing from $InstallDirectory."
+    }
+    $state = [IO.File]::ReadAllText($statePath) | ConvertFrom-Json
+    $saved = Get-Value $state 'runtimes'
+    if ($null -eq $saved) { return @() }
+    return , @(@($saved) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+}
+
+function Get-InstallationList([string]$ResultId, [int]$Attempts) {
+    # runtime.installations.list only holds installations the Runtime search environment has
+    # already discovered (crates/rovai-core/src/application.rs:10979-10987), so immediately
+    # after start it may legitimately be empty until the first discovery round publishes.
+    # The read is therefore retried inside the readiness budget until two consecutive
+    # non-empty reads agree; the LAST observation is the one judged. If the budget runs out
+    # on an empty list the row still judges that empty list (a FAIL), so a stalled discovery
+    # never turns into a SKIP or a silent pass.
+    if ($Attempts -lt 1) { $Attempts = 1 }
+    $kinds = @()
+    $previous = $null
+    $failure = $null
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            $kinds = @(Get-AdListView (Invoke-CoreRequest 'runtime.installations.list' ([ordered]@{})))
+            $failure = $null
+        } catch {
+            $failure = Hide-Secrets $_.Exception.Message
+            $kinds = @()
+        }
+        if (-not $failure -and $kinds.Count -gt 0 -and $null -ne $previous -and
+            (Test-SameKindSet $previous $kinds)) {
+            # Two consecutive non-empty observations agree: discovery has settled.
+            return , $kinds
+        }
+        $previous = $kinds
+        if ($attempt -lt $Attempts) { Start-Sleep -Seconds 2 }
+    }
+    if ($failure) {
+        throw "runtime.installations.list for $ResultId failed: $failure"
+    }
+    return , $kinds
+}
+
+function Assert-RuntimeSelectionObserved([string]$ResultId, [int]$ListenPort, [string[]]$ExpectedKinds,
+    [string[]]$ObservedKinds, [string]$Label, [string]$Provenance) {
+    # The single judge both rows share: exact set equality against the expected adapterKind
+    # ids, reported with the unexpected and the missing side spelled out.
+    if (Test-SameKindSet $ExpectedKinds $ObservedKinds) {
+        Add-Result $ResultId 'PASS' ("{0} on port {1}: {2} runtime.installations.list reports exactly {3}." -f `
+                $Label, $ListenPort, $Provenance, (Format-KindSet $ObservedKinds))
+        return $true
+    }
+    $extra = @($ObservedKinds | Where-Object { @($ExpectedKinds) -notcontains $_ })
+    $missing = @($ExpectedKinds | Where-Object { @($ObservedKinds) -notcontains $_ })
+    $sides = New-Object 'Collections.Generic.List[string]'
+    if ($extra.Count -gt 0) { $sides.Add(('unexpected: ' + (Format-KindSet $extra))) }
+    if ($missing.Count -gt 0) { $sides.Add(('missing: ' + (Format-KindSet $missing))) }
+    $why = if ($sides.Count -gt 0) { $sides -join '; ' } else { 'the list repeats an adapterKind' }
+    Add-Result $ResultId 'FAIL' ("{0} on port {1}: {2} runtime.installations.list reports {3}; expected exactly {4} ({5})." -f `
+            $Label, $ListenPort, $Provenance, (Format-KindSet $ObservedKinds), (Format-KindSet $ExpectedKinds), $why)
+    return $false
+}
+
+# --------------------------------------------------------------------------------------
+# The three runtime-selection groups
+# --------------------------------------------------------------------------------------
+#
+# Group 1 (RUNTIME_SELECTION) measures the primary instance this run installed with no
+# -Runtimes, i.e. the installer's all-four default. Groups 2 and 3 are independent,
+# short-lived instances built by the ONE helper below so their install/start/login/stop and
+# their cleanup can never drift apart. Each isolated group:
+#   * installs with its own -Runtimes value into its own directory on its own port,
+#   * launches through its own Start-Loom.cmd with the inherited Claude opt-in stripped,
+#   * logs in with its own server-token and measures only runtime.installations.list (plus,
+#     for Claude, the admission read-back),
+#   * is stopped through the same exact-tree taskkill and then has its directories removed,
+#     whether it passed, failed or threw.
+# A group that cannot install, start, log in or measure is a FAIL, never a SKIP.
+
+function Invoke-RuntimeSelectionCheck {
+    # A. The default install (no -Runtimes) this run already installed and started must
+    # report exactly the four shipped Runtimes. The primary instance is under test here, so
+    # the request origin stays on $Port and no second instance is involved.
+    $defaultExpected = @('codex-cli', 'pi', 'deepseek-harness', 'claude-code-cli')
+    $label = 'default all-four install'
+    Use-RequestOrigin $script:Origin
+    $savedRuntimes = @()
+    $observed = @()
+    try {
+        $savedRuntimes = @(Get-SavedRuntimeSelection $script:InstallDirectory)
+        $observed = @(Get-InstallationList 'RUNTIME_SELECTION' 15)
+    } catch {
+        Add-Result 'RUNTIME_SELECTION' 'FAIL' (Hide-Secrets ("{0} on port {1}: {2}" -f $label, $Port, $_.Exception.Message))
+        return
+    } finally {
+        $script:Evidence['runtimeSelectionDefault'] = [ordered]@{
+            installerArguments = @('-Action', 'Install', '(no -Runtimes: installer all-four default)')
+            installDirectory = $script:InstallDirectory
+            dataDirectory = $script:DataDirectory
+            port = $Port
+            installationJsonRuntimes = $savedRuntimes
+            runtimeInstallationsList = $observed
+            expectedAdapterKinds = $defaultExpected
+        }
+    }
+    if (-not (Test-SameKindSet $defaultExpected $savedRuntimes)) {
+        Add-Result 'RUNTIME_SELECTION' 'FAIL' ("{0} on port {1}: installation.json records {2}, and a default install must record exactly {3}." -f `
+                $label, $Port, (Format-KindSet $savedRuntimes), (Format-KindSet $defaultExpected))
+        return
+    }
+    [void](Assert-RuntimeSelectionObserved 'RUNTIME_SELECTION' $Port $defaultExpected $observed $label `
+            'installed without -Runtimes;')
+}
+
+
+function Invoke-IsolatedRuntimeSelection {
+    <#
+        Runs one isolated install/start/measure/stop cycle.
+
+        - RuntimeSelection is the installer's own -Runtimes argument.
+        - ExpectedKinds is the exact adapterKind set runtime.installations.list must report.
+        - AdditionalCheck is an optional scriptblock invoked after the list has been judged;
+          it receives the group evidence and must report its own rows with Add-Result.
+        The returned object says whether the whole group passed, so the caller's finally
+        block can add a summary FAIL only when a failure was not already reported.
+    #>
+    param(
+        [string]$ResultId,
+        [string]$Label,
+        [string]$RuntimeSelection,
+        [int]$ListenPort,
+        [string[]]$ExpectedKinds,
+        [string]$InstallDirectory,
+        [string]$DataDirectory,
+        [string]$LogDirectory,
+        [string]$LogPrefix,
+        [string]$EvidenceKey,
+        [scriptblock]$AdditionalCheck = $null
+    )
+    $origin = "http://127.0.0.1:$ListenPort"
+    $evidence = [ordered]@{
+        installerArguments = @('Install', '-Runtimes', $RuntimeSelection)
+        installDirectory = $InstallDirectory
+        dataDirectory = $DataDirectory
+        port = $ListenPort
+        installationJsonRuntimes = @()
+        runtimeInstallationsList = @()
+        expectedAdapterKinds = @($ExpectedKinds)
+        claudeRuntimeEnvironmentStripped = $true
+    }
+    $script:Evidence[$EvidenceKey] = $evidence
+    $launcher = $null
+    $groupOk = $false
+    try {
+        try {
+            $installed = Install-Package $InstallDirectory $DataDirectory $ListenPort $LogDirectory $RuntimeSelection
+            $savedRuntimes = @($installed.runtimes)
+        } catch {
+            Add-Result $ResultId 'FAIL' ("{0} on port {1}: install failed: {2}" -f `
+                    $Label, $ListenPort, (Hide-Secrets $_.Exception.Message))
+            return $false
+        }
+        $evidence['installationJsonRuntimes'] = $savedRuntimes
+        if (-not (Test-SameKindSet $ExpectedKinds $savedRuntimes)) {
+            Add-Result $ResultId 'FAIL' ("{0} on port {1}: install recorded {2} in installation.json; -Runtimes {3} must record exactly {4}." -f `
+                    $Label, $ListenPort, (Format-KindSet $savedRuntimes), $RuntimeSelection, (Format-KindSet $ExpectedKinds))
+            return $false
+        }
+        try {
+            $launcher = Start-LoomConsole $InstallDirectory $LogDirectory $LogPrefix
+            $listener = Wait-ServerReady $launcher $ListenPort $InstallDirectory
+            $administratorToken = Get-AdministratorToken $DataDirectory
+            $session = Connect-Administrator $origin $administratorToken
+        } catch {
+            Add-Result $ResultId 'FAIL' ("{0} on port {1}: {2}" -f `
+                    $Label, $ListenPort, (Hide-Secrets $_.Exception.Message))
+            return $false
+        }
+        $evidence['listener'] = $listener
+        # The isolated instance is measured through the same Core request helper; only the
+        # origin and the session token change, and both are restored immediately after, so
+        # no later row can accidentally talk to the wrong instance.
+        $primarySession = $script:SessionToken
+        $observed = @()
+        try {
+            Use-RequestOrigin $origin
+            $script:SessionToken = $session
+            try {
+                $observed = @(Get-InstallationList $ResultId 15)
+            } catch {
+                Add-Result $ResultId 'FAIL' ("{0} on port {1}: {2}" -f `
+                        $Label, $ListenPort, (Hide-Secrets $_.Exception.Message))
+                return $false
+            }
+            $evidence['runtimeInstallationsList'] = $observed
+            $listed = Assert-RuntimeSelectionObserved $ResultId $ListenPort $ExpectedKinds $observed `
+                $Label ("installed with -Runtimes {0}, started through its own Start-Loom.cmd and logged in;" -f $RuntimeSelection)
+            if (-not $listed) {
+                $groupOk = $false
+            } elseif ($AdditionalCheck) {
+                $groupOk = [bool](& $AdditionalCheck $evidence)
+            } else {
+                $groupOk = $true
+            }
+        } finally {
+            $script:SessionToken = $primarySession
+            Use-RequestOrigin $script:Origin
+        }
+        return $groupOk
+    } finally {
+        # Always: stop the exact tree first (the listener must be gone before the files are
+        # touched), then remove the group's own install/data/log directories so a rerun
+        # starts from a clean root and no leaked instance can answer for a later acceptance.
+        Use-RequestOrigin $script:Origin
+        $stopId = $ResultId + '_STOP'
+        try {
+            $stopped = Stop-LoomConsole $launcher $ListenPort $stopId
+        } catch {
+            Add-Result $stopId 'FAIL' (Hide-Secrets $_.Exception.Message)
+            $stopped = $false
+        }
+        try {
+            $removed = Remove-IsolatedRuntimeSelectionDirectories $ResultId $Label $InstallDirectory $DataDirectory `
+                $LogDirectory $ListenPort
+        } catch {
+            Add-Result ($ResultId + '_CLEANUP') 'FAIL' (Hide-Secrets $_.Exception.Message)
+            $removed = $false
+        }
+        # A failure to release the port or to remove the group's directories is already
+        # reported by the two calls above; nothing else is needed here, and a failed group
+        # is already a FAIL through its own rows.
+        $null = $stopped, $removed
+    }
+}
+
+function Remove-IsolatedRuntimeSelectionDirectories([string]$ResultId, [string]$Label,
+    [string]$InstallDirectory, [string]$DataDirectory, [string]$LogDirectory, [int]$ListenPort) {
+    # The group owns everything it created: (install, data) are removed by their parent
+    # selection root, and the log directory is kept only for the report. Removal runs only
+    # after the listener is gone, and a directory that survives the removal is a FAIL: a
+    # left-behind root is exactly what would make the next run's readiness check pass
+    # against the wrong build (Assert-ShortWorkRoot refuses to reuse it).
+    $ok = $true
+    foreach ($target in @($InstallDirectory, $DataDirectory)) {
+        if (-not $target) { continue }
+        if (-not [IO.Directory]::Exists($target)) { continue }
+        try {
+            [IO.Directory]::Delete($target, $true)
+        } catch {
+            Add-Result ($ResultId + '_CLEANUP') 'FAIL' ("{0}: could not remove {1}: {2}" -f `
+                    $Label, $target, (Hide-Secrets $_.Exception.Message))
+            $ok = $false
+        }
+        if ([IO.Directory]::Exists($target)) {
+            Add-Result ($ResultId + '_CLEANUP') 'FAIL' ("{0}: {1} still exists after cleanup" -f $Label, $target)
+            $ok = $false
+        }
+    }
+    if ($LogDirectory -and [IO.Directory]::Exists($LogDirectory)) {
+        # The log directory is reported, not deleted: it is the only forensic trace of a
+        # failed isolated install, and it holds no instance state.
+        Add-Result ($ResultId + '_CLEANUP') 'PASS' ("{0}: port {1} released and instance directories removed; logs kept in {2}" -f `
+                $Label, $ListenPort, $LogDirectory)
+    } elseif ($ok) {
+        Add-Result ($ResultId + '_CLEANUP') 'PASS' ("{0}: port {1} released and instance directories removed" -f $Label, $ListenPort)
+    }
+    return $ok
+}
+
+function Get-PlatformAdmissionRow($StatusPayload, [string]$RuntimeKind) {
+    # runtime.status.get answers {hostPlatform, runtimePlatformAdmission[], ...}
+    # (crates/rovai-core/src/application.rs:4969-5035). The row that counts is the one for
+    # the reported host platform and the asked RuntimeKind, exactly like the renderer picks
+    # it (apps/desktop/src/renderer/src/runtime-status.ts:138-145).
+    $hostPlatform = [string](Get-Value $StatusPayload 'hostPlatform')
+    $admissions = @(Get-Value $StatusPayload 'runtimePlatformAdmission')
+    if (-not $hostPlatform) { throw 'runtime.status.get reported no hostPlatform; the admission row cannot be attributed.' }
+    if ($admissions.Count -eq 0) { throw 'runtime.status.get reported no runtimePlatformAdmission rows.' }
+    foreach ($row in $admissions) {
+        if ([string](Get-Value $row 'runtimeKind') -ceq $RuntimeKind -and
+            [string](Get-Value $row 'platform') -ceq $hostPlatform) {
+            return $row
+        }
+    }
+    return $null
+}
+
+function Test-AdmissionAllowsUse($Row) {
+    # The product's own predicate: only qualified and preview allow Runtime use
+    # (crates/rovai-core/src/runtime_platform_admission.rs:218-223 and
+    # apps/desktop/src/renderer/src/runtime-status.ts:149-153). Anything else — including
+    # the `disabled` + runtime_disabled_by_policy answer of the un-opted-in policy — denies.
+    $status = [string](Get-Value $Row 'status')
+    return ($status -ceq 'qualified' -or $status -ceq 'preview')
+}
+
+function Assert-ClaudeAdmissionReleased($Evidence) {
+    # Group 3's extra judge. Two independent read-backs of the SAME isolated instance:
+    #   1. runtime.status.get must report claude-code-cli as admitted on the host platform;
+    #   2. runtime.product.check must complete with a ready outcome.
+    # Both are observations only: nothing here launches a probe on its own, writes probe
+    # state or sets LOOM_CLAUDE_RUNTIME_ENABLED. If the instance had not been opted in by
+    # the installer, the admission row is `disabled`/`runtime_disabled_by_policy` and this
+    # FAILS, which is exactly the case a real regression would produce.
+    $ok = $true
+    $row = $null
+    try {
+        $statusPayload = Invoke-CoreRequest 'runtime.status.get' ([ordered]@{}) 180
+        $row = Get-PlatformAdmissionRow $statusPayload 'claude-code-cli'
+        $hostPlatform = [string](Get-Value $statusPayload 'hostPlatform')
+        $Evidence['hostPlatform'] = $hostPlatform
+        if (-not $row) {
+            Add-Result 'RUNTIME_SELECTION_CLAUDE_ADMISSION' 'FAIL' ("the claude-code-cli instance reports no runtimePlatformAdmission row for {0}; the admission is unknown." -f $hostPlatform)
+            $ok = $false
+        } elseif (-not (Test-AdmissionAllowsUse $row)) {
+            Add-Result 'RUNTIME_SELECTION_CLAUDE_ADMISSION' 'FAIL' ("claude-code-cli is listed but not admitted on {0}: status={1} reasonCode={2}; expected qualified or preview, so a selection without the installer's opt-in is a FAIL." -f `
+                    $hostPlatform, [string](Get-Value $row 'status'), [string](Get-Value $row 'reasonCode'))
+            $ok = $false
+        } else {
+            Add-Result 'RUNTIME_SELECTION_CLAUDE_ADMISSION' 'PASS' ("claude-code-cli is admitted on {0}: status={1} evidenceRevision={2}" -f `
+                    $hostPlatform, [string](Get-Value $row 'status'), [string](Get-Value $row 'evidenceRevision'))
+        }
+        $Evidence['platformAdmission'] = [ordered]@{
+            hostPlatform = $hostPlatform
+            runtimeKind = [string](Get-Value $row 'runtimeKind')
+            platform = [string](Get-Value $row 'platform')
+            status = [string](Get-Value $row 'status')
+            reasonCode = [string](Get-Value $row 'reasonCode')
+            evidenceRevision = [string](Get-Value $row 'evidenceRevision')
+            allowsRuntimeUse = [bool](Test-AdmissionAllowsUse $row)
+        }
+    } catch {
+        Add-Result 'RUNTIME_SELECTION_CLAUDE_ADMISSION' 'FAIL' ("runtime.status.get failed on the claude-code-cli instance: {0}" -f `
+                (Hide-Secrets $_.Exception.Message))
+        $ok = $false
+    }
+    $check = $null
+    try {
+        # The ready flag is the product check outcome for the admission the instance just
+        # published; a policy-disabled Runtime cannot answer ready.
+        $check = Invoke-CoreRequest 'runtime.product.check' ([ordered]@{ runtimeKind = 'claude-code-cli' }) 300
+        $completed = [bool](Get-Value $check 'completed')
+        $ready = [bool](Get-Value $check 'ready')
+        $outcome = [string](Get-Value $check 'outcome')
+        $Evidence['productCheck'] = [ordered]@{
+            runtimeKind = [string](Get-Value $check 'runtimeKind')
+            completed = $completed
+            ready = $ready
+            outcome = $outcome
+            status = [string](Get-Value $check 'status')
+        }
+        if (-not $completed) {
+            Add-Result 'RUNTIME_SELECTION_CLAUDE_PRODUCT_CHECK' 'FAIL' ("runtime.product.check for claude-code-cli did not complete on the Claude-only instance (outcome={0})." -f $outcome)
+            $ok = $false
+        } elseif (-not $ready) {
+            Add-Result 'RUNTIME_SELECTION_CLAUDE_PRODUCT_CHECK' 'FAIL' ("runtime.product.check for claude-code-cli completed without a ready outcome ({0}); a regulated Runtime that is only listed is not admitted." -f $outcome)
+            $ok = $false
+        } else {
+            Add-Result 'RUNTIME_SELECTION_CLAUDE_PRODUCT_CHECK' 'PASS' ("runtime.product.check for claude-code-cli completed ready ({0})." -f $outcome)
+        }
+    } catch {
+        Add-Result 'RUNTIME_SELECTION_CLAUDE_PRODUCT_CHECK' 'FAIL' ("runtime.product.check for claude-code-cli failed on the Claude-only instance: {0}" -f `
+                (Hide-Secrets $_.Exception.Message))
+        $ok = $false
+    }
+    return $ok
+}
+
+function Invoke-RuntimeSelectionPiDshCheck {
+    # B. `-Runtimes pi,dsh` in a second, fully isolated instance. pi,dsh are the
+    # installer's own aliases for pi and deepseek-harness
+    # (scripts/manage-loom-personal.ps1:28-49), and the installer normalizes them to the
+    # canonical pair before writing installation.json (:65-95,:519-529). No credential, no
+    # model, no member and no Mission are involved: the group only installs, starts, logs
+    # in, reads runtime.installations.list and stops. The helper stops and cleans this
+    # instance itself, before the primary instance is stopped.
+    [void](Invoke-IsolatedRuntimeSelection -ResultId 'RUNTIME_SELECTION_PI_DSH' `
+            -Label 'isolated -Runtimes pi,dsh install' -RuntimeSelection 'pi,dsh' `
+            -ListenPort $RuntimeSelectionPort -ExpectedKinds @('pi', 'deepseek-harness') `
+            -InstallDirectory $script:SelectionInstallDirectory -DataDirectory $script:SelectionDataDirectory `
+            -LogDirectory $script:Paths['selLogs'] -LogPrefix 'sel-server' `
+            -EvidenceKey 'runtimeSelectionPiDsh')
+}
+
+function Invoke-RuntimeSelectionClaudeCheck {
+    # C. `-Runtimes claude` in a THIRD, fully isolated instance (its own port, install,
+    # data and log directories). claude is the installer's alias for claude-code-cli
+    # (scripts/manage-loom-personal.ps1:30). Two things are required, and both are read
+    # back from the instance, never assumed:
+    #   1. runtime.installations.list reports exactly claude-code-cli;
+    #   2. the Claude admission is released (Assert-ClaudeAdmissionReleased).
+    # The opt-in LOOM_CLAUDE_RUNTIME_ENABLED is NOT written here: the installer derives it
+    # from the selection (Set-ClaudeRuntimeEnvironment), and the helper strips any value
+    # inherited from the calling shell before the child starts.
+    [void](Invoke-IsolatedRuntimeSelection -ResultId 'RUNTIME_SELECTION_CLAUDE' `
+            -Label 'isolated -Runtimes claude install' -RuntimeSelection 'claude' `
+            -ListenPort $ClaudeRuntimePort -ExpectedKinds @('claude-code-cli') `
+            -InstallDirectory $script:ClaudeInstallDirectory -DataDirectory $script:ClaudeDataDirectory `
+            -LogDirectory $script:Paths['selClaudeLogs'] -LogPrefix 'selclaude-server' `
+            -EvidenceKey 'runtimeSelectionClaude' -AdditionalCheck ${function:Assert-ClaudeAdmissionReleased})
 }
 
 function Select-MemberAndModel {
@@ -1551,6 +2179,16 @@ function Write-AcceptanceArtifacts {
     foreach ($name in @('install.out.txt', 'install.err.txt', 'server.out.txt', 'server.err.txt')) {
         Clear-SecretFromFile (Join-Path $logRoot $name)
     }
+    # The two isolated selection instances log into their own directories; their
+    # server-tokens are the only secret-shaped values they can carry, so the same redaction
+    # pass runs over every log file.
+    foreach ($selectionLogRoot in @($script:Paths['selLogs'], $script:Paths['selClaudeLogs'])) {
+        if ($selectionLogRoot -and (Test-Path -LiteralPath $selectionLogRoot -PathType Container)) {
+            foreach ($file in @(Get-ChildItem -LiteralPath $selectionLogRoot -Filter '*.txt' -File -Force -ErrorAction SilentlyContinue)) {
+                Clear-SecretFromFile $file.FullName
+            }
+        }
+    }
     if ($script:InstallDirectory -and (Test-Path -LiteralPath $script:InstallDirectory)) {
         Get-ChildItem -LiteralPath $script:InstallDirectory -Force |
             Select-Object Name, Length, LastWriteTime |
@@ -1559,6 +2197,18 @@ function Write-AcceptanceArtifacts {
         $statePath = Join-Path $script:InstallDirectory 'installation.json'
         if (Test-Path -LiteralPath $statePath) {
             Copy-Item -LiteralPath $statePath -Destination (Join-Path $logRoot 'installation.json') -Force
+        }
+    }
+    if ($script:SelectionInstallDirectory -and (Test-Path -LiteralPath $script:SelectionInstallDirectory)) {
+        $selectionStatePath = Join-Path $script:SelectionInstallDirectory 'installation.json'
+        if (Test-Path -LiteralPath $selectionStatePath) {
+            Copy-Item -LiteralPath $selectionStatePath -Destination (Join-Path $logRoot 'installation-pi-dsh.json') -Force
+        }
+    }
+    if ($script:ClaudeInstallDirectory -and (Test-Path -LiteralPath $script:ClaudeInstallDirectory)) {
+        $claudeStatePath = Join-Path $script:ClaudeInstallDirectory 'installation.json'
+        if (Test-Path -LiteralPath $claudeStatePath) {
+            Copy-Item -LiteralPath $claudeStatePath -Destination (Join-Path $logRoot 'installation-claude.json') -Force
         }
     }
     if ($script:DataDirectory -and (Test-Path -LiteralPath $script:DataDirectory)) {
@@ -1592,6 +2242,14 @@ function Write-AcceptanceArtifacts {
         modelLane = if ($script:InstallOnly) { 'N/A: install-only mode configures no member model' } else { "explicit $ModelId" }
         installDirectory = $script:InstallDirectory
         dataDirectory = $script:DataDirectory
+        runtimeSelectionInstallDirectory = $script:SelectionInstallDirectory
+        runtimeSelectionDataDirectory = $script:SelectionDataDirectory
+        runtimeSelectionPort = $RuntimeSelectionPort
+        claudeRuntimeInstallDirectory = $script:ClaudeInstallDirectory
+        claudeRuntimeDataDirectory = $script:ClaudeDataDirectory
+        claudeRuntimePort = $ClaudeRuntimePort
+        claudeRuntimeEnvironmentVariable = $script:ClaudeRuntimeEnvName
+        claudeRuntimeEnvironmentSetByHarness = $false
         packageRoot = $packageRoot
         credentialSource = $credentialSource
         statusCounts = $statusCounts
@@ -1612,6 +2270,16 @@ function Write-AcceptanceArtifacts {
         $lines.Add('mode:    real - $env:OCT_API_KEY (value never recorded), oct-chat Pi catalog, explicit member model')
     }
     $lines.Add('')
+    # The three runtime-selection groups are always printed, even when the run aborted
+    # before they were measured: a missing row must never read like a pass in the report.
+    $runtimeSelectionIds = @('RUNTIME_SELECTION', 'RUNTIME_SELECTION_PI_DSH',
+        'RUNTIME_SELECTION_CLAUDE', 'RUNTIME_SELECTION_CLAUDE_ADMISSION',
+        'RUNTIME_SELECTION_CLAUDE_PRODUCT_CHECK')
+    foreach ($id in $runtimeSelectionIds) {
+        if (@($script:Results | Where-Object { $_.id -eq $id }).Count -eq 0) {
+            $lines.Add(('{0,-18} {1}: not reached; the acceptance did not measure this row' -f 'NOT_MEASURED', $id))
+        }
+    }
     foreach ($status in @('PASS', 'N/A', 'FAIL', 'SKIP', 'SKIP_STOP_WINDOW')) {
         foreach ($entry in @($script:Results | Where-Object { $_.status -eq $status })) {
             $lines.Add(('{0,-18} {1}: {2}' -f $entry.status, $entry.id, $entry.detail))
@@ -1633,6 +2301,23 @@ try {
     Assert-ShortWorkRoot
     Set-Content -LiteralPath (Join-Path $script:Paths['logs'] 'report.txt') -Value 'acceptance started' -Encoding UTF8
 
+    # The Claude opt-in is the installer's decision, never the harness's. Strip whatever this
+    # process inherited from the parent shell before any child starts (Invoke-Manager and
+    # Start-LoomConsole strip it again per child) and record that fact in the report.
+    $inheritedClaudeOptIn = Clear-InheritedClaudeRuntimeEnvironment
+    $script:Evidence['claudeRuntimeEnvironment'] = [ordered]@{
+        variable = $script:ClaudeRuntimeEnvName
+        inheritedFromParent = $null -ne $inheritedClaudeOptIn
+        inheritedValueRecorded = $false
+        setByHarness = $false
+        decisionOwner = 'installer (scripts/manage-loom-personal.ps1 Set-ClaudeRuntimeEnvironment)'
+    }
+    Add-Result 'RUNTIME_SELECTION_ENV' 'PASS' (if ($null -ne $inheritedClaudeOptIn) {
+            "an inherited {0} was removed from the acceptance process; every child instance starts with it unset and only the installer may set it" -f $script:ClaudeRuntimeEnvName
+        } else {
+            "{0} was unset in the parent environment; every child instance starts with it unset and only the installer may set it" -f $script:ClaudeRuntimeEnvName
+        })
+
     if ($script:InstallOnly) {
         # Install-only mode never reads, requires or sets a provider credential, and it never
         # starts a provider: the model lane belongs to the cloud VM real deepseek acceptance.
@@ -1653,16 +2338,33 @@ try {
     $packageRoot = Expand-Package
     Add-Result 'EXTRACT' 'PASS' "package extracted under $($script:Paths['work'])"
 
-    Install-Package
-    Add-Result 'INSTALL' 'PASS' ("installed {0} on port {1}" -f (Get-Value $script:Evidence['installation'] 'current'), $Port)
+    $installation = Install-Package $script:InstallDirectory $script:DataDirectory $Port $script:Paths['logs'] $null
+    $script:Evidence['installation'] = $installation
+    Add-Result 'INSTALL' 'PASS' ("installed {0} on port {1}" -f $installation.current, $Port)
 
-    [void](Start-LoomConsole)
-    Wait-ServerReady
+    $script:Launcher = Start-LoomConsole $script:InstallDirectory $script:Paths['logs'] 'server'
+    $script:Evidence['listener'] = Wait-ServerReady $script:Launcher $Port $script:InstallDirectory
     Add-Result 'START' 'PASS' "installed Server answers $($script:Origin)/"
 
-    [void](Get-AdministratorToken)
-    Connect-Administrator
+    $script:AdminToken = Get-AdministratorToken $script:DataDirectory
+    $script:SessionToken = Connect-Administrator $script:Origin $script:AdminToken
+    $script:Evidence['app'] = [ordered]@{ name = [string](Get-Value (Invoke-CoreRequest 'app.info' ([ordered]@{})) 'name') }
     Add-Result 'LOGIN' 'PASS' 'administrator token accepted by /api/v1/login'
+
+    # A. the default install this run started: exactly the four shipped Runtimes.
+    Invoke-RuntimeSelectionCheck
+
+    # B. an independent `-Runtimes pi,dsh` instance: exactly pi and deepseek-harness.
+    # C. an independent `-Runtimes claude` instance: exactly claude-code-cli AND an
+    #    admission that allows Runtime use.
+    # Each group runs while the primary instance is still up, on its own port, install,
+    # data and log directories, and each one stops and cleans its own instance in its own
+    # finally block (Invoke-IsolatedRuntimeSelection), so the three listeners never overlap
+    # after the rows are judged and a leaked extra instance is impossible. B is run before
+    # C so the Claude-only instance is the last isolated one, and a failure in either group
+    # never prevents the other from being measured.
+    Invoke-RuntimeSelectionPiDshCheck
+    Invoke-RuntimeSelectionClaudeCheck
 
     $agentId = if ($script:InstallOnly) { Select-InstallOnlyMember } else { Select-MemberAndModel }
     $threadId = New-Camp $agentId "Windows real install acceptance $((Get-Date).ToString('yyyyMMdd-HHmmss'))"
@@ -1686,8 +2388,21 @@ try {
     }
 } catch {
     Add-Result 'ACCEPTANCE' 'FAIL' (Hide-Secrets $_.Exception.Message)
+    # No selection row may silently disappear when the run aborts before reaching it:
+    # a step that never ran is a FAIL, never a SKIP (the rows are only added when absent).
+    foreach ($id in @('RUNTIME_SELECTION', 'RUNTIME_SELECTION_PI_DSH', 'RUNTIME_SELECTION_CLAUDE',
+            'RUNTIME_SELECTION_CLAUDE_ADMISSION', 'RUNTIME_SELECTION_CLAUDE_PRODUCT_CHECK')) {
+        if (@($script:Results | Where-Object { $_.id -eq $id }).Count -eq 0) {
+            Add-Result $id 'FAIL' 'the acceptance aborted before this row could be measured'
+        }
+    }
 } finally {
-    try { if ($script:Launcher) { [void](Stop-LoomConsole) } } catch {
+    # The isolated instances tear themselves down inside Invoke-IsolatedRuntimeSelection,
+    # including their directories, and that helper also stops a half-started instance in
+    # its own finally. This block only restores the request origin, so a later teardown or
+    # report can never talk to an isolated listener.
+    Use-RequestOrigin $script:Origin
+    try { if ($script:Launcher) { [void](Stop-LoomConsole $script:Launcher $Port 'STOP_CONSOLE') } } catch {
         Add-Result 'STOP_CONSOLE' 'FAIL' (Hide-Secrets $_.Exception.Message)
     }
     try {

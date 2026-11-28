@@ -93,6 +93,28 @@ function Format-RuntimeSelection($Selection) {
     return (,$(($canonical) -join ','))
 }
 
+function Test-RuntimeSelected($Selection, [string]$Canonical) {
+    # True when the (already validated) effective selection contains the given
+    # canonical AdapterKind id. Used to derive the Claude opt-in from exactly the
+    # same selection the launcher exports, never from a separate saved field.
+    foreach ($name in @(Get-CanonicalRuntimes $Selection)) {
+        if ([string]::Equals([string]$name, $Canonical, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Set-ClaudeRuntimeEnvironment($Selection) {
+    # Claude Code is disabled by product policy unless the Server process is
+    # explicitly opted in with LOOM_CLAUDE_RUNTIME_ENABLED=1. For an installed
+    # launch the installer decides it: selecting claude-code-cli at install time
+    # (or on Start) sets the variable, a selection without it must not set it.
+    # The variable is removed rather than set to 0 so a value inherited from the
+    # console that launched LOOM can never leak into a non-Claude launch, and it
+    # is never written to installation.json.
+    Remove-Item Env:\LOOM_CLAUDE_RUNTIME_ENABLED -ErrorAction SilentlyContinue
+    if (Test-RuntimeSelected $Selection 'claude-code-cli') { $env:LOOM_CLAUDE_RUNTIME_ENABLED = '1' }
+}
+
 function Select-RuntimesInteractively([string]$DefaultList) {
     if (-not [Environment]::UserInteractive -or [Console]::IsInputRedirected) { return $null }
     Write-Host ''
@@ -449,6 +471,7 @@ function Run-Loom([string]$Root, [string]$DataRoot, [int]$ListenPort, $Manifest,
     # Every packaged runtime stays installed; this list only tells LOOM which
     # ones this installation advertises to the Host and the web UI.
     $env:LOOM_ENABLED_RUNTIMES = Format-RuntimeSelection $EnabledRuntimes
+    Set-ClaudeRuntimeEnvironment $EnabledRuntimes
     $env:ROVAI_EMBEDDED_PI_ROOT = Join-Path $Root 'runtime\pi'
     # Only fill the embedded DSH root when the user has not chosen one.
     if (-not $env:ROVAI_EMBEDDED_DSH_ROOT) { $env:ROVAI_EMBEDDED_DSH_ROOT = Join-Path $Root 'runtime\dsh' }
@@ -470,6 +493,8 @@ function Run-Loom([string]$Root, [string]$DataRoot, [int]$ListenPort, $Manifest,
     Write-Host 'Keep this window open. Press Ctrl+C to stop.'
     Write-Host "Personal data: $DataRoot"
     Write-Host "Enabled runtimes: $($env:LOOM_ENABLED_RUNTIMES)"
+    $claudeRuntime = if ($env:LOOM_CLAUDE_RUNTIME_ENABLED) { $env:LOOM_CLAUDE_RUNTIME_ENABLED } else { 'off' }
+    Write-Host "Claude runtime: $claudeRuntime"
     # The native Server prepares its private data root, Skill library and MCP
     # path. Never create this directory with inherited ACLs in the launcher.
     & (Join-Path $Root 'rovai-server.exe') --data-dir $DataRoot --listen "127.0.0.1:$ListenPort"

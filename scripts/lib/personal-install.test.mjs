@@ -401,6 +401,40 @@ test('Start persists a normalized runtimes selection even without -Runtimes', ()
     'the selection must be normalized before the state file is written')
 })
 
+// Claude Code is disabled by product policy inside LOOM unless the Server is
+// launched with LOOM_CLAUDE_RUNTIME_ENABLED=1. For an installed launch the
+// installer owns that decision: it is derived from the same effective runtime
+// selection that becomes LOOM_ENABLED_RUNTIMES, cleared when Claude is not
+// selected, and never persisted in installation.json.
+test('the launcher derives the Claude opt-in from the effective runtime selection', () => {
+  const managerText = readFileSync(manager, 'utf8')
+  // Run-Loom is the only path that starts rovai-server.exe, so it must set the
+  // flag from the selection it already exports.
+  const runLoom = managerText.slice(managerText.indexOf('function Run-Loom'))
+  const selection = runLoom.indexOf('$env:LOOM_ENABLED_RUNTIMES = Format-RuntimeSelection $EnabledRuntimes')
+  const claude = runLoom.indexOf('Set-ClaudeRuntimeEnvironment $EnabledRuntimes')
+  const server = runLoom.indexOf("'rovai-server.exe'")
+  assert.notEqual(selection, -1, 'Run-Loom must export the canonical runtime list')
+  assert.notEqual(claude, -1, 'Run-Loom must derive the Claude opt-in from the same selection')
+  assert.ok(claude > selection && claude < server, 'the opt-in must be resolved before the Server starts')
+  // Set, clear, then set from the derived selection: never inherited, never a
+  // different source of truth than LOOM_ENABLED_RUNTIMES.
+  assert.match(managerText, /Remove-Item Env:\\LOOM_CLAUDE_RUNTIME_ENABLED -ErrorAction SilentlyContinue/)
+  assert.match(managerText, /if \(Test-RuntimeSelected \$Selection 'claude-code-cli'\) \{ \$env:LOOM_CLAUDE_RUNTIME_ENABLED = '1' \}/)
+  assert.match(managerText, /if \(\[string\]::Equals\(\[string\]\$name, \$Canonical, \[StringComparison\]::OrdinalIgnoreCase\)\) \{ return \$true \}/)
+  // Start and Portable are the only paths that launch the Server, and both go
+  // through Run-Loom, so no second, divergent opt-in decision exists.
+  const calls = managerText.match(/^\s*Run-Loom /gm) || []
+  assert.equal(calls.length, 2, 'Start and Portable both launch through Run-Loom')
+  // Not a persisted field: the selection stays the only stored runtime state.
+  // Only the install branch that writes installation.json is inspected.
+  const installStart = managerText.indexOf("if ($Action -eq 'Install') {")
+  const installEnd = managerText.indexOf("} elseif ($Action -eq 'Status') {")
+  assert.ok(installStart > 0 && installEnd > installStart, 'the Install branch moved; update this test')
+  assert.doesNotMatch(managerText.slice(installStart, installEnd), /LOOM_CLAUDE_RUNTIME_ENABLED/,
+    'the opt-in must not be written to installation.json')
+})
+
 // Run an expression against the manager's real selection helpers without
 // executing the installer body. The helper block is extracted from the shipped
 // script so the test can never drift onto a copy of the code.
