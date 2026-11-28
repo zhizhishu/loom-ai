@@ -233,3 +233,45 @@ describe('approval cards above composer', () => {
     expect(html.indexOf('ln-approval-request')).toBeLessThan(html.indexOf('class="ln-composer"'))
   })
 })
+
+// 手机网页（工兵单 C）只认会话流里的两个 DOM 钩子：等待你的授权卡，和消息自带的附件卡。
+// 几何与真机截图在 phone-layout.test.tsx 与 host-web-phone-loom.test.mjs 里断言；这里只钉
+// 「流程需要的元素确实由 ConversationView 渲染出来」，不合成 Runtime 审批或附件读取。
+describe('phone flow hooks: approval and sent attachments', () => {
+  const attachment = {
+    id: 'at1', displayName: 'release-notes.png', kind: 'file', fileCount: null,
+    mediaType: 'image/png', byteSize: 327_680, previewKind: 'image', availability: 'available'
+  }
+  const sent = {
+    id: 'm-attach', sequence: 2, authorType: 'user' as const, authorId: 'local_user', authorDisplayName: null,
+    body: '截图在这里', withdrawn: false, attachments: [attachment], agentRunId: null, createdAt: '2026-11-22T00:00:00.000Z'
+  }
+
+  it('draws the pending approval as one card above the composer, with an option button per choice', () => {
+    const approval = {
+      id: 'ap1', actionId: 'ac1', actionKind: 'shell.command', actionSummary: '运行 npm test', canonicalInput: {},
+      reason: '这条命令会写入工作目录', agentRunId: 'r1', agentId: 'a1', adapterKind: 'pi',
+      nativeMethod: null, requestDigest: null, permissionSemantics: 'core_enforced_v1',
+      options: [
+        { optionId: 'o1', kind: 'allow_once', label: '允许一次', consequence: '只运行这一条命令', nativeResponseDigest: 'd1' },
+        { optionId: 'o2', kind: 'allow_session', label: '本次会话允许', consequence: '本会话不再询问', nativeResponseDigest: 'd2' }
+      ],
+      status: 'pending', requestedForUserId: 'local_user', resolvedByType: null, resolvedById: null,
+      resolutionCode: null, version: 1, requestedAt: '2026-11-22T00:00:00.000Z', resolvedAt: null
+    } as ActionApprovalView
+    const html = view({ ...snapshot('发版群', [member('a1', 'Hanzi')]), approvals: [approval] } as unknown as ThreadSnapshot)
+    expect(html.match(/class="ln-approval-request"/g)).toHaveLength(1)
+    expect(html).toContain('data-state="pending"')
+    expect(html).toContain('>允许一次</button>')
+    expect(html).toContain('>本次会话允许</button>')
+    expect(html).toContain('aria-label="等待你的授权"')
+  })
+
+  it('renders a sent attachment inside its message row so the phone file card can size it', () => {
+    const html = view({ ...snapshot('发版群', [member('a1', 'Hanzi')]), messages: [sent] } as unknown as ThreadSnapshot)
+    expect(html).toContain('class="ln-message-files"')
+    expect(html).toContain('class="ln-file-card is-image"')
+    expect(html).toContain('release-notes.png')
+    expect(html).toContain('aria-label="预览附件 release-notes.png"')
+  })
+})

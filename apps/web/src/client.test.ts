@@ -163,6 +163,63 @@ describe('console transport', () => {
     expect(scoped.takeChanges()).toEqual([{ messages: [] }])
   })
 
+  it('tracks SSE ids across LF and CRLF frames and never rewinds on resync or malformed ids', () => {
+    for (const separator of ['\n', '\r\n']) {
+      const numbered = `id: 7${separator}event: invalidate${separator}data: {"tasksChanged":true}${separator}${separator}`
+      for (let split = 0; split <= numbered.length; split++) {
+        const decoder = new InvalidationDecoder()
+        expect(decoder.lastId()).toBe(0)
+        decoder.push(numbered.slice(0, split))
+        decoder.push(numbered.slice(split))
+        expect(decoder.lastId()).toBe(7)
+        expect(decoder.takeChanges()).toEqual([{ messages: [], tasksChanged: true }])
+      }
+      const decoder = new InvalidationDecoder()
+      decoder.push(`event: resync${separator}data: {"epoch":"a","revision":0}${separator}${separator}`)
+      expect(decoder.lastId()).toBe(0)
+      expect(decoder.takeChanges()).toEqual([{ resync: true }])
+      decoder.push(numbered)
+      decoder.push(`id: 3${separator}event: invalidate${separator}data: {}${separator}${separator}`)
+      decoder.push(`id: ${separator}event: invalidate${separator}data: {}${separator}${separator}`)
+      expect(decoder.lastId()).toBe(7)
+    }
+  })
+
+  it('resumes the event stream from the last framed id and omits the header for id-less servers', async () => {
+    const headers: Array<string | null> = []
+    const streams: ReadableStreamDefaultController<Uint8Array>[] = []
+    const fetcher = vi.fn<typeof fetch>(async (url, init) => {
+      if (String(url).endsWith('/login')) return Response.json({ protocolVersion: 5, token: 'a'.repeat(64), clientId: 'd'.repeat(64), editorProof: 'e'.repeat(64), ownerId: 'local_user' })
+      if (String(url).endsWith('/events')) {
+        headers.push(new Headers(init?.headers).get('Last-Event-ID'))
+        return new Response(new ReadableStream({ start(controller) { streams.push(controller) } }))
+      }
+      return Response.json({ result: {} })
+    })
+    const client = new ConsoleClient('http://127.0.0.1:4317', fetcher)
+    await client.login('b'.repeat(64))
+    const unsubscribe = client.subscribe(() => undefined, () => undefined)
+    await vi.waitFor(() => expect(streams).toHaveLength(1))
+    expect(headers).toEqual([null])
+    // A server that never sends ids keeps the cursor at zero: the reconnect is
+    // byte-for-byte the legacy request and still receives its own resync.
+    streams[0].close()
+    await vi.waitFor(() => expect(streams).toHaveLength(2), { timeout: 4000 })
+    expect(headers).toEqual([null, null])
+    streams[1].enqueue(new TextEncoder().encode('id: 41\nevent: invalidate\ndata: {"tasksChanged":true}\n\n'))
+    await vi.waitFor(() => expect(headers).toHaveLength(2))
+    streams[1].close()
+    await vi.waitFor(() => expect(streams).toHaveLength(3), { timeout: 4000 })
+    expect(headers).toEqual([null, null, '41'])
+    // Logging out forgets the cursor; the next session never resumes an old one.
+    unsubscribe(); streams[2].close(); client.clear()
+    await client.login('b'.repeat(64))
+    const second = client.subscribe(() => undefined, () => undefined)
+    await vi.waitFor(() => expect(streams).toHaveLength(4))
+    expect(headers.at(-1)).toBe(null)
+    second(); streams[3].close(); client.clear()
+  }, 15_000)
+
   it('retains an unknown command across reauthentication and only looks up its original receipt', async () => {
     let recorded = false
     const params = { commandId: newCommandId(), threadId: 'test', draftRevision: 4, execution: null }

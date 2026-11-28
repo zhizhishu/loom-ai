@@ -242,7 +242,7 @@ test('trusted Web HTML uses native storage, forms, popups and modals while prese
     await browser.click(`[...document.querySelectorAll('.web-upload-actions button')].find(e=>e.textContent==='取消上传')`)
     await browser.send('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 })
     await browser.wait(`!document.querySelector('.web-upload-status') || document.querySelector('.web-upload-status').textContent.includes('已取消')`)
-    assert.equal(await browser.evaluate(`document.querySelector('.web-offline-dialog')===null`), true, 'cancelling an upload does not block a healthy page')
+    assert.equal(await browser.evaluate(`document.querySelector('.web-live-bar')===null`), true, 'cancelling an upload does not block a healthy page')
     // Host may still be observing the aborted stream. Recheck the same receipt
     // until the admitted attempt settles; never manufacture a second intent.
     await within((async () => {

@@ -40,17 +40,29 @@
 }
 html[data-motion-preference="reduce"] .web-login-spinner { animation: none; }
 html[data-motion-preference="reduce"] .web-login-submit { transition: none; }
-.web-connection-content { display: contents; }
-.web-offline-scrim { position: fixed; inset: 0; z-index: 1000; background: var(--overlay); }
-.web-offline-dialog.app-dialog { position: fixed; z-index: 1001; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(400px, calc(100vw - 40px)); max-height: calc(100dvh - 40px); overflow: auto; padding: 28px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--surface-raised); color: var(--ink); box-shadow: var(--shadow-float); outline: none; }
-.web-offline-symbol { width: 36px; height: 36px; display: grid; place-items: center; margin-bottom: 20px; border: 1px solid color-mix(in srgb, var(--attention) 28%, var(--line)); border-radius: 8px; background: var(--attention-soft); color: var(--attention); }
-.web-offline-symbol svg { width: 20px; height: 20px; }
-.web-offline-title { margin: 0; font-size: 18px; font-weight: 600; line-height: 1.5; letter-spacing: -.025em; }
-.web-offline-description { margin: 8px 0 24px; color: var(--muted); font-size: 13px; line-height: 1.7; }
-.web-offline-retry { width: 100%; min-height: 40px; display: flex; align-items: center; justify-content: center; gap: 8px; }
-.web-offline-retry .web-login-spinner { border-color: currentColor; border-top-color: transparent; }
+/* Reconnect bar: literal-color Web chrome, independent of LOOM application tokens. */
+.web-live-bar { --live-bar-bg: #fff; --live-bar-ink: #222; --live-bar-muted: #666; --live-bar-line: #e5e5e5; --live-bar-action: #2b2b2c; --live-bar-action-ink: #fff; --live-bar-shadow: #00000024; position: fixed; top: max(10px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%); z-index: 1000; width: min(560px, calc(100vw - 24px)); box-sizing: border-box; display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--live-bar-line); border-radius: 12px; background: var(--live-bar-bg); color: var(--live-bar-ink); box-shadow: 0 10px 30px var(--live-bar-shadow); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; font-size: 13px; line-height: 1.5; }
+.web-live-bar-copy { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.web-live-bar-title { font-weight: 600; }
+.web-live-bar-description { color: var(--live-bar-muted); font-size: 12px; overflow-wrap: anywhere; }
+.web-live-bar-retry { flex: none; display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 34px; padding: 6px 12px; border: 0; border-radius: 9px; background: var(--live-bar-action); color: var(--live-bar-action-ink); font: inherit; font-weight: 500; cursor: pointer; }
+.web-live-bar-retry:disabled { opacity: .6; cursor: default; }
+.web-live-bar-retry .web-login-spinner { border-color: currentColor; border-top-color: transparent; }
+.web-live-bar-dismiss { flex: none; width: 30px; height: 30px; display: grid; place-items: center; border: 0; border-radius: 8px; background: transparent; color: var(--live-bar-muted); font: inherit; font-size: 17px; line-height: 1; cursor: pointer; }
+.web-live-bar-dismiss:hover { color: var(--live-bar-ink); }
+.web-live-bar-retry:focus-visible, .web-live-bar-dismiss:focus-visible { outline: 2px solid var(--live-bar-muted); outline-offset: 2px; }
+@media (prefers-color-scheme: dark) {
+  .web-live-bar { --live-bar-bg: #26272a; --live-bar-ink: #f0f0f1; --live-bar-muted: #a6a7aa; --live-bar-line: #3a3b3f; --live-bar-action: #e5e5e7; --live-bar-action-ink: #1c1c1e; --live-bar-shadow: #00000059; }
+}
+html[data-theme="day"] .web-live-bar { --live-bar-bg: #fff; --live-bar-ink: #222; --live-bar-muted: #666; --live-bar-line: #e5e5e5; --live-bar-action: #2b2b2c; --live-bar-action-ink: #fff; --live-bar-shadow: #00000024; }
+html[data-theme="night"] .web-live-bar { --live-bar-bg: #26272a; --live-bar-ink: #f0f0f1; --live-bar-muted: #a6a7aa; --live-bar-line: #3a3b3f; --live-bar-action: #e5e5e7; --live-bar-action-ink: #1c1c1e; --live-bar-shadow: #00000059; }
+@media (max-width: 480px) {
+  .web-live-bar { top: max(8px, env(safe-area-inset-top)); width: calc(100vw - 16px); flex-wrap: wrap; gap: 8px; padding: 10px; }
+  .web-live-bar-copy { flex: 1 1 100%; }
+  .web-live-bar-retry { flex: 1 1 auto; }
+  .web-live-bar-retry, .web-live-bar-dismiss { min-height: 36px; }
+}
 
 html,body,#root{margin:0;width:100%;height:100%;overflow:hidden}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
 .language-bootstrap{position:fixed;inset:0;background:#fff}.web-authenticated-shell{display:contents}.web-authenticated-shell[hidden]{display:none}
-.web-offline-scrim{background:#20202045;backdrop-filter:blur(5px)}.web-offline-dialog.app-dialog{background:#fff;color:#222;border:1px solid #e5e5e5;box-shadow:0 15px 50px #0003;border-radius:16px}.web-offline-dialog button{font:inherit;cursor:pointer}.web-offline-retry{border:0;border-radius:10px;background:#155dff;color:#fff;padding:9px 14px}
 .web-recovery-error{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:1010;max-width:calc(100vw - 40px);padding:12px 16px;border:1px solid #efc7c3;border-radius:12px;background:#fff6f4;color:#a83830;font-size:13px}.web-recovery-error button{border:0;background:none;color:inherit;cursor:pointer;margin-left:15px}

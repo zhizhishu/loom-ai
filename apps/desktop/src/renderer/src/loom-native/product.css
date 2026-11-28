@@ -280,3 +280,16 @@
 .ln-artifact-spreadsheet table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .ln-artifact-spreadsheet th, .ln-artifact-spreadsheet td { max-width: 260px; overflow: hidden; border-bottom: 1px solid var(--ln-border); padding: 7px 10px; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .ln-artifact-spreadsheet th { position: sticky; top: 0; background: var(--ln-panel-strong, var(--ln-panel)); font-weight: 600; }
+
+/* Phone materials (390x844): 玻璃层在手机上只做一层薄模糊，避免整块 backdrop
+   采样拖慢滚动；层次仍由 --ln-glass-raised 保留。 */
+@media(max-width:520px){
+  .ln-sidebar{backdrop-filter:blur(14px) saturate(1.06);-webkit-backdrop-filter:blur(14px) saturate(1.06)}
+  .ln-inspector{backdrop-filter:blur(14px) saturate(1.04);-webkit-backdrop-filter:blur(14px) saturate(1.04)}
+  .ln-composer{backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
+  /* 手机群头里工作根只留图标：点开仍是同一个「管理工作根目录」，标题在 aria-label 里。 */
+  .ln-chat-root{max-width:32px;padding:5px 7px!important;justify-content:center}
+  .ln-chat-root span{display:none}
+  .ln-surface-dialog{background:var(--ln-bg);backdrop-filter:none;-webkit-backdrop-filter:none}
+  .ln-choice-menu{backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
+}

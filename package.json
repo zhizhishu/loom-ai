@@ -180,6 +180,7 @@
     "test:host-web-recovery": "node --test scripts/lib/web-connection-recovery.test.mjs",
     "test:host-web-recovery-live": "node --test scripts/lib/web-connection-recovery-live.test.mjs",
     "test:host-web-mobile": "node --test scripts/lib/host-web-mobile.test.mjs",
+    "test:host-web-phone": "node --test scripts/lib/host-web-phone-loom.test.mjs",
     "test:member-creation": "node --test scripts/lib/member-creation.test.mjs",
     "test:member-avatar-flow": "tsc --noEmit -p scripts/fixtures/member-avatar-flow/tsconfig.json && node --test scripts/lib/member-avatar-flow.test.mjs",
     "test:mission-board": "node --test scripts/lib/mission-board.test.mjs",
