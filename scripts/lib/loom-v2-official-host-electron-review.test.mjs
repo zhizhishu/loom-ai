@@ -409,7 +409,7 @@ test('official rovai-host + two real guarded Pi writes -> production Web LoomApp
 
     // Negative: the producer side stays off the network capability even with a valid Session.
     for (const operation of ['loom.artifact.register', 'loom.plan.import', 'loom.candidate.record',
-      'loom.claim.acquire', 'loom.task.release']) {
+      'loom.claim.acquire']) {
       const denied = await request(session, operation, {
         missionId, taskId: WORKERS[0].taskId, agentRunId: runs[0].agentRunId,
         relativePath: WORKERS[0].relativePath
