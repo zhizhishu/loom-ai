@@ -225,7 +225,10 @@ function Verify-Package([string]$Root, [switch]$InstalledStart) {
             @($allowed | Where-Object {
                 $_ -match '^runtime/dsh-hook-executor/(hook-executor-bundle\.json|executor\.mjs|verify\.mjs|package(?:-lock)?\.json|THIRD-PARTY-NOTICES\.txt)$'
             })
-        $entries += @('runtime/pi/node/node.exe', 'runtime/dsh/dsh-runtime-bundle.json', 'runtime/dsh/dsh.cmd', 'runtime/dsh/node/node.exe')
+        $entries += 'runtime/pi/node/node.exe'
+        if ($manifest.ContainsKey('dshRuntime')) {
+            $entries += @('runtime/dsh/dsh-runtime-bundle.json', 'runtime/dsh/dsh.cmd', 'runtime/dsh/node/node.exe')
+        }
         foreach ($relative in $entries) {
             $file = Resolve-Directory (Join-Path $Root $relative)
             if ((File-Hash $file) -cne $manifest.files[$relative]) { throw "Damaged program file: $relative" }
