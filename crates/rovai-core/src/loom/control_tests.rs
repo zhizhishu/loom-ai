@@ -17,7 +17,7 @@ use super::{
     LoomCommandError, LoomPlanImportCriterion, LoomPlanImportDependency, LoomPlanImportInput,
     LoomPlanImportTask, LoomReviewRecordInput, LoomReviewVerdict, LoomTaskReleaseInput,
     LoomVerificationRecordInput, LoomVerificationResult, candidate_record, claim_acquire,
-    claim_acquire_reusing_own_lease, plan_import, review_record, task_release,
+    claim_acquire_reusing_own_lease, plan_import, review_record, task_release, task_release_as,
     verification_record_with_archives,
 };
 use crate::agent_profile::AdapterKind;
@@ -9708,5 +9708,673 @@ fn loom_m6c_existing_recovery_successor_suppresses_second_launch() {
         ),
         ("BLOCKED", Some("runtime_turn_failed_2"), 2),
         "assertion the_suppressed_child_parks_with_its_own_reason_and_the_ledger_grows_no_third_row"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The User's own redo decision about a stage-blocked delivery.
+//
+// A `BLOCKED` stage verdict is final: it keeps the Task parked for a User, and nothing in the
+// scheduler, the watchdog or the budget may lift it. The one decision that returns the work is the
+// Owner's release, which writes a *later* `loom.task_rework_requested` fact beside the verdict
+// instead of editing it. These owners prove the whole path — release, event, next dispatch — and
+// the refusals that keep every other parked Task where its own owner left it.
+// ---------------------------------------------------------------------------------------------
+
+/// The Task's `blocked_reason` as the current-state mirror records it.
+fn blocked_reason_of(
+    database: &OwnedTestDatabase,
+    mission_id: &str,
+    task_id: &str,
+) -> Option<String> {
+    database
+        .connection()
+        .query_row(
+            "SELECT task.blocked_reason FROM loom_task task
+             JOIN loom_plan plan ON plan.plan_id = task.plan_id
+             WHERE plan.mission_id=?1 AND task.task_id=?2",
+            params![mission_id, task_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// Every `loom.task_rework_requested` fact of one Task: who wrote it and the payload it carries, so
+/// "the user asked for this delivery to be redone" is proven by the ledger.
+fn rework_requests(database: &OwnedTestDatabase, task_id: &str) -> Vec<(String, String, String)> {
+    let mut statement = database
+        .connection()
+        .prepare(
+            "SELECT actor_type, actor_id, payload_json FROM event_log
+             WHERE event_type='loom.task_rework_requested'
+               AND entity_type='loom_task' AND entity_id=?1
+             ORDER BY created_at, rowid",
+        )
+        .unwrap();
+    statement
+        .query_map([task_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+/// One `loom.task_rework_requested` row with an explicit actor, so a same-named fact written by
+/// somebody other than the User can be replayed beside the User's own decision.
+fn insert_rework_request(
+    database: &OwnedTestDatabase,
+    camp_id: &str,
+    actor_type: &str,
+    actor_id: &str,
+    payload: &serde_json::Value,
+) {
+    database
+        .connection()
+        .execute(
+            "INSERT INTO event_log(event_id,event_type,payload_json,camp_id,entity_type,entity_id,
+                                   actor_type,actor_id,created_at)
+             VALUES(?1,'loom.task_rework_requested',?2,?3,'loom_task','task_a',?4,?5,?6)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                serde_json::to_string(payload).unwrap(),
+                camp_id,
+                actor_type,
+                actor_id,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )
+        .unwrap();
+}
+
+/// Every dispatch of the Mission's Plan in ledger order: kind, Candidate and recipient.
+fn mission_dispatches(
+    database: &OwnedTestDatabase,
+    mission_id: &str,
+) -> Vec<(String, Option<String>, String)> {
+    let mut statement = database
+        .connection()
+        .prepare(
+            "SELECT dispatch.kind, dispatch.candidate_id, dispatch.recipient_agent_id
+             FROM loom_control_dispatch dispatch
+             JOIN loom_plan plan ON plan.plan_id = dispatch.plan_id
+             WHERE plan.mission_id=?1
+             ORDER BY dispatch.created_at, dispatch.rowid",
+        )
+        .unwrap();
+    statement
+        .query_map([mission_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+/// A Plan whose `task_a` is explicitly assigned. A repair is handed back to the Task's own
+/// assignee, so a fixture that leaves the Task unassigned would put no producer in the REWORK lane
+/// and would prove nothing about the redo decision.
+fn plan_with_assignee(mission_id: &str, assignee_agent_id: &str) -> LoomPlanImportInput {
+    let mut input = plan_input(mission_id);
+    if let Some(task) = input
+        .tasks
+        .iter_mut()
+        .find(|task| task.task_id == "task_a")
+    {
+        task.assignee_agent_id = Some(assignee_agent_id.to_string());
+    }
+    input
+}
+
+/// The stage review the block of one delivery is: the newest `BLOCKED` verdict of that Candidate.
+fn blocked_stage_review_id(database: &OwnedTestDatabase, candidate_id: &str) -> String {
+    database
+        .connection()
+        .query_row(
+            "SELECT stage_review_id FROM loom_stage_review
+             WHERE candidate_id=?1 AND verdict='BLOCKED'
+             ORDER BY reviewed_at DESC, rowid DESC LIMIT 1",
+            [candidate_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// One delivery parked by a real stage `BLOCKED` verdict: the fixture walks the product's own
+/// release → claim → candidate → review path and stops at the block, so nothing below is invented.
+/// Returns `(mission_id, camp_id, candidate_id)`.
+fn stage_blocked_delivery(
+    database: &mut OwnedTestDatabase,
+    title: &str,
+) -> (String, String, String) {
+    let mission_id = create_mission(database, title);
+    plan_import(database, plan_with_assignee(&mission_id, PRODUCER_AGENT)).unwrap();
+    let camp_id = camp_of(database, &mission_id);
+    seed_run(database, &camp_id, PRODUCER_AGENT, PRODUCER_RUN);
+    seed_run(database, &camp_id, REVIEWER_AGENT, REVIEWER_RUN);
+    control::configure(
+        database,
+        OWNER,
+        policy_input(&mission_id, "command_approve_stage_block", REVIEWER_AGENT),
+    )
+    .unwrap();
+    let (candidate_id, manifest) = submitted_candidate(database, &mission_id, PRODUCER_RUN);
+    finish_run(database, REVIEWER_RUN);
+    let reviewer_run = dispatched_review_run(database, &camp_id, &candidate_id);
+    let mut blocked = stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Blocked);
+    blocked.reason = "the delivery needs a decision nobody has made".into();
+    let recorded = control::stage_review_record(
+        database,
+        &mission_id,
+        REVIEWER_AGENT,
+        &reviewer_run,
+        "command_stage_block",
+        blocked,
+    )
+    .unwrap();
+    assert_eq!(
+        recorded.task_status,
+        super::LoomTaskStatus::Blocked,
+        "assertion the_fixture_parks_the_task"
+    );
+    (mission_id, camp_id, candidate_id)
+}
+
+fn release_input_of(mission_id: &str) -> LoomTaskReleaseInput {
+    LoomTaskReleaseInput {
+        mission_id: mission_id.into(),
+        task_id: "task_a".into(),
+    }
+}
+
+/// Release boundary: the Owner's release of a stage-blocked Task is one User decision — `READY`, no
+/// `blocked_reason`, one `loom.task_rework_requested` fact, and the same delivery handed back to its
+/// assignee on the next scheduler pass. The `BLOCKED` verdict itself is never rewritten, and the same
+/// verdict cannot produce a second rework.
+#[test]
+fn releasing_a_stage_blocked_task_records_the_redo_and_dispatches_one_rework() {
+    let mut database = fixture();
+    let (mission_id, _camp_id, candidate_id) =
+        stage_blocked_delivery(&mut database, "control blocked rework");
+    assert_eq!(
+        task_state(&database, &mission_id, "task_a"),
+        "BLOCKED",
+        "assertion the_delivery_is_parked"
+    );
+    let parked_reason = blocked_reason_of(&database, &mission_id, "task_a")
+        .expect("a stage block records its reason");
+    assert!(
+        parked_reason.starts_with("stage review: "),
+        "assertion the_park_is_the_stage_reviews_own"
+    );
+    // A blocked delivery is handed to nobody, however many passes the scheduler makes.
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion a_blocked_delivery_mints_no_dispatch"
+    );
+
+    let released = task_release(&mut database, release_input_of(&mission_id)).unwrap();
+    assert_eq!(
+        released.task.status,
+        super::LoomTaskStatus::Ready,
+        "assertion the_users_release_returns_the_task_to_ready"
+    );
+    assert_eq!(
+        released.task.blocked_reason, None,
+        "assertion the_release_clears_the_park_reason"
+    );
+    assert_eq!(
+        task_state(&database, &mission_id, "task_a"),
+        "READY",
+        "assertion the_release_is_persisted"
+    );
+    assert_eq!(
+        blocked_reason_of(&database, &mission_id, "task_a"),
+        None,
+        "assertion the_stored_park_reason_is_gone"
+    );
+
+    let requests = rework_requests(&database, "task_a");
+    assert_eq!(
+        requests.len(),
+        1,
+        "assertion the_release_records_exactly_one_redo_decision"
+    );
+    let (actor_type, actor_id, payload_json) = requests.into_iter().next().unwrap();
+    assert_eq!(
+        (actor_type.as_str(), actor_id.as_str()),
+        ("user", OWNER),
+        "assertion the_redo_decision_is_the_users_own"
+    );
+    let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
+    assert_eq!(
+        (
+            payload.get("missionId").and_then(|value| value.as_str()),
+            payload.get("taskId").and_then(|value| value.as_str()),
+            payload.get("candidateId").and_then(|value| value.as_str()),
+            payload.get("stageReviewId").and_then(|value| value.as_str()),
+        ),
+        (
+            Some(mission_id.as_str()),
+            Some("task_a"),
+            Some(candidate_id.as_str()),
+            Some(blocked_stage_review_id(&database, &candidate_id).as_str())
+        ),
+        "assertion the_redo_decision_names_the_delivery_and_verdict_it_is_about"
+    );
+    assert_eq!(
+        payload.get("blockedReason").and_then(|value| value.as_str()),
+        Some(parked_reason.as_str()),
+        "assertion the_redo_decision_keeps_the_reason_it_overrides"
+    );
+
+    // The next pass turns that decision into the one rework a `REQUEST_CHANGES` verdict would send:
+    // same recipient, same Candidate.
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_released_task_is_handed_back_to_its_assignee"
+    );
+    assert_eq!(
+        mission_dispatches(&database, &mission_id)
+            .into_iter()
+            .filter(|(kind, _, _)| kind == "REWORK")
+            .collect::<Vec<_>>(),
+        vec![(
+            "REWORK".to_string(),
+            Some(candidate_id.clone()),
+            PRODUCER_AGENT.to_string()
+        )],
+        "assertion the_rework_names_the_blocked_candidate_and_its_assignee"
+    );
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion the_same_stage_verdict_is_never_redispatched"
+    );
+    // The block is still the newest judgement of that delivery: a redo decision is a later fact, not
+    // an edit of the verdict.
+    let verdicts: Vec<String> = {
+        let mut statement = database
+            .connection()
+            .prepare("SELECT verdict FROM loom_stage_review ORDER BY reviewed_at, rowid")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        verdicts,
+        vec!["BLOCKED".to_string()],
+        "assertion the_blocked_verdict_survives_the_redo_untouched"
+    );
+}
+
+/// Identity boundary: a redo decision only returns the delivery it names. A Task somebody moved back
+/// to `READY` gets no work, and neither does one whose decision names another verdict; the very same
+/// fact, re-written to name this verdict, is honoured — no clock is read to tell them apart.
+#[test]
+fn a_stage_block_without_a_matching_redo_decision_dispatches_nothing() {
+    let mut database = fixture();
+    let (mission_id, camp_id, candidate_id) =
+        stage_blocked_delivery(&mut database, "control blocked without redo");
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion the_parked_delivery_is_not_handed_out"
+    );
+
+    // The state alone is not a decision: a Task reading READY with the same BLOCKED verdict and no
+    // release fact mints nothing.
+    database
+        .connection()
+        .execute(
+            "UPDATE loom_task SET status='READY', blocked_reason=NULL WHERE task_id='task_a'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion a_task_moved_to_ready_by_hand_gets_no_rework"
+    );
+    assert_eq!(
+        mission_dispatches(&database, &mission_id)
+            .into_iter()
+            .filter(|(kind, _, _)| kind == "REWORK")
+            .count(),
+        0,
+        "assertion nothing_was_dispatched_for_the_unreleased_block"
+    );
+
+    // A redo decision that names another verdict is not a decision about this block: it was taken
+    // for an older delivery of the same Candidate, so the scheduler still dispatches nothing.
+    let plan_id: String = database
+        .connection()
+        .query_row(
+            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+            [&mission_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stage_review_id = blocked_stage_review_id(&database, &candidate_id);
+    let older_decision = serde_json::json!({
+        "missionId": mission_id,
+        "planId": plan_id,
+        "taskId": "task_a",
+        "candidateId": candidate_id,
+        "stageReviewId": "stage_review_of_an_older_delivery",
+        "blockedReason": "stage review: an older decision",
+    });
+    let event_id = uuid::Uuid::new_v4().to_string();
+    database
+        .connection()
+        .execute(
+            "INSERT INTO event_log(event_id,event_type,payload_json,camp_id,entity_type,entity_id,
+                                   actor_type,actor_id,created_at)
+             VALUES(?1,'loom.task_rework_requested',?2,?3,'loom_task','task_a','user',?4,?5)",
+            params![
+                event_id,
+                serde_json::to_string(&older_decision).unwrap(),
+                camp_id,
+                OWNER,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion a_decision_about_another_verdict_releases_nothing"
+    );
+
+    // The same fact, naming this very verdict, is the decision the scheduler honours.
+    let this_decision = serde_json::json!({
+        "missionId": mission_id,
+        "planId": plan_id,
+        "taskId": "task_a",
+        "candidateId": candidate_id,
+        "stageReviewId": stage_review_id,
+        "blockedReason": "stage review: the delivery needs a decision nobody has made",
+    });
+    database
+        .connection()
+        .execute(
+            "UPDATE event_log SET payload_json=?1 WHERE event_id=?2",
+            params![serde_json::to_string(&this_decision).unwrap(), event_id],
+        )
+        .unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_decision_about_this_verdict_is_the_one_that_returns_the_work"
+    );
+}
+
+/// Actor boundary: the redo decision is the User's. The same payload naming this very verdict,
+/// written by an Agent or a System component — or by a user id Core does not run for — releases
+/// nothing: the scheduler reads the event's actor columns, not an id the payload claims.
+#[test]
+fn a_redo_decision_written_by_someone_other_than_the_user_dispatches_nothing() {
+    let mut database = fixture();
+    let (mission_id, camp_id, candidate_id) =
+        stage_blocked_delivery(&mut database, "control blocked foreign actor");
+    let plan_id: String = database
+        .connection()
+        .query_row(
+            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+            [&mission_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stage_review_id = blocked_stage_review_id(&database, &candidate_id);
+    // The Task half of a release: a Task reading `READY` beside the untouched `BLOCKED` verdict. The
+    // state cannot tell the writers apart, so the actor is the only thing that may decide it.
+    database
+        .connection()
+        .execute(
+            "UPDATE loom_task SET status='READY', blocked_reason=NULL WHERE task_id='task_a'",
+            [],
+        )
+        .unwrap();
+    let decision = serde_json::json!({
+        "missionId": mission_id.as_str(),
+        "planId": plan_id.as_str(),
+        "taskId": "task_a",
+        "candidateId": candidate_id.as_str(),
+        "stageReviewId": stage_review_id.as_str(),
+        "blockedReason": "stage review: the delivery needs a decision nobody has made",
+        // The payload claims the Owner; only the event's actor columns decide.
+        "requestedByUserId": crate::current_user::CURRENT_USER_ID,
+    });
+
+    // Same event type, same entity, same payload that names exactly this delivery and verdict.
+    for (actor_type, actor_id) in [
+        ("agent", PRODUCER_AGENT),
+        ("system", "loom_scheduler"),
+        ("user", REVIEWER_AGENT),
+    ] {
+        insert_rework_request(&database, &camp_id, actor_type, actor_id, &decision);
+        assert_eq!(
+            control::admit_due_dispatches(&mut database).unwrap(),
+            0,
+            "assertion a_redo_decision_by_{actor_type}_{actor_id}_releases_nothing"
+        );
+        assert_eq!(
+            mission_dispatches(&database, &mission_id)
+                .into_iter()
+                .filter(|(kind, _, _)| kind == "REWORK")
+                .count(),
+            0,
+            "assertion a_redo_decision_by_{actor_type}_{actor_id}_dispatches_nothing"
+        );
+    }
+
+    // The one actor that is the Owner: the same fact, written by the User Core runs for.
+    insert_rework_request(
+        &database,
+        &camp_id,
+        "user",
+        crate::current_user::CURRENT_USER_ID,
+        &decision,
+    );
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_users_own_decision_is_the_one_that_returns_the_work"
+    );
+    assert_eq!(
+        mission_dispatches(&database, &mission_id)
+            .into_iter()
+            .filter(|(kind, _, _)| kind == "REWORK")
+            .collect::<Vec<_>>(),
+        vec![(
+            "REWORK".to_string(),
+            Some(candidate_id.clone()),
+            PRODUCER_AGENT.to_string()
+        )],
+        "assertion the_rework_after_the_users_own_decision_names_the_blocked_candidate"
+    );
+}
+
+/// Authority boundary: the Owner decides to redo a delivery, so the identity is compared with the
+/// one Core runs for and a payload cannot name it. Nothing may be written when it does not match.
+#[test]
+fn only_the_owner_can_release_a_stage_blocked_task() {
+    let mut database = fixture();
+    let (mission_id, _camp_id, _candidate_id) =
+        stage_blocked_delivery(&mut database, "control blocked authority");
+    let error =
+        task_release_as(&mut database, REVIEWER_AGENT, release_input_of(&mission_id)).unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_TASK_RELEASE_NOT_AUTHORIZED",
+        "assertion a_non_owner_cannot_return_a_blocked_delivery"
+    );
+    assert_eq!(
+        task_state(&database, &mission_id, "task_a"),
+        "BLOCKED",
+        "assertion the_refusal_leaves_the_task_parked"
+    );
+    assert!(
+        blocked_reason_of(&database, &mission_id, "task_a").is_some(),
+        "assertion the_refusal_keeps_the_park_reason"
+    );
+    assert_eq!(
+        rework_requests(&database, "task_a").len(),
+        0,
+        "assertion a_refused_release_writes_no_redo_decision"
+    );
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion a_refused_release_dispatches_nothing"
+    );
+}
+
+/// Scope boundary: only a stage review's own park is the User's to lift. The watchdog's hold, the
+/// spent rework budget and a lost execution authority all belong to the owner that wrote them, so a
+/// release is refused and writes nothing.
+#[test]
+fn a_block_another_owner_wrote_is_not_releasable_here() {
+    for reason in [
+        "loom.execution_authority_lost",
+        "loom.rework_budget_exhausted",
+        "loom.watchdog.task_stalled",
+        "loom.dispatch_previous_outcome_unknown",
+    ] {
+        let mut database = fixture();
+        let (mission_id, _camp_id, _candidate_id) =
+            stage_blocked_delivery(&mut database, "control blocked foreign reason");
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_task SET blocked_reason=?1 WHERE task_id='task_a'",
+                [reason],
+            )
+            .unwrap();
+        let error = task_release(&mut database, release_input_of(&mission_id)).unwrap_err();
+        assert_eq!(
+            rejection_code(&error),
+            "LOOM_TASK_NOT_DRAFT",
+            "assertion a_block_written_by_another_owner_is_refused: {reason}"
+        );
+        assert_eq!(
+            task_state(&database, &mission_id, "task_a"),
+            "BLOCKED",
+            "assertion the_refused_reason_keeps_the_task_parked: {reason}"
+        );
+        assert_eq!(
+            blocked_reason_of(&database, &mission_id, "task_a").as_deref(),
+            Some(reason),
+            "assertion the_refused_reason_is_untouched: {reason}"
+        );
+        assert_eq!(
+            rework_requests(&database, "task_a").len(),
+            0,
+            "assertion a_refused_reason_writes_no_redo_decision: {reason}"
+        );
+    }
+}
+
+/// Neighbour boundary: a Task that is not blocked at all keeps every refusal it had. A delivery the
+/// reviewer passed stays `IN_REVIEW` for the Owner, and one the Owner accepted stays `DONE`; neither
+/// is releasable, and neither writes a redo decision or spends a rework.
+#[test]
+fn release_leaves_a_passed_or_accepted_delivery_alone() {
+    let mut database = fixture();
+    let mission_id = create_mission(&mut database, "control release neighbours");
+    plan_import(&mut database, plan_input(&mission_id)).unwrap();
+    let camp_id = camp_of(&database, &mission_id);
+    seed_run(&database, &camp_id, PRODUCER_AGENT, PRODUCER_RUN);
+    seed_run(&database, &camp_id, REVIEWER_AGENT, REVIEWER_RUN);
+    control::configure(
+        &mut database,
+        OWNER,
+        policy_input(
+            &mission_id,
+            "command_approve_release_neighbours",
+            REVIEWER_AGENT,
+        ),
+    )
+    .unwrap();
+    let (candidate_id, manifest) = submitted_candidate(&mut database, &mission_id, PRODUCER_RUN);
+    finish_run(&database, REVIEWER_RUN);
+    let reviewer_run = dispatched_review_run(&mut database, &camp_id, &candidate_id);
+    control::stage_review_record(
+        &mut database,
+        &mission_id,
+        REVIEWER_AGENT,
+        &reviewer_run,
+        "command_stage_pass_release_neighbours",
+        stage_input(&candidate_id, 1, &manifest, LoomStageVerdict::Pass),
+    )
+    .unwrap();
+    assert_eq!(
+        task_state(&database, &mission_id, "task_a"),
+        "IN_REVIEW",
+        "assertion a_pass_keeps_the_task_in_review_for_the_owner"
+    );
+    let error = task_release(&mut database, release_input_of(&mission_id)).unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_TASK_NOT_DRAFT",
+        "assertion a_delivery_in_review_is_not_releasable"
+    );
+    assert_eq!(
+        task_state(&database, &mission_id, "task_a"),
+        "IN_REVIEW",
+        "assertion the_refused_release_leaves_the_review_untouched"
+    );
+
+    review_record(
+        &mut database,
+        LoomReviewRecordInput {
+            mission_id: mission_id.clone(),
+            task_id: "task_a".into(),
+            candidate_id: candidate_id.clone(),
+            command_id: "command_review_accept_release_neighbours".into(),
+            acceptance_criteria_version: "ac-v1".into(),
+            verdict: LoomReviewVerdict::Accepted,
+            reason: "the Owner accepts the delivery".into(),
+            criteria_results: vec![
+                criterion_result("criterion_one", true),
+                criterion_result("criterion_two", true),
+            ],
+            reviewer_id: OWNER.into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        task_state(&database, &mission_id, "task_a"),
+        "DONE",
+        "assertion an_accepted_delivery_finishes_the_task"
+    );
+    let error = task_release(&mut database, release_input_of(&mission_id)).unwrap_err();
+    assert_eq!(
+        rejection_code(&error),
+        "LOOM_TASK_NOT_DRAFT",
+        "assertion an_accepted_task_is_not_releasable"
+    );
+    assert_eq!(
+        task_state(&database, &mission_id, "task_a"),
+        "DONE",
+        "assertion the_refused_release_leaves_the_accepted_task_done"
+    );
+    assert_eq!(
+        rework_requests(&database, "task_a").len(),
+        0,
+        "assertion neither_unblocked_state_writes_a_redo_decision"
+    );
+    assert_eq!(
+        mission_dispatches(&database, &mission_id)
+            .into_iter()
+            .filter(|(kind, _, _)| kind == "REWORK")
+            .count(),
+        0,
+        "assertion neither_unblocked_state_spends_a_rework"
     );
 }

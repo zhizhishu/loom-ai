@@ -143,6 +143,12 @@ const VERIFICATION_MISMATCH_EVENT: &str = "loom.verification_mismatch";
 const VERIFICATION_MISMATCH_REASON: &str = "LOOM_EVIDENCE_HASH_MISMATCH";
 const VERIFICATION_MISMATCH_REWORK: &str = "verification_mismatch";
 
+/// The User's own redo decision about a stage-blocked delivery, written by `loom::task_release`.
+/// It is the *only* later fact that may hand a `BLOCKED` delivery back to its assignee: the stage
+/// verdict itself is never rewritten, deleted or reinterpreted, and a Task someone moved to `READY`
+/// by hand still gets no work.
+const REWORK_REQUESTED_EVENT: &str = "loom.task_rework_requested";
+
 /// The four `blocked_reason` values the watchdog owns. They are the LOOM spelling of the
 /// upstream `attempt.output.watchdog.reasonCode` (`task_stalled`, `external_effect_uncertain`,
 /// `stop_unacknowledged`, `recovery_exhausted`): the receipt keeps the upstream literal, this
@@ -1341,6 +1347,52 @@ fn due_events(
                             prepare_ready: false,
                         }
                     }
+                    // The User's redo decision: the stage verdict is still `BLOCKED` — never
+                    // rewritten — but the Owner released the Task afterwards and asked for the same
+                    // delivery to be redone. The REWORK is exactly the one a `REQUEST_CHANGES`
+                    // verdict sends: same recipient, same dedupe on that stage verdict, same
+                    // per-Task rework budget. A `BLOCKED` verdict nobody released still stops the
+                    // Task right here.
+                    Some("BLOCKED") => {
+                        if status != "READY" {
+                            continue;
+                        }
+                        if !stage_block_rework_requested(
+                            transaction,
+                            plan_id,
+                            task_id,
+                            &candidate_id,
+                            policy.authorization_revision,
+                        )? {
+                            continue;
+                        }
+                        let Some(assignee) = assignee.filter(|assignee| !assignee.is_empty()) else {
+                            continue;
+                        };
+                        let Some(stage_review_id) = latest_stage_review_id(
+                            transaction,
+                            plan_id,
+                            &candidate_id,
+                            policy.authorization_revision,
+                        )?
+                        else {
+                            continue;
+                        };
+                        DispatchEvent {
+                            task_id: task_id.clone(),
+                            kind: REWORK,
+                            candidate_id: Some(candidate_id.clone()),
+                            recipient_agent_id: assignee,
+                            dedupe_key: dedupe_key(&[
+                                REWORK,
+                                plan_id,
+                                task_id.as_str(),
+                                stage_review_id.as_str(),
+                            ])?,
+                            release_task: false,
+                            prepare_ready: false,
+                        }
+                    }
                     // A blocked verdict stops the Task for a User decision: no dispatch at all.
                     Some(_) => continue,
                 }
@@ -1609,7 +1661,22 @@ fn event_problem(
                 if task_status != "READY" {
                     return Ok(Some("loom.dispatch_task_not_ready"));
                 }
-                if current_stage.as_deref() != Some("REQUEST_CHANGES") {
+                // The same two doors as the decision table: an explicit `REQUEST_CHANGES`, or the
+                // User's own redo decision recorded after a `BLOCKED` verdict. The block is read
+                // again here, under the lock, so a reserved REWORK Delivery whose Task was parked
+                // in the meantime cannot start.
+                let rework_requested = match current_stage.as_deref() {
+                    Some("REQUEST_CHANGES") => true,
+                    Some("BLOCKED") => stage_block_rework_requested(
+                        transaction,
+                        plan_id,
+                        task_id,
+                        &latest_id,
+                        authorization_revision,
+                    )?,
+                    _ => false,
+                };
+                if !rework_requested {
                     return Ok(Some("loom.dispatch_rework_not_requested"));
                 }
             }
@@ -3408,6 +3475,71 @@ fn latest_stage_review_id(
             |row| row.get(0),
         )
         .optional()?)
+}
+
+/// Whether the User has explicitly released the newest `BLOCKED` stage verdict of this Candidate
+/// for a redo.
+///
+/// The release names the exact verdict it is overriding, so nothing here has to guess an order from
+/// clocks: a `stageReviewId` can only be quoted once that verdict exists, which makes an event that
+/// names this one a decision written *after* it. The verdict itself stays the newest stage judgement
+/// — this reads a later fact rather than editing an older one.
+///
+/// The identity is checked the whole way down: the same Plan, Task and Candidate, that very
+/// verdict, and the actor — only `actor_type='user'` with `actor_id`
+/// [`crate::current_user::CURRENT_USER_ID`] is the Owner's decision, so a same-named fact written by
+/// an Agent or a System component releases nothing. A request naming another (older) verdict, or
+/// naming none, is not a decision about this block either — including one a hand-written or migrated
+/// event left behind.
+fn stage_block_rework_requested(
+    connection: &Connection,
+    plan_id: &str,
+    task_id: &str,
+    candidate_id: &str,
+    authorization_revision: i64,
+) -> Result<bool> {
+    let stage_review_id: Option<String> = connection
+        .query_row(
+            "SELECT stage_review_id FROM loom_stage_review
+             WHERE plan_id=?1 AND candidate_id=?2 AND policy_revision=?3 AND verdict='BLOCKED'
+             ORDER BY reviewed_at DESC, rowid DESC LIMIT 1",
+            params![plan_id, candidate_id, authorization_revision],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(stage_review_id) = stage_review_id else {
+        return Ok(false);
+    };
+    let mut statement = connection.prepare(
+        "SELECT payload_json FROM event_log
+         WHERE event_type=?1 AND entity_type='loom_task' AND entity_id=?2
+           AND actor_type='user' AND actor_id=?3
+         ORDER BY created_at DESC, rowid DESC",
+    )?;
+    let records = statement.query_map(
+        params![
+            REWORK_REQUESTED_EVENT,
+            task_id,
+            crate::current_user::CURRENT_USER_ID
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    for record in records {
+        let payload: serde_json::Value = serde_json::from_str(&record?)
+            .context("a recorded LOOM rework request must be JSON")?;
+        let same_decision = payload
+            .get("stageReviewId")
+            .and_then(serde_json::Value::as_str)
+            == Some(stage_review_id.as_str())
+            && payload.get("planId").and_then(serde_json::Value::as_str) == Some(plan_id)
+            && payload.get("taskId").and_then(serde_json::Value::as_str) == Some(task_id)
+            && payload.get("candidateId").and_then(serde_json::Value::as_str)
+                == Some(candidate_id);
+        if same_decision {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The persisted switch of one recipient: the Agent profile and its Camp membership. Read from the

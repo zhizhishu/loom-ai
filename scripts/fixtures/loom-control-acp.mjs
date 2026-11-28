@@ -25,6 +25,17 @@ const journalPath = journalIndex === -1 ? null : arguments_[journalIndex + 1]
 const sessionId = `loom-control-${process.pid}`
 const handled = []
 
+// Opt-in first verdict. Unset (the default, and the only thing `scripts/smoke-loom-control.mjs` ever
+// sets) keeps the historical chain: v1 -> `request_changes` -> rework -> v2 -> `pass`. A harness that
+// has to prove the Owner's own "退回重做" release sets `LOOM_CONTROL_FIXTURE_FIRST_VERDICT=blocked`, and
+// only the *first* candidate's verdict changes: without a User decision a block is terminal, so the
+// release under test is the one thing that can bring the chain back.
+const firstVerdict = (process.env.LOOM_CONTROL_FIXTURE_FIRST_VERDICT ?? '').trim().toLowerCase()
+if (firstVerdict !== '' && !['request_changes', 'blocked'].includes(firstVerdict)) {
+  // A typo must fail the ACP handshake loudly instead of quietly running the default chain.
+  throw new Error(`LOOM_CONTROL_FIXTURE_FIRST_VERDICT must be request_changes or blocked, not ${firstVerdict}`)
+}
+
 function journal(entry) {
   if (journalPath === null) return
   const record = { at: new Date().toISOString(), pid: process.pid, sessionId, ...entry }
@@ -175,15 +186,16 @@ function reviewBranch(facts) {
   const evidenceIds = (inspected.artifacts ?? []).map(artifact => artifact.artifactId)
   const criteria = inspected.task?.acceptanceCriteria?.criteria ?? []
   if (criteria.length === 0) throw new Error('loom inspect returned no acceptance criteria')
-  // v1 (no previous candidate) is sent back for rework; the chained v2 passes.
+  // v1 (no previous candidate) is sent back by the opt-in first verdict; the chained v2 passes.
   const rework = candidate.previousCandidateId === null
+  const verdict = rework ? firstVerdict === 'blocked' ? 'blocked' : 'request_changes' : 'pass'
+  const blocked = verdict === 'blocked'
   const criteriaResults = criteria.map(criterion => ({
     criterionId: criterion.criterionId,
     satisfied: !rework,
     ...(evidenceIds.length > 0 ? { evidenceIds } : {}),
     note: rework ? 'the first delivery does not answer this criterion yet' : 'the chained delivery answers this criterion'
   }))
-  const verdict = rework ? 'request_changes' : 'pass'
   const receipt = must(
     runCli(['loom', 'stage-review'], {
       payload: {
@@ -192,9 +204,11 @@ function reviewBranch(facts) {
         policyRevision: inspected.policyRevision,
         manifestHash: inspected.manifestHash,
         verdict,
-        reason: rework
-          ? 'The first candidate needs one rework pass before it can pass.'
-          : 'The chained candidate answers every acceptance criterion.',
+        reason: !rework
+          ? 'The chained candidate answers every acceptance criterion.'
+          : blocked
+            ? 'The first candidate cannot be judged until its owner decides what the delivery should be.'
+            : 'The first candidate needs one rework pass before it can pass.',
         criteriaResults
       }
     }),

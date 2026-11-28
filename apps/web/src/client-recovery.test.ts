@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { ConsoleClient } from './client'
+import { ConsoleClient, WEB_OPERATIONS } from './client'
 import type { ThreadReadInvalidation } from '@contracts'
 import { RECOVERY_KEY } from './tab-recovery'
 import { newCommandId } from '../../desktop/src/shared/command-id'
@@ -128,6 +128,35 @@ describe('global Web connection recovery', () => {
       message: 'LOOM task t is BLOCKED and cannot be reviewed'
     })
     expect(operations).toEqual(['loom.review.record'])
+    expect(client.connectionState).toBe('live')
+    expect(client.pendingCommandCount).toBe(0)
+    client.clear()
+  })
+
+  // 退回重做（Hark 的受阻视图写 `loom.task.release`）：只在已登录的 Owner 会话里原样发出
+  // Mission 和 Task 两个身份，不带 commandId，也不被当成断线去 reconcile。
+  it('sends the Owner task release unchanged and never reconciles it', async () => {
+    const bodies: Array<{ operation: string; params: unknown }> = []
+    const fetcher = vi.fn<typeof fetch>(async (url, init) => {
+      if (String(url).endsWith('/login')) return Response.json(identity)
+      const request = JSON.parse(String(init?.body)) as { operation: string; params: unknown }
+      bodies.push(request)
+      if (request.operation === 'commands.reconcile') throw new Error('a LOOM command must not be reconciled')
+      return Response.json({ error: {
+        kind: 'domain_rejection', code: 'LOOM_TASK_NOT_RELEASABLE',
+        message: 'LOOM task t cannot be released from its current state'
+      } })
+    })
+    const client = new ConsoleClient(origin, fetcher)
+    await client.login('test')
+    expect(WEB_OPERATIONS).toContain('loom.task.release')
+    const rejection = await client.request('loom.task.release', { missionId: 'm', taskId: 't' }).catch(error => error)
+    // 只发真实身份这两字段：没有 commandId，也不转发任何用户身份字段。
+    expect(bodies).toEqual([{ operation: 'loom.task.release', params: { missionId: 'm', taskId: 't' } }])
+    expect(rejection).toMatchObject({
+      kind: 'domain_rejection', code: 'LOOM_TASK_NOT_RELEASABLE',
+      message: 'LOOM task t cannot be released from its current state'
+    })
     expect(client.connectionState).toBe('live')
     expect(client.pendingCommandCount).toBe(0)
     client.clear()

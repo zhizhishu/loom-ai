@@ -504,6 +504,7 @@ const LOOM_DAG_CYCLE: &str = "LOOM_DAG_CYCLE";
 const LOOM_PLAN_NOT_FOUND: &str = "LOOM_PLAN_NOT_FOUND";
 const LOOM_TASK_NOT_FOUND: &str = "LOOM_TASK_NOT_FOUND";
 const LOOM_TASK_NOT_DRAFT: &str = "LOOM_TASK_NOT_DRAFT";
+const LOOM_TASK_RELEASE_NOT_AUTHORIZED: &str = "LOOM_TASK_RELEASE_NOT_AUTHORIZED";
 const LOOM_TASK_NOT_READY: &str = "LOOM_TASK_NOT_READY";
 const LOOM_DEPENDENCY_UNRELEASED: &str = "LOOM_DEPENDENCY_UNRELEASED";
 const LOOM_CLAIM_HELD: &str = "LOOM_CLAIM_HELD";
@@ -1492,14 +1493,57 @@ fn blocking_dependencies(
     Ok(blocking)
 }
 
-/// LOOM release path: a Task the Plan already defines becomes `READY` inside the Mission
-/// that owns its Plan, and nothing else about it moves.
+/// The prefix [`crate::loom::control::stage_review_record`] writes into `loom_task.blocked_reason`
+/// when a stage verdict parks a Task. The User can take that hold back by asking for a redo; every
+/// other `BLOCKED` reason belongs to another owner (the watchdog, the rework budget) and is not the
+/// User's to release here.
+const STAGE_REVIEW_BLOCK_PREFIX: &str = "stage review: ";
+
+/// The domain event one User release of a stage-blocked Task writes. It never rewrites the stage
+/// verdict: it is the *later* fact the scheduler reads to hand the same delivery back to its
+/// assignee (`loom::dispatch`).
+const TASK_REWORK_REQUESTED_EVENT: &str = "loom.task_rework_requested";
+
+/// LOOM release path: a Task the Plan already defines becomes `READY` inside the Mission that owns
+/// its Plan, and nothing else about it moves.
+///
+/// The Owner identity is the one Core runs for. A caller that carries its own identity uses
+/// [`task_release_as`], which is the path the Host uses to inject `CURRENT_USER_ID`.
 pub fn task_release(
     database: &mut Database,
     input: LoomTaskReleaseInput,
 ) -> Result<LoomTaskReleaseResult> {
+    task_release_as(database, crate::current_user::CURRENT_USER_ID, input)
+}
+
+/// The same release with the trusted Owner identity passed in, exactly like `loom::control`'s
+/// writes: the Host injects the current user, so a payload can never nominate it. Releasing a
+/// stage-blocked Task is an Owner decision — "redo this delivery" — and only the Owner may take it.
+///
+/// Two states are releasable, and both end `READY`:
+///
+/// - `DRAFT`, unchanged: the Task the Plan already defines becomes claimable work.
+/// - `BLOCKED` by a stage review (the reason carries [`STAGE_REVIEW_BLOCK_PREFIX`]): the User sends
+///   the delivery back to its assignee, which is recorded as one `loom.task_rework_requested`
+///   domain event. The verdict stays exactly as it was — this is a new decision, not an edit of the
+///   old one. `execution_authority_lost`, the rework budget and every other hold keep the Task
+///   parked; releasing them would forge a decision their own owner has not made.
+pub fn task_release_as(
+    database: &mut Database,
+    trusted_user_id: &str,
+    input: LoomTaskReleaseInput,
+) -> Result<LoomTaskReleaseResult> {
     let mission_id = required_field("task release", "missionId", &input.mission_id)?;
     let task_id = required_field("task release", "taskId", &input.task_id)?;
+    let trusted_user_id = required_field("task release", "trustedUserId", trusted_user_id)?;
+    // `control::ensure_owner`'s rule, applied to this write: the identity is injected by the Host
+    // and compared here, never read back out of the request.
+    if trusted_user_id != crate::current_user::CURRENT_USER_ID {
+        return Err(LoomCommandError::rejection(
+            LOOM_TASK_RELEASE_NOT_AUTHORIZED,
+            format!("only the Owner can release LOOM task {task_id}"),
+        ));
+    }
     let now = chrono::Utc::now().to_rfc3339();
     let transaction = database
         .connection_mut()
@@ -1528,30 +1572,62 @@ pub fn task_release(
             format!("mission {mission_id} has no LOOM plan"),
         ));
     };
-    let status: Option<String> = transaction
+    let task_state: Option<(String, Option<String>)> = transaction
         .query_row(
-            "SELECT status FROM loom_task WHERE plan_id=?1 AND task_id=?2",
+            "SELECT status, blocked_reason FROM loom_task WHERE plan_id=?1 AND task_id=?2",
             params![&plan_id, &task_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let Some(status) = status else {
+    let Some((status, blocked_reason)) = task_state else {
         return Err(LoomCommandError::rejection(
             LOOM_TASK_NOT_FOUND,
             format!("task {task_id} does not belong to the plan of mission {mission_id}"),
         ));
     };
-    if status != "DRAFT" {
-        return Err(LoomCommandError::rejection(
-            LOOM_TASK_NOT_DRAFT,
-            format!("LOOM task {task_id} is {status}; only a DRAFT task can be released"),
-        ));
-    }
+    let stage_rework = match status.as_str() {
+        // The Plan's own Task becoming claimable work: unchanged, and no rework decision is implied.
+        "DRAFT" => false,
+        "BLOCKED" => {
+            let stage_review_parked = blocked_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(STAGE_REVIEW_BLOCK_PREFIX));
+            if !stage_review_parked {
+                return Err(LoomCommandError::rejection(
+                    LOOM_TASK_NOT_DRAFT,
+                    format!(
+                        "LOOM task {task_id} is BLOCKED for a reason its own owner must lift; only a stage-review block can be released for rework"
+                    ),
+                ));
+            }
+            true
+        }
+        _ => {
+            return Err(LoomCommandError::rejection(
+                LOOM_TASK_NOT_DRAFT,
+                format!("LOOM task {task_id} is {status}; only a DRAFT task can be released"),
+            ));
+        }
+    };
+    // `blocked_reason` is the current-state mirror of whichever hold parked the Task; the release
+    // is the end of that hold, so the reason goes with it. A DRAFT Task carries none anyway.
     transaction.execute(
-        "UPDATE loom_task SET status='READY', updated_at=?1, revision=revision+1
+        "UPDATE loom_task SET status='READY', blocked_reason=NULL, updated_at=?1,
+                             revision=revision+1
          WHERE plan_id=?2 AND task_id=?3",
         params![&now, &plan_id, &task_id],
     )?;
+    if stage_rework {
+        record_task_rework_requested(
+            &transaction,
+            &mission_id,
+            &plan_id,
+            &task_id,
+            blocked_reason.as_deref(),
+            &trusted_user_id,
+            &now,
+        )?;
+    }
     transaction.commit()?;
     let task = tasks_list(&*database, &mission_id)?
         .into_iter()
@@ -1567,6 +1643,75 @@ pub fn task_release(
         plan_id,
         task,
     })
+}
+
+/// The `User` decision that sends a stage-blocked delivery back to its assignee, written beside the
+/// release itself so the two facts cannot disagree.
+///
+/// Nothing about the stage verdict is touched: the `BLOCKED` row stays the newest judgement of that
+/// Candidate, and this is the *later* event the scheduler requires before it may hand the same
+/// delivery out again. The Candidate and stage review ids name the exact context the decision is
+/// about, so a request for one delivery can never release a different one; a Task with no Candidate
+/// at all simply records neither.
+fn record_task_rework_requested(
+    transaction: &Transaction<'_>,
+    mission_id: &str,
+    plan_id: &str,
+    task_id: &str,
+    blocked_reason: Option<&str>,
+    trusted_user_id: &str,
+    now: &str,
+) -> Result<()> {
+    let camp_id: Option<String> = transaction
+        .query_row(
+            "SELECT camp_id FROM mission WHERE id=?1",
+            [mission_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let candidate_id: Option<String> = transaction
+        .query_row(
+            "SELECT candidate_id FROM loom_candidate
+             WHERE plan_id=?1 AND task_id=?2 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![plan_id, task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let stage_review_id: Option<String> = match candidate_id.as_deref() {
+        Some(candidate_id) => transaction
+            .query_row(
+                "SELECT stage_review_id FROM loom_stage_review
+                 WHERE plan_id=?1 AND candidate_id=?2 AND verdict='BLOCKED'
+                 ORDER BY reviewed_at DESC, rowid DESC LIMIT 1",
+                params![plan_id, candidate_id],
+                |row| row.get(0),
+            )
+            .optional()?,
+        None => None,
+    };
+    crate::collaboration::append_domain_event(
+        transaction,
+        TASK_REWORK_REQUESTED_EVENT,
+        camp_id.as_deref(),
+        Some(("loom_task", task_id)),
+        &crate::command::ActorRef::User {
+            user_id: trusted_user_id.to_string(),
+        },
+        None,
+        &serde_json::json!({
+            "missionId": mission_id,
+            "planId": plan_id,
+            "taskId": task_id,
+            "candidateId": candidate_id,
+            "stageReviewId": stage_review_id,
+            "blockedReason": blocked_reason,
+            "previousStatus": "BLOCKED",
+            "taskStatus": "READY",
+            "reason": "the User returned the stage-blocked delivery for rework",
+            "requestedByUserId": trusted_user_id,
+            "requestedAt": now,
+        }),
+    )
 }
 
 /// How a claim command treats an open, unexpired lease that the *same* Run already holds on the
@@ -6067,6 +6212,35 @@ mod tests {
             task_status(&database, "task_a"),
             "READY",
             "assertion rejected_release_keeps_the_task_ready"
+        );
+    }
+
+    /// A `DRAFT` release is the Plan's own Task becoming claimable work — unchanged — so it is not a
+    /// User decision to redo a delivery and must leave the event log alone.
+    #[test]
+    fn release_of_a_draft_task_records_no_rework_request() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM release without a redo");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        let released = task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        assert_eq!(
+            released.task.status,
+            LoomTaskStatus::Ready,
+            "assertion a_draft_task_still_just_becomes_ready"
+        );
+        assert_eq!(
+            released.task.blocked_reason, None,
+            "assertion a_draft_release_clears_nothing_because_nothing_was_parked"
+        );
+        assert_eq!(
+            domain_events(&database, TASK_REWORK_REQUESTED_EVENT, "task_a"),
+            0,
+            "assertion a_draft_release_writes_no_redo_decision"
+        );
+        assert_eq!(
+            task_status(&database, "task_b"),
+            "DRAFT",
+            "assertion a_draft_release_leaves_the_other_task_alone"
         );
     }
 

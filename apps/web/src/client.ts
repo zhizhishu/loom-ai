@@ -163,6 +163,7 @@ export const WEB_OPERATIONS = [
   'loom.artifact.preview',
   'loom.reviews.list',
   'loom.verifications.list',
+  'loom.task.release',
   'loom.review.record',
   'loom.verification.record',
   'loom.control.get',
@@ -309,10 +310,11 @@ const RECONCILABLE_COMMANDS = new Set<WebOperation>([
   'missions.status',
   'missions.start',
   'missions.linkPr',
-  // `loom.review.record` stays out of this set: Core's `commands.reconcile` does not admit
-  // LOOM operations (web_commands.rs own reconcile whitelist), so a domain rejection would
-  // look like a lost service. The command is already idempotent by `commandId` inside
-  // `review_record`, and the artifact service keeps the original attempt for an explicit retry.
+  // `loom.review.record` and `loom.task.release` stay out of this set: Core's `commands.reconcile`
+  // does not admit LOOM operations (web_commands.rs own reconcile whitelist), so a domain
+  // rejection would look like a lost service. `review_record` is already idempotent by `commandId`,
+  // the task release carries no `commandId` and is confirmed by re-reading the Mission, and the
+  // artifact service keeps the original attempt for an explicit retry.
   'loom.verification.record',
   'loom.control.configure',
   'loom.control.pause',

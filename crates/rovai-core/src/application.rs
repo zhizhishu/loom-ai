@@ -10051,8 +10051,26 @@ impl Core {
             "loom.task.release" => {
                 let input: rovai_core::loom::LoomTaskReleaseInput =
                     serde_json::from_value(request.params.clone())?;
+                // The Owner identity is always injected from the trusted Host, never trusted from
+                // the payload: releasing a stage-blocked Task for a redo is the User's own
+                // decision, and only that identity may take it.
+                let mission_id = input.mission_id.clone();
                 let mut database = self.database.lock().await;
-                let result = rovai_core::loom::task_release(&mut database, input)?;
+                let result = rovai_core::loom::task_release_as(
+                    &mut database,
+                    CURRENT_USER_ID,
+                    input,
+                )?;
+                // A release is the User's verdict on a stopped Task, so the pages and the lanes
+                // learn about it exactly as they do for `loom.review.record`: the invalidated
+                // Mission is re-read, the batch scheduler is woken, and the execution lanes are
+                // given a chance to start the work the release just made possible. The result
+                // contract itself is unchanged.
+                let camp_id = mission_camp_id(&database, &mission_id)?;
+                drop(database);
+                emit_missions_invalidated(&self.output, "missions.loomUpdated", camp_id.as_deref());
+                self.delivery_batch_scheduler_notify.notify_one();
+                self.execution_wake.runs.notify_one();
                 Ok(serde_json::to_value(result)?)
             }
             "loom.claim.acquire" => {

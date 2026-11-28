@@ -231,13 +231,48 @@ describe('native immutable artifact and explicit acceptance', () => {
     expect(blockedFacts.reviewKind).toBe('blocked')
     expect(blockedFacts.reviewable).toBe(false)
     const html = renderToStaticMarkup(createElement(ArtifactReviewBlockedNotice, {
-      reason: blockedFacts.task?.blockedReason ?? null, onRefresh: () => {}
+      reason: blockedFacts.task?.blockedReason ?? null, onRefresh: () => {},
+      onReleaseRework: async () => {}
     }))
     expect(html).toContain('受阻')
     expect(html).toContain('stage review: missing evidence')
     expect(html).toContain('刷新记录')
-    // 不给 Core 无法完成的动作：没有接受/退回、没有提交表单。
-    expect(html).not.toMatch(/接受|退回|确认接受|ln-artifact-review-form/)
+    // 不给 Core 无法完成的动作：没有接受/退回验收、没有提交表单。
+    expect(html).not.toMatch(/确认接受|ln-artifact-review-form|ln-artifact-reject|ln-artifact-accept/)
+    // 阶段审查受阻才有那一个已有的写出口（Core 的 loom.task.release），不是验收结论。
+    expect(html).toContain('退回重做')
+    expect(html).toContain('data-action="release-stage-review"')
+  })
+  it('offers the rework release only for a stage review block, never for a lost execution authority', () => {
+    const blockedOf = (blockedReason: string) => artifactCandidateFacts(
+      bundle([first], { tasks: [{ ...task, status: 'blocked' as const, blockedReason }], control: observed() }), artifact, first)
+    const render = (blockedReason: string) => renderToStaticMarkup(createElement(ArtifactReviewBlockedNotice, {
+      reason: blockedOf(blockedReason).task?.blockedReason ?? null, onRefresh: () => {},
+      onReleaseRework: async () => {}
+    }))
+    // 阶段审查前缀：有按钮；pending 锁未锁上（初次渲染不是 disabled）。
+    const stageReview = render('stage review: missing evidence')
+    expect(stageReview).toContain('退回重做')
+    expect(stageReview).not.toContain('disabled')
+    // 执行权丢失与其他预算阻塞：只剩刷新，没有退回重做的出口。
+    for (const reason of ['execution_authority_lost', 'loom.rework_budget_exhausted', 'loom.dispatch_budget_exhausted']) {
+      const html = render(reason)
+      expect(html).toContain('刷新记录')
+      expect(html).not.toContain('退回重做')
+      expect(html).not.toContain('release-stage-review')
+    }
+    // 受阻原因不是阶段审查前缀时，即使调用方传了处理函数也不渲染。
+    const nearMiss = renderToStaticMarkup(createElement(ArtifactReviewBlockedNotice, {
+      reason: 'stage review missing evidence', onRefresh: () => {}, onReleaseRework: async () => {}
+    }))
+    expect(nearMiss).not.toContain('退回重做')
+  })
+  it('keeps the blocked notice read-only when no release path was wired', () => {
+    const html = renderToStaticMarkup(createElement(ArtifactReviewBlockedNotice, {
+      reason: 'stage review: missing evidence', onRefresh: () => {}
+    }))
+    expect(html).toContain('刷新记录')
+    expect(html).not.toContain('退回重做')
   })
   it('submits exactly the pinned candidate and criteria with no spoofed reviewer identity', async () => {
     const request=vi.fn().mockResolvedValue({});const facts=artifactCandidateFacts(bundle([first],{tasks:[{...task,status:'in_review'}]}),artifact,first)

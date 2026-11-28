@@ -921,6 +921,88 @@ export function refreshArtifactSelection(
   }
 }
 
+// ------------------------------------------------------- stage review rework release
+
+/**
+ * 阶段审查受阻的前缀：Core 只把助手阶段审查的结论写成 `stage review: <reason>`。
+ * 这是唯一有「退回重做」出口的阻塞；execution_authority_lost 等其他阻塞属于执行权/
+ * 运行时问题，退回重发既救不回来，也会多发一条真实写命令。
+ */
+const STAGE_REVIEW_BLOCK_PREFIX = 'stage review: '
+
+/** 这条阻塞原因是否来自阶段审查（决定要不要给出退回重做）。 */
+export function stageReviewBlocked(reason: string | null | undefined): boolean {
+  return (reason ?? '').trim().startsWith(STAGE_REVIEW_BLOCK_PREFIX)
+}
+
+/** `loom.task.release` 回执（Core `LoomTaskReleaseResult`）：只用来确认写成功，界面状态一律重读。 */
+export type LoomTaskReleaseReceipt = {
+  missionId: string
+  planId: string
+}
+
+/**
+ * 退回重做：真实写入已有的准入操作 `loom.task.release`，参数只取浮层里真实投影的
+ * missionId/taskId。不生成第二个任务、不自造原因、不改写任务正文；成功后界面必须
+ * 由调用方 `await onRefresh()` 重读，本函数不缓存任何第二份状态。
+ */
+export async function releaseStageReviewTask(
+  rpc: LoomRpc,
+  missionId: string,
+  taskId: string
+): Promise<LoomTaskReleaseReceipt> {
+  const mission = missionId.trim()
+  const task = taskId.trim()
+  // 空身份只会写出一条 Core 必然拒绝的请求：宁可在这里说清楚。
+  if (mission === '' || task === '') throw new Error('缺少真实的任务身份，暂时不能退回重做')
+  return rpc.request<LoomTaskReleaseReceipt>('loom.task.release', { missionId: mission, taskId: task })
+}
+
+/**
+ * 退回重做的在途表：同一个 Channel + 同一个任务只允许一条 `loom.task.release`。
+ * 与验收 attempt 仓同一个手法（按 rpc 对象存 WeakMap），不进全局变量、不跟界面耦合。
+ * Core 的 release 接受 DRAFT 或阶段审查受阻的 BLOCKED，一次点击只该是一条命令：
+ * 所以 pending 期间的重复点击必须复用同一个 Promise，而不是再写一次。
+ */
+const releasesInFlight = new WeakMap<object, Map<string, Promise<void>>>()
+
+function inFlightReleases(rpc: LoomRpc): Map<string, Promise<void>> {
+  let store = releasesInFlight.get(rpc)
+  if (!store) { store = new Map(); releasesInFlight.set(rpc, store) }
+  return store
+}
+
+/**
+ * 一次「退回重做」点击的全部行为，组件只把它接到按钮上：
+ * 1. 真实写 `loom.task.release`（missionId/taskId 来自当前投影，不造假）；
+ * 2. pending 期间重复点击拿到同一次写入，不会第二条；
+ * 3. 写成功后 `await refresh()`，界面只认重读后的投影；
+ * 4. 失败原样抛出，由调用方的现有错误位显示。
+ */
+export function releaseStageReviewRework(input: {
+  rpc: LoomRpc
+  missionId: string
+  taskId: string
+  refresh(): Promise<void> | void
+}): Promise<void> {
+  const store = inFlightReleases(input.rpc)
+  const key = `${input.missionId}\u0000${input.taskId}`
+  const pending = store.get(key)
+  if (pending !== undefined) return pending
+  const run = (async (): Promise<void> => {
+    await releaseStageReviewTask(input.rpc, input.missionId, input.taskId)
+    // 写已经成功：刷新失败不能被说成「退回失败」，否则用户会再点一次。
+    try {
+      await input.refresh()
+    } catch (error) {
+      throw new Error('已退回重做，但列表刷新失败：' + readErrorMessage(error, '请稍后刷新'))
+    }
+  })()
+  store.set(key, run)
+  // 成功后清表：下一次点击是一次新的真实意图，复用旧 Promise 会让界面等不到刷新。
+  return run.finally(() => { if (store.get(key) === run) store.delete(key) })
+}
+
 /** 验收标准快照的精确相等：同 version、同序、每条 criterionId/text 相同。 */
 function sameAcceptanceCriteria(
   a: LoomCandidate['acceptanceCriteria'],
