@@ -56,9 +56,12 @@
 #     building the server package. This runner therefore uses the CI-produced
 #     binaries as delivered and makes no Gate A provenance claim; it rewrites no
 #     manifest and only warns.
-#   Only the allowlisted payload is copied, so the personal-package extras
-#   (runtime/, rovai-core, loom-node, *-Loom.sh, candidate-manifest.json) simply
-#   never reach the build context or the image.
+#   Only the allowlisted payload is copied. The embedded Pi runtime is part of
+#   that allowlist — runtime/pi and runtime/extensions are staged into the image
+#   so Core can configure Pi (members.runtime.set pi) — while the remaining
+#   personal-package extras (runtime/computer, runtime/office, rovai-core,
+#   loom-node, *-Loom.sh, candidate-manifest.json) never reach the build
+#   context or the image.
 set -Eeuo pipefail
 umask 022
 
@@ -169,9 +172,11 @@ if [ -z "$source_commit" ]; then
 fi
 
 # ----------------------------------------- 3. stage the docker build context
-# Exactly what docker/Dockerfile copies: the server payload under package/ plus
-# the two container scripts. No source checkout, no .git, no credential, and no
-# personal-package extra can enter the context.
+# Exactly what docker/Dockerfile copies: the server payload under package/ —
+# including the embedded Pi runtime staged below as package/runtime/pi and
+# package/runtime/extensions — plus the two container scripts. No source
+# checkout, no .git, no credential, and no other personal-package extra can
+# enter the context.
 log 'staging the docker context from the personal package payload'
 context=$work/context
 package=$context/package
@@ -181,6 +186,24 @@ for item in "${payload[@]}"; do
   [ -e "$personal/$item" ] && [ ! -L "$personal/$item" ] ||
     die "the personal package has no regular $item; it is not a complete linux-x64 server package"
   cp -a -- "$personal/$item" "$package/$item"
+done
+# The personal package ships the embedded Pi runtime
+# (scripts/package-linux-personal.mjs REQUIRED: runtime/pi/pi-bundle.json,
+# runtime/pi/node/node, runtime/pi/pi and
+# runtime/extensions/pi-purge/upstream/extensions/pi-purge.ts). The server image
+# must carry it: without /opt/rovai/runtime/pi Core resolves no packaged Pi
+# bundle and members.runtime.set pi answers runtime_configuration_unavailable.
+# Stage exactly runtime/pi and runtime/extensions under package/runtime —
+# docker/Dockerfile's `COPY package/ /opt/rovai/` lands them at
+# /opt/rovai/runtime/… where ROVAI_EMBEDDED_PI_ROOT (docker-compose.yml) points
+# and crates/rovai-core/src/pi/host.rs finds the pinned pi-purge source. The
+# rest of runtime/ (computer, office) is deliberately left out, so runtime/ is
+# never copied whole.
+mkdir -p "$package/runtime"
+for runtime_item in pi extensions; do
+  [ -e "$personal/runtime/$runtime_item" ] && [ ! -L "$personal/runtime/$runtime_item" ] ||
+    die "the personal package has no regular runtime/$runtime_item; it is not a complete linux-x64 personal package with the embedded Pi runtime"
+  cp -a -- "$personal/runtime/$runtime_item" "$package/runtime/$runtime_item"
 done
 cp docker/Dockerfile docker/entrypoint.sh docker/healthcheck.sh "$context/"
 # smoke-linux-server.py is only used by the `verify` stage, which is not built
