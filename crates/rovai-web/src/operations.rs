@@ -37,10 +37,11 @@ pub enum Operation {
     MissionLinkPr,
 
     // LOOM is a Mission surface, so the workspace a browser opens has to be able to project it.
-    // Reads project the workspace and preview archived evidence; the four writes are the two verdicts
-    // and the control gate the Owner records from that page. Registration, claims, task release
-    // and assistant stage review stay off the network capability: those belong to the agent side
-    // that owns the workspace.
+    // Reads project the workspace and preview archived evidence; the writes are the two verdicts,
+    // the control gate and the rework exit the Owner records from that page — a stage-review block
+    // is the one blocker whose「退回重做」writes `loom.task.release` (Mission and Task identity only;
+    // Core injects the Owner). Registration, claims, plan import and assistant stage review stay off
+    // the network capability: those belong to the agent side that owns the workspace.
     #[serde(rename = "loom.bundles.getMany")]
     LoomBundlesGetMany,
     #[serde(rename = "loom.plan.get")]
@@ -61,6 +62,8 @@ pub enum Operation {
     LoomReviewsList,
     #[serde(rename = "loom.verifications.list")]
     LoomVerificationsList,
+    #[serde(rename = "loom.task.release")]
+    LoomTaskRelease,
     #[serde(rename = "loom.review.record")]
     LoomReviewRecord,
     #[serde(rename = "loom.verification.record")]
@@ -561,6 +564,10 @@ impl Operation {
                     "unavailableReason",
                 ],
             ),
+            // The rework exit answers with the release receipt: the Mission and plan it moved plus
+            // the Task as Core now reports it. A field added to that receipt in Core stays off the
+            // network capability until it is named here.
+            Self::LoomTaskRelease => select_fields(&value, &["missionId", "planId", "task"]),
             // The approval gate is its own projection: a strategy field added in Core stays
             // unreachable until it is admitted here on purpose.
             Self::LoomControlGet | Self::LoomControlConfigure | Self::LoomControlPause => {
@@ -615,6 +622,7 @@ impl Operation {
             Self::LoomArtifactPreview => "loom.artifact.preview",
             Self::LoomReviewsList => "loom.reviews.list",
             Self::LoomVerificationsList => "loom.verifications.list",
+            Self::LoomTaskRelease => "loom.task.release",
             Self::LoomReviewRecord => "loom.review.record",
             Self::LoomVerificationRecord => "loom.verification.record",
             Self::LoomControlGet => "loom.control.get",
@@ -1243,5 +1251,40 @@ mod tests {
         let continuation =
             serde_json::from_value::<Operation>(json!("agentRuns.continue")).unwrap();
         assert_eq!(continuation.method(), "agentRuns.continue");
+    }
+
+    // The Owner's rework exit is the one new write: a stage-review block can only be undone from the
+    // page that shows it. Admission and its receipt are the whole change; the producer writes that
+    // belong to the agent side stay unreachable from the network.
+    #[test]
+    fn public_operation_admits_the_owner_task_release_only() {
+        let release = serde_json::from_value::<Operation>(json!("loom.task.release"))
+            .expect("the Owner's rework exit is admitted by the Web Host");
+        assert_eq!(release.method(), "loom.task.release");
+        let receipt = json!({
+            "missionId":"mission_fixture", "planId":"plan_fixture",
+            "task":{"taskId":"task_fixture", "planId":"plan_fixture", "status":"ready",
+                "blockedReason":null, "revision":4},
+            "futureCredentialField":"receipt-secret"
+        });
+        // The receipt is read back after the write, so the released Task keeps the same identity the
+        // list projections already admit; a field Core adds later stays off the network.
+        assert_eq!(
+            release.project(receipt),
+            json!({"missionId":"mission_fixture", "planId":"plan_fixture",
+                "task":{"taskId":"task_fixture", "planId":"plan_fixture", "status":"ready",
+                    "blockedReason":null, "revision":4}})
+        );
+        for agent_side in [
+            "loom.plan.import",
+            "loom.claim.acquire",
+            "loom.candidate.record",
+            "loom.artifact.register",
+        ] {
+            assert!(
+                serde_json::from_value::<Operation>(json!(agent_side)).is_err(),
+                "{agent_side} belongs to the agent side that owns the workspace"
+            );
+        }
     }
 }
