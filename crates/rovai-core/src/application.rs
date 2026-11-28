@@ -13902,13 +13902,39 @@ impl Core {
                 )
             }
             rovai_core::agent_profile::AdapterKind::ClaudeCodeCli => {
-                let probe = health::claude_code_capability_probe_at(
+                let mut probe = health::claude_code_capability_probe_at(
                     executable_path,
                     fingerprint,
                     known_version,
                     static_capabilities,
                 )
                 .await;
+                if probe.result.status == health::AgentRuntimeProbeStatus::AuthenticationRequired {
+                    let environments = {
+                        let database = self.database.lock().await;
+                        rovai_core::member_environment::claude_probe_launch_environments(
+                            database.connection(),
+                        )
+                    };
+                    if let Ok(environments) = environments {
+                        for environment in environments {
+                            let retry = rovai_core::runtime_discovery::with_launch_environment(
+                                Some(environment),
+                                health::claude_code_capability_probe_at(
+                                    executable_path,
+                                    fingerprint,
+                                    known_version,
+                                    static_capabilities,
+                                ),
+                            )
+                            .await;
+                            if retry.result.status == health::AgentRuntimeProbeStatus::Ready {
+                                probe = retry;
+                                break;
+                            }
+                        }
+                    }
+                }
                 let failure = probe.result.failure.clone();
                 let snapshot =
                     registry.claude_code_capability_snapshot(ClaudeCodeProbeObservation {
@@ -29645,6 +29671,9 @@ mod tests {
     use super::*;
     #[cfg(feature = "slow-tests")]
     use std::fs;
+
+    #[cfg(unix)]
+    mod claude_probe_gateway_tests;
 
     #[cfg(feature = "slow-tests")]
     fn test_git_binary() -> PathBuf {
