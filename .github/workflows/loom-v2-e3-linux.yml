@@ -18,6 +18,8 @@ on:
       - 'scripts/install-loom-personal.sh'
       - '.github/workflows/loom-v2-e3-linux.yml'
       - 'scripts/lib/linux-personal.test.mjs'
+      - 'scripts/node/Connect-LoomNode.sh'
+      - 'scripts/node/README-linux.md'
 
 permissions:
   contents: read
@@ -88,6 +90,37 @@ jobs:
         run: node scripts/build-server.mjs --target-key linux-x64 --debug
       - name: Build Linux LOOM helper binaries
         run: cargo +1.97.1 build --locked -p rovai-core -p loom-node -p loom-pi-launcher --bins
+      - name: Package the standalone Linux Node kit
+        shell: bash
+        run: |
+          set -euo pipefail
+          kit_name="loom-node-linux-${LOOM_SOURCE_COMMIT}"
+          test -f target/debug/loom-node
+          test -f target/debug/rovai
+          bash -n scripts/node/Connect-LoomNode.sh
+          staging="out/loom-node-kit"
+          rm -rf "$staging"
+          mkdir -p "$staging"
+          cp target/debug/loom-node "$staging/loom-node"
+          cp target/debug/rovai "$staging/rovai"
+          cp scripts/node/Connect-LoomNode.sh "$staging/Connect-LoomNode.sh"
+          cp scripts/node/README-linux.md "$staging/README.md"
+          chmod +x "$staging/loom-node" "$staging/rovai" "$staging/Connect-LoomNode.sh"
+          test "$(ls -A "$staging" | wc -l)" -eq 4
+          archive="out/${kit_name}.tar.gz"
+          rm -f "$archive"
+          tar -czf "$archive" -C "$staging" .
+          test -f "$archive"
+
+      - name: Upload the standalone Linux Node kit
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: loom-node-linux-${{ env.LOOM_SOURCE_COMMIT }}
+          path: out/loom-node-linux-${{ env.LOOM_SOURCE_COMMIT }}.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Verify reviewed computer helper
         run: python3 -m unittest discover -s resources/computer -v
       - name: Install pinned Pi source
