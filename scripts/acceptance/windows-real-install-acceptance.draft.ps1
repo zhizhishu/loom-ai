@@ -1351,40 +1351,50 @@ function Get-RunById([string]$ThreadId, [string]$RunId) {
 }
 
 function Select-InstallOnlyMember {
-    # Reuse whatever the personal roster already holds and only create a member when the
-    # roster stays empty. A pi-adapted member is preferred because it is the member the
-    # real-machine run configures, but any mentionable member is enough here: install-only
-    # mode configures no model, so members.runtime.set is never sent.
+    # Install-only mode must run on the member startup seeds and binds to Pi. The binding
+    # happens in the background task that runs after runtime discovery, and members.list
+    # only reports already bound members
+    # (crates/rovai-core/src/application.rs:21905-21913, :3717-3789, :3797-3808), so one
+    # read is a race: wait the same 90 s window and take ONLY the member that reports
+    # runtimeConfiguration.adapterKind 'pi'. Any other member - including one that reports
+    # no adapter at all - is not a valid install-only target: the next steps open the Camp
+    # thread on the selected member, and a fallback pick turns the STOP lane into a
+    # different member than the one a real machine configures. members.create is not part
+    # of install-only mode, so a missing seeded Pi member is a FAIL, never a created or a
+    # substituted bare member.
     $selected = Wait-Until -TimeoutSeconds 90 -IntervalMilliseconds 1500 -Probe {
         try { $members = @(Invoke-CoreRequest 'members.list' ([ordered]@{})) }
         catch { $members = @() }
-        $fallback = $null
         foreach ($member in $members) {
             if (-not $member) { continue }
             $candidate = [string](Get-Value $member 'agentId')
             if (-not $candidate) { continue }
             $adapterKind = [string](Get-Value (Get-Value $member 'runtimeConfiguration') 'adapterKind')
-            if ($adapterKind -eq 'pi') {
-                return [pscustomobject]@{ agentId = $candidate; adapterKind = $adapterKind }
-            }
-            if (-not $fallback) {
-                $fallback = [pscustomobject]@{ agentId = $candidate; adapterKind = $adapterKind }
-            }
+            if ($adapterKind -ne 'pi') { continue }
+            return [pscustomobject]@{ agentId = $candidate; adapterKind = $adapterKind }
         }
-        if ($null -ne $fallback) { return $fallback }
         return $null
     }
-    $agentId = $null
-    $adapterKind = ''
-    if ($null -ne $selected) {
-        $agentId = [string](Get-Value $selected 'agentId')
-        $adapterKind = [string](Get-Value $selected 'adapterKind')
-        $reported = if ($adapterKind) { $adapterKind } else { 'none reported' }
-        Add-Result 'MEMBER_CREATE' 'SKIP' ("member {0} is already present (adapter {1}); members.create was not called" -f $agentId, $reported)
-    } else {
-        $agentId = New-PiAssistant
-        Add-Result 'MEMBER_CREATE' 'PASS' "members.create created member $agentId"
+    if ($null -eq $selected) {
+        # One plain read for the report only: it records what the roster held while the
+        # 90 s window ran out, so a slow seeding run and a missing seed are distinguishable.
+        $observed = @()
+        try {
+            foreach ($member in @(Invoke-CoreRequest 'members.list' ([ordered]@{}))) {
+                if (-not $member) { continue }
+                $kind = [string](Get-Value (Get-Value $member 'runtimeConfiguration') 'adapterKind')
+                if (-not $kind) { $kind = 'none reported' }
+                $observed += ('{0} -> {1}' -f [string](Get-Value $member 'agentId'), $kind)
+            }
+        } catch { }
+        $roster = if ($observed.Count -gt 0) { 'the roster held ' + ($observed -join ', ') } else { 'the roster was empty or unreadable' }
+        $reason = "no member bound to runtimeConfiguration.adapterKind pi appeared within 90 s; $roster. install-only mode never calls members.create and never selects a bare member"
+        Add-Result 'MEMBER_CREATE' 'FAIL' $reason
+        throw "install-only mode requires the seeded Pi assistant member: $reason"
     }
+    $agentId = [string](Get-Value $selected 'agentId')
+    $adapterKind = [string](Get-Value $selected 'adapterKind')
+    Add-Result 'MEMBER_CREATE' 'SKIP' ("member {0} is already present and bound to adapter {1}; members.create was not called" -f $agentId, $adapterKind)
     Add-Result 'MEMBER_MODEL' 'N/A' 'install-only mode: provider credential and model lane are out of scope; members.runtime.set was not called'
     $script:Evidence['member'] = [ordered]@{
         agentId = $agentId
