@@ -13,8 +13,12 @@ Trust rules enforced here, not in the model's prompt:
   query, no fragment, no redirect, no proxy, no other host.
 * The token file path is not a tool argument and can never be one: the tool schemas are
   closed and carry only screen coordinates, a key name, or bounded text.
-* Every tool call carries the client's own JSON-RPC request id forward unchanged. The
-  Host makes that id single-use per grant, so a retry can never duplicate input.
+* Every tool call gets a Host `requestId` this process mints itself: a random per-process
+  prefix plus a sequence. The Host's ledger is single-use **per grant** and outlives this
+  process, while MCP JSON-RPC ids restart at 0 in every new bridge, so forwarding the
+  client id would re-use ids an earlier run burned (the Host answers
+  `computer_agent_request_replayed`). A retry still can never duplicate input: no id is
+  ever minted twice. The client's own JSON-RPC id is preserved on the response.
 * stdout carries JSON lines and nothing else; diagnostics never reach it.
 
 A `401`/`403`/`404` from the Host means the grant is gone: the bridge answers that calls
@@ -44,6 +48,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+import uuid
 
 MAX_LINE_BYTES = 1024 * 1024
 MAX_TEXT_CODEPOINTS = 2048
@@ -66,6 +71,12 @@ UNCONFIRMED_ERRORS = frozenset({"computer_agent_input_unknown", "computer_input_
 NOT_SENT_ERRORS = frozenset(
     {"computer_agent_node_offline", "computer_input_not_sent", "node_offline"}
 )
+REPLAY_TEXT = (
+    "Computer request id was already used for this grant: the Host rejected the call as a "
+    "replay for idempotency (nothing was sent). This is a stale/id-reuse fault on the "
+    "bridge side, not a desktop, grant or device fault. Do not retry the same call."
+)
+REPLAY_ERRORS = frozenset({"computer_agent_request_replayed"})
 
 # The runtimes whose MCP projection can reach this bridge, kept identical to the Host's
 # `RUNTIMES` (crates/rovai-web/src/computer_agent.rs). `claude-code-cli` is refused by
@@ -310,6 +321,11 @@ class Bridge:
         self.scope = scope
         self.fatal = False
         self.opener = opener or endpoint_opener(endpoint)
+        # Host ids are single-use per grant and the grant survives this process; MCP ids
+        # restart at 0 per connection. A random prefix makes every id this process mints
+        # unique against every earlier run, so the Host ledger never sees a repeat.
+        self.request_prefix = uuid.uuid4().hex
+        self.sequence = 0
 
     def tools(self):
         """Exactly the tools this grant's scope exposes, in declaration order."""
@@ -319,8 +335,13 @@ class Bridge:
     def allows(self, tool):
         return tool in SCOPE_TOOLS[self.scope]
 
-    def call(self, request_id, tool, arguments):
-        body = json.dumps(call_body(request_id, tool, arguments, self.digest)).encode("utf-8")
+    def next_request_id(self):
+        """A Host requestId no other call, in this process or any earlier one, can reuse."""
+        self.sequence += 1
+        return "%s-%d" % (self.request_prefix, self.sequence)
+
+    def call(self, tool, arguments):
+        body = json.dumps(call_body(self.next_request_id(), tool, arguments, self.digest)).encode("utf-8")
         request = urllib.request.Request(
             self.endpoint,
             data=body,
@@ -394,7 +415,9 @@ def describe(result):
 
 
 def tool_error(message):
-    if message in UNCONFIRMED_ERRORS:
+    if message in REPLAY_ERRORS:
+        text = REPLAY_TEXT
+    elif message in UNCONFIRMED_ERRORS:
         text = UNCONFIRMED_TEXT
     elif message in NOT_SENT_ERRORS:
         text = NOT_SENT_TEXT
@@ -448,7 +471,7 @@ def handle(bridge, message):
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": describe(bridge.call(request_id, tool, arguments)),
+                "result": describe(bridge.call(tool, arguments)),
             }
         except BridgeError as failure:
             if failure.fatal:

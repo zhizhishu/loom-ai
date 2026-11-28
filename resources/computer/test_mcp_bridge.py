@@ -149,9 +149,9 @@ class ToolSurface(unittest.TestCase):
         with self.assertRaises(bridge.BridgeError):
             bridge.call_body("1", "shell", {}, DIGEST)
 
-    def test_wire_body_carries_the_request_id_and_no_secret(self):
-        body = bridge.call_body("req-1", "mouse_click", {"x": 1, "y": 2, "button": "left", "step": "Click button"}, DIGEST)
-        self.assertEqual(body["requestId"], "req-1")
+    def test_wire_body_serializes_the_host_id_and_no_secret(self):
+        body = bridge.call_body("host-1", "mouse_click", {"x": 1, "y": 2, "button": "left", "step": "Click button"}, DIGEST)
+        self.assertEqual(body["requestId"], "host-1")
         self.assertEqual(body["tool"], "mouse_click")
         self.assertEqual(body["expectedConfigDigest"], DIGEST)
         serialized = json.dumps(body)
@@ -202,13 +202,64 @@ class Protocol(unittest.TestCase):
             self.assertEqual(sent["headers"]["authorization"], "Bearer " + TOKEN)
             self.assertEqual(sent["headers"]["origin"], fixture.origin)
             body = json.loads(sent["body"])
-            self.assertEqual(body["requestId"], "req-abc")
+            # The MCP id labels the response; the Host gets an id this process minted.
+            self.assertEqual(response["id"], "req-abc")
+            self.assertNotEqual(body["requestId"], "req-abc")
             self.assertEqual(body["tool"], "key")
             self.assertEqual(body["expectedConfigDigest"], DIGEST)
             self.assertEqual(body["arguments"], {"key": "enter", "step": "Press Enter"})
             self.assertNotIn(TOKEN, sent["body"].decode("utf-8"))
         finally:
             fixture.close()
+
+    def test_repeated_mcp_ids_get_distinct_host_ids_and_keep_their_own_response_id(self):
+        """The reported REWORK fault: same inbound id twice must never replay."""
+        fixture = Fixture()
+        try:
+            instance = bridge.Bridge(
+                fixture.endpoint, fixture.origin, TOKEN, 10, DIGEST, scope="control"
+            )
+            responses = [
+                bridge.handle(
+                    instance,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {"name": "key", "arguments": {"key": "enter", "step": "Press Enter"}},
+                    },
+                )
+                for _ in range(2)
+            ]
+            # Same MCP id in, same MCP id out, two different single-use Host ids out.
+            self.assertEqual([response["id"] for response in responses], [2, 2])
+            sent = [json.loads(request["body"])["requestId"] for request in fixture.requests]
+            self.assertEqual(len(sent), 2)
+            self.assertNotEqual(sent[0], sent[1])
+            for host_id in sent:
+                self.assertNotEqual(host_id, "2")
+                # The Host's own admission rule for a requestId.
+                self.assertLessEqual(len(host_id), 64)
+                self.assertTrue(
+                    all(character.isascii() and (character.isalnum() or character in "-_")
+                        for character in host_id),
+                    host_id,
+                )
+        finally:
+            fixture.close()
+
+    def test_a_new_process_never_reuses_an_earlier_process_id(self):
+        """A new bridge (new run, same grant) must mint ids outside the burned range."""
+        first = bridge.Bridge(
+            "http://127.0.0.1:1/x", "http://127.0.0.1:1", TOKEN, 1, DIGEST, scope="control"
+        )
+        second = bridge.Bridge(
+            "http://127.0.0.1:1/x", "http://127.0.0.1:1", TOKEN, 1, DIGEST, scope="control"
+        )
+        minted = {first.next_request_id() for _ in range(4)}
+        minted |= {second.next_request_id() for _ in range(4)}
+        self.assertEqual(len(minted), 8)
+        self.assertNotEqual(first.request_prefix, second.request_prefix)
 
     def test_screenshot_returns_an_image_content_block(self):
         fixture = Fixture(
@@ -237,11 +288,28 @@ class Protocol(unittest.TestCase):
             fixture.close()
 
     def test_host_refusals_surface_public_codes_only(self):
+        fixture = Fixture(status=409, body={"ok": False, "error": {"code": "computer_agent_view_unavailable"}})
+        try:
+            response = self.call(fixture, "req-stale", "text", {"text": "hi", "step": "Type greeting"})
+            self.assertTrue(response["result"]["isError"])
+            # Unchanged: every other code keeps the single generic refusal text.
+            self.assertEqual(response["result"]["content"][0]["text"], bridge.FAILURE_TEXT)
+        finally:
+            fixture.close()
+
+    def test_a_replayed_request_id_says_replay_not_a_generic_denial(self):
+        """The reported symptom was this code collapsing into "denied/expired"."""
         fixture = Fixture(status=409, body={"ok": False, "error": {"code": "computer_agent_request_replayed"}})
         try:
             response = self.call(fixture, "req-dup", "text", {"text": "hi", "step": "Type greeting"})
             self.assertTrue(response["result"]["isError"])
-            self.assertEqual(response["result"]["content"][0]["text"], bridge.FAILURE_TEXT)
+            text = response["result"]["content"][0]["text"]
+            self.assertEqual(text, bridge.REPLAY_TEXT)
+            self.assertNotEqual(text, bridge.FAILURE_TEXT)
+            self.assertIn("request id was already used", text)
+            self.assertIn("nothing was sent", text)
+            self.assertNotIn("denied, expired", text)
+            self.assertEqual(len(fixture.requests), 1, "the bridge must not replay")
         finally:
             fixture.close()
 
@@ -686,8 +754,9 @@ class PiLifecycle(unittest.TestCase):
         self.assertEqual(len(fixture.requests), 1)
         lines = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
         self.assertEqual(
-            lines[0]["result"]["content"][0]["text"], bridge.FAILURE_TEXT
+            lines[0]["result"]["content"][0]["text"], bridge.REPLAY_TEXT
         )
+        self.assertNotEqual(bridge.REPLAY_TEXT, bridge.FAILURE_TEXT)
         self.assertTrue(lines[0]["result"]["isError"])
 
 
