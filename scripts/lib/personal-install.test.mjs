@@ -382,6 +382,23 @@ test('launcher exports LOOM_ENABLED_RUNTIMES as the canonical comma list', () =>
   assert.match(managerText, /elseif \(\[Environment\]::UserInteractive -and -not \[Console\]::IsInputRedirected\)/)
 })
 
+test('Start persists a normalized runtimes selection even without -Runtimes', () => {
+  // The Windows-only legacy-state test covers the behaviour; this mirrors the
+  // shipped source so a regression is caught on every host. A state file from
+  // before the light edition has no runtimes property, so Start must always
+  // write one: an explicit -Runtimes wins, otherwise the saved/default value is
+  // normalized and stored before the Server starts.
+  const managerText = readFileSync(manager, 'utf8')
+  const start = managerText.slice(managerText.indexOf("$Action -eq 'Start'"))
+  const explicit = start.indexOf('if ($startRuntimes) { Set-SavedRuntimes $state $startRuntimes }')
+  const fallback = start.indexOf('else { Set-SavedRuntimes $state (Get-SavedRuntimes $state) }')
+  assert.notEqual(explicit, -1, 'Start must persist an explicit -Runtimes selection')
+  assert.notEqual(fallback, -1, 'Start must persist a normalized selection without -Runtimes')
+  assert.ok(fallback > explicit, 'the default branch must follow the explicit one')
+  assert.ok(start.indexOf('Write-AtomicJson $statePath $state') > fallback,
+    'the selection must be normalized before the state file is written')
+})
+
 // Run an expression against the manager's real selection helpers without
 // executing the installer body. The helper block is extracted from the shipped
 // script so the test can never drift onto a copy of the code.

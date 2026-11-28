@@ -582,9 +582,14 @@ try {
         }
         $state = Set-SavedValue $state 'lastStarted' $state.current
         # An explicit -Runtimes on Start changes the saved choice; otherwise the
-        # installation keeps the selection recorded at install time.
+        # installation keeps the selection recorded at install time. Either way
+        # the value is normalized and persisted here: a state file written
+        # before the light edition has no runtimes property, and Start is the
+        # first write path that upgrades it (schema stays 1). An absent or
+        # unusable saved selection normalizes to the all-four default.
         $startRuntimes = ConvertFrom-RuntimeSelection $Runtimes
         if ($startRuntimes) { Set-SavedRuntimes $state $startRuntimes }
+        else { Set-SavedRuntimes $state (Get-SavedRuntimes $state) }
         Write-AtomicJson $statePath $state
         Run-Loom $release $state.dataDirectory $state.port $selected (Format-RuntimeSelection (Get-SavedRuntimes $state))
     }
