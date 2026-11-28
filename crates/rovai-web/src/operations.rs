@@ -1310,6 +1310,10 @@ mod tests {
             assert!(
                 serde_json::from_value::<Operation>(json!(unadmitted)).is_err(),
                 "{unadmitted} must stay outside the network capability"
+            );
+        }
+    }
+
     // The Owner's rework exit is the one new write: a stage-review block can only be undone from the
     // page that shows it. Admission and its receipt are the whole change; the producer writes that
     // belong to the agent side stay unreachable from the network.
