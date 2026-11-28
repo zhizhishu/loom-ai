@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::{OsStr, OsString},
     fs,
@@ -250,6 +250,23 @@ pub enum RuntimeLaunchPurpose {
 }
 
 pub fn runtime_launch_allowed(kind: AdapterKind, purpose: RuntimeLaunchPurpose) -> bool {
+    runtime_launch_allowed_with_selection(
+        &crate::runtime_selection::enabled_runtimes_from_process(),
+        kind,
+        purpose,
+    )
+}
+
+/// [`runtime_launch_allowed`] against an explicit deployment selection.
+///
+/// Split out so tests can assert launch refusals for an unselected Runtime
+/// without touching the shared process environment (other tests in this
+/// binary read the same variable in parallel).
+pub fn runtime_launch_allowed_with_selection(
+    enabled: &BTreeSet<AdapterKind>,
+    kind: AdapterKind,
+    purpose: RuntimeLaunchPurpose,
+) -> bool {
     // LOOM 自有决定（Claude 禁用，2026-11-18）：Claude Code 只识别，不启动。
     // 所有 purpose（DiscoveryVersion / AvailabilityCheck / InstallationRefresh /
     // HealthProbe / DispatchPreflight / AgentExecution）一律拒绝启动进程："只识别"=
@@ -261,6 +278,13 @@ pub fn runtime_launch_allowed(kind: AdapterKind, purpose: RuntimeLaunchPurpose) 
     if kind == AdapterKind::ClaudeCodeCli
         && !crate::runtime_platform_admission::claude_runtime_enabled_by_policy_opt_in()
     {
+        return false;
+    }
+    // The deployment selection (`LOOM_ENABLED_RUNTIMES`) is a second, independent
+    // refusal: an operator that did not enable one of the four scoped Runtimes
+    // must not have a process launched for it, for any purpose. Unscoped
+    // Adapters are unaffected.
+    if !crate::runtime_selection::runtime_enabled_by_selection(enabled, kind) {
         return false;
     }
     let _ = purpose;
@@ -2711,6 +2735,11 @@ mod tests {
 
     #[test]
     fn runtime_launch_policy_is_uniform_for_every_product_runtime() {
+        // Explicit selection: the launch policy test must not depend on (or
+        // mutate) the shared process environment, which other tests in this
+        // binary read in parallel. "Everything enabled" is the default
+        // deployment, so this is the shape production sees unconfigured.
+        let every_selectable = crate::runtime_selection::parse_enabled_runtimes(None);
         for purpose in [
             RuntimeLaunchPurpose::DiscoveryVersion,
             RuntimeLaunchPurpose::AvailabilityCheck,
@@ -2725,7 +2754,11 @@ mod tests {
                 if kind == AdapterKind::ClaudeCodeCli {
                     continue;
                 }
-                assert!(runtime_launch_allowed(kind, purpose));
+                assert!(runtime_launch_allowed_with_selection(
+                    &every_selectable,
+                    kind,
+                    purpose
+                ));
             }
         }
     }

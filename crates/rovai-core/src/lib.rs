@@ -141,6 +141,7 @@ pub mod runtime_platform_admission;
 pub mod runtime_probe_process;
 pub mod runtime_resolution;
 pub mod runtime_search_operation;
+pub mod runtime_selection;
 pub mod runtime_startup;
 mod runtime_thinking;
 pub mod single_chat;
