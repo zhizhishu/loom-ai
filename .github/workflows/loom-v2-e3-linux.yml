@@ -12,6 +12,7 @@ on:
       - 'resources/computer/**'
       - 'resources/dsh-runtime/**'
       - 'scripts/package-dsh-runtime.mjs'
+      - 'scripts/lib/dsh-runtime-package.test.mjs'
       - 'scripts/package-linux-personal.mjs'
       - 'scripts/package-computer-runtime-linux.mjs'
       - 'scripts/package-office-runtime-linux.sh'
@@ -22,7 +23,6 @@ on:
       - 'scripts/lib/linux-personal.test.mjs'
       - 'scripts/node/Connect-LoomNode.sh'
       - 'scripts/node/README-linux.md'
-      - 'scripts/lib/dsh-runtime-package.test.mjs'
 
 permissions:
   contents: read
