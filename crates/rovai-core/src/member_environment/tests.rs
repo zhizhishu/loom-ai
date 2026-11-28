@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    agent_identity::{LUOKE_AGENT_ID, MUWA_AGENT_ID},
+    agent_identity::{LUOKE_AGENT_ID, MIANZHI_AGENT_ID, MUWA_AGENT_ID},
     agent_profile::FrozenAgentRuntimeConfig,
     db::Database,
 };
@@ -24,6 +24,21 @@ fn save(connection: &Connection, member: &str, revision: i64, values: Value) -> 
         connection,
         member,
         AdapterKind::Pi,
+        &ModelSelection::RuntimeDefault,
+        EnvironmentEdit {
+            inherit_common: None,
+            expected_revision: revision,
+            json: values.to_string(),
+        },
+    )?
+    .commit(connection)
+}
+
+fn save_claude(connection: &Connection, member: &str, revision: i64, values: Value) -> Result<()> {
+    prepare(
+        connection,
+        member,
+        AdapterKind::ClaudeCodeCli,
         &ModelSelection::RuntimeDefault,
         EnvironmentEdit {
             inherit_common: None,
@@ -689,6 +704,193 @@ fn legacy_archive_is_inert_read_only_and_acknowledgment_survives_path_edits() {
     );
     assert!(
         legacy_acknowledge(database.connection(), AdapterKind::ClaudeCodeCli, "stale").is_err()
+    );
+    drop(database);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn claude_probe_scan_is_empty_without_a_routing_overlay() {
+    let (database, root) = database();
+    assert!(
+        claude_probe_launch_environments(database.connection())
+            .unwrap()
+            .is_empty()
+    );
+    save_claude(
+        database.connection(),
+        LUOKE_AGENT_ID,
+        0,
+        json!({"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1"}),
+    )
+    .unwrap();
+    // Another Runtime's routing configuration is not a Claude probe overlay.
+    save(
+        database.connection(),
+        LUOKE_AGENT_ID,
+        0,
+        json!({"ANTHROPIC_BASE_URL":"https://pi.example"}),
+    )
+    .unwrap();
+    assert!(
+        claude_probe_launch_environments(database.connection())
+            .unwrap()
+            .is_empty()
+    );
+    drop(database);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn claude_probe_scan_returns_routable_member_environments_deterministically() {
+    let (database, root) = database();
+    save_claude(
+        database.connection(),
+        MUWA_AGENT_ID,
+        0,
+        json!({"ANTHROPIC_BASE_URL":"https://b.example","ANTHROPIC_AUTH_TOKEN":"fixture-token-b"}),
+    )
+    .unwrap();
+    save_claude(
+        database.connection(),
+        MIANZHI_AGENT_ID,
+        0,
+        json!({"ANTHROPIC_MODEL":"fixture-model"}),
+    )
+    .unwrap();
+    save_claude(
+        database.connection(),
+        LUOKE_AGENT_ID,
+        0,
+        json!({"ANTHROPIC_BASE_URL":"https://a.example","ANTHROPIC_AUTH_TOKEN":"fixture-token-a"}),
+    )
+    .unwrap();
+    let environments = claude_probe_launch_environments(database.connection()).unwrap();
+    assert_eq!(environments.len(), 2);
+    assert_eq!(
+        environments[0].overlay.as_ref().unwrap()["ANTHROPIC_BASE_URL"],
+        "https://a.example"
+    );
+    assert_eq!(
+        environments[0].values.as_ref().unwrap()["ANTHROPIC_AUTH_TOKEN"],
+        "fixture-token-a"
+    );
+    assert_eq!(
+        environments[0].values.as_ref().unwrap()["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"],
+        "1"
+    );
+    assert_eq!(
+        environments[1].overlay.as_ref().unwrap()["ANTHROPIC_AUTH_TOKEN"],
+        "fixture-token-b"
+    );
+    assert_eq!(
+        environments[1].values.as_ref().unwrap()["ANTHROPIC_BASE_URL"],
+        "https://b.example"
+    );
+    drop(database);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn claude_probe_ciphertext_does_not_contain_overlay_credentials() {
+    let (database, root) = database();
+    save_claude(
+        database.connection(),
+        LUOKE_AGENT_ID,
+        0,
+        json!({"ANTHROPIC_BASE_URL":"https://gateway.example","ANTHROPIC_AUTH_TOKEN":"fixture-probe-token"}),
+    )
+    .unwrap();
+    let ciphertext: Vec<u8> = database
+        .connection()
+        .query_row(
+            "SELECT ciphertext FROM member_runtime_environment WHERE member_id=?1 AND runtime_kind=?2",
+            params![LUOKE_AGENT_ID, AdapterKind::ClaudeCodeCli.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let stored = String::from_utf8_lossy(&ciphertext);
+    assert!(!stored.contains("fixture-probe-token"));
+    assert!(!stored.contains("https://gateway.example"));
+    assert_eq!(
+        claude_probe_launch_environments(database.connection()).unwrap()[0]
+            .values
+            .as_ref()
+            .unwrap()["ANTHROPIC_AUTH_TOKEN"],
+        "fixture-probe-token"
+    );
+    drop(database);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn claude_probe_scan_excludes_removed_members() {
+    let (database, root) = database();
+    save_claude(
+        database.connection(),
+        LUOKE_AGENT_ID,
+        0,
+        json!({"ANTHROPIC_BASE_URL":"https://removed.example","ANTHROPIC_AUTH_TOKEN":"fixture-removed-token"}),
+    )
+    .unwrap();
+    let environments = claude_probe_launch_environments(database.connection()).unwrap();
+    assert_eq!(environments.len(), 1);
+    assert_eq!(
+        environments[0].overlay.as_ref().unwrap()["ANTHROPIC_AUTH_TOKEN"],
+        "fixture-removed-token"
+    );
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_profile SET profile_status='removed', removed_at=datetime('now') WHERE id=?1",
+            [LUOKE_AGENT_ID],
+        )
+        .unwrap();
+    assert!(
+        claude_probe_launch_environments(database.connection())
+            .unwrap()
+            .is_empty()
+    );
+    drop(database);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn claude_probe_scan_skips_members_with_damaged_environments() {
+    let (database, root) = database();
+    save_claude(
+        database.connection(),
+        LUOKE_AGENT_ID,
+        0,
+        json!({"ANTHROPIC_BASE_URL":"https://damaged.example","ANTHROPIC_AUTH_TOKEN":"fixture-damaged-token"}),
+    )
+    .unwrap();
+    save_claude(
+        database.connection(),
+        MUWA_AGENT_ID,
+        0,
+        json!({"ANTHROPIC_BASE_URL":"https://healthy.example","ANTHROPIC_AUTH_TOKEN":"fixture-healthy-token"}),
+    )
+    .unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE member_runtime_environment SET ciphertext=x'00'
+            WHERE member_id=?1 AND runtime_kind=?2
+              AND revision=(SELECT MAX(revision) FROM member_runtime_environment
+                WHERE member_id=?1 AND runtime_kind=?2)",
+            params![LUOKE_AGENT_ID, AdapterKind::ClaudeCodeCli.as_str()],
+        )
+        .unwrap();
+    let environments = claude_probe_launch_environments(database.connection()).unwrap();
+    assert_eq!(environments.len(), 1);
+    assert_eq!(
+        environments[0].overlay.as_ref().unwrap()["ANTHROPIC_BASE_URL"],
+        "https://healthy.example"
+    );
+    assert_eq!(
+        environments[0].values.as_ref().unwrap()["ANTHROPIC_AUTH_TOKEN"],
+        "fixture-healthy-token"
     );
     drop(database);
     std::fs::remove_dir_all(root).unwrap();

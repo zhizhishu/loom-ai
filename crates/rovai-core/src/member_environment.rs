@@ -111,6 +111,57 @@ pub fn current_for_launch(
         crate::runtime_discovery::capture_host_runtime_environment,
     )
 }
+
+/// Resolves the deterministic set of Claude member launch environments used by
+/// the global probe. Members are scanned by ID; only overlays that route traffic
+/// through a member gateway are returned. Values remain in memory.
+pub fn claude_probe_launch_environments(connection: &Connection) -> Result<Vec<LaunchEnvironment>> {
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT environment.member_id
+        FROM member_runtime_environment AS environment
+        JOIN agent_profile AS profile ON profile.id = environment.member_id
+        WHERE environment.runtime_kind=?1 AND profile.profile_status <> 'removed'
+        ORDER BY environment.member_id",
+    )?;
+    let members = statement
+        .query_map([AdapterKind::ClaudeCodeCli.as_str()], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut environments = Vec::new();
+    for member in members {
+        let environment = match current_for_launch(connection, &member, AdapterKind::ClaudeCodeCli)
+        {
+            Ok(environment) => environment,
+            Err(error) => {
+                eprintln!(
+                    "Claude probe environment skipped for member {member}: {}",
+                    probe_environment_error_category(&error)
+                );
+                continue;
+            }
+        };
+        if environment
+            .overlay
+            .as_ref()
+            .is_some_and(claude_routing_override)
+        {
+            environments.push(environment);
+        }
+    }
+    Ok(environments)
+}
+
+fn probe_environment_error_category(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string();
+    if message.contains("Member is unavailable") {
+        "member unavailable"
+    } else if message.contains("Private environment") {
+        "private environment unavailable"
+    } else {
+        "launch environment unavailable"
+    }
+}
 fn launch_with_host(
     connection: &Connection,
     member: &str,
