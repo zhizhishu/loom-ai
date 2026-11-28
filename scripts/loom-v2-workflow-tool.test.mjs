@@ -31,6 +31,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import managedHost from '../crates/rovai-core/src/pi/managed-host.ts'
 
 import {
+  ATTACHMENT_OUTPUT_DIR_ENV,
   CLI_ENV,
   applyReadbackForCall,
   ENVELOPE_VERSION,
@@ -314,6 +315,7 @@ function plan(fixtureValue, params, overrides = {}) {
     nowMs: overrides.nowMs ?? Date.now(),
     cliPath: overrides.cliPath ?? fixtureValue.cliPath,
     baseEnv: overrides.baseEnv ?? { PATH: '/usr/bin', [CLI_ENV]: fixtureValue.cliPath },
+    materialized: overrides.materialized ?? null,
   })
 }
 
@@ -951,19 +953,20 @@ test('14 · a 1 MiB workspace write fits the managed stdin budget and one byte m
   } finally { rm(current.root, { recursive: true, force: true }) }
 })
 
-test('15 · an untruncated read becomes one generated local file under ROVAI_RUN_TMP', () => {
+test('15 · an untruncated read becomes one durable local file under the attachment output root', () => {
   const payload = Buffer.from('UEsDBBQAAAAIAA==', 'base64')
   const sha = createHash('sha256').update(payload).digest('hex')
   const expectedName = `${MATERIALIZED_PREFIX}${sha.slice(0, 16)}.docx`
   // The seam joins with the platform separator, exactly like the production implementation.
+  const outputRoot = resolve('/attachments/camp-1')
   const runTmp = resolve('/run-tmp')
-  const expectedTarget = join(runTmp, expectedName)
+  const expectedTarget = join(outputRoot, expectedName)
   const wholeRead = () => readResult({ kind: 'read', encoding: 'base64', data: payload.toString('base64'), offset: 0, truncated: false })
 
   // 1. A whole read is materialized under the run directory with a content-addressed name.
-  const fsApi = fakeMaterializeFs({ directory: runTmp })
+  const fsApi = fakeMaterializeFs({ directory: outputRoot })
   const first = materializeReadBack({
-    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'deliverables/report.docx', runTmp, fsApi,
+    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'deliverables/report.docx', attachmentOutputRoot: outputRoot, fsApi,
   })
   assert.equal(first.localFile.path, expectedTarget)
   assert.equal(first.localFile.bytes, payload.length)
@@ -974,40 +977,48 @@ test('15 · an untruncated read becomes one generated local file under ROVAI_RUN
 
   // 2. The same bytes map to the same name and are reused, never re-written.
   const again = materializeReadBack({
-    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'deliverables/report.docx', runTmp, fsApi,
+    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'deliverables/report.docx', attachmentOutputRoot: outputRoot, fsApi,
   })
   assert.equal(again.localFile.path, first.localFile.path)
   assert.match(again.text, /already materialized/u)
 
   // 3. A name already holding different bytes is a conflict, not an overwrite.
-  const conflictFs = fakeMaterializeFs({ directory: runTmp, files: [[expectedTarget, Buffer.from('different')]] })
+  const conflictFs = fakeMaterializeFs({ directory: outputRoot, files: [[expectedTarget, Buffer.from('different')]] })
   const conflict = materializeReadBack({
-    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'deliverables/report.docx', runTmp, fsApi: conflictFs,
+    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'deliverables/report.docx', attachmentOutputRoot: outputRoot, fsApi: conflictFs,
   })
   assert.equal(conflict.localFile, undefined)
   assert.match(conflict.text, /loom_materialize_conflict/u)
   assert.equal(conflictFs.files.get(expectedTarget).toString(), 'different')
 
-  // 4. Nothing is materialized without a real run directory, a whole page, or a contained result.
-  const noRunTmp = materializeReadBack({
-    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'out.docx', runTmp: undefined, fsApi,
+  // 4. Nothing is materialized without a real output root, a whole page, or a contained result.
+  const noRoot = materializeReadBack({
+    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'out.docx', attachmentOutputRoot: undefined, fsApi,
   })
-  assert.equal(noRunTmp.localFile, undefined)
-  assert.match(noRunTmp.text, /loom_run_tmp_unavailable/u)
-  const relativeRunTmp = materializeReadBack({
-    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'out.docx', runTmp: 'relative/run-tmp', fsApi,
+  assert.equal(noRoot.localFile, undefined)
+  assert.match(noRoot.text, /loom_attachment_output_unavailable/u)
+  const relativeRoot = materializeReadBack({
+    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'out.docx', attachmentOutputRoot: 'relative/attachments', fsApi,
   })
-  assert.match(relativeRunTmp.text, /loom_run_tmp_unavailable/u)
+  assert.match(relativeRoot.text, /loom_attachment_output_unavailable/u)
+  // The retired run directory is NOT a fallback: a readback with only ROVAI_RUN_TMP writes nothing.
+  const runTmpOnly = materializeReadBack({
+    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'out.docx',
+    attachmentOutputRoot: undefined, fsApi: fakeMaterializeFs({ directory: runTmp }), runTmp,
+  })
+  assert.equal(runTmpOnly.localFile, undefined, 'run-tmp must never receive a durable copy')
+  assert.match(runTmpOnly.text, /loom_attachment_output_unavailable/u)
+  assert.equal(runTmpOnly.text.includes('local file:'), false)
   const truncated = materializeReadBack({
     operation: MATERIALIZE_OPERATION,
     result: readResult({ kind: 'read', encoding: 'base64', data: payload.toString('base64'), offset: 0, truncated: true }),
-    requestedPath: 'out.docx', runTmp, fsApi,
+    requestedPath: 'out.docx', attachmentOutputRoot: outputRoot, fsApi,
   })
   assert.equal(truncated.localFile, undefined)
   assert.match(truncated.text, /loom_read_truncated/u)
   const escaped = materializeReadBack({
-    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'out.docx', runTmp,
-    fsApi: fakeMaterializeFs({ directory: runTmp, fileEscape: true }),
+    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'out.docx', attachmentOutputRoot: outputRoot,
+    fsApi: fakeMaterializeFs({ directory: outputRoot, fileEscape: true }),
   })
   assert.equal(escaped.localFile, undefined)
   assert.match(escaped.text, /loom_materialize_escaped/u)
@@ -1015,24 +1026,24 @@ test('15 · an untruncated read becomes one generated local file under ROVAI_RUN
   const offsetPage = materializeReadBack({
     operation: MATERIALIZE_OPERATION,
     result: readResult({ kind: 'read', encoding: 'base64', data: payload.toString('base64'), offset: 1024, truncated: false }),
-    requestedPath: 'out.docx', runTmp, fsApi,
+    requestedPath: 'out.docx', attachmentOutputRoot: outputRoot, fsApi,
   })
   assert.equal(offsetPage.localFile, undefined, 'a nonzero-offset read must not become a complete file')
   assert.match(offsetPage.text, /loom_read_offset_nonzero/u)
   assert.match(offsetPage.text, /No local attachment copy/u)
   assert.equal(fsApi.files.size, 1, 'only the whole read produced a copy')
   const createFails = materializeReadBack({
-    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'out.docx', runTmp,
-    fsApi: fakeMaterializeFs({ directory: runTmp, createFails: 'EACCES' }),
+    operation: MATERIALIZE_OPERATION, result: wholeRead(), requestedPath: 'out.docx', attachmentOutputRoot: outputRoot,
+    fsApi: fakeMaterializeFs({ directory: outputRoot, createFails: 'EACCES' }),
   })
   assert.equal(createFails.localFile, undefined)
   assert.match(createFails.text, /loom_materialize_failed/u)
 
   // 5. A failed operation and every other operation pass through untouched.
   const failed = { isError: true, code: 'path_rejected', text: 'rejected', indeterminate: false }
-  assert.equal(materializeReadBack({ operation: MATERIALIZE_OPERATION, result: failed, requestedPath: 'a.docx', runTmp: '/run-tmp', fsApi }), failed)
+  assert.equal(materializeReadBack({ operation: MATERIALIZE_OPERATION, result: failed, requestedPath: 'a.docx', attachmentOutputRoot: '/attachments/camp-1', fsApi }), failed)
   const other = { isError: false, code: 'ok', text: '{"kind":"list"}', indeterminate: false }
-  assert.equal(materializeReadBack({ operation: 'loom.workspace.list', result: other, requestedPath: 'a.docx', runTmp: '/run-tmp', fsApi }), other)
+  assert.equal(materializeReadBack({ operation: 'loom.workspace.list', result: other, requestedPath: 'a.docx', attachmentOutputRoot: '/attachments/camp-1', fsApi }), other)
 
   // 6. The model never names the output: only a safe extension of the requested path survives.
   assert.equal(materializedExtension('deliverables/report.docx'), '.docx')
@@ -1053,55 +1064,70 @@ test('15 · an untruncated read becomes one generated local file under ROVAI_RUN
 })
 
 test('15b · the production materialization seam writes one private file and never overwrites', async () => {
-  const runTmp = mkdtempSync(join(tmpdir(), 'loom-readback-'))
+  const outputRoot = mkdtempSync(join(tmpdir(), 'loom-readback-output-'))
+  const runTmp = mkdtempSync(join(tmpdir(), 'loom-readback-run-tmp-'))
   try {
     const bytes = Buffer.from('fixture-docx-bytes-for-one-run', 'utf8')
     const result = readResult({ kind: 'read', encoding: 'base64', data: bytes.toString('base64'), offset: 0, truncated: false })
-    const first = materializeReadBack({ operation: MATERIALIZE_OPERATION, result, requestedPath: 'out/report.docx', runTmp })
+    const first = materializeReadBack({ operation: MATERIALIZE_OPERATION, result, requestedPath: 'out/report.docx', attachmentOutputRoot: outputRoot })
     assert.ok(first.localFile, first.text)
     assert.equal(readFileSync(first.localFile.path).equals(bytes), true, 'the copy is byte-identical')
     assert.equal(statSync(first.localFile.path).isFile(), true)
     assert.equal(first.localFile.path.endsWith('.docx'), true)
-    assert.equal(resolve(first.localFile.path).startsWith(resolve(runTmp)), true, 'the copy lives in the run directory')
+    assert.equal(resolve(first.localFile.path).startsWith(resolve(outputRoot)), true, 'the copy lives in the attachment output root')
+    assert.equal(resolve(first.localFile.path).startsWith(resolve(runTmp)), false, 'the copy never lives in run-tmp')
     if (process.platform !== 'win32') assert.equal(statSync(first.localFile.path).mode & 0o777, 0o600)
     // A retry reuses the identical copy instead of failing or rewriting it.
-    const again = materializeReadBack({ operation: MATERIALIZE_OPERATION, result, requestedPath: 'out/report.docx', runTmp })
+    const again = materializeReadBack({ operation: MATERIALIZE_OPERATION, result, requestedPath: 'out/report.docx', attachmentOutputRoot: outputRoot })
     assert.equal(again.localFile.path, first.localFile.path)
     assert.match(again.text, /already materialized/u)
     // A different payload never reuses this name.
     const other = readResult({ kind: 'read', encoding: 'base64', data: Buffer.from('another payload').toString('base64'), offset: 0, truncated: false })
-    const second = materializeReadBack({ operation: MATERIALIZE_OPERATION, result: other, requestedPath: 'out/report.docx', runTmp })
+    const second = materializeReadBack({ operation: MATERIALIZE_OPERATION, result: other, requestedPath: 'out/report.docx', attachmentOutputRoot: outputRoot })
     assert.notEqual(second.localFile.path, first.localFile.path)
     assert.equal(existsSync(first.localFile.path) && existsSync(second.localFile.path), true)
     // A real symlink standing where the copy would go is refused, never followed.
     const sha = createHash('sha256').update(bytes).digest('hex')
     const linkedName = `${MATERIALIZED_PREFIX}${sha.slice(0, 16)}.md`
-    const outside = join(runTmp, 'outside-target.txt')
+    const outside = join(outputRoot, 'outside-target.txt')
     writeFileSync(outside, 'outside secret\n', 'utf8')
     let linked = false
     try {
-      symlinkSync(outside, join(runTmp, linkedName), 'file')
+      symlinkSync(outside, join(outputRoot, linkedName), 'file')
       linked = true
     } catch (error) {
       if (error?.code !== 'EPERM' && error?.code !== 'EACCES') throw error
     }
     if (linked) {
-      const linkResult = materializeReadBack({ operation: MATERIALIZE_OPERATION, result, requestedPath: 'out/report.md', runTmp })
+      const linkResult = materializeReadBack({ operation: MATERIALIZE_OPERATION, result, requestedPath: 'out/report.md', attachmentOutputRoot: outputRoot })
       assert.equal(linkResult.localFile, undefined)
       assert.match(linkResult.text, /loom_materialize_conflict/u)
       assert.equal(readFileSync(outside, 'utf8'), 'outside secret\n')
     }
-  } finally { await rm(runTmp, { recursive: true, force: true }) }
+    // Deleting the retired run directory cannot touch the durable copy.
+    await rm(runTmp, { recursive: true, force: true })
+    assert.equal(existsSync(first.localFile.path), true, 'the durable copy survives run-tmp deletion')
+    assert.equal(readFileSync(first.localFile.path).equals(bytes), true)
+    // A replay of the same read reuses the same durable name instead of writing again.
+    const replay = materializeReadBack({ operation: MATERIALIZE_OPERATION, result, requestedPath: 'out/report.docx', attachmentOutputRoot: outputRoot })
+    assert.equal(replay.localFile.path, first.localFile.path)
+    assert.match(replay.text, /already materialized/u)
+  } finally {
+    await rm(outputRoot, { recursive: true, force: true })
+    await rm(runTmp, { recursive: true, force: true })
+  }
 })
 
 test('16 · thread.message.send is the ordinary attachment path for a materialized file', async () => {
   const current = fixture()
-  const runTmp = mkdtempSync(join(tmpdir(), 'loom-send-path-'))
+  const outputRoot = mkdtempSync(join(tmpdir(), 'loom-send-path-'))
   try {
-    const localFile = join(runTmp, `${MATERIALIZED_PREFIX}0123456789abcdef.docx`)
+    // The bridge materialized this exact file into this Run's attachment output root.
+    const localFile = join(outputRoot, `${MATERIALIZED_PREFIX}0123456789abcdef.docx`)
     writeFileSync(localFile, 'docx-bytes', 'utf8')
+    const materialized = { root: outputRoot, files: new Set([localFile]) }
     const planned = plan(current, { operation: 'thread.message.send', input: { body: 'Delivery attached.', files: [localFile] } },
-      { baseEnv: { PATH: '/usr/bin', [CLI_ENV]: current.cliPath, [RUN_TMP_ENV]: runTmp } })
+      { baseEnv: { PATH: '/usr/bin', [CLI_ENV]: current.cliPath, [ATTACHMENT_OUTPUT_DIR_ENV]: outputRoot }, materialized })
     assert.equal(planned.ok, true, planned.code)
     assert.deepEqual([...planned.plan.argv], ['send'], 'the fixed CLI word is the one group-send verb')
     assert.deepEqual(JSON.parse(planned.plan.stdin), { body: 'Delivery attached.', files: [localFile] })
@@ -1128,78 +1154,123 @@ test('16 · thread.message.send is the ordinary attachment path for a materializ
     assert.match(validateLoomParams({ operation: 'thread.message.send', input: { files: ['a\u0000b'] } }).code, /loom_send_files_nul_byte/u)
     assert.match(validateLoomParams({ operation: 'thread.message.send', input: { files: 'a.docx' } }).code, /loom_send_files_not_array/u)
     assert.match(validateLoomParams({ operation: 'thread.message.send', input: { files: Array.from({ length: 11 }, (_, index) => `f${index}.docx`) } }).code, /loom_send_files_too_many/u)
-    assert.equal(attachmentFilesProblem([localFile], { runTmp }), null)
+    assert.equal(attachmentFilesProblem([localFile], { attachmentOutputRoot: outputRoot, materialized }), null)
+    // An absolute file this bridge never materialized is refused, even inside the output root.
+    assert.equal(attachmentFilesProblem([localFile], { attachmentOutputRoot: outputRoot, materialized: null }), 'path_not_allowed')
+    assert.equal(attachmentFilesProblem([localFile], { attachmentOutputRoot: outputRoot, materialized: { root: outputRoot, files: new Set() } }), 'path_not_allowed')
     assert.equal(attachmentFilesProblem(['deliverables/report.docx']), null, 'a relative path needs no run directory')
   } finally {
     await rm(current.root, { recursive: true, force: true })
-    await rm(runTmp, { recursive: true, force: true })
+    await rm(outputRoot, { recursive: true, force: true })
   }
 })
 
-test('16b · a send attachment is workspace-relative or this Run\'s own run-private copy', async () => {
+test('16b · a send attachment is workspace-relative or a file this bridge materialized', async () => {
   const current = fixture()
-  const runTmp = mkdtempSync(join(tmpdir(), 'loom-send-run-tmp-'))
+  const outputRoot = mkdtempSync(join(tmpdir(), 'loom-send-output-'))
   const outside = mkdtempSync(join(tmpdir(), 'loom-send-outside-'))
   try {
-    const delivered = join(runTmp, `${MATERIALIZED_PREFIX}0123456789abcdef.docx`)
+    const delivered = join(outputRoot, `${MATERIALIZED_PREFIX}0123456789abcdef.docx`)
     writeFileSync(delivered, 'docx-bytes', 'utf8')
+    // A real file in the same output root that the bridge never wrote: an ordinary host path.
+    const foreign = join(outputRoot, 'someone-elses.docx')
+    writeFileSync(foreign, 'foreign-bytes', 'utf8')
     const secret = join(outside, 'secret.docx')
     writeFileSync(secret, 'secret-bytes', 'utf8')
-    const env = { PATH: '/usr/bin', [CLI_ENV]: current.cliPath, [RUN_TMP_ENV]: runTmp }
-    const send = (files, baseEnv = env) => plan(current, { operation: 'thread.message.send', input: { files } }, { baseEnv })
-    const refused = (files, baseEnv = env) => {
-      const outcome = send(files, baseEnv)
+    const materialized = { root: outputRoot, files: new Set([delivered]) }
+    const env = { PATH: '/usr/bin', [CLI_ENV]: current.cliPath, [ATTACHMENT_OUTPUT_DIR_ENV]: outputRoot, [RUN_TMP_ENV]: outputRoot }
+    const send = (files, baseEnv = env, materializedFiles = materialized) =>
+      plan(current, { operation: 'thread.message.send', input: { files } }, { baseEnv, materialized: materializedFiles })
+    const refused = (files, baseEnv = env, materializedFiles = materialized) => {
+      const outcome = send(files, baseEnv, materializedFiles)
       assert.equal(outcome.ok, false, `${JSON.stringify(files)} must be refused`)
       assert.equal(outcome.code, 'loom_send_path_not_allowed', `${JSON.stringify(files)} code`)
       assert.equal('plan' in outcome, false, 'no child is planned for a refused path')
     }
-    // The generated run-private copy and every workspace-relative path are accepted.
+    // The generated copy and every workspace-relative path are accepted.
     assert.equal(send([delivered]).ok, true, send([delivered]).code)
     assert.equal(send(['deliverables/report.docx']).ok, true)
     assert.equal(send(['deliverables/report.docx'], { PATH: '/usr/bin', [CLI_ENV]: current.cliPath }).ok, true)
-    // Any other absolute host path is refused: outside the run directory, the directory itself, a
-    // name that is not a real file, and a Host with no usable ROVAI_RUN_TMP at all.
+    // Any other absolute host path is refused: outside the output root, an output-root file the bridge
+    // never materialized, the directory itself, a name that is not a real file, and a Host with no
+    // usable attachment output root at all.
     refused([secret])
     refused([delivered, secret])
-    refused([runTmp])
-    refused([join(runTmp, 'missing.docx')])
-    refused([resolve(runTmp, '..', 'escape.docx')])
-    refused([delivered], { PATH: '/usr/bin', [CLI_ENV]: current.cliPath })
-    refused([delivered], { PATH: '/usr/bin', [CLI_ENV]: current.cliPath, [RUN_TMP_ENV]: join(runTmp, 'gone') })
-    // A symlink inside the run directory is a host path this bridge never follows.
+    refused([foreign])
+    refused([join(outputRoot, 'never-written.docx')])
+    refused([delivered, foreign])
+    refused([outputRoot])
+    refused([join(outputRoot, 'missing.docx')])
+    refused([resolve(outputRoot, '..', 'escape.docx')])
+    // A registry that says "materialized" without the Host naming that same root is not authority.
+    refused([delivered], { PATH: '/usr/bin', [CLI_ENV]: current.cliPath, [ATTACHMENT_OUTPUT_DIR_ENV]: join(outputRoot, 'elsewhere') },
+      { root: join(outputRoot, 'elsewhere'), files: new Set([delivered]) })
+    // A Host that handed this bridge no output root at all has nothing to compare against.
+    refused([delivered], { PATH: '/usr/bin', [CLI_ENV]: current.cliPath }, null)
+    // An empty registry is an empty allow-list, never "everything in the root".
+    refused([delivered], env, null)
+    // A canonical output root that no longer exists refuses, even when the registry names it.
+    refused([delivered], env, { root: join(outputRoot, 'gone'), files: new Set([delivered]) })
+    // A registry that holds a different file refuses this one.
+    refused([delivered], env, { root: outputRoot, files: new Set([foreign]) })
+    // run-tmp is no longer an absolute-send authority: a file under ROVAI_RUN_TMP that the bridge
+    // materialized nowhere is refused even though run-tmp is canonical.
+    const runTmpOnlyDir = mkdtempSync(join(tmpdir(), 'loom-send-run-tmp-only-'))
+    try {
+      const runTmpFile = join(runTmpOnlyDir, `${MATERIALIZED_PREFIX}0123456789abcdef.docx`)
+      writeFileSync(runTmpFile, 'docx-bytes', 'utf8')
+      refused([runTmpFile], { PATH: '/usr/bin', [CLI_ENV]: current.cliPath, [RUN_TMP_ENV]: runTmpOnlyDir })
+    } finally {
+      await rm(runTmpOnlyDir, { recursive: true, force: true })
+    }
+    // A symlink inside the output root is a host path this bridge never follows.
     let linked = false
     try {
-      symlinkSync(secret, join(runTmp, 'link.docx'), 'file')
+      symlinkSync(secret, join(outputRoot, 'link.docx'), 'file')
       linked = true
     } catch (error) {
       if (error?.code !== 'EPERM' && error?.code !== 'EACCES') throw error
     }
-    if (linked) refused([join(runTmp, 'link.docx')])
+    if (linked) refused([join(outputRoot, 'link.docx')])
     // The existing shape, count, NUL and parent checks still answer first.
     assert.equal(send(['../escape.docx']).code, 'loom_send_files_parent_escape')
     assert.equal(send(['a\u0000b']).code, 'loom_send_files_nul_byte')
     assert.equal(send(Array.from({ length: 11 }, (_, index) => `${index}.docx`)).code, 'loom_send_files_too_many')
   } finally {
     await rm(current.root, { recursive: true, force: true })
-    await rm(runTmp, { recursive: true, force: true })
+    await rm(outputRoot, { recursive: true, force: true })
     await rm(outside, { recursive: true, force: true })
   }
 })
 
-test('15c · the extension wiring resolves the requested path and ROVAI_RUN_TMP in one place', () => {
-  const runTmp = resolve('/run-tmp')
-  const fsApi = fakeMaterializeFs({ directory: runTmp })
+test('15c · the extension wiring resolves the requested path and ROVAI_ATTACHMENT_OUTPUT_DIR in one place', () => {
+  const outputRoot = resolve('/attachments/camp-1')
+  const fsApi = fakeMaterializeFs({ directory: outputRoot })
   const result = readResult({ kind: 'read', encoding: 'base64', data: Buffer.from('docx-bytes').toString('base64'), offset: 0, truncated: false })
+  const recorded = []
   const delivered = applyReadbackForCall({
     operation: MATERIALIZE_OPERATION,
     result,
     params: { operation: MATERIALIZE_OPERATION, input: { workspaceId: 'w', path: 'deliverables/report.docx' } },
-    env: { [RUN_TMP_ENV]: runTmp },
+    env: { [ATTACHMENT_OUTPUT_DIR_ENV]: outputRoot },
+    recordMaterialized: (root, file) => recorded.push([root, file]),
     fsApi,
   })
   assert.ok(delivered.localFile, delivered.text)
   assert.equal(delivered.localFile.path.endsWith('.docx'), true)
-  // No run directory, no local copy — and the model still sees the read result.
+  assert.deepEqual(recorded, [[outputRoot, delivered.localFile.path]], 'the written file becomes the only sendable absolute path')
+  // A readback that produced no file records nothing.
+  const recordedAfterMiss = []
+  applyReadbackForCall({
+    operation: 'loom.workspace.list',
+    result: { isError: false, code: 'ok', text: '{"kind":"list"}', indeterminate: false },
+    params: { operation: 'loom.workspace.list', input: {} },
+    env: { [ATTACHMENT_OUTPUT_DIR_ENV]: outputRoot },
+    recordMaterialized: (root, file) => recordedAfterMiss.push([root, file]),
+    fsApi,
+  })
+  assert.deepEqual(recordedAfterMiss, [])
+  // No output root, no local copy — and the model still sees the read result.
   const unwired = applyReadbackForCall({
     operation: MATERIALIZE_OPERATION,
     result,
@@ -1208,9 +1279,9 @@ test('15c · the extension wiring resolves the requested path and ROVAI_RUN_TMP 
     fsApi,
   })
   assert.equal(unwired.localFile, undefined)
-  assert.match(unwired.text, /loom_run_tmp_unavailable/u)
+  assert.match(unwired.text, /loom_attachment_output_unavailable/u)
   // A malformed parameter object can never select a path.
-  const noInput = applyReadbackForCall({ operation: MATERIALIZE_OPERATION, result, params: 'not-an-object', env: { [RUN_TMP_ENV]: runTmp }, fsApi })
+  const noInput = applyReadbackForCall({ operation: MATERIALIZE_OPERATION, result, params: 'not-an-object', env: { [ATTACHMENT_OUTPUT_DIR_ENV]: outputRoot }, fsApi })
   assert.equal(noInput.localFile !== undefined, true, 'extension falls back to .bin rather than failing')
   assert.equal(noInput.localFile.path.endsWith('.bin'), true)
 })

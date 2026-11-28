@@ -1236,6 +1236,28 @@ mod managed_workflow_source_tests {
         assert!(PI_FILE_GUARD_EXTENSION_SOURCE.contains("loadGrantFromFile(grantPath)"));
     }
 
+    /// The durable readback root travels by one environment name on both ends of the same contract.
+    ///
+    /// The Rust side sets `ROVAI_ATTACHMENT_OUTPUT_DIR` from `attachment_authorization.output_root`;
+    /// the embedded bridge reads that exact name. A drift here would silently send every materialized
+    /// copy back to the run-tmp tree that is retired with the Run.
+    #[test]
+    fn the_bridge_and_the_host_agree_on_the_attachment_output_root_name() {
+        assert_eq!(
+            crate::builtin_tool_transport::ROVAI_ATTACHMENT_OUTPUT_DIR_ENV,
+            "ROVAI_ATTACHMENT_OUTPUT_DIR"
+        );
+        assert!(
+            MANAGED_WORKFLOW_TOOL_EXTENSION
+                .contains("ATTACHMENT_OUTPUT_DIR_ENV = \"ROVAI_ATTACHMENT_OUTPUT_DIR\"")
+        );
+        // The managed extension records what it materialized; the bridge refuses any other absolute
+        // path. run-tmp is no longer the write root, and it is no longer an absolute-send authority.
+        assert!(include_str!("pi/managed-host.ts").contains("recordMaterialized"));
+        assert!(MANAGED_WORKFLOW_TOOL_EXTENSION.contains("loom_attachment_output_unavailable"));
+        assert!(!MANAGED_WORKFLOW_TOOL_EXTENSION.contains("under ROVAI_RUN_TMP"));
+    }
+
     /// P0 step 3: the document the shared guard reads is re-issued for the claim the Run holds now,
     /// and ONLY the claim moves. The guard re-reads this file before every decision, so this is the
     /// whole mechanism that lets a `loom.claim` issued after the Host started take effect — including

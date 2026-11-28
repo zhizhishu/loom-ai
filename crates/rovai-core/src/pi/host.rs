@@ -45,6 +45,7 @@ use url::Url;
 use crate::{
     acp::CompletedAcpAction,
     builtin_tool_runtime::{BuiltinToolProcessConfig, BuiltinToolProcessConfigFactory},
+    builtin_tool_transport::ROVAI_ATTACHMENT_OUTPUT_DIR_ENV,
     loom::LiveClaim,
     runtime_fleet::{
         AgentRuntimeFleetManager, FleetAcquireRequest, FleetReleaseDisposition,
@@ -435,6 +436,10 @@ struct PiHostLaunch<'a> {
     /// `true` only for `workspace_workflow`: the managed business tool needs the Core-injected CLI
     /// context, so a Host without it must fail closed instead of loading an unusable tool.
     require_builtin_tools: bool,
+    /// The durable Camp attachment output root the managed bridge materializes into. `/` means the
+    /// launching Core named none, and the bridge then declines to write rather than falling back to
+    /// the retired run directory.
+    attachment_output_root: Option<&'a Path>,
 }
 
 struct PiProbeRootCleanup(PathBuf);
@@ -740,6 +745,11 @@ impl PiHost {
         }
         if let Some(config) = &launch.builtin_tools {
             config.configure_command(&mut command)?;
+        }
+        // The managed bridge writes readback copies here. It is the Run's existing
+        // `attachmentOutputRoot`, never the process-private run directory.
+        if let Some(output_root) = launch.attachment_output_root {
+            command.env(ROVAI_ATTACHMENT_OUTPUT_DIR_ENV, node_path(output_root));
         }
         let entry = managed_mcp.as_ref().map_or(extension_path.as_path(), |(_, _, entry)| entry.as_path());
         append_host_arguments(
@@ -2353,6 +2363,13 @@ pub struct PiAgentRunRuntimeRequest<'a> {
     /// grant must refuse `write`/`edit` until a live claim is presented (P0 step 3). `false` keeps
     /// ordinary chat Grants byte-identical to the pre-P0 behaviour.
     pub requires_claim: bool,
+    /// This Run's durable Camp attachment output root (`attachment_authorization.output_root`).
+    ///
+    /// The managed workflow bridge writes its generated readback copies there instead of into the
+    /// process-private `ROVAI_RUN_TMP`, which is retired with the Run and would leave a group
+    /// attachment's `sourcePath` dangling. It is handed to the Host as one environment value; it is
+    /// not a new grant, a new record field or a wire change.
+    pub attachment_output_root: &'a Path,
 }
 
 impl PiRpcRuntimeAdapter {
@@ -2463,6 +2480,8 @@ impl PiRpcRuntimeAdapter {
         let spawn_mcp = request.mcp.cloned();
         let spawn_purge = request.frozen_runtime.pi_purge.clone();
         let spawn_agent_id = request.agent_id.to_string();
+        // The managed bridge's write root, owned by this closure like every other spawned value.
+        let spawn_attachment_output_root = request.attachment_output_root.to_path_buf();
         // The policy comes from the frozen runtime permissions; the workspace is the canonical root Core
         // already chose for this AgentRun. Neither the prompt nor the environment may supply either.
         let file_access_mode = mode_from_permissions(&request.frozen_runtime.permissions.values)?;
@@ -2545,6 +2564,7 @@ impl PiRpcRuntimeAdapter {
                         file_grant: spawn_file_grant.as_ref(),
                         pi_purge: spawn_purge.as_ref(),
                         require_builtin_tools,
+                        attachment_output_root: Some(&spawn_attachment_output_root),
                     })
                     .await?;
                     Ok(RuntimeProcessHost::Pi(host))
@@ -2828,6 +2848,7 @@ async fn spawn_probe_host(executable: &Path) -> Result<(Arc<PiHost>, PiProbeRoot
         file_grant: None,
         pi_purge: None,
         require_builtin_tools: false,
+        attachment_output_root: None,
     })
     .await?;
     Ok((host, _probe_root_cleanup))
@@ -4156,6 +4177,7 @@ done
             file_grant: None,
             pi_purge: None,
             require_builtin_tools: false,
+            attachment_output_root: None,
         })
         .await
         .unwrap();
@@ -4396,6 +4418,7 @@ done
                 file_grant: None,
                 pi_purge: None,
                 require_builtin_tools: false,
+                attachment_output_root: None,
             })
             .await
             .unwrap();
@@ -4753,6 +4776,7 @@ done
                 file_grant: None,
                 pi_purge: None,
                 require_builtin_tools: false,
+                attachment_output_root: None,
             })
             .await?;
             let state = host.command("get_state", json!({})).await;

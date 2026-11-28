@@ -16,12 +16,15 @@
  *
  * Binary deliveries: Pi's own `write` tool is text-only, so a Run cannot materialize a `.docx` with
  * it. After an untruncated `loom.workspace.read`, this bridge decodes the returned bytes itself and
- * writes one generated copy under `ROVAI_RUN_TMP` (mode 0600, exclusive create, content-addressed
- * name), then reports that absolute path. `thread.message.send` `files` is the existing ordinary
- * attachment path, and Core's `camp_attachment` accepts exactly workspace or `ROVAI_RUN_TMP`
- * sources, so the model never needs a filesystem capability of its own. A `files` entry is a
- * workspace-relative path or that run-private copy; the bridge refuses any other absolute host path
- * before a child starts.
+ * writes one generated copy under this Run's durable attachment output root
+ * (`ROVAI_ATTACHMENT_OUTPUT_DIR`, the Camp `attachmentOutputRoot` Core already exposes) with mode
+ * 0600, exclusive create and a content-addressed name, then reports that absolute path. That root
+ * outlives the Run: the process-private run-tmp tree is retired when the Run ends, so a copy left
+ * there would make a group attachment's `sourcePath` dangle. `thread.message.send` `files` is the
+ * existing ordinary attachment path, so the model never needs a filesystem capability of its own. A
+ * `files` entry is either a workspace-relative path (unchanged semantics) or exactly one of the
+ * absolute files this bridge materialized in this extension process; every other absolute host path
+ * is refused before a child starts.
  *
  * This file is a pure contract plus one injected-runtime helper:
  * - No top-level side effects: importing it starts no process and touches no credential or
@@ -35,7 +38,7 @@
  *   is two fixed words (one for `send`) taken from a closed table; the model's parameters travel on
  *   stdin only.
  * - No arbitrary output path and no delete: the only file this module ever creates is one generated
- *   copy under `ROVAI_RUN_TMP`, and it never overwrites an existing name.
+ *   copy under the Run's attachment output root, and it never overwrites an existing name.
  * - No silent retry: an unknown outcome is reported as indeterminate instead of being re-sent with a
  *   fresh request id.
  */
@@ -92,7 +95,7 @@ export const LOOM_OPERATION_ARGV: Readonly<Record<string, readonly string[]>> = 
   "loom.workspace.read": ["workspace", "read"],
   "loom.workspace.write": ["workspace", "write"],
   // The one operation outside the `rovai loom` family: the ordinary group send whose `files` names
-  // the local copy this bridge materialized under ROVAI_RUN_TMP.
+  // the local copy this bridge materialized under ROVAI_ATTACHMENT_OUTPUT_DIR.
   "thread.message.send": ["send"],
 })
 
@@ -209,8 +212,16 @@ const RESERVED_DEVICE = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i
 /** Interpreters, not executables: a child started through one is an arbitrary-command surface. */
 const SCRIPT_EXTENSIONS = [".cmd", ".bat", ".com", ".ps1", ".vbs", ".js", ".mjs", ".cjs", ".sh", ".py"]
 const IS_WIN = process.platform === "win32"
-/** The run-private directory Core already fills for this Run; the only place this module writes. */
+/** The run-private directory Core already fills for this Run (readable; retired when the Run ends). */
 export const RUN_TMP_ENV = "ROVAI_RUN_TMP"
+/**
+ * This Run's durable Camp attachment output root — the only place this module writes.
+ *
+ * Core fills it from the same `attachment_authorization.output_root` that `RUN_FACTS` publishes as
+ * `attachmentOutputRoot`, so a generated copy survives the Run (and the run-tmp retirement that
+ * follows it) and stays attachable. A Host without it neither guesses nor falls back to run-tmp.
+ */
+export const ATTACHMENT_OUTPUT_DIR_ENV = "ROVAI_ATTACHMENT_OUTPUT_DIR"
 /** The one operation whose untruncated result bytes become a local file. */
 export const MATERIALIZE_OPERATION = "loom.workspace.read"
 /** Mirrors `MAX_WRITE_BYTES` / `MAX_READ_BYTES` in crates/loom-protocol/src/workspace_rpc.rs. */
@@ -486,11 +497,12 @@ export function workspaceWriteDataProblem(data: string): string | null {
  * Pre-check the local sources one group send may name.
  *
  * Each entry must be a non-empty local path string with no NUL and no parent segment. A relative
- * entry is resolved by Core against the Run workspace; an absolute entry is only admissible when it
- * is this Run's own materialized copy inside the canonical `ROVAI_RUN_TMP`. Core's
- * `camp_attachment::freeze_agent_sources` is still the authority: it accepts only the AgentRun
- * workspace or `ROVAI_RUN_TMP`, refuses symlinks and parent components, and freezes a copy. This
- * refuses every other host path — and every shape no authority could accept — before a child exists.
+ * entry keeps its unchanged workspace semantics: Core resolves it against the Run workspace. An
+ * absolute entry is only admissible when it is exactly one of the files this bridge materialized in
+ * this extension process, inside the canonical attachment output root this Run was given (see
+ * `MaterializedRegistry`). Core's `camp_attachment::freeze_agent_sources` remains the authority for
+ * the freeze itself; this refuses every other host path — and every shape no authority could accept —
+ * before a child exists.
  */
 export function attachmentFilesProblem(raw: unknown, paths?: SendPathContext): string | null {
   if (raw === undefined || raw === null) return null
@@ -505,29 +517,60 @@ export function attachmentFilesProblem(raw: unknown, paths?: SendPathContext): s
   return absoluteFilesProblem(raw, paths)
 }
 
-/** The run-private directory Core handed this Host, plus the filesystem seam a test can drive. */
-export type SendPathContext = { runTmp?: unknown; fsApi?: MaterializeFs }
+/**
+ * The exact canonical files this bridge materialized in this extension process, plus the canonical
+ * attachment output root they were written into.
+ *
+ * This registry is the whole absolute-path allow-list for a send: a path that is not in here was not
+ * produced by the bridge, even when it sits in the same directory. Paths compare case-insensitively
+ * on Windows, where two spellings can name one file.
+ */
+export type MaterializedRegistry = {
+  root: string
+  files: ReadonlySet<string>
+}
+
+/** The Run's output root env values, the materialized allow-list, and the filesystem seam a test drives. */
+export type SendPathContext = {
+  runTmp?: unknown
+  attachmentOutputRoot?: unknown
+  materialized?: MaterializedRegistry | null
+  fsApi?: MaterializeFs
+}
 
 /**
  * Refuse an arbitrary absolute host path.
  *
- * An absolute entry may only name the run-private copy this bridge materialized: `ROVAI_RUN_TMP`
- * must canonicalize to an existing directory, and the entry must be a regular non-symlink file
- * whose own canonical path is inside it. A Host with no usable run directory refuses every absolute
- * entry rather than guessing.
+ * An absolute entry may only name a file this bridge materialized: its canonical path must be in the
+ * registry, the registry's canonical root must still exist, and that exact canonical path must sit
+ * inside it. A Host with no usable output root, or a file the bridge never wrote, refuses every
+ * absolute entry rather than guessing.
  */
 function absoluteFilesProblem(files: readonly string[], paths?: SendPathContext): string | null {
   const absolute = files.filter(isAbsoluteHostPath)
   if (absolute.length === 0) return null
   const fsApi = paths?.fsApi ?? materializeFs()
-  const runTmp = paths?.runTmp
-  const root = typeof runTmp === "string" && runTmp.length > 0 ? fsApi.canonicalDirectory(runTmp) : null
+  const materialized = paths?.materialized ?? null
+  if (!materialized) return "path_not_allowed"
+  const root = fsApi.canonicalDirectory(materialized.root)
   if (root === null) return "path_not_allowed"
   for (const entry of absolute) {
     const settled = fsApi.canonicalFile(entry)
     if (settled === null || !containedIn(root, settled)) return "path_not_allowed"
+    if (!registryHas(materialized.files, settled)) return "path_not_allowed"
   }
   return null
+}
+
+/** True when this exact canonical path is one the bridge materialized (case-insensitive on Windows). */
+function registryHas(files: ReadonlySet<string>, settled: string): boolean {
+  if (files.has(settled)) return true
+  if (!IS_WIN) return false
+  const target = norm(settled)
+  for (const known of files) {
+    if (norm(known) === target) return true
+  }
+  return false
 }
 
 /** Absolute, drive-qualified or host-rooted: every shape Core would resolve as a host path. */
@@ -643,6 +686,10 @@ export type InvocationPlan = {
  * Build the exact invocation for one tool call: the frozen operation table plus a per-child
  * environment carrying this call's request id. Nothing here reads or writes `process.env`, so two
  * concurrent calls in one Host cannot cross request ids.
+ *
+ * `materialized` is the extension process's own record of the files this bridge wrote. It is never
+ * derived from the environment, so a Run cannot widen its own absolute-path allow-list by naming a
+ * directory.
  */
 export function planInvocation(options: {
   toolCallId: unknown
@@ -653,6 +700,8 @@ export function planInvocation(options: {
   nowMs: number
   cliPath: unknown
   baseEnv: Record<string, string | undefined>
+  /** The files this bridge materialized in this process; absent means "none". */
+  materialized?: MaterializedRegistry | null
 }): { ok: true; plan: InvocationPlan } | { ok: false; code: string } {
   const { grant, binding, nowMs } = options
   if (typeof options.toolCallId !== "string" || options.toolCallId.trim().length === 0) {
@@ -672,6 +721,8 @@ export function planInvocation(options: {
   }
   const validated = validateLoomParams(options.params, options.contracts, {
     runTmp: options.baseEnv[RUN_TMP_ENV],
+    attachmentOutputRoot: options.baseEnv[ATTACHMENT_OUTPUT_DIR_ENV],
+    materialized: options.materialized ?? null,
   })
   if (!validated.ok) return validated
   const resolved = resolveTrustedCli(options.cliPath)
@@ -829,18 +880,23 @@ function materializeFs(): MaterializeFs {
 }
 
 /**
- * Turn the bytes of one untruncated read into a local file under `ROVAI_RUN_TMP`.
+ * Turn the bytes of one untruncated read into a durable copy under the Run's attachment output root.
  *
- * The name is generated from the payload digest, so a retry maps to the same file and a different
- * payload can never reuse a name. Creation is exclusive: an existing name is either the identical
- * copy (reused) or a conflict (refused). No path comes from the model, nothing is overwritten, and
- * nothing outside the canonicalized run directory is written.
+ * The root is the Camp `attachmentOutputRoot` Core handed this Host; it is the ONLY directory this
+ * bridge writes, and it is never `ROVAI_RUN_TMP`: the run-tmp tree is retired with the Run, which is
+ * exactly what made an attached `sourcePath` dangle. A Host without a usable output root reports a
+ * fail-safe note and writes nothing — there is no run-tmp fallback.
+ *
+ * The name is generated from the payload digest, so a retry (or a replay) maps to the same file and a
+ * different payload can never reuse a name. Creation is exclusive: an existing name is either the
+ * identical copy (reused) or a conflict (refused). No path comes from the model, nothing is
+ * overwritten, and nothing outside the canonicalized output root is written.
  */
 export function materializeReadBack(options: {
   operation: string
   result: RunResult
   requestedPath: unknown
-  runTmp: unknown
+  attachmentOutputRoot: unknown
   fsApi?: MaterializeFs
 }): RunResult {
   const { operation, result } = options
@@ -850,8 +906,10 @@ export function materializeReadBack(options: {
     ...result,
     text: `${result.text}\n[rovai] No local attachment copy: ${code}. Use a smaller maxBytes with offset 0 and retry the read if the file must be attached.`,
   })
-  const root = typeof options.runTmp === "string" && options.runTmp.length > 0 ? fsApi.canonicalDirectory(options.runTmp) : null
-  if (root === null) return withNote("loom_run_tmp_unavailable")
+  const outputRoot = options.attachmentOutputRoot
+  const root = typeof outputRoot === "string" && outputRoot.length > 0 ? fsApi.canonicalDirectory(outputRoot) : null
+  // Fail safe: never fall back to the process-private run directory.
+  if (root === null) return withNote("loom_attachment_output_unavailable")
   const decoded = readPayload(result.text)
   if (!decoded.ok) return withNote(decoded.code)
   const { bytes, encoding, offset } = decoded.payload
@@ -879,21 +937,26 @@ export function materializeReadBack(options: {
     ...result,
     localFile: file,
     text: `${header}\n\n[rovai] local file: ${file.path}\n`
-      + `${bytes.length} bytes, sha256 ${sha256}, ${reused ? "already materialized" : "written"} under ROVAI_RUN_TMP, untruncated read from offset 0.`
+      + `${bytes.length} bytes, sha256 ${sha256}, ${reused ? "already materialized" : "written"} under this Run's attachment output root, untruncated read from offset 0.`
       + ` Pass exactly this path in thread.message.send files to attach it.`,
   }
 }
 
 /**
  * Production wiring for one finished call: the extension hands over the planned operation, the raw
- * provider parameters and its own environment, and this resolves the two inputs the readback needs
- * (the requested workspace path and `ROVAI_RUN_TMP`) in ONE place that a unit test can drive.
+ * provider parameters and its own environment, and this resolves the inputs the readback needs (the
+ * requested workspace path and `ROVAI_ATTACHMENT_OUTPUT_DIR`) in ONE place a unit test can drive.
+ *
+ * `recordMaterialized` is the extension's own allow-list: it is called with the canonical path of
+ * every file this bridge wrote, so a later `thread.message.send` can name exactly that file and
+ * nothing else. A failed materialization records nothing.
  */
 export function applyReadbackForCall(options: {
   operation: string
   result: RunResult
   params: unknown
   env: Record<string, string | undefined>
+  recordMaterialized?: (root: string, path: string) => void
   fsApi?: MaterializeFs
 }): RunResult {
   const input = isRecord(options.params) && isRecord(options.params.input) ? options.params.input : {}
@@ -901,10 +964,16 @@ export function applyReadbackForCall(options: {
     operation: options.operation,
     result: options.result,
     requestedPath: input.path,
-    runTmp: options.env[RUN_TMP_ENV],
+    attachmentOutputRoot: options.env[ATTACHMENT_OUTPUT_DIR_ENV],
   }
   if (options.fsApi) request.fsApi = options.fsApi
-  return materializeReadBack(request)
+  const delivered = materializeReadBack(request)
+  const file = delivered.localFile
+  if (file && options.recordMaterialized) {
+    const root = options.env[ATTACHMENT_OUTPUT_DIR_ENV]
+    if (typeof root === "string" && root.length > 0) options.recordMaterialized(root, file.path)
+  }
+  return delivered
 }
 
 // ---------------------------------------------------------------------------
@@ -983,7 +1052,7 @@ export type RunResult = {
   text: string
   /** `true` when Core may have committed the operation; the caller must never retry with a new id. */
   indeterminate: boolean
-  /** Set only when an untruncated `loom.workspace.read` produced a run-private local copy. */
+  /** Set only when an untruncated `loom.workspace.read` produced a durable local copy. */
   localFile?: MaterializedFile
 }
 

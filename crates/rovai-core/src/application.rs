@@ -18324,6 +18324,10 @@ impl Core {
                 mcp: managed_mcp.as_ref(),
                 live_claim: loom_binding.claim.as_ref(),
                 requires_claim: loom_binding.requires_claim,
+                // The managed workflow bridge materializes generated readback copies here (the same
+                // `attachmentOutputRoot` RUN_FACTS already publishes) instead of into the
+                // process-private run-tmp tree, which is retired when this Run ends.
+                attachment_output_root: &attachment_authorization.output_root,
             })
             .await;
         let runtime = match runtime_result {
@@ -18397,6 +18401,7 @@ impl Core {
                 mcp: managed_mcp.as_ref(),
                         live_claim: loom_binding.claim.as_ref(),
                         requires_claim: loom_binding.requires_claim,
+                        attachment_output_root: &attachment_authorization.output_root,
                     })
                     .await
                     .with_context(|| {
