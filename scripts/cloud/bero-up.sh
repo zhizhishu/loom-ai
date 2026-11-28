@@ -3,6 +3,7 @@
 # LOOM one-command runner for the DE-BERO host.
 #
 #   bash scripts/cloud/bero-up.sh <loom-personal-preview-linux-<sha>.tar.gz>
+#   bash scripts/cloud/bero-up.sh --upgrade <loom-personal-preview-linux-<sha>.tar.gz>
 #
 # Input is one downloaded CI Linux personal artifact (uploaded by
 # .github/workflows/loom-v2-e3-linux.yml as loom-personal-preview-linux-<sha>,
@@ -10,6 +11,21 @@
 # WebUI behind a cloudflared quick tunnel, plus the operator facts needed to use
 # it: tunnel URL, image tag, where the Owner token lives and the exact command
 # that prints it.
+#
+# Both modes share one build path: the archive is extracted, the allowlisted
+# payload is staged and the `runtime` image is built exactly the same way. They
+# differ only in what they do to the running compose stack:
+#   * normal (no flag) starts cloudflared + core, waits for the quick tunnel URL
+#     and recreates core once with PUBLIC_ORIGIN=<that URL>.
+#   * --upgrade leaves the running stack alone. It never runs the initial
+#     `docker compose up -d --wait`, never starts or restarts cloudflared, and
+#     never recreates the tunnel. It reads the CURRENT quick tunnel URL from
+#     `docker compose logs cloudflared`, refuses if that log holds none, and
+#     recreates ONLY core with the new image and that URL, via
+#     `--force-recreate --no-deps`. The live tunnel URL therefore keeps working.
+#     No volume is removed, `down` is never run and /data (rovai.sqlite,
+#     web-auth.json, skills, logs) is reused as-is, so the Owner token and all
+#     server state survive the upgrade.
 #
 # Nothing here compiles: no cargo, no pnpm, no npm, no python3, neither inside
 # nor outside the image. The only build is the `runtime` stage of
@@ -45,6 +61,10 @@ umask 022
 
 usage() {
   printf 'usage: bash scripts/cloud/bero-up.sh <CI-linux-personal.tar.gz>\n' >&2
+  printf '       bash scripts/cloud/bero-up.sh --upgrade <CI-linux-personal.tar.gz>\n' >&2
+  printf '  --upgrade  build the new image, then recreate only core against the\n' >&2
+  printf '             existing cloudflared quick tunnel URL (cloudflared and /data\n' >&2
+  printf '             are left untouched)\n' >&2
 }
 
 die() {
@@ -67,8 +87,16 @@ for required in docker-compose.yml docker/Dockerfile docker/entrypoint.sh docker
   [ -f "$required" ] || die "$repo_root is not a LOOM checkout: missing $required"
 done
 
+mode=normal
+if [ "${1:-}" = '--upgrade' ]; then
+  mode=upgrade
+  shift
+fi
 [ "$#" -eq 1 ] || { usage; exit 2; }
 archive_input=$1
+case "$archive_input" in
+  -*) usage; exit 2 ;;
+esac
 [ -f "$archive_input" ] && [ -r "$archive_input" ] ||
   die "input is not a readable file: $archive_input"
 case "$archive_input" in
@@ -165,34 +193,68 @@ docker build --progress=plain --target runtime \
 
 # ---------------------------------------------------- 4. cloudflared + core
 export LOOM_IMAGE="$image"
-log 'starting cloudflared and core'
-docker compose up -d --wait ||
-  die 'docker compose up --wait did not reach a healthy state; inspect: docker compose ps; docker compose logs core'
 
-log 'waiting up to 60s for the cloudflared quick tunnel URL'
-tunnel_url=''
-deadline=$((SECONDS + 60))
-while [ "$SECONDS" -lt "$deadline" ]; do
-  # The quick tunnel URL lives in cloudflared's own log and changes only when
-  # cloudflared restarts, so the most recent URL there is the live one.
-  tunnel_url=$(docker compose logs cloudflared 2>/dev/null |
-    grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -n 1 || true)
-  if [ -n "$tunnel_url" ]; then
-    break
-  fi
-  sleep 2
-done
-[ -n "$tunnel_url" ] ||
-  die 'cloudflared did not print a https://<name>.trycloudflare.com URL within 60s; inspect: docker compose logs cloudflared'
+# The quick tunnel URL lives in cloudflared's own log and changes only when
+# cloudflared restarts, so the most recent URL there is the live one.
+current_tunnel_url() {
+  docker compose logs cloudflared 2>/dev/null |
+    grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -n 1 || true
+}
 
-# Only core is recreated, so PUBLIC_ORIGIN takes effect without minting a new
-# tunnel URL. cloudflared keeps running untouched.
-log "recreating core with PUBLIC_ORIGIN=$tunnel_url (cloudflared is left running)"
-PUBLIC_ORIGIN="$tunnel_url" docker compose up -d --force-recreate --wait core ||
-  die 'core did not become healthy with the new PUBLIC_ORIGIN; inspect: docker compose logs core'
+if [ "$mode" = upgrade ]; then
+  # Upgrade never brings the stack up: cloudflared must already be running, and
+  # its current URL is reused verbatim so existing clients keep working.
+  log 'upgrade: reading the current cloudflared quick tunnel URL'
+  tunnel_url=$(current_tunnel_url)
+  [ -n "$tunnel_url" ] ||
+    die 'upgrade refused: docker compose logs cloudflared shows no https://<name>.trycloudflare.com URL; start the stack first (normal mode, or docker compose up -d --wait) — core was not recreated'
+
+  # --no-deps keeps cloudflared out of the recreation: it is neither started nor
+  # restarted, so the tunnel URL stays valid. No volume is removed and no `down`
+  # runs, so /data and the Owner token survive the upgrade.
+  log "upgrade: recreating only core with image $image and the reused PUBLIC_ORIGIN=$tunnel_url (cloudflared untouched, /data kept)"
+  PUBLIC_ORIGIN="$tunnel_url" docker compose up -d --force-recreate --no-deps --wait core ||
+    die 'core did not become healthy on the new image; inspect: docker compose logs core (no volume and no /data was removed)'
+else
+  log 'starting cloudflared and core'
+  docker compose up -d --wait ||
+    die 'docker compose up --wait did not reach a healthy state; inspect: docker compose ps; docker compose logs core'
+
+  log 'waiting up to 60s for the cloudflared quick tunnel URL'
+  tunnel_url=''
+  deadline=$((SECONDS + 60))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    tunnel_url=$(current_tunnel_url)
+    if [ -n "$tunnel_url" ]; then
+      break
+    fi
+    sleep 2
+  done
+  [ -n "$tunnel_url" ] ||
+    die 'cloudflared did not print a https://<name>.trycloudflare.com URL within 60s; inspect: docker compose logs cloudflared'
+
+  # Only core is recreated, so PUBLIC_ORIGIN takes effect without minting a new
+  # tunnel URL. cloudflared keeps running untouched.
+  log "recreating core with PUBLIC_ORIGIN=$tunnel_url (cloudflared is left running)"
+  PUBLIC_ORIGIN="$tunnel_url" docker compose up -d --force-recreate --wait core ||
+    die 'core did not become healthy with the new PUBLIC_ORIGIN; inspect: docker compose logs core'
+fi
 
 # ------------------------------------------------------------ 5. operator output
-cat <<EOF
+if [ "$mode" = upgrade ]; then
+  cat <<EOF
+
+LOOM Core was upgraded in place through the existing cloudflared quick tunnel.
+
+  new image        : $image
+  reused tunnel URL: $tunnel_url
+  source commit    : $source_commit
+  cloudflared      : left running, tunnel URL unchanged
+  data             : untouched (/data volume reused, nothing removed)
+  Owner token file : /data/web-auth.json (inside the core container)
+EOF
+else
+  cat <<EOF
 
 LOOM Core is up through the cloudflared quick tunnel.
 
@@ -200,6 +262,10 @@ LOOM Core is up through the cloudflared quick tunnel.
   image           : $image
   source commit   : $source_commit
   Owner token file: /data/web-auth.json (inside the core container)
+EOF
+fi
+
+cat <<EOF
 
 Read the Owner token only when you choose to. Its stdout is a secret: do not
 paste it into logs, issues, URLs or chat.
