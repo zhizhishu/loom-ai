@@ -5,7 +5,7 @@ authority: shared-host-web-transport
 status: accepted
 version: 4
 source_version: v1.67
-last_updated: 2026-10-17
+last_updated: 2026-11-28
 ---
 
 # Host Web v4
@@ -41,6 +41,24 @@ Composer；拒绝、尚无成功结果或后来编辑过的草稿保持不变。
 重选的 Thread、目标、文件名、大小和摘要一致时使用原意图（含原 revision），不生成第二个上传 ID。
 已知绑定失败结算原上传；未提交的普通草稿不会被连接恢复动作发送。
 呈现与键盘边界见 [Web 连接恢复](../ui/host-web-connection-recovery.md)。
+
+### SSE 事件编号与断点续传
+
+`GET /api/v1/events` 每一帧仍是授权后的失效通知，不是 Core 私有事件的回放。进程内 hub 为每条失效
+分配全进程单调的 `id`（从 1 起，跨 Session 共用一个序列）；`resync` 快照帧不带 `id`，与今天一样
+发 `{"epoch": …, "revision": 0}`。`invalidate` 帧的 `id:` 行就是该编号，payload 的 `revision` 字段
+同样是这个编号，仅用于观测，客户端不依赖其取值。编号和最近 2048 条失效只存在内存里，不落盘：
+重启即新 `epoch`，所有客户端重新取快照。
+
+重连带请求头 `Last-Event-ID: <最后收到的编号>`。服务端按以下规则决定是否发快照：
+
+- 无该头、值无法解析、编号大于本进程已发出的最新编号（重启或另一个 `epoch`）、或环里已不再包含
+  该编号之后的全部失效：与没有编号时一致，先发 `resync` 再续流；
+- 其余情况不发 `resync`，按序补发该编号之后的全部失效帧（各自带原 `id`），随后无缝接上实时流。
+
+hub 落后于 Core 或单个流的待发队列溢出时，丢失的失效不会再进入环，因此这些客户端同样只能收到
+`resync`。编号只保证同一进程内的连续性，不承诺跨 `resync` 或跨重启的连续；客户端收到 `resync`
+后必须重新取授权快照，不能把它当作可继续的流。旧客户端不带头时行为完全不变。
 
 ## Public Composer 上传恢复
 

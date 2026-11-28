@@ -345,6 +345,9 @@ type CommandReceipt = { state: 'unknown' | 'recorded'; result?: unknown; error?:
 export class InvalidationDecoder {
   #buffer = ''
   #changes: ThreadReadInvalidation[] = []
+  #lastId = 0
+  /** Highest `id:` this connection has framed; a resync frame carries none. */
+  lastId(): number { return this.#lastId }
   takeChanges(): ThreadReadInvalidation[] { return this.#changes.splice(0) }
   push(text: string): boolean {
     this.#buffer += text
@@ -355,6 +358,8 @@ export class InvalidationDecoder {
       if (!match) return changed
       const frame = this.#buffer.slice(0, match.index)
       this.#buffer = this.#buffer.slice(match.index + match[0].length)
+      const id = Number(/^id: ?(\d+)\r?$/m.exec(frame)?.[1])
+      if (Number.isSafeInteger(id) && id > this.#lastId) this.#lastId = id
       if (/^event: ?(?:resync|invalidate)\r?$/m.test(frame)) {
         changed = true
         if (/^event: ?resync\r?$/m.test(frame)) this.#changes.push({ resync: true })
@@ -453,6 +458,9 @@ export class ConsoleClient {
   #needsRecovery = false
   #connectionListeners = new Set<() => void>()
   #wakeReconnect: (() => void) | null = null
+  // Process-wide SSE id from the last framed invalidation. Reconnects resume
+  // after it; a server that never sends ids leaves it 0, so no header is sent.
+  #lastEventId = 0
   get connectionState(): ConnectionState {
     return this.#connection === 'live' && this.#needsRecovery ? 'offline' : this.#connection
   }
@@ -716,6 +724,7 @@ export class ConsoleClient {
     this.#expiresAt = this.#localExpiry = null
     this.#retryRenewalAt = 0
     this.#renewal = null
+    this.#lastEventId = 0
     this.#generation++
     this.#localUploads.clear()
     this.#lifetime.abort()
@@ -987,6 +996,10 @@ export class ConsoleClient {
     }
     return body
   }
+
+  /** Returns the page to the network now instead of waiting out SSE backoff.
+   * iOS suspends background pages, so visibility/online wakes the loop too. */
+  wakeLive(): void { this.#wakeReconnect?.() }
 
   /** Explicit user action only. Reconcile first, then reuse exact identities and
    * payloads for requests whose receipts are still unknown. Never called by SSE,
@@ -1397,7 +1410,11 @@ export class ConsoleClient {
         try {
           // Starting another fetch neither proves availability nor invalidates
           // the successful login. Keep an existing offline gate until it opens.
-          const response = await this.#authorized('events', { signal })
+          const lastEventId = this.#lastEventId
+          const response = await this.#authorized('events', {
+            signal,
+            ...(lastEventId > 0 ? { headers: { 'Last-Event-ID': String(lastEventId) } } : {})
+          })
           if (signal.aborted) { await response.body?.cancel(); return }
           if (!response.body) throw new Error('实时连接不可用。')
           reader = response.body.getReader()
@@ -1410,6 +1427,7 @@ export class ConsoleClient {
             const { value, done } = await reader.read()
             if (done) break
             if (frames.push(decoder.decode(value, { stream: true }))) {
+              this.#lastEventId = frames.lastId()
               const changes = frames.takeChanges()
               invalidate({ resync: changes.some(change => change.resync), ...(changes.some(change => change.referencesChanged) ? { referencesChanged: true } : {}), ...(changes.some(change => change.notificationsChanged) ? { notificationsChanged: true } : {}), ...(changes.some(change => change.tasksChanged) ? { tasksChanged: true } : {}), ...(changes.some(change => change.teamsChanged) ? { teamsChanged: true } : {}), messages: changes.flatMap(change => change.messages ?? []) })
               void this.reconcilePending()

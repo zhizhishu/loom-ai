@@ -23,7 +23,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Extension, Path, Request, State},
-    http::{HeaderValue, Method, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response, Sse,
@@ -34,10 +34,13 @@ use axum::{
 use rovai_core::application::CoreService;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque, convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc,
+    time::Duration,
+};
 use tokio::{
     net::TcpListener,
-    sync::{Semaphore, oneshot},
+    sync::{Semaphore, broadcast, oneshot},
     task::JoinHandle,
 };
 
@@ -52,6 +55,155 @@ pub struct WebConfig {
     #[serde(default)]
     pub allow_insecure_lan: bool,
     pub ui_directory: PathBuf,
+}
+
+/// How many invalidations one process retains for replay. A client whose last
+/// id has fallen out of this window resynchronizes instead.
+const EVENT_LOG_CAPACITY: usize = 2048;
+/// Live fan-out backlog per stream; a stream that falls further behind
+/// resynchronizes, exactly like a Core lag.
+const EVENT_HUB_CAPACITY: usize = 256;
+
+/// One hub frame. Ids are assigned once, by the hub, so every Session observing
+/// the same Core change sees the same number.
+#[derive(Clone)]
+enum HubEvent {
+    Invalidate {
+        seq: u64,
+        change: Value,
+    },
+    /// The hub itself dropped Core invalidations; no stream can resume across it.
+    Resync,
+}
+
+#[derive(Default)]
+struct EventLogState {
+    /// Highest id handed out so far. Ids start at 1 and never repeat.
+    last_seq: u64,
+    /// Newest frames, oldest first.
+    ring: VecDeque<(u64, Value)>,
+    /// Smallest last-delivered id from which the ring still holds every later
+    /// frame. Ring eviction and hub lag both move it forward.
+    floor: u64,
+}
+
+/// Process-wide invalidation ids. Memory only: a restart is a new `epoch` and
+/// every client takes a fresh snapshot, so no cursor is persisted.
+struct EventLog {
+    state: std::sync::Mutex<EventLogState>,
+    live: broadcast::Sender<HubEvent>,
+}
+
+/// What one reconnecting stream gets before it joins the live fan-out.
+struct EventReplay {
+    frames: Vec<(u64, Value)>,
+    /// Highest id this connection already accounts for: live frames at or below
+    /// it were either replayed here or covered by the snapshot it is taking.
+    watermark: u64,
+    resync: bool,
+}
+
+impl EventLog {
+    fn new() -> Arc<Self> {
+        let (live, _) = broadcast::channel(EVENT_HUB_CAPACITY);
+        Arc::new(Self {
+            state: Default::default(),
+            live,
+        })
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<HubEvent> {
+        self.live.subscribe()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, EventLogState> {
+        // A panic elsewhere must not turn into a silently dead event stream.
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Assign the next id, retain the frame for replay, then publish it. The ring
+    /// is updated before the broadcast, so a snapshot always contains every id
+    /// that was ever sent and no connection sees a duplicate or a hole.
+    fn record(&self, change: Value) {
+        let (seq, change) = {
+            let mut state = self.lock();
+            state.last_seq += 1;
+            let seq = state.last_seq;
+            state.ring.push_back((seq, change.clone()));
+            while state.ring.len() > EVENT_LOG_CAPACITY {
+                if let Some((dropped, _)) = state.ring.pop_front() {
+                    state.floor = state.floor.max(dropped);
+                }
+            }
+            (seq, change)
+        };
+        let _ = self.live.send(HubEvent::Invalidate { seq, change });
+    }
+
+    /// Core outran the hub. The lost changes were never assigned an id, so no
+    /// client may resume across them: the next snapshot is required instead.
+    fn lag(&self) {
+        {
+            let mut state = self.lock();
+            state.floor = state.floor.max(state.last_seq + 1);
+        }
+        let _ = self.live.send(HubEvent::Resync);
+    }
+
+    /// No usable header always resynchronizes, and so does an id this process
+    /// cannot continue from: another epoch or restart (id ahead of the log), or
+    /// a gap the ring already dropped.
+    fn replay(&self, last_event_id: Option<u64>) -> EventReplay {
+        let state = self.lock();
+        let resync = last_event_id.is_none_or(|last_event_id| {
+            last_event_id > state.last_seq || last_event_id < state.floor
+        });
+        match last_event_id {
+            Some(last_event_id) if !resync => EventReplay {
+                frames: state
+                    .ring
+                    .iter()
+                    .filter(|(seq, _)| *seq > last_event_id)
+                    .cloned()
+                    .collect(),
+                watermark: state.last_seq,
+                resync: false,
+            },
+            _ => EventReplay {
+                frames: Vec::new(),
+                watermark: state.last_seq,
+                resync: true,
+            },
+        }
+    }
+}
+
+/// The reconnect cursor. Absent, empty, non-numeric or oversized values are all
+/// "no usable id" and take the resynchronize path; ids start at 1, so a client
+/// that never received one sends no header at all.
+fn last_event_id(headers: &HeaderMap) -> Option<u64> {
+    let value = headers.get("last-event-id")?.to_str().ok()?.trim();
+    if value.is_empty() || value.len() > 20 {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// One task owns id assignment so the sequence stays global across Sessions. It
+/// ends when Core's invalidation broadcast closes.
+fn start_event_hub(core: &CoreService, events: Arc<EventLog>) -> JoinHandle<()> {
+    let mut changes = core.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match changes.recv().await {
+                Ok(change) => events.record(change),
+                Err(broadcast::error::RecvError::Lagged(_)) => events.lag(),
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 #[derive(Clone)]
@@ -77,6 +229,7 @@ struct WebState {
     downloads: Arc<downloads::Downloads>,
     nodes: Arc<nodes::Hub>,
     multiuser: Arc<multiuser::Multiuser>,
+    events: Arc<EventLog>,
 }
 
 /// Owns only a network listener and its credentials. Stopping or dropping it
@@ -181,7 +334,11 @@ impl WebServer {
             downloads: Arc::new(downloads::Downloads::new()?),
             nodes,
             multiuser,
+            events: EventLog::new(),
         };
+        // The hub must be running before the listener admits any `/events`, so a
+        // stream never starts from an id no one is assigning.
+        start_event_hub(&state.core, state.events.clone());
         sessions.enable();
         let app = routes(state);
         let (shutdown, stopped) = oneshot::channel();
@@ -366,6 +523,20 @@ fn routes(state: WebState) -> Router {
         // Web root; only these names are served, never a directory.
         .route("/loom-favicon-9bd461c1.png", get(favicon_png))
         .route("/loom-favicon.svg", get(favicon_svg))
+        // Installable-app metadata. Same exact-file allowlist as the favicons:
+        // names, never a directory listing. `manifest.webmanifest` plus the
+        // `loom-icon-*` names are what the shipped entry and manifest reference
+        // today; the bare names are reserved by this contract so a renamed build
+        // does not need a Rust change.
+        .route("/manifest.webmanifest", get(root_file))
+        .route("/apple-touch-icon.png", get(root_file))
+        .route("/icon-192.png", get(root_file))
+        .route("/icon-512.png", get(root_file))
+        .route("/icon-maskable-512.png", get(root_file))
+        .route("/loom-icon-192.png", get(root_file))
+        .route("/loom-icon-512.png", get(root_file))
+        .route("/loom-icon-maskable-192.png", get(root_file))
+        .route("/loom-icon-maskable-512.png", get(root_file))
         .route(
             "/preview-assets/{token}/{*path}",
             get(resources::preview_asset),
@@ -426,7 +597,7 @@ async fn boundary(State(state): State<WebState>, req: Request, next: Next) -> Re
             "no-store"
         }),
     );
-    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob: data:; font-src 'self'; connect-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"));
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; manifest-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob: data:; font-src 'self'; connect-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"));
     if preview_asset && response.status().is_success() {
         // Preserve the existing resource response policy, including direct navigation.
         response.headers_mut().insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(
@@ -905,22 +1076,106 @@ async fn request(
     }
 }
 
+/// The snapshot marker. It carries no event id: it tells the client to take a
+/// new authorized snapshot instead of continuing a sequence.
+fn resync_frame(state: &WebState) -> Event {
+    Event::default()
+        .event("resync")
+        .data(json!({"epoch":state.epoch,"revision":0}).to_string())
+}
+
+/// The one place an invalidation payload is built, shared by replayed and live
+/// frames so they are indistinguishable. `revision` is the process-wide id, not
+/// a per-connection counter, and the multi-user boundary is applied to both.
+fn invalidation_payload(
+    state: &WebState,
+    session: &Session,
+    change: &Value,
+    revision: u64,
+) -> Value {
+    let mut payload = json!({"epoch":state.epoch,"revision":revision});
+    if change["method"] == "preferences.tasks_changed" {
+        payload["tasksChanged"] = json!(true);
+    }
+    if rovai_core::thread_reference::invalidates_directory(
+        change["method"].as_str().unwrap_or_default(),
+        &change["params"],
+    ) {
+        payload["referencesChanged"] = json!(true);
+    }
+    if change["method"] == "teams.changed" {
+        payload["teamsChanged"] = json!(true);
+    }
+    if matches!(
+        change["method"].as_str(),
+        Some("notification_episode.changed" | "notification_episode.preference_changed")
+    ) {
+        payload["notificationsChanged"] = json!(true);
+    }
+    if change["method"] == "thread.messages.changed" {
+        let params = &change["params"];
+        if let (Some(thread_id), Some(index_changed), Some(through)) = (
+            params["threadId"].as_str(),
+            params["indexChanged"].as_bool(),
+            params["throughGlobalSequence"].as_i64(),
+        ) {
+            payload["messages"] = json!([{"threadId":thread_id,
+                "indexChanged":index_changed,"throughGlobalSequence":through,
+                "unavailableMessageIds":params["unavailableMessageIds"].as_array()
+                    .map(|ids| ids.iter().filter_map(|id| id.as_str()).collect::<Vec<_>>()).unwrap_or_default()}]);
+        }
+    }
+    // Multi-user boundary: drop message invalidations for camps this user cannot
+    // see; the thread id never leaks.
+    if state.multiuser.enabled() {
+        if let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) {
+            messages.retain(|message| {
+                message["threadId"].as_str().is_some_and(|thread_id| {
+                    state
+                        .multiuser
+                        .camp_visible(&session.cloud_user_id, thread_id)
+                })
+            });
+            if messages.is_empty() {
+                payload
+                    .as_object_mut()
+                    .expect("SSE payload")
+                    .remove("messages");
+            }
+        }
+    }
+    payload
+}
+
 async fn events(
     State(state): State<WebState>,
     Extension(session): Extension<Arc<Session>>,
+    headers: HeaderMap,
 ) -> Response {
     let Ok(permit) = session.streams.clone().try_acquire_owned() else {
         return error(StatusCode::TOO_MANY_REQUESTS, "subscription_capacity");
     };
-    let mut source = state.core.subscribe();
+    // Subscribe before snapshotting. Everything the snapshot already accounts
+    // for is dropped by the watermark; everything later arrives on `live`.
+    let mut live = state.events.subscribe();
+    let replay = state.events.replay(last_event_id(&headers));
     let mut revoked = session.revoked.subscribe();
     let mut expiry = session.expires_at.subscribe();
     let stream = async_stream::stream! {
         let _permit = permit;
-        let mut revision = 0u64;
-        // Invalidation stream, not a replay of raw internal Core events. Every
-        // reconnect and lag requires an authorized snapshot before showing live.
-        yield Ok::<_, Infallible>(Event::default().event("resync").data(json!({"epoch":state.epoch,"revision":revision}).to_string()));
+        let mut watermark = replay.watermark;
+        // Invalidation stream, not a replay of raw internal Core events. A stream
+        // that cannot continue from the client's id starts with an authorized
+        // snapshot before showing live.
+        if replay.resync {
+            yield Ok::<_, Infallible>(resync_frame(&state));
+        }
+        for (seq, change) in replay.frames {
+            let payload = invalidation_payload(&state, &session, &change, seq);
+            yield Ok::<_, Infallible>(Event::default().id(seq.to_string()).event("invalidate").data(payload.to_string()));
+            // Bound browser refresh work during Runtime output bursts.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         loop {
             if !state.sessions.is_live(&session) { break; }
             let remaining = Duration::from_millis((*expiry.borrow_and_update()).saturating_sub(state.sessions.now()));
@@ -929,57 +1184,27 @@ async fn events(
                 _ = revoked.changed() => break,
                 _ = expiry.changed() => continue,
                 _ = tokio::time::sleep(remaining.min(Duration::from_secs(60))) => continue,
-                result = source.recv() => {
-                    if matches!(result, Err(tokio::sync::broadcast::error::RecvError::Closed)) { break; }
-                    revision += 1;
-                    let event = if result.is_err() { "resync" } else { "invalidate" };
-                    let mut payload = json!({"epoch":state.epoch,"revision":revision});
-                    if let Ok(change) = &result {
-                        if change["method"] == "preferences.tasks_changed" { payload["tasksChanged"] = json!(true); }
-                        if rovai_core::thread_reference::invalidates_directory(change["method"].as_str().unwrap_or_default(), &change["params"]) {
-                            payload["referencesChanged"] = json!(true);
+                frame = live.recv() => {
+                    match frame {
+                        Ok(HubEvent::Invalidate { seq, change }) => {
+                            // Already covered by the snapshot or by the replay above.
+                            if seq <= watermark { continue; }
+                            watermark = seq;
+                            let payload = invalidation_payload(&state, &session, &change, seq);
+                            yield Ok::<_, Infallible>(Event::default().id(seq.to_string()).event("invalidate").data(payload.to_string()));
+                            // Bound browser refresh work during Runtime output bursts.
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
-                        if change["method"] == "teams.changed" { payload["teamsChanged"] = json!(true); }
-                        if matches!(change["method"].as_str(), Some("notification_episode.changed" | "notification_episode.preference_changed")) {
-                            payload["notificationsChanged"] = json!(true);
+                        // The hub and this stream publish the same contract: a
+                        // dropped invalidation always ends in a snapshot.
+                        Ok(HubEvent::Resync) => {
+                            yield Ok::<_, Infallible>(resync_frame(&state));
                         }
-                        if change["method"] == "thread.messages.changed" {
-                            let params = &change["params"];
-                            if let (Some(thread_id), Some(index_changed), Some(through)) = (
-                                params["threadId"].as_str(), params["indexChanged"].as_bool(),
-                                params["throughGlobalSequence"].as_i64()) {
-                                payload["messages"] = json!([{"threadId":thread_id,
-                                    "indexChanged":index_changed,"throughGlobalSequence":through,
-                                    "unavailableMessageIds":params["unavailableMessageIds"].as_array()
-                                        .map(|ids| ids.iter().filter_map(|id| id.as_str()).collect::<Vec<_>>()).unwrap_or_default()}]);
-                            }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            yield Ok::<_, Infallible>(resync_frame(&state));
                         }
-                        // Multi-user boundary: drop message invalidations for
-                        // camps this user cannot see; the thread id never leaks.
-                        if state.multiuser.enabled() {
-                            if let Some(messages) =
-                                payload.get_mut("messages").and_then(Value::as_array_mut)
-                            {
-                                messages.retain(|message| {
-                                    message["threadId"].as_str().is_some_and(|thread_id| {
-                                        state.multiuser.camp_visible(
-                                            &session.cloud_user_id,
-                                            thread_id,
-                                        )
-                                    })
-                                });
-                                if messages.is_empty() {
-                                    payload
-                                        .as_object_mut()
-                                        .expect("SSE payload")
-                                        .remove("messages");
-                                }
-                            }
-                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
-                    yield Ok(Event::default().event(event).data(payload.to_string()));
-                    // Bound browser refresh work during Runtime output bursts.
-                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
         }
@@ -1003,6 +1228,29 @@ async fn favicon_png(State(state): State<WebState>) -> Response {
 }
 async fn favicon_svg(State(state): State<WebState>) -> Response {
     static_file(&state, "loom-favicon.svg").await
+}
+
+/// Exact root files that are addressable by name, outside `assets/`.
+const ROOT_FILES: [&str; 9] = [
+    "manifest.webmanifest",
+    "apple-touch-icon.png",
+    "icon-192.png",
+    "icon-512.png",
+    "icon-maskable-512.png",
+    "loom-icon-192.png",
+    "loom-icon-512.png",
+    "loom-icon-maskable-192.png",
+    "loom-icon-maskable-512.png",
+];
+
+/// One allowlisted root file. The name is the whole identity: no directory, no
+/// traversal, and a name outside the list never reaches the disk.
+async fn root_file(State(state): State<WebState>, uri: Uri) -> Response {
+    let name = uri.path().trim_start_matches('/');
+    if !ROOT_FILES.contains(&name) {
+        return error(StatusCode::NOT_FOUND, "asset_not_found");
+    }
+    static_file(&state, name).await
 }
 
 async fn static_file(state: &WebState, relative: &str) -> Response {
@@ -1030,6 +1278,7 @@ async fn static_file(state: &WebState, relative: &str) -> Response {
         Some("webp") => "image/webp",
         Some("jpg" | "jpeg") => "image/jpeg",
         Some("svg") => "image/svg+xml",
+        Some("webmanifest") => "application/manifest+json",
         Some("ico") => "image/vnd.microsoft.icon",
         _ => return error(StatusCode::NOT_FOUND, "asset_not_found"),
     };
@@ -1126,10 +1375,152 @@ async fn load_asset_cache(root: &std::path::Path) -> std::collections::HashMap<S
 
 #[cfg(test)]
 mod tests {
-    use super::{Method, is_settings_deep_link};
+    use super::{
+        EVENT_LOG_CAPACITY, EventLog, HubEvent, Method, is_settings_deep_link, json, last_event_id,
+    };
+    use axum::http::{HeaderMap, HeaderValue};
 
     fn get(query: &str) -> bool {
         is_settings_deep_link(&Method::GET, "/", query)
+    }
+
+    /// Ids are assigned once, in order, and every live subscriber sees the same
+    /// number for the same Core change.
+    #[test]
+    fn event_log_assigns_one_monotonic_id_per_change() {
+        let events = EventLog::new();
+        let mut live = events.subscribe();
+        events.record(json!({"method": "first"}));
+        events.record(json!({"method": "second"}));
+        let mut ids = Vec::new();
+        for expected in 1..=2u64 {
+            match live.try_recv() {
+                Ok(HubEvent::Invalidate { seq, change }) => {
+                    assert_eq!(seq, expected);
+                    ids.push(seq);
+                    assert_eq!(
+                        change["method"],
+                        if expected == 1 { "first" } else { "second" }
+                    );
+                }
+                _ => panic!("expected an invalidation {expected}"),
+            }
+        }
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    /// A reconnect continues from its last delivered id: no snapshot marker and
+    /// no frame it has already seen.
+    #[test]
+    fn event_log_replays_only_frames_after_the_last_delivered_id() {
+        let events = EventLog::new();
+        for method in ["a", "b", "c"] {
+            events.record(json!({"method": method}));
+        }
+        let replay = events.replay(Some(1));
+        assert!(!replay.resync);
+        assert_eq!(replay.watermark, 3);
+        let seqs: Vec<u64> = replay.frames.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, vec![2, 3]);
+        assert_eq!(replay.frames[1].1["method"], "c");
+    }
+
+    /// An up-to-date cursor resumes with nothing to replay and, crucially, no
+    /// resynchronize. A cursor at 0 is the ring origin, which no client sends.
+    #[test]
+    fn event_log_latest_or_zero_cursor_resynchronizes_never() {
+        let events = EventLog::new();
+        events.record(json!({"method": "a"}));
+        events.record(json!({"method": "b"}));
+        let latest = events.replay(Some(2));
+        assert!(!latest.resync);
+        assert!(latest.frames.is_empty());
+        assert_eq!(latest.watermark, 2);
+        let origin = events.replay(Some(0));
+        assert!(!origin.resync);
+        assert_eq!(origin.frames.len(), 2);
+    }
+
+    /// No header (a first load or an old client) still asks for a snapshot, as
+    /// does a cursor from another process epoch.
+    #[test]
+    fn event_log_without_or_ahead_of_the_log_resynchronizes() {
+        let events = EventLog::new();
+        events.record(json!({"method": "a"}));
+        let absent = events.replay(None);
+        assert!(absent.resync);
+        assert!(absent.frames.is_empty());
+        assert_eq!(absent.watermark, 1);
+        let ahead = events.replay(Some(1_000));
+        assert!(
+            ahead.resync,
+            "an id this process never handed out is another epoch"
+        );
+        assert!(ahead.frames.is_empty());
+        assert_eq!(ahead.watermark, 1);
+    }
+
+    /// Dropping the oldest frames ends continuity: the ring can no longer serve
+    /// every later id, so a cursor at or below the dropped one resynchronizes.
+    #[test]
+    fn event_log_ring_eviction_resynchronizes_across_the_gap() {
+        let events = EventLog::new();
+        for index in 0..=EVENT_LOG_CAPACITY as u64 {
+            events.record(json!({"index": index}));
+        }
+        let dropped = events.replay(Some(0));
+        assert!(dropped.resync, "the first frame has been evicted");
+        assert!(dropped.frames.is_empty());
+        let boundary = events.replay(Some(1));
+        assert!(!boundary.resync, "the dropped id itself is not needed");
+        assert_eq!(boundary.frames.len(), EVENT_LOG_CAPACITY);
+        assert_eq!(boundary.frames[0].0, 2);
+        assert_eq!(boundary.watermark, EVENT_LOG_CAPACITY as u64 + 1);
+    }
+
+    /// A hub lag loses changes that were never given an id, so even a client at
+    /// the newest id must snapshot; later frames resume normally again.
+    #[test]
+    fn event_log_hub_lag_resynchronizes_even_at_the_latest_id() {
+        let events = EventLog::new();
+        let mut live = events.subscribe();
+        events.record(json!({"method": "a"}));
+        assert!(matches!(
+            live.try_recv(),
+            Ok(HubEvent::Invalidate { seq: 1, .. })
+        ));
+        events.lag();
+        assert!(matches!(live.try_recv(), Ok(HubEvent::Resync)));
+        assert!(events.replay(Some(1)).resync);
+        events.record(json!({"method": "b"}));
+        let resumed = events.replay(Some(2));
+        assert!(!resumed.resync);
+        assert!(resumed.frames.is_empty());
+    }
+
+    #[test]
+    fn last_event_id_header_needs_a_bare_bounded_decimal() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(last_event_id(&headers), None);
+        for (value, expected) in [
+            ("42", Some(42)),
+            (" 7 ", Some(7)),
+            ("0", Some(0)),
+            ("18446744073709551615", Some(u64::MAX)),
+            ("", None),
+            ("-1", None),
+            ("0x10", None),
+            ("1e3", None),
+            ("1 2", None),
+            ("abc", None),
+            ("99999999999999999999999", None),
+        ] {
+            headers.insert(
+                "last-event-id",
+                HeaderValue::from_str(value).expect("header"),
+            );
+            assert_eq!(last_event_id(&headers), expected, "{value:?}");
+        }
     }
 
     #[test]

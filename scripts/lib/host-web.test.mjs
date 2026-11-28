@@ -123,6 +123,40 @@ test('Desktop and Web share one Core while listener failure, revocation and stop
       assert.deepEqual(Buffer.from(await icon.arrayBuffer()), await readAssetFile(join(ownedUiDirectory, name)), `${name} bytes are the approved file, unmodified`)
     }
     assert.equal((await fetch(`${origin}/index.html`)).status, 404, 'only allowlisted root files are served')
+    // PWA install metadata stays on the same exact-file allowlist, with the
+    // manifest media type and a CSP that admits the manifest fetch.
+    const iconBytes = await readAssetFile(join(ownedUiDirectory, 'loom-favicon-9bd461c1.png'))
+    const shippedManifest = JSON.parse(await readAssetFile(join(ownedUiDirectory, 'manifest.webmanifest')))
+    const manifestResponse = await fetch(`${origin}/manifest.webmanifest`, { redirect: 'error' })
+    assert.equal(manifestResponse.status, 200, 'the shipped manifest must be reachable')
+    assert.equal(manifestResponse.headers.get('content-type'), 'application/manifest+json')
+    assert.deepEqual(await manifestResponse.json(), shippedManifest, 'the manifest bytes are the shipped file, unmodified')
+    for (const icon of shippedManifest.icons) {
+      const response = await fetch(origin + icon.src, { redirect: 'error' })
+      assert.equal(response.status, 200, `manifest icon ${icon.src} must be served`)
+      assert.equal(response.headers.get('content-type'), 'image/png')
+      assert.deepEqual(Buffer.from(await response.arrayBuffer()), await readAssetFile(join(ownedUiDirectory, icon.src.slice(1))), `${icon.src} bytes are the approved file`)
+    }
+    // The reserved names of this contract are served the same way when the build
+    // contains them, and every other root name stays unroutable.
+    for (const [name, bytes] of [
+      ['apple-touch-icon.png', iconBytes],
+      ['icon-192.png', iconBytes],
+      ['icon-512.png', iconBytes],
+      ['icon-maskable-512.png', iconBytes]
+    ]) {
+      await writeFile(join(ownedUiDirectory, name), bytes)
+      const file = await fetch(`${origin}/${name}`, { redirect: 'error' })
+      assert.equal(file.status, 200, `${name} must be served from the Web root`)
+      assert.equal(file.headers.get('content-type'), 'image/png', name)
+      assert.equal(file.headers.get('cache-control'), 'no-store', name)
+      assert.deepEqual(Buffer.from(await file.arrayBuffer()), bytes, `${name} bytes are the approved file, unmodified`)
+    }
+    assert.match((await fetch(origin)).headers.get('content-security-policy'), /manifest-src 'self'/, 'the entry admits its own manifest')
+    assert.equal((await fetch(`${origin}/manifest.webmanifest`, { headers: { Origin: 'https://outside.invalid' } })).status, 403, 'a PWA file keeps the same-origin boundary')
+    for (const name of ['other.webmanifest', 'manifest.json', 'loom-icon-256.png']) {
+      assert.equal((await fetch(`${origin}/${name}`)).status, 404, `${name} is not on the root allowlist`)
+    }
     const assetPath = join(ownedUiDirectory, assetUrl.slice(1))
     const originalAsset = await readAssetFile(assetPath)
     await writeFile(assetPath, 'changed under the same URL')
@@ -555,6 +589,81 @@ test('Desktop and Web share one Core while listener failure, revocation and stop
       otherReaders.push(reader)
     }
     assert.equal((await authorized(first, 'events')).status, 429, 'a third stream must exceed only this session quota')
+    // Reconnects are gapless. A stream presenting its last id continues the same
+    // process-wide sequence instead of taking a new snapshot.
+    const sseReader = reader => {
+      const decoder = new TextDecoder()
+      let buffered = ''
+      const pending = []
+      const drain = () => {
+        for (let split = buffered.indexOf('\n\n'); split !== -1; split = buffered.indexOf('\n\n')) {
+          if (buffered.slice(0, split).trim()) pending.push(buffered.slice(0, split))
+          buffered = buffered.slice(split + 2)
+        }
+      }
+      return async done => {
+        drain()
+        while (!done(pending)) {
+          const next = await within(reader.read())
+          assert.equal(next.done, false, 'an invalidation stream stays open')
+          buffered += decoder.decode(next.value, { stream: true })
+          drain()
+        }
+        return pending.splice(0)
+      }
+    }
+    const invalidationIds = frames => frames
+      .filter(frame => /^event: invalidate$/m.test(frame))
+      .map(frame => Number(frame.match(/^id: (\d+)$/m)[1]))
+    const renameCamp = async title => {
+      const current = (await call(first, 'camps.open', { threadId, traceId: crypto.randomUUID() })).thread
+      const renamed = await call(first, 'camps.rename', { commandId: crypto.randomUUID(), command: { threadId, expectedVersion: current.version, title } })
+      assert.equal(renamed.status, 'applied', JSON.stringify(renamed))
+    }
+    // `second` keeps one reader from the quota check above; a closed stream
+    // releases its slot, possibly a moment later.
+    const openEvents = async (session, extraHeaders = {}) => {
+      for (let attempt = 0; ; attempt++) {
+        const controller = new AbortController(); controllers.push(controller)
+        const response = await fetch(`${origin}/api/v1/events`, {
+          headers: { Authorization: `Bearer ${session.token}`, ...extraHeaders }, signal: controller.signal
+        })
+        if (response.status === 200) return { controller, reader: response.body.getReader() }
+        assert.equal(response.status, 429, 'a closed stream releases only its own quota slot')
+        assert.ok(attempt < 100, 'a closed stream must release its quota slot')
+        await response.body.cancel()
+        await pause(50)
+      }
+    }
+    const live = await openEvents(second)
+    const readLive = sseReader(live.reader)
+    const opened = await readLive(frames => frames.length >= 1)
+    assert.match(opened[0], /^event: resync$/m, 'a stream without a cursor starts from a snapshot')
+    assert.match(opened[0], /"revision":0/)
+    assert.doesNotMatch(opened[0], /^id:/m, 'a snapshot marker never consumes an event id')
+    await renameCamp('SSE replay first')
+    const before = [...opened, ...(await readLive(frames => invalidationIds(frames).length >= 1))]
+    const cursor = Math.max(...invalidationIds(before))
+    assert.ok(Number.isSafeInteger(cursor) && cursor >= 1, 'a live invalidation carries its process-wide id')
+    assert.equal(Number(before.find(frame => /^event: invalidate$/m.test(frame)).match(/"revision":(\d+)/)[1]), cursor,
+      'the payload revision is the event id, not a per-connection counter')
+    live.controller.abort()
+    // Two changes land while nothing is connected; the next stream replays them.
+    await renameCamp('SSE replay second')
+    await renameCamp('SSE replay third')
+    const continued = await openEvents(second, { 'Last-Event-ID': String(cursor) })
+    const resumedFrames = await sseReader(continued.reader)(frames => invalidationIds(frames).length >= 2)
+    assert.equal(resumedFrames.some(frame => /^event: resync$/m.test(frame)), false, 'a cursor the ring can serve never resynchronizes')
+    const resumedIds = invalidationIds(resumedFrames)
+    assert.deepEqual(resumedIds.slice(0, 2), [cursor + 1, cursor + 2], 'replay continues exactly after the last delivered id')
+    assert.ok(resumedIds.every((id, index) => index === 0 || id === resumedIds[index - 1] + 1), `ids stay consecutive: ${resumedIds}`)
+    continued.controller.abort()
+    // An id this process never handed out (another epoch, or a restart) is not a
+    // continuation: it takes the snapshot path like any uncursored stream.
+    const epoch = await openEvents(second, { 'Last-Event-ID': String(cursor + 100000) })
+    const epochOpened = await sseReader(epoch.reader)(frames => frames.length >= 1)
+    assert.match(epochOpened[0], /^event: resync$/m, 'an id ahead of this process is another epoch')
+    epoch.controller.abort()
     // Sequential closed-tab recoveries, not simultaneous logins. Two other
     // Sessions retain actual SSE readers throughout; their drafts must survive.
     let candidate = first

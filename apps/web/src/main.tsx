@@ -188,7 +188,11 @@ function WebEntry() {
   useEffect(() => {
     if (!authenticated) return
     const renew = (): void => {
-      if (document.visibilityState === 'visible') void transport.renewIfNeeded().catch(() => undefined)
+      if (document.visibilityState !== 'visible') return
+      // iOS suspends SSE with the page; resume from the last event id now
+      // instead of waiting out the reconnect backoff.
+      transport.wakeLive()
+      void transport.renewIfNeeded().catch(() => undefined)
     }
     renew()
     const timer = setInterval(renew, 60_000)
