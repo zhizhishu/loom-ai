@@ -1,22 +1,28 @@
-# SIMULATED acceptance replay of the LOOM Windows real-install acceptance.
+# Windows INSTALL-ONLY acceptance of the LOOM Windows preview artifact.
 #
-# This workflow re-runs scripts/acceptance/windows-real-install-acceptance.draft.ps1 on a
-# GitHub Actions windows-2022 runner against the personal preview artifact of one existing
-# candidate run. The model lane is driven by the scripted loopback provider started by the
-# acceptance script's -SimulatedProvider switch: no real model is called, no real provider
-# credential is read, and nothing here is a real-machine or Owner acceptance.
+# This workflow re-runs scripts/acceptance/windows-real-install-acceptance.draft.ps1 with
+# -InstallOnly on a GitHub Actions windows-2022 runner against the personal preview artifact
+# of one existing candidate run. It verifies the install chain only: there is no provider
+# key, no GitHub secret, no scripted provider and no commercial model anywhere in this run,
+# so the model lane is N/A and realModelUsed stays false. Nothing here is a real-machine or
+# Owner acceptance.
 #
 # The summary's canonical 14 acceptance ids mirror the real-machine final acceptance script
-# commit aabb965fba31c7c90c334bc57fd6ba0e827c6d23 (the aabb口径); every other summary row is
-# an extra row and never part of the canonical expectation.
+# commit aabb965fba31c7c90c334bc57fd6ba0e827c6d23 (the aabb口径); any other row the script
+# emits is an extra infrastructure row and never part of the canonical expectation. In
+# install-only mode CREDENTIAL, MEMBER_MODEL, REAL_MODEL_IDENTITY, REAL_MODEL, DOCX_MARKER and
+# PPTX_PREVIEW are expected N/A, the executable chain is EXTRACT, INSTALL, START, LOGIN,
+# CAMP, PPTX_UPLOAD and STOP, and MEMBER_CREATE may report PASS, SKIP or N/A. The summary
+# table prints only the rows the acceptance actually recorded, so an absent row is N/A
+# rather than an inferred status.
 #
 # It never publishes, releases, deploys or promotes a channel. Inputs name an existing run
 # and its commit; the artifact id is resolved read-only from that run's artifact metadata.
-name: LOOM V2 Windows acceptance simulation (scripted provider)
+name: LOOM V2 Windows install-only acceptance
 
 on:
   # workflow_dispatch needs the workflow on the default branch, so a trial branch
-  # could never be dispatched. A push to loom/trial-* runs the same simulation;
+  # could never be dispatched. A push to loom/trial-* runs the same install-only acceptance;
   # push carries no inputs, so every inputs.* use below falls back to the
   # workflow_dispatch defaults.
   push:
@@ -40,12 +46,12 @@ permissions:
   actions: read
 
 concurrency:
-  group: loom-win-acceptance-sim-${{ inputs.package_commit || '864537843aefe88b45b677a50841e776d397ad00' }}-${{ inputs.source_run_id || '46141704596' }}
+  group: loom-win-acceptance-install-only-${{ inputs.package_commit || '864537843aefe88b45b677a50841e776d397ad00' }}-${{ inputs.source_run_id || '46141704596' }}
   cancel-in-progress: false
 
 jobs:
-  windows-acceptance-sim:
-    name: Windows 2022 simulated real-install acceptance (scripted provider)
+  windows-install-only-acceptance:
+    name: Windows 2022 install-only acceptance (no provider, model lane N/A)
     if: github.event_name != 'push' || !github.event.deleted
     runs-on: windows-2022
     timeout-minutes: 120
@@ -60,11 +66,6 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
-
-      - name: Set up pinned Node 24 for the scripted provider runtime
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: 24.14.1
 
       - name: Preflight the source run artifact (fail fast)
         id: preflight
@@ -154,7 +155,7 @@ jobs:
           LOOM_ARTIFACT_DIGEST: ${{ steps.preflight.outputs.artifact_digest }}
           LOOM_SOURCE_RUN_HEAD_SHA: ${{ steps.preflight.outputs.source_run_head_sha }}
           LOOM_SOURCE_RUN_CONCLUSION: ${{ steps.preflight.outputs.source_run_conclusion }}
-          LOOM_EVIDENCE_DIR: ${{ runner.temp }}/loom-win-acceptance-sim
+          LOOM_EVIDENCE_DIR: ${{ runner.temp }}/loom-win-acceptance-install-only
         run: |
           $ErrorActionPreference = 'Stop'
           $zipPath = $env:LOOM_PACKAGE_ZIP
@@ -180,12 +181,12 @@ jobs:
           } finally { $archive.Dispose() }
           if ([string]$manifest.commit -ne $env:LOOM_PACKAGE_COMMIT) { throw "candidate-manifest commit $($manifest.commit) is not $($env:LOOM_PACKAGE_COMMIT)" }
           if ([string]$manifest.qualification -ne 'isolated-personal-development-preview') { throw "unexpected candidate qualification: $($manifest.qualification)" }
-          if ($manifest.dailyDataIncluded -ne $false) { throw 'the preview carries daily data; refusing to simulate acceptance' }
-          if ($manifest.realProviderVerified -ne $false -or $manifest.ownerAccepted -ne $false) { throw 'the preview claims provider or Owner acceptance; refusing to simulate acceptance' }
+          if ($manifest.dailyDataIncluded -ne $false) { throw 'the preview carries daily data; refusing the install-only acceptance' }
+          if ($manifest.realProviderVerified -ne $false -or $manifest.ownerAccepted -ne $false) { throw 'the preview claims provider or Owner acceptance; refusing the install-only acceptance' }
           $null = New-Item -ItemType Directory -Path $env:LOOM_EVIDENCE_DIR -Force
           [ordered]@{
-            kind = 'loom-windows-acceptance-simulation'
-            scope = 'SIMULATED - not a real-machine acceptance'
+            kind = 'loom-windows-install-only-acceptance'
+            scope = 'INSTALL-ONLY - installer chain only; no provider key and no commercial model'
             packageCommit = $env:LOOM_PACKAGE_COMMIT
             sourceRunId = $env:LOOM_SOURCE_RUN_ID
             sourceRunHeadSha = $env:LOOM_SOURCE_RUN_HEAD_SHA
@@ -196,13 +197,14 @@ jobs:
             candidateVersion = [string]$manifest.version
             candidateQualification = [string]$manifest.qualification
             dailyDataIncluded = [bool]$manifest.dailyDataIncluded
+            installOnly = $true
             realModelUsed = $false
-            providerMode = 'scripted-loopback'
-            credential = 'SIMULATED/SCRIPTED - no real provider credential is read or stored'
+            modelLane = 'N/A - this run configures no provider and exercises no model lane'
+            credential = 'N/A - no provider credential is read, stored or required'
             ownerAccepted = $false
-          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:LOOM_EVIDENCE_DIR 'simulation.json') -Encoding utf8
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:LOOM_EVIDENCE_DIR 'install-only.json') -Encoding utf8
 
-      - name: Run the real-install acceptance with the scripted provider
+      - name: Run the install-only acceptance
         id: acceptance
         shell: pwsh
         # The script keeps its own internal timeouts; this bound only guarantees that the
@@ -210,7 +212,7 @@ jobs:
         timeout-minutes: 100
         env:
           LOOM_PACKAGE_ZIP: ${{ steps.preflight.outputs.package_zip }}
-          LOOM_EVIDENCE_DIR: ${{ runner.temp }}/loom-win-acceptance-sim
+          LOOM_EVIDENCE_DIR: ${{ runner.temp }}/loom-win-acceptance-install-only
         run: |
           $ErrorActionPreference = 'Stop'
           $invocation = @(
@@ -220,7 +222,7 @@ jobs:
             '-PackageZip', $env:LOOM_PACKAGE_ZIP,
             '-WorkRoot', $env:LOOM_WORK_ROOT,
             '-Port', $env:LOOM_ACCEPTANCE_PORT,
-            '-SimulatedProvider'
+            '-InstallOnly'
           )
           Write-Host ('acceptance: powershell.exe ' + ($invocation -join ' '))
           # The acceptance script owns its own timeouts; no extra timeout argument is passed.
@@ -232,18 +234,18 @@ jobs:
             command = 'powershell.exe ' + ($invocation -join ' ')
             workRoot = $env:LOOM_WORK_ROOT
             port = [int]$env:LOOM_ACCEPTANCE_PORT
-            simulatedProvider = $true
+            installOnly = $true
             realModelUsed = $false
           } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:LOOM_EVIDENCE_DIR 'acceptance-run.json') -Encoding utf8
           Write-Host "acceptance exit code: $exitCode"
           exit $exitCode
 
-      - name: Stage acceptance logs and scripted provider requests
+      - name: Stage the acceptance logs
         id: stage
         if: always()
         shell: pwsh
         env:
-          LOOM_EVIDENCE_DIR: ${{ runner.temp }}/loom-win-acceptance-sim
+          LOOM_EVIDENCE_DIR: ${{ runner.temp }}/loom-win-acceptance-install-only
         run: |
           $ErrorActionPreference = 'Stop'
           $stageLogs = (New-Item -ItemType Directory -Path (Join-Path $env:LOOM_EVIDENCE_DIR 'logs') -Force).FullName
@@ -251,32 +253,19 @@ jobs:
           if (Test-Path -LiteralPath $sourceLogs -PathType Container) {
             Copy-Item -Path (Join-Path $sourceLogs '*') -Destination $stageLogs -Recurse -Force -ErrorAction SilentlyContinue
           }
-          $requestCount = 0
-          if (Test-Path -LiteralPath $env:LOOM_WORK_ROOT -PathType Container) {
-            $requests = @(Get-ChildItem -LiteralPath $env:LOOM_WORK_ROOT -File -Recurse -Depth 3 -Force -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -match '(?i)provider[-_]?requests?' -and -not $_.FullName.StartsWith($sourceLogs, [StringComparison]::OrdinalIgnoreCase) })
-            foreach ($request in $requests) {
-              $relative = [IO.Path]::GetRelativePath($env:LOOM_WORK_ROOT, $request.FullName).Replace('\', '/')
-              $target = Join-Path $stageLogs ('provider-requests/' + $relative.Replace('/', '_'))
-              $null = New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($target)) -Force
-              Copy-Item -LiteralPath $request.FullName -Destination $target -Force
-              $requestCount++
-            }
-          }
           $logCount = @(Get-ChildItem -LiteralPath $stageLogs -File -Recurse -Force -ErrorAction SilentlyContinue).Count
           [ordered]@{
             stagedLogFiles = $logCount
-            stagedProviderRequestFiles = $requestCount
             stagedAt = (Get-Date).ToString('o')
           } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:LOOM_EVIDENCE_DIR 'staged.json') -Encoding utf8
-          Write-Host "staged $logCount log file(s) and $requestCount provider request file(s)"
+          Write-Host "staged $logCount log file(s)"
 
       - name: Refuse credential-shaped evidence before any upload
         id: scan
         if: always()
         shell: pwsh
         env:
-          LOOM_EVIDENCE_DIR: ${{ runner.temp }}/loom-win-acceptance-sim
+          LOOM_EVIDENCE_DIR: ${{ runner.temp }}/loom-win-acceptance-install-only
         run: |
           $ErrorActionPreference = 'Stop'
           # Same credential-shaped shapes the repository already rejects:
@@ -284,7 +273,7 @@ jobs:
           #   scripts/lib/qualification-semantic-judge.mjs:1107,1121
           #   scripts/loom-v2-core-native-pi.mjs:63
           # The bare word CREDENTIAL is only matched when it carries a token-shaped value,
-          # so the acceptance's own "CREDENTIAL: <sentence>" result row is not a false hit.
+          # so a free-form "CREDENTIAL: <sentence>" note is not a false hit.
           $patterns = @(
             '(?im)authorization:\s*bearer\s+\S+',
             '(?im)(?:api[_-]?key|access[_-]?token|token|secret|password)\s*[:=]\s*\S+',
@@ -308,21 +297,21 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'clean=true'
           Write-Host "credential scan clean across $($files.Count) evidence file(s)"
 
-      - name: Upload the scanned simulation evidence
+      - name: Upload the scanned install-only evidence
         id: upload
         if: always() && steps.scan.outputs.clean == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: loom-win-acceptance-sim-${{ inputs.package_commit || '864537843aefe88b45b677a50841e776d397ad00' }}
-          path: ${{ runner.temp }}/loom-win-acceptance-sim/
+          name: loom-win-acceptance-install-only-${{ inputs.package_commit || '864537843aefe88b45b677a50841e776d397ad00' }}
+          path: ${{ runner.temp }}/loom-win-acceptance-install-only/
           if-no-files-found: warn
           retention-days: 3
 
-      - name: Summarize the simulated acceptance
+      - name: Summarize the install-only acceptance
         if: always()
         shell: pwsh
         env:
-          LOOM_EVIDENCE_DIR: ${{ runner.temp }}/loom-win-acceptance-sim
+          LOOM_EVIDENCE_DIR: ${{ runner.temp }}/loom-win-acceptance-install-only
           LOOM_ARTIFACT_ID: ${{ steps.preflight.outputs.artifact_id }}
           LOOM_SOURCE_RUN_HEAD_SHA: ${{ steps.preflight.outputs.source_run_head_sha }}
           LOOM_EVIDENCE_CLEAN: ${{ steps.scan.outputs.clean }}
@@ -331,7 +320,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $evidenceDir = $env:LOOM_EVIDENCE_DIR
           $json = @{}
-          foreach ($name in @('simulation', 'acceptance-run', 'staged')) {
+          foreach ($name in @('install-only', 'acceptance-run', 'staged')) {
             $path = Join-Path $evidenceDir ($name + '.json')
             if (Test-Path -LiteralPath $path -PathType Leaf) { $json[$name] = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json }
           }
@@ -342,12 +331,14 @@ jobs:
           # Canonical 14 acceptance ids, exactly as the real-machine final acceptance script
           # at commit aabb965fba31c7c90c334bc57fd6ba0e827c6d23 reports them. This is the aabb
           # final口径: PPTX_PREVIEW_INTERFACE is retired and is no longer a canonical row.
-          # Infrastructure-only rows - STOP_CONSOLE, PROVIDER, PI_PROVIDER, PROVIDER_REQUESTS,
-          # ACCEPTANCE - are
-          # reported afterwards as extra rows and are not part of the canonical set.
-          # MEMBER_CREATE may be absent from summary.json when the seed member already exists;
-          # it stays a canonical expectation on the table, and NOT_RUN here only means no
-          # result was recorded, not that the row is optional.
+          # In this install-only run CREDENTIAL, MEMBER_MODEL, REAL_MODEL_IDENTITY, REAL_MODEL,
+          # DOCX_MARKER and PPTX_PREVIEW are expected N/A and the acceptance is not expected to
+          # record them; the executable chain is EXTRACT, INSTALL, START, LOGIN, CAMP,
+          # PPTX_UPLOAD and STOP, and MEMBER_CREATE may report PASS, SKIP or N/A.
+          # Infrastructure-only extra rows - STOP_CONSOLE and ACCEPTANCE - may be recorded
+          # afterwards and are never part of the canonical set. The table below prints only the
+          # ids summary.json actually carries, so an absent id is N/A rather than NOT_RUN and is
+          # never inferred as a pass.
           $expected = @(
             'CREDENTIAL', 'EXTRACT', 'INSTALL', 'START', 'LOGIN', 'MEMBER_CREATE', 'MEMBER_MODEL',
             'CAMP', 'REAL_MODEL_IDENTITY', 'REAL_MODEL', 'DOCX_MARKER', 'PPTX_UPLOAD',
@@ -359,24 +350,25 @@ jobs:
 
           $exitCode = if ($json.ContainsKey('acceptance-run')) { [string]$json['acceptance-run'].exitCode } else { 'not-run' }
           $lines = New-Object 'Collections.Generic.List[string]'
-          $lines.Add('## LOOM Windows real-install acceptance - SIMULATED replay')
+          $lines.Add('## LOOM Windows install-only acceptance')
           $lines.Add('')
-          $lines.Add('This is a **scripted simulation** on a GitHub-hosted windows-2022 runner. It is **not** a real-machine acceptance and implies no Owner acceptance or release.')
+          $lines.Add('This is an **install-only acceptance** on a GitHub-hosted windows-2022 runner: it verifies the installed package chain and nothing else. There is **no provider key, no GitHub secret, no scripted provider and no commercial model** in this run, so the model lane is N/A and `realModelUsed` stays `false`. It is **not** a real-machine acceptance and implies no Owner acceptance or release.')
           $lines.Add('')
           $artifactId = if ([string]::IsNullOrEmpty($env:LOOM_ARTIFACT_ID)) { 'unresolved' } else { $env:LOOM_ARTIFACT_ID }
           $headSha = if ([string]::IsNullOrEmpty($env:LOOM_SOURCE_RUN_HEAD_SHA)) { 'unresolved' } else { $env:LOOM_SOURCE_RUN_HEAD_SHA }
           $lines.Add('- package commit: `' + $env:LOOM_PACKAGE_COMMIT + '`')
           $lines.Add('- source run: `' + $env:LOOM_SOURCE_RUN_ID + '` (head `' + $headSha + '`)')
           $lines.Add('- preview artifact id: `' + $artifactId + '` (`loom-personal-preview-windows-' + $env:LOOM_PACKAGE_COMMIT + '`)')
-          if ($json.ContainsKey('simulation')) {
-            $lines.Add('- candidate zip sha256: `' + [string]$json['simulation'].candidateZipSha256 + '` (' + [string]$json['simulation'].candidateZipEntries + ' entries)')
-            $lines.Add('- candidate qualification: `' + [string]$json['simulation'].candidateQualification + '`')
+          if ($json.ContainsKey('install-only')) {
+            $lines.Add('- candidate zip sha256: `' + [string]$json['install-only'].candidateZipSha256 + '` (' + [string]$json['install-only'].candidateZipEntries + ' entries)')
+            $lines.Add('- candidate qualification: `' + [string]$json['install-only'].candidateQualification + '`')
           }
           $lines.Add('- acceptance exit code: `' + $exitCode + '`')
-          $lines.Add('- **realModelUsed: false** - model lane served by a scripted loopback provider (`-SimulatedProvider`)')
-          $lines.Add('- **CREDENTIAL row is SIMULATED/SCRIPTED**: no real provider key exists in this repository or this run; the credential check exercises the simulated path only.')
+          $lines.Add('- **installOnly: true / realModelUsed: false** - no provider is configured, so no model lane runs')
+          $lines.Add('- model lane **N/A**: `CREDENTIAL`, `MEMBER_MODEL`, `REAL_MODEL_IDENTITY`, `REAL_MODEL`, `DOCX_MARKER` and `PPTX_PREVIEW` are expected N/A in install-only mode; an absent row means that lane was not exercised, never an inferred pass')
+          $lines.Add('- executable install chain: `EXTRACT`, `INSTALL`, `START`, `LOGIN`, `CAMP`, `PPTX_UPLOAD`, `STOP`; `MEMBER_CREATE` may report PASS, SKIP or N/A')
           $uploadLine = if ($env:LOOM_UPLOAD_OUTCOME -eq 'success') {
-            'scanned clean and uploaded as `loom-win-acceptance-sim-' + $env:LOOM_PACKAGE_COMMIT + '`'
+            'scanned clean and uploaded as `loom-win-acceptance-install-only-' + $env:LOOM_PACKAGE_COMMIT + '`'
           } elseif ($env:LOOM_EVIDENCE_CLEAN -eq 'false') {
             '**REFUSED** (credential-shaped evidence)'
           } elseif ($env:LOOM_UPLOAD_OUTCOME) {
@@ -391,17 +383,15 @@ jobs:
           foreach ($id in $expected) {
             if ($rows.Contains($id)) {
               $lines.Add('| ' + $id + ' | ' + [string]$rows[$id].status + ' | ' + (& $truncate ([string]$rows[$id].detail)) + ' |')
-            } else {
-              $lines.Add('| ' + $id + ' | NOT_RUN | no result recorded |')
             }
           }
           foreach ($id in @($rows.Keys | Where-Object { $expected -notcontains $_ })) {
             $lines.Add('| ' + $id + ' | ' + [string]$rows[$id].status + ' | ' + (& $truncate ([string]$rows[$id].detail)) + ' |')
           }
-          if (-not $summary) {
+          if ($rows.Count -eq 0) {
             $lines.Add('')
-            $lines.Add('No `summary.json` was produced, so the acceptance did not reach its reporting stage; every row above is NOT_RUN rather than inferred.')
+            $lines.Add('No acceptance result row was recorded, so the table stays empty instead of being inferred: the acceptance did not reach its reporting stage.')
           }
           $lines.Add('')
-          $lines.Add('SIMULATED: SCRIPTED/SIMULATED provider output only; `realModelUsed=false`.')
+          $lines.Add('INSTALL-ONLY: no provider key, no commercial model and no model lane in this run; `realModelUsed=false`.')
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($lines.ToArray()) -Encoding utf8

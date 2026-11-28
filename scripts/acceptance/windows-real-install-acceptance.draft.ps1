@@ -84,18 +84,27 @@
                    thread.messages.send, agentRuns.cancel, threads.create,
                    members.runtime.set, loom.artifacts.list, loom.artifact.preview
 
+    Two modes, one script, and the default is the real machine:
+      * real machine (no switch): every hard rule below applies unchanged - the credential
+        is read from $env:OCT_API_KEY, the oct-chat Pi catalog is written, the member model
+        is frozen explicitly and every model-driven step is PASS/FAIL;
+      * -InstallOnly (CI): EXTRACT, INSTALL, START, LOGIN, member, CAMP, PPTX_UPLOAD and STOP
+        only. No credential is read, required or set, no scripted/loopback provider is
+        started, no models.json/settings.json and no member model are written, the model
+        rows are reported N/A, and STOP proves the real Web/API cancel control path on a
+        model-free queued/nonterminal AgentRun.
+
     Hard rules encoded below:
-      * the model credential is read from $env:OCT_API_KEY only, fails fast when absent,
-        and is never written to a log, command line, report or exception;
+      * in the default mode the model credential is read from $env:OCT_API_KEY only, fails
+        fast when absent, and is never written to a log, command line, report or exception;
       * every path stays under a short work root (default C:\loomacc);
       * default port 18990, never 64851/64852;
       * the pptx preview is the REAL artifact preview: the agent registers the uploaded
         acceptance.pptx through rovai_loom, loom.artifact.preview must answer status
         "ready", and a preview that is not ready is a FAIL, never a SKIP;
-      * -SimulatedProvider is a CI replay only: the single Pi provider section points at a
-        loopback scripted Node provider instead of the oct gateway, no commercial model is
-        contacted, and every model-driven step is reported as SIMULATED instead of PASS.
-        Without the switch nothing in this script moves.
+      * -InstallOnly never claims a model result: the model lane belongs to the cloud VM
+        real deepseek acceptance, so REAL_MODEL_IDENTITY, REAL_MODEL, DOCX_MARKER and
+        PPTX_PREVIEW are N/A there and no model message, Mission or preview is created.
 #>
 [CmdletBinding()]
 param(
@@ -106,11 +115,8 @@ param(
     [int]$ReadyTimeoutSeconds = 180,
     [int]$RunTimeoutSeconds = 420,
     [int]$StopTimeoutSeconds = 120,
-    # CI replay only. Absent (the real-machine default) nothing else in this script moves.
-    [switch]$SimulatedProvider,
-    [string]$ProviderListenHostPort = '127.0.0.1:0',
-    [string]$ProviderModelId = 'loom-acc-scripted',
-    [string]$ProviderScriptPath = ''
+    # CI install-only mode. Absent (the real-machine default) every step runs unchanged.
+    [switch]$InstallOnly
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -129,16 +135,7 @@ $script:Paths = [ordered]@{ logs = [IO.Path]::GetTempPath() }
 $script:Launcher = $null
 $script:InstallDirectory = $null
 $script:DataDirectory = $null
-$script:Simulated = [bool]$SimulatedProvider
-# -ModelId keeps its real-machine default. Under -SimulatedProvider an unbound -ModelId is
-# replaced with -ProviderModelId before the work root is even created (see main).
-$script:ModelIdBound = $PSBoundParameters.ContainsKey('ModelId')
-$script:CredentialSimulated = $false
-$script:Provider = $null
-$script:ProviderPort = 0
-$script:ProviderBaseUrl = $null
-$script:ProviderScript = $null
-$script:ProviderRequestsFile = $null
+$script:InstallOnly = [bool]$InstallOnly
 
 # --------------------------------------------------------------------------------------
 # reporting, redaction, tiny helpers
@@ -167,17 +164,6 @@ function Add-Result([string]$Id, [string]$Status, [string]$Detail) {
     }
     [void]$script:Results.Add($entry)
     Write-Host ('[{0}] {1}: {2}' -f $entry.status, $entry.id, $entry.detail)
-}
-
-# A model-driven step is PASS only when a commercial model answered. Under
-# -SimulatedProvider the same step runs against the loopback scripted provider and is
-# reported as SIMULATED, which summary.json and report.txt count separately from PASS.
-function Add-ModelResult([string]$Id, [string]$Detail) {
-    if ($script:Simulated) {
-        Add-Result $Id 'SIMULATED' ('SCRIPTED provider, no commercial model: ' + $Detail)
-    } else {
-        Add-Result $Id 'PASS' $Detail
-    }
 }
 
 function Get-Value($Object, [string]$Name) {
@@ -721,167 +707,6 @@ function Stop-LoomConsole {
 }
 
 # --------------------------------------------------------------------------------------
-# scripted Pi provider (CI replay only, -SimulatedProvider)
-#
-# The switch moves exactly one thing: the model endpoint. The Pi catalog still references
-# $OCT_API_KEY, and the installed product still runs its own runtime, run and stop plumbing,
-# but the provider section points at a loopback Node stub that answers OpenAI-compatible SSE,
-# so the commercial oct gateway is never contacted and no real credential exists in the run.
-# --------------------------------------------------------------------------------------
-
-function Get-ProviderListenHost([string]$Listen) {
-    $hostPart = '127.0.0.1'
-    if ($Listen -match '^\s*\[([^\]]+)\]\s*:\s*(\d+)\s*$') { $hostPart = $Matches[1] }
-    elseif ($Listen -match '^\s*([^:]+)\s*:\s*(\d+)\s*$') { $hostPart = $Matches[1].Trim() }
-    if ($hostPart -eq '0.0.0.0' -or $hostPart -eq '*' -or $hostPart -eq '::') { $hostPart = '127.0.0.1' }
-    if ($hostPart.Contains(':') -and -not $hostPart.StartsWith('[')) { $hostPart = '[' + $hostPart + ']' }
-    return $hostPart
-}
-
-function Read-ScriptedProviderPort([string]$Path) {
-    # The provider owns the port-file schema
-    # (scripts/acceptance/windows-acceptance-scripted-provider.mjs:18-22), so only the port is
-    # read and every shape that carries a port is accepted: {"port":N}, "host:port", or a
-    # bare number.
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
-    try { $text = [IO.File]::ReadAllText($Path) } catch { return $null }
-    if (-not $text.Trim()) { return $null }
-    $port = 0
-    $parsed = $null
-    try { $parsed = $text | ConvertFrom-Json } catch { $parsed = $null }
-    foreach ($name in @('port', 'hostPort', 'listen', 'address')) {
-        $value = Get-Value $parsed $name
-        if ($null -eq $value) { continue }
-        if ($value -is [int] -or $value -is [long] -or $value -is [double]) { $port = [int]$value }
-        elseif ([string]$value -match '(\d{2,5})\s*$') { $port = [int]$Matches[1] }
-        if ($port -gt 0) { break }
-    }
-    if ($port -le 0 -and $text -match ':(\d{2,5})') { $port = [int]$Matches[1] }
-    if ($port -le 0 -and $text -match '(\d{2,5})') { $port = [int]$Matches[1] }
-    if ($port -lt 1 -or $port -gt 65535) { return $null }
-    return $port
-}
-
-function Start-ScriptedProvider {
-    $node = Get-Command 'node' -ErrorAction SilentlyContinue
-    if (-not $node) {
-        Add-Result 'PROVIDER' 'FAIL' 'node is not on PATH; -SimulatedProvider needs Node for the loopback scripted provider'
-        throw 'FAIL_FAST: node is missing for -SimulatedProvider.'
-    }
-    $nodePath = [string]$node.Source
-    if (-not $nodePath) { $nodePath = [string]$node.Path }
-    if (-not $nodePath) {
-        Add-Result 'PROVIDER' 'FAIL' 'node was found on PATH but its executable path is unavailable'
-        throw 'FAIL_FAST: node cannot be launched for -SimulatedProvider.'
-    }
-    $script:ProviderScript = $ProviderScriptPath
-    if (-not $script:ProviderScript -and $PSScriptRoot) {
-        $script:ProviderScript = Join-Path $PSScriptRoot 'windows-acceptance-scripted-provider.mjs'
-    }
-    if (-not $script:ProviderScript) {
-        $script:ProviderScript = Join-Path (Get-Location).Path 'scripts/acceptance/windows-acceptance-scripted-provider.mjs'
-    }
-    if (-not (Test-Path -LiteralPath $script:ProviderScript -PathType Leaf)) {
-        Add-Result 'PROVIDER' 'FAIL' "the scripted provider script is missing: $($script:ProviderScript)"
-        throw 'FAIL_FAST: the scripted provider script was not found.'
-    }
-    # The logs directory only exists after Assert-ShortWorkRoot, so this runs after it.
-    $portFile = Join-Path $script:Paths['logs'] 'provider-port.json'
-    $script:ProviderRequestsFile = Join-Path $script:Paths['logs'] 'provider-requests.json'
-    if (Test-Path -LiteralPath $portFile -PathType Leaf) { Remove-Item -LiteralPath $portFile -Force }
-    $out = Join-Path $script:Paths['logs'] 'provider.out.txt'
-    $err = Join-Path $script:Paths['logs'] 'provider.err.txt'
-    $script:Provider = Start-Process -FilePath $nodePath -PassThru -WindowStyle Hidden `
-        -ArgumentList @(
-            ('"' + $script:ProviderScript + '"'),
-            '--listen', $ProviderListenHostPort,
-            '--port-file', ('"' + $portFile + '"'),
-            '--requests-file', ('"' + $script:ProviderRequestsFile + '"')
-        ) -RedirectStandardOutput $out -RedirectStandardError $err
-    $deadline = (Get-Date).AddSeconds(60)
-    $port = 0
-    while ((Get-Date) -lt $deadline) {
-        $port = Read-ScriptedProviderPort $portFile
-        if ($port -gt 0) { break }
-        if ($script:Provider.HasExited) { break }
-        Start-Sleep -Milliseconds 200
-    }
-    if ($port -le 0) {
-        $tail = ''
-        if (Test-Path -LiteralPath $err -PathType Leaf) {
-            $tail = (@(Get-Content -LiteralPath $err -Tail 5 -ErrorAction SilentlyContinue) -join ' | ')
-        }
-        $state = if ($script:Provider.HasExited) { "exit $($script:Provider.ExitCode)" } else { 'still starting' }
-        Add-Result 'PROVIDER' 'FAIL' ("the scripted provider published no port in {0} ({1}) {2}" -f $portFile, $state, (Hide-Secrets $tail))
-        throw 'FAIL_FAST: the scripted provider did not start.'
-    }
-    $script:ProviderPort = $port
-    $script:ProviderBaseUrl = 'http://' + (Get-ProviderListenHost $ProviderListenHostPort) + ':' + $port + '/v1'
-    $script:Evidence['scriptedProvider'] = [ordered]@{
-        kind = 'loopback scripted provider (SCRIPTED/SIMULATED, no commercial model)'
-        script = $script:ProviderScript
-        listen = $ProviderListenHostPort
-        boundPort = $port
-        baseUrl = $script:ProviderBaseUrl
-        modelId = $ProviderModelId
-        requestsFile = $script:ProviderRequestsFile
-    }
-    Add-Result 'PROVIDER' 'SIMULATED' ("node scripted provider on {0} (pid {1}); OpenAI-compatible base {2}" -f $ProviderListenHostPort, $script:Provider.Id, $script:ProviderBaseUrl)
-}
-
-function Update-ScriptedProviderEvidence {
-    $path = $script:ProviderRequestsFile
-    if (-not $path) { return }
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return }
-    $count = 0
-    try {
-        $text = [IO.File]::ReadAllText($path)
-        if ($text.Trim()) {
-            $parsed = $null
-            try { $parsed = $text | ConvertFrom-Json } catch { $parsed = $null }
-            if ($null -eq $parsed) {
-                $count = @([IO.File]::ReadAllLines($path) | Where-Object { $_.Trim().Length -gt 0 }).Count
-            } else {
-                # The provider publishes totals.requests and a requests[] record list.
-                $total = Get-Value (Get-Value $parsed 'totals') 'requests'
-                if ($null -ne $total) {
-                    $count = [int]$total
-                } else {
-                    $items = Get-Value $parsed 'requests'
-                    if ($null -eq $items) { $items = $parsed }
-                    $count = @($items).Count
-                }
-            }
-        }
-    } catch { return }
-    if ($script:Evidence['scriptedProvider']) {
-        $script:Evidence['scriptedProvider']['requestCount'] = $count
-    }
-    Add-Result 'PROVIDER_REQUESTS' 'SIMULATED' "the loopback scripted provider recorded $count OpenAI request(s); see logs\provider-requests.json"
-}
-
-function Stop-ScriptedProvider {
-    # This script owns the provider process, so it is always reaped, including after a
-    # FAIL_FAST that happens before any install.
-    $provider = $script:Provider
-    if (-not $provider) { return }
-    $script:Provider = $null
-    try {
-        if (-not $provider.HasExited) { & taskkill.exe /PID $provider.Id /T /F | Out-Null }
-    } catch { }
-    try {
-        if (-not $provider.HasExited) { Stop-Process -Id $provider.Id -Force -ErrorAction SilentlyContinue }
-        if (-not $provider.HasExited) {
-            [void](Wait-Until -TimeoutSeconds 30 -IntervalMilliseconds 200 -Probe {
-                    if ($provider.HasExited) { return $true }
-                    return $null
-                })
-        }
-    } catch { }
-    Update-ScriptedProviderEvidence
-}
-
-# --------------------------------------------------------------------------------------
 # acceptance steps
 # --------------------------------------------------------------------------------------
 
@@ -924,16 +749,9 @@ function New-PiModelEntry {
 }
 
 function New-PiProviderEntry {
-    $baseUrl = 'https://oct.agent-ai.vip/v1'
-    if ($script:Simulated) {
-        # CI replay: the single Pi provider section points at the loopback scripted provider,
-        # so the commercial oct gateway is never contacted.
-        $baseUrl = [string]$script:ProviderBaseUrl
-        if (-not $baseUrl) { throw 'the scripted provider published no base URL before the Pi catalog was written.' }
-    }
     return [ordered]@{
         name = 'oct-chat gateway'
-        baseUrl = $baseUrl
+        baseUrl = 'https://oct.agent-ai.vip/v1'
         # Environment reference only: Pi resolves $OCT_API_KEY from its own process
         # environment, so the literal key never lands in a file
         # (scripts/accept-loom-live-lead.mjs:578,598; scripts/loom-v2-core-native-pi.mjs:559).
@@ -983,16 +801,6 @@ function Set-PiOctChatGateway {
     if (-not $reference) {
         $provider['apiKey'] = '$OCT_API_KEY'
         $written = $true
-    }
-    if ($script:Simulated) {
-        # A reused catalog must not keep pointing at the commercial gateway in a replay.
-        $targetBaseUrl = [string]$script:ProviderBaseUrl
-        if (-not $targetBaseUrl) { throw 'the scripted provider published no base URL before the Pi catalog was written.' }
-        $existingBaseUrl = [string]($provider['baseUrl'])
-        if ($existingBaseUrl.TrimEnd('/') -cne $targetBaseUrl.TrimEnd('/')) {
-            $provider['baseUrl'] = $targetBaseUrl
-            $written = $true
-        }
     }
     $offers = @()
     foreach ($entry in @($provider['models'])) {
@@ -1046,14 +854,7 @@ function Set-PiOctChatGateway {
         modelsRewritten = $written
         settingsRewritten = $settingsChanged
     }
-    if ($script:Simulated) {
-        $gateway['mode'] = 'SIMULATED loopback scripted provider'
-        $gateway['baseUrl'] = [string]$script:ProviderBaseUrl
-    }
     $script:Evidence['piGateway'] = $gateway
-    if ($script:Simulated) {
-        Add-Result 'PI_PROVIDER' 'SIMULATED' ("the oct-chat provider section points at the loopback scripted base {0} model {1} (apiKey reference OCT_API_KEY, value never recorded)" -f [string]$script:ProviderBaseUrl, $ModelId)
-    }
 }
 
 function Get-PiModelParts([string]$Value) {
@@ -1275,7 +1076,7 @@ function Select-MemberAndModel {
         installationId = [string](Get-Value $installation 'id')
         probeStatus = [string](Get-Value (Get-Value $installation 'snapshot') 'probeStatus')
     }
-    Add-ModelResult 'MEMBER_MODEL' "$agentId uses $adapterKind / $resolvedModel"
+    Add-Result 'MEMBER_MODEL' 'PASS' "$agentId uses $adapterKind / $resolvedModel"
     return $agentId
 }
 
@@ -1313,7 +1114,7 @@ function Invoke-RealModelTurn([string]$ThreadId, [string]$AgentId) {
     if (-not $observedModelId) {
         Add-Result 'REAL_MODEL_IDENTITY' 'SKIP' 'the Run and the reply reported no runtimeModel.modelId'
     } else {
-        Add-ModelResult 'REAL_MODEL_IDENTITY' "run reported $observedModelId"
+        Add-Result 'REAL_MODEL_IDENTITY' 'PASS' "run reported $observedModelId"
     }
     $script:Evidence['realModel'] = [ordered]@{
         threadId = $ThreadId
@@ -1323,8 +1124,7 @@ function Invoke-RealModelTurn([string]$ThreadId, [string]$AgentId) {
         observedModelId = $observedModelId
         replyPreview = $body.Substring(0, [Math]::Min(200, $body.Length))
     }
-    $replyDetail = if ($script:Simulated) { "scripted reply received for $nonce" } else { "real reply received for $nonce" }
-    Add-ModelResult 'REAL_MODEL' $replyDetail
+    Add-Result 'REAL_MODEL' 'PASS' "real reply received for $nonce"
 }
 
 function Invoke-DocxCheck([string]$ThreadId, [string]$AgentId) {
@@ -1361,7 +1161,7 @@ function Invoke-DocxCheck([string]$ThreadId, [string]$AgentId) {
         agentRunId = [string](Get-Value $run 'id')
         replyPreview = $body.Substring(0, [Math]::Min(200, $body.Length))
     }
-    Add-ModelResult 'DOCX_MARKER' "assistant quoted $marker from the uploaded docx"
+    Add-Result 'DOCX_MARKER' 'PASS' "assistant quoted $marker from the uploaded docx"
 }
 
 function Test-PptxPreviewInterface([string]$ThreadId, [string]$AgentId) {
@@ -1484,7 +1284,7 @@ function Test-PptxPreviewInterface([string]$ThreadId, [string]$AgentId) {
         previewStatus = $previewStatus
         previewSlides = $previewSlides.Count
     }
-    Add-ModelResult 'PPTX_PREVIEW' "pptxPreview.status is ready with $($previewSlides.Count) slide(s) for $artifactId, equal to the $expectedSlides slide(s) in the uploaded acceptance.pptx"
+    Add-Result 'PPTX_PREVIEW' 'PASS' "pptxPreview.status is ready with $($previewSlides.Count) slide(s) for $artifactId, equal to the $expectedSlides slide(s) in the uploaded acceptance.pptx"
 }
 
 function Invoke-StopCheck([string]$ThreadId, [string]$AgentId) {
@@ -1536,7 +1336,203 @@ function Invoke-StopCheck([string]$ThreadId, [string]$AgentId) {
         finalStatus = $status
         cancelAcknowledgedAt = Get-Value $settled 'cancelAcknowledgedAt'
     }
-    Add-ModelResult 'STOP' "agentRuns.cancel settled the Run as cancelled"
+    Add-Result 'STOP' 'PASS' "agentRuns.cancel settled the Run as cancelled"
+}
+
+# --------------------------------------------------------------------------------------
+# -InstallOnly steps (CI): member reuse, a real pptx upload, and a model-free STOP
+# --------------------------------------------------------------------------------------
+
+function Get-RunById([string]$ThreadId, [string]$RunId) {
+    foreach ($run in @(Get-Value (Get-CampSnapshot $ThreadId) 'agentRuns')) {
+        if ($run -and [string](Get-Value $run 'id') -eq $RunId) { return $run }
+    }
+    return $null
+}
+
+function Select-InstallOnlyMember {
+    # Reuse whatever the personal roster already holds and only create a member when the
+    # roster stays empty. A pi-adapted member is preferred because it is the member the
+    # real-machine run configures, but any mentionable member is enough here: install-only
+    # mode configures no model, so members.runtime.set is never sent.
+    $selected = Wait-Until -TimeoutSeconds 45 -IntervalMilliseconds 1500 -Probe {
+        try { $members = @(Invoke-CoreRequest 'members.list' ([ordered]@{})) }
+        catch { $members = @() }
+        $fallback = $null
+        foreach ($member in $members) {
+            if (-not $member) { continue }
+            $candidate = [string](Get-Value $member 'agentId')
+            if (-not $candidate) { continue }
+            $adapterKind = [string](Get-Value (Get-Value $member 'runtimeConfiguration') 'adapterKind')
+            if ($adapterKind -eq 'pi') {
+                return [pscustomobject]@{ agentId = $candidate; adapterKind = $adapterKind }
+            }
+            if (-not $fallback) {
+                $fallback = [pscustomobject]@{ agentId = $candidate; adapterKind = $adapterKind }
+            }
+        }
+        if ($null -ne $fallback) { return $fallback }
+        return $null
+    }
+    $agentId = $null
+    $adapterKind = ''
+    if ($null -ne $selected) {
+        $agentId = [string](Get-Value $selected 'agentId')
+        $adapterKind = [string](Get-Value $selected 'adapterKind')
+        $reported = if ($adapterKind) { $adapterKind } else { 'none reported' }
+        Add-Result 'MEMBER_CREATE' 'SKIP' ("member {0} is already present (adapter {1}); members.create was not called" -f $agentId, $reported)
+    } else {
+        $agentId = New-PiAssistant
+        Add-Result 'MEMBER_CREATE' 'PASS' "members.create created member $agentId"
+    }
+    Add-Result 'MEMBER_MODEL' 'N/A' 'install-only mode: provider credential and model lane are out of scope; members.runtime.set was not called'
+    $script:Evidence['member'] = [ordered]@{
+        agentId = $agentId
+        adapterKind = $adapterKind
+        modelId = $null
+        mode = 'install-only (no members.runtime.set)'
+    }
+    return $agentId
+}
+
+function Invoke-PptxUploadInstallOnly([string]$ThreadId) {
+    # The same minimal OOXML file the real-machine run uploads, through the same upload
+    # endpoint. Nothing is copied into a quick-chat workspace and no Mission is created.
+    $marker = 'LOOM-PPTX-MARKER-' + (Get-Random -Minimum 100000 -Maximum 999999)
+    $path = Join-Path $script:Paths['files'] 'acceptance.pptx'
+    [void](New-PptxFile $path ("$marker slide one."))
+    $expectedSlides = Get-PptxSlideCount $path
+    $draft = Invoke-Upload $ThreadId $path 'acceptance.pptx'
+    $sourcePath = [string](Get-Value $draft 'sourcePath')
+    if (-not $sourcePath) { throw 'the pptx upload returned no source path.' }
+    if (-not [IO.File]::Exists($sourcePath)) { throw "the uploaded pptx source is not readable: $sourcePath" }
+    $uploadedSlides = Get-PptxSlideCount $sourcePath
+    if ($uploadedSlides -ne $expectedSlides) {
+        throw ("the uploaded pptx at {0} declares {1} slide(s), not the {2} slide(s) written by this run." -f `
+                $sourcePath, $uploadedSlides, $expectedSlides)
+    }
+    $localSha = Get-FileSha256 $path
+    $uploadedSha = Get-FileSha256 $sourcePath
+    if ($uploadedSha -cne $localSha) {
+        throw ("the uploaded pptx bytes ({0}) are not the generated acceptance.pptx ({1})." -f $uploadedSha, $localSha)
+    }
+    $expectedBytes = (Get-Item -LiteralPath $path).Length
+    $observedBytes = Get-Value $draft 'observedByteSize'
+    if ($null -ne $observedBytes -and [int64]$observedBytes -ne [int64]$expectedBytes) {
+        throw ("the upload observed {0} byte(s) but the generated pptx is {1} byte(s)." -f $observedBytes, $expectedBytes)
+    }
+    $attachmentId = [string](Get-Value $draft 'id')
+    $script:Evidence['pptxUpload'] = [ordered]@{
+        attachmentId = $attachmentId
+        sourcePath = $sourcePath
+        sha256 = $localSha
+        slides = $expectedSlides
+        byteSize = [int64]$expectedBytes
+        mode = 'install-only (upload only, no Mission, no preview)'
+    }
+    Add-Result 'PPTX_UPLOAD' 'PASS' ("uploaded acceptance.pptx as {0} from {1}: {2} slide(s), sha256 {3}, {4} byte(s)" -f `
+            $attachmentId, $sourcePath, $uploadedSlides, $uploadedSha, $expectedBytes)
+}
+
+function Invoke-StopCheckInstallOnly([string]$ThreadId, [string]$AgentId) {
+    # No provider credential exists in install-only mode, so the Run this message creates is
+    # expected to stay queued/waiting (it never has to reach running). thread.messages.send
+    # and agentRuns.cancel are still the real Web/API control path: a Run that is never
+    # created, a cancel that is rejected or a Run that does not end cancelled is a FAIL, and
+    # no PASS is ever recorded without observing the cancelled Run.
+    $terminal = @('succeeded', 'failed', 'cancelled')
+    $before = Get-CampSnapshot $ThreadId
+    $excluded = New-Object 'Collections.Generic.HashSet[string]'
+    foreach ($run in @(Get-Value $before 'agentRuns')) { if ($run) { [void]$excluded.Add([string](Get-Value $run 'id')) } }
+
+    try {
+        $messageId = Send-ThreadMessage $ThreadId $AgentId `
+            'Stop check: do not answer this message. It exists only to create the AgentRun this acceptance cancels through agentRuns.cancel.' @()
+    } catch {
+        Add-Result 'STOP' 'FAIL' ('install-only stop check could not send thread.messages.send: ' + (Hide-Secrets $_.Exception.Message))
+        return
+    }
+
+    $deadline = (Get-Date).AddSeconds($StopTimeoutSeconds)
+    $run = $null
+    while (-not $run -and (Get-Date) -lt $deadline) {
+        $run = Get-NewRun (Get-CampSnapshot $ThreadId) $messageId $excluded
+        if (-not $run) { Start-Sleep -Milliseconds 100 }
+    }
+    if (-not $run) {
+        Add-Result 'STOP' 'FAIL' ("thread.messages.send created no AgentRun within {0} s, so agentRuns.cancel had nothing to cancel" -f $StopTimeoutSeconds)
+        return
+    }
+
+    $runId = [string](Get-Value $run 'id')
+    $status = [string](Get-Value $run 'status')
+    $observed = New-Object 'Collections.Generic.List[string]'
+    [void]$observed.Add($status)
+    $cancelCommands = 0
+    while ($terminal -notcontains $status -and $cancelCommands -lt 5 -and (Get-Date) -lt $deadline) {
+        $cancelCommands++
+        $reply = Try-CoreRequest 'agentRuns.cancel' ([ordered]@{
+                commandId = New-CommandId
+                command = [ordered]@{
+                    threadId = $ThreadId
+                    agentRunId = $runId
+                    expectedVersion = Get-Value $run 'version'
+                }
+            })
+        if (-not $reply.Ok) {
+            $code = [string]$reply.Code
+            if (-not $code) { $code = 'transport' }
+            # A concurrent status/version bump is not a rejection of the control path: the
+            # Run is re-read and cancelled again with its current version.
+            $current = Get-RunById $ThreadId $runId
+            if ($code -notlike '*version_conflict*' -or -not $current) {
+                Add-Result 'STOP' 'FAIL' ("agentRuns.cancel was rejected for run {0}: {1}" -f $runId, (Hide-Secrets $code))
+                return
+            }
+            $run = $current
+        } else {
+            $settled = Wait-Until -TimeoutSeconds 30 -IntervalMilliseconds 200 -Probe {
+                $candidate = Get-RunById $ThreadId $runId
+                if ($candidate -and $terminal -contains [string](Get-Value $candidate 'status')) { return $candidate }
+                return $null
+            }
+            if ($settled) { $run = $settled } else { $run = Get-RunById $ThreadId $runId }
+            if (-not $run) {
+                Add-Result 'STOP' 'FAIL' ("AgentRun {0} disappeared from camps.open after agentRuns.cancel" -f $runId)
+                return
+            }
+        }
+        $status = [string](Get-Value $run 'status')
+        if ($observed -notcontains $status) { [void]$observed.Add($status) }
+    }
+
+    $firstStatus = [string]$observed[0]
+    $current = Get-RunById $ThreadId $runId
+    if ($status -eq 'cancelled') {
+        $script:Evidence['stop'] = [ordered]@{
+            threadId = $ThreadId
+            agentRunId = $runId
+            observedStatuses = @($observed)
+            finalStatus = $status
+            cancelCommands = $cancelCommands
+            cancelAcknowledgedAt = Get-Value $current 'cancelAcknowledgedAt'
+            mode = 'install-only (model-free queued/nonterminal cancel control path)'
+        }
+        Add-Result 'STOP' 'PASS' ("model-free queued/nonterminal cancel control path: thread.messages.send created Run {0} ({1}) and agentRuns.cancel settled it cancelled after {2} cancel command(s)" -f `
+                $runId, $firstStatus, $cancelCommands)
+        return
+    }
+    if ($cancelCommands -eq 0 -and $terminal -contains $status) {
+        Add-Result 'STOP' 'FAIL' ("the AgentRun {0} was already {1} when it was first observed, so agentRuns.cancel could not cancel it and the cancel control path is unproven" -f `
+                $runId, $status)
+        return
+    }
+    if ($terminal -contains $status) {
+        Add-Result 'STOP' 'FAIL' ("agentRuns.cancel left the AgentRun {0} {1}, not cancelled" -f $runId, $status)
+        return
+    }
+    Add-Result 'STOP' 'FAIL' ("the AgentRun {0} stayed {1} {2} s after agentRuns.cancel and never reached cancelled" -f `
+            $runId, $status, $StopTimeoutSeconds)
 }
 
 # --------------------------------------------------------------------------------------
@@ -1552,7 +1548,7 @@ function Clear-SecretFromFile([string]$Path) {
 
 function Write-AcceptanceArtifacts {
     $logRoot = $script:Paths['logs']
-    foreach ($name in @('install.out.txt', 'install.err.txt', 'server.out.txt', 'server.err.txt', 'provider.out.txt', 'provider.err.txt')) {
+    foreach ($name in @('install.out.txt', 'install.err.txt', 'server.out.txt', 'server.err.txt')) {
         Clear-SecretFromFile (Join-Path $logRoot $name)
     }
     if ($script:InstallDirectory -and (Test-Path -LiteralPath $script:InstallDirectory)) {
@@ -1572,27 +1568,28 @@ function Write-AcceptanceArtifacts {
             Set-Content -LiteralPath (Join-Path $logRoot 'data-dir.txt') -Encoding UTF8
     }
     $failed = @($script:Results | Where-Object { $_.status -eq 'FAIL' }).Count -gt 0
-    # SIMULATED is its own status: a step that ran and passed without a commercial model.
+    # Every status is counted as reported, N/A included: a step that does not belong to this
+    # mode is never folded into PASS or FAIL.
     $statusCounts = [ordered]@{}
     foreach ($entry in $script:Results) {
         $status = [string]$entry.status
         if ($statusCounts.Contains($status)) { $statusCounts[$status] = [int]$statusCounts[$status] + 1 }
         else { $statusCounts[$status] = 1 }
     }
-    $credentialSource = if ($script:CredentialSimulated) {
-        'SIMULATED: no real OCT key; a loopback scripted provider answered; no commercial model was contacted; no credential value is recorded'
+    $credentialSource = if ($script:InstallOnly) {
+        'N/A: install-only mode reads, requires and stores no provider credential'
     } else {
         'OCT_API_KEY (value never recorded)'
     }
     $summary = [ordered]@{
         kind = 'loom-windows-real-install-acceptance'
-        mode = if ($script:Simulated) { 'simulated' } else { 'real' }
+        mode = if ($script:InstallOnly) { 'install-only' } else { 'real' }
+        installOnly = [bool]$script:InstallOnly
         status = if ($failed) { 'FAIL' } else { 'PASS' }
         finishedAt = (Get-Date).ToString('o')
         port = $Port
-        modelId = $ModelId
-        simulatedProvider = [bool]$script:Simulated
-        providerModelId = if ($script:Simulated) { $ProviderModelId } else { $null }
+        modelId = if ($script:InstallOnly) { $null } else { $ModelId }
+        modelLane = if ($script:InstallOnly) { 'N/A: install-only mode configures no member model' } else { "explicit $ModelId" }
         installDirectory = $script:InstallDirectory
         dataDirectory = $script:DataDirectory
         packageRoot = $packageRoot
@@ -1607,12 +1604,15 @@ function Write-AcceptanceArtifacts {
     $lines.Add("finished: $((Get-Date).ToString('o'))")
     $lines.Add("install: $($script:InstallDirectory)")
     $lines.Add("data:    $($script:DataDirectory)")
-    $lines.Add("port:    $Port   model: $ModelId")
-    if ($script:Simulated) {
-        $lines.Add('mode:    SIMULATED - loopback scripted provider; no commercial model was contacted')
+    if ($script:InstallOnly) {
+        $lines.Add("port:    $Port   model: N/A (install-only)")
+        $lines.Add('mode:    install-only - no provider credential, no provider catalog, no member model; the model lane is covered by the cloud VM real deepseek acceptance')
+    } else {
+        $lines.Add("port:    $Port   model: $ModelId")
+        $lines.Add('mode:    real - $env:OCT_API_KEY (value never recorded), oct-chat Pi catalog, explicit member model')
     }
     $lines.Add('')
-    foreach ($status in @('PASS', 'SIMULATED', 'FAIL', 'SKIP', 'SKIP_STOP_WINDOW')) {
+    foreach ($status in @('PASS', 'N/A', 'FAIL', 'SKIP', 'SKIP_STOP_WINDOW')) {
         foreach ($entry in @($script:Results | Where-Object { $_.status -eq $status })) {
             $lines.Add(('{0,-18} {1}: {2}' -f $entry.status, $entry.id, $entry.detail))
         }
@@ -1630,47 +1630,25 @@ function Write-AcceptanceArtifacts {
 $packageRoot = $null
 $exitCode = 0
 try {
-    if ($script:Simulated) {
-        # The scripted provider serves exactly one model id, so the real-machine -ModelId
-        # default is replaced by it. A bound -ModelId must name that same model: the Pi
-        # catalog, the runtime readback and the Run identity are all compared against it.
-        if (-not $script:ModelIdBound) {
-            $ModelId = $ProviderModelId
-            Write-Host ("model:   $ModelId (simulated -ModelId default)")
-        } elseif ($ModelId -cne $ProviderModelId) {
-            $exitCode = 2
-            throw 'FAIL_FAST: -ModelId must equal -ProviderModelId under -SimulatedProvider.'
-        }
-    }
-
     Assert-ShortWorkRoot
     Set-Content -LiteralPath (Join-Path $script:Paths['logs'] 'report.txt') -Value 'acceptance started' -Encoding UTF8
 
-    # FAIL_FAST: the credential is read from the environment only and never echoed.
-    # -SimulatedProvider is the one exception: with no OCT_API_KEY in this process a
-    # non-credential placeholder is set in-process for the Pi catalog, the loopback scripted
-    # provider ignores it, and CREDENTIAL is reported as SIMULATED, never PASS.
-    $credential = $env:OCT_API_KEY
-    if (-not $credential -or $credential.Trim().Length -eq 0) {
-        if (-not $script:Simulated) {
+    if ($script:InstallOnly) {
+        # Install-only mode never reads, requires or sets a provider credential, and it never
+        # starts a provider: the model lane belongs to the cloud VM real deepseek acceptance.
+        Add-Result 'CREDENTIAL' 'N/A' 'install-only mode: provider credential and model lane are out of scope'
+    } else {
+        # FAIL_FAST: the credential is read from the environment only and never echoed.
+        $credential = $env:OCT_API_KEY
+        if (-not $credential -or $credential.Trim().Length -eq 0) {
             Add-Result 'CREDENTIAL' 'FAIL' 'OCT_API_KEY is not set in this process; FAIL_FAST before install'
             $exitCode = 2
             throw 'FAIL_FAST: OCT_API_KEY is missing.'
         }
-        $script:CredentialSimulated = $true
-        $env:OCT_API_KEY = 'ci-scripted-not-a-secret'
-        $credential = $env:OCT_API_KEY
-    }
-    # The placeholder is registered as a secret too, so any accidental echo is redacted.
-    Add-Secret $credential
-    $credential = $null
-    if ($script:CredentialSimulated) {
-        Add-Result 'CREDENTIAL' 'SIMULATED' 'no real OCT key: loopback scripted provider only; no commercial model is contacted; the in-process placeholder is not a credential and never reaches evidence'
-    } else {
+        Add-Secret $credential
+        $credential = $null
         Add-Result 'CREDENTIAL' 'PASS' 'OCT_API_KEY present and held only in the process environment'
     }
-
-    if ($script:Simulated) { Start-ScriptedProvider }
 
     $packageRoot = Expand-Package
     Add-Result 'EXTRACT' 'PASS' "package extracted under $($script:Paths['work'])"
@@ -1686,23 +1664,31 @@ try {
     Connect-Administrator
     Add-Result 'LOGIN' 'PASS' 'administrator token accepted by /api/v1/login'
 
-    $agentId = Select-MemberAndModel
+    $agentId = if ($script:InstallOnly) { Select-InstallOnlyMember } else { Select-MemberAndModel }
     $threadId = New-Camp $agentId "Windows real install acceptance $((Get-Date).ToString('yyyyMMdd-HHmmss'))"
     Add-Result 'CAMP' 'PASS' "created thread $threadId"
 
-    Invoke-RealModelTurn $threadId $agentId
-    Invoke-DocxCheck $threadId $agentId
-    Test-PptxPreviewInterface $threadId $agentId
-    Invoke-StopCheck $threadId $agentId
+    if ($script:InstallOnly) {
+        # No model message, no docx turn, no Mission and no preview: those rows are N/A
+        # because the model lane runs in the cloud VM real deepseek acceptance instead.
+        $modelLaneDetail = 'N/A on Windows Actions: the model lane is covered by the cloud VM real deepseek acceptance; this install-only run sends no model message, no docx turn and no pptx Mission'
+        foreach ($id in @('REAL_MODEL_IDENTITY', 'REAL_MODEL', 'DOCX_MARKER')) {
+            Add-Result $id 'N/A' $modelLaneDetail
+        }
+        Invoke-PptxUploadInstallOnly $threadId
+        Add-Result 'PPTX_PREVIEW' 'N/A' 'N/A on Windows Actions: no Mission and no artifact preview are created here; the pptx preview lane belongs to the cloud VM real deepseek acceptance'
+        Invoke-StopCheckInstallOnly $threadId $agentId
+    } else {
+        Invoke-RealModelTurn $threadId $agentId
+        Invoke-DocxCheck $threadId $agentId
+        Test-PptxPreviewInterface $threadId $agentId
+        Invoke-StopCheck $threadId $agentId
+    }
 } catch {
     Add-Result 'ACCEPTANCE' 'FAIL' (Hide-Secrets $_.Exception.Message)
 } finally {
     try { if ($script:Launcher) { [void](Stop-LoomConsole) } } catch {
         Add-Result 'STOP_CONSOLE' 'FAIL' (Hide-Secrets $_.Exception.Message)
-    }
-    # The scripted provider is this script's own child process; it is always reaped.
-    try { Stop-ScriptedProvider } catch {
-        Add-Result 'PROVIDER_STOP' 'FAIL' (Hide-Secrets $_.Exception.Message)
     }
     try {
         $failed = Write-AcceptanceArtifacts
@@ -1714,9 +1700,9 @@ try {
 }
 
 $passed = @($script:Results | Where-Object { $_.status -eq 'PASS' }).Count
-$simulated = @($script:Results | Where-Object { $_.status -eq 'SIMULATED' }).Count
+$notApplicable = @($script:Results | Where-Object { $_.status -eq 'N/A' }).Count
 $skipped = @($script:Results | Where-Object { $_.status -like 'SKIP*' }).Count
 $failed = @($script:Results | Where-Object { $_.status -eq 'FAIL' }).Count
 Write-Host ''
-Write-Host ("acceptance: {0} PASS / {1} SIMULATED / {2} SKIP / {3} FAIL; logs in {4}" -f $passed, $simulated, $skipped, $failed, $script:Paths['logs'])
+Write-Host ("acceptance: {0} PASS / {1} N/A / {2} SKIP / {3} FAIL; logs in {4}" -f $passed, $notApplicable, $skipped, $failed, $script:Paths['logs'])
 exit $exitCode
