@@ -205,6 +205,18 @@ function Verify-Package([string]$Root, [switch]$InstalledStart) {
             throw 'DSH Hook manifest does not match the package file list.'
         }
     }
+    if ($manifest.ContainsKey('dshRuntime')) {
+        $dsh = $manifest.dshRuntime
+        foreach ($required in @('runtime/dsh/dsh-runtime-bundle.json', 'runtime/dsh/dsh.cmd',
+            'runtime/dsh/node/node.exe', 'runtime/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js')) {
+            if (-not $allowed.Contains($required)) { throw "DSH runtime is incomplete: $required" }
+        }
+        if ($dsh.platform -cne 'windows' -or $dsh.arch -cne 'x86_64' -or
+            $dsh.manifestSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $dsh.manifestSha256 -cne $manifest.files.'runtime/dsh/dsh-runtime-bundle.json') {
+            throw 'DSH runtime manifest does not match the package file list.'
+        }
+    }
     if ($InstalledStart) {
         # The whole closure was verified before activation. Recheck entry
         # points on launch without rereading thousands of Pi dependency files.
@@ -213,7 +225,7 @@ function Verify-Package([string]$Root, [switch]$InstalledStart) {
             @($allowed | Where-Object {
                 $_ -match '^runtime/dsh-hook-executor/(hook-executor-bundle\.json|executor\.mjs|verify\.mjs|package(?:-lock)?\.json|THIRD-PARTY-NOTICES\.txt)$'
             })
-        $entries += @('runtime/pi/node/node.exe')
+        $entries += @('runtime/pi/node/node.exe', 'runtime/dsh/dsh-runtime-bundle.json', 'runtime/dsh/dsh.cmd', 'runtime/dsh/node/node.exe')
         foreach ($relative in $entries) {
             $file = Resolve-Directory (Join-Path $Root $relative)
             if ((File-Hash $file) -cne $manifest.files[$relative]) { throw "Damaged program file: $relative" }
@@ -273,6 +285,8 @@ function Data-Contract($Manifest) {
 function Run-Loom([string]$Root, [string]$DataRoot, [int]$ListenPort, $Manifest) {
     Assert-DataSeparate $DataRoot $Root
     $env:ROVAI_EMBEDDED_PI_ROOT = Join-Path $Root 'runtime\pi'
+    # Only fill the embedded DSH root when the user has not chosen one.
+    if (-not $env:ROVAI_EMBEDDED_DSH_ROOT) { $env:ROVAI_EMBEDDED_DSH_ROOT = Join-Path $Root 'runtime\dsh' }
     $env:PI_CODING_AGENT_DIR = Join-Path $DataRoot 'runtime-home\pi'
     $env:CODEX_HOME = Join-Path $DataRoot 'runtime-home\codex'
     $env:CLAUDE_CONFIG_DIR = Join-Path $DataRoot 'runtime-home\claude'

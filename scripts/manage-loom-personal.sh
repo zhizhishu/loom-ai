@@ -51,6 +51,9 @@ verify_package() {
   require_file "$root/runtime/pi/pi-bundle.json" runtime/pi/pi-bundle.json
   require_exec "$root/runtime/pi/node/node" runtime/pi/node/node
   require_exec "$root/runtime/pi/pi" runtime/pi/pi
+  require_file "$root/runtime/dsh/dsh-runtime-bundle.json" runtime/dsh/dsh-runtime-bundle.json
+  require_exec "$root/runtime/dsh/dsh" runtime/dsh/dsh
+  require_exec "$root/runtime/dsh/node/node" runtime/dsh/node/node
   require_file "$root/runtime/computer/computer-bundle.json" runtime/computer/computer-bundle.json
   require_exec "$root/runtime/computer/python" runtime/computer/python
   require_file "$root/runtime/computer/host_desktop.py" runtime/computer/host_desktop.py
@@ -72,6 +75,9 @@ run_loom() {
   listen_port=$3
   assert_separate "$root" "$data"
   export ROVAI_EMBEDDED_PI_ROOT="$root/runtime/pi"
+  # Only fill the embedded DSH root when the user has not chosen one.
+  ROVAI_EMBEDDED_DSH_ROOT=${ROVAI_EMBEDDED_DSH_ROOT:-"$root/runtime/dsh"}
+  export ROVAI_EMBEDDED_DSH_ROOT
   export PI_CODING_AGENT_DIR="$data/runtime-home/pi"
   export CODEX_HOME="$data/runtime-home/codex"
   export CLAUDE_CONFIG_DIR="$data/runtime-home/claude"
