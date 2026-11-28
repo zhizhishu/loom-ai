@@ -139,7 +139,9 @@ function runWrapper(t, { cmd, copy }, args) {
     env: { ...process.env, LOCALAPPDATA: join(f.root, 'isolated-local-data'), LOOM_WRAPPER_ARGV: receivedPath }
   })
   assert.equal(existsSync(receivedPath), true, result.stderr || result.stdout)
-  return readFileSync(receivedPath, 'utf8').split(/\r?\n/).filter(Boolean)
+  // Windows PowerShell 5 Set-Content -Encoding UTF8 writes a BOM; it is an
+  // artefact of the test's own recorder, not part of the forwarded token.
+  return readFileSync(receivedPath, 'utf8').replace(/^\uFEFF/, '').split(/\r?\n/).filter(Boolean)
 }
 
 for (const wrapper of wrapperCases) {
@@ -438,7 +440,9 @@ if (@($csv).Count -ne 1) { throw 'the export must stay one scalar string' }
 $state = [ordered]@{ schema = 1; runtimes = @($csv) }
 Set-SavedRuntimes $state $csv
 $json = $state | ConvertTo-Json -Compress
-if ($json -notmatch '"runtimes":\["pi","deepseek-harness"\]') { throw "json mismatch: $json" }
+# A literal substring check keeps the regex character-class range syntax
+# ('[x-y]', which PowerShell 5.1 rejects as a reversed range) out of the assertion.
+if (-not $json.Contains('"runtimes":["pi","deepseek-harness"]')) { throw "json mismatch: $json" }
 # The setter must also work when the state object predates the property: both
 # the PSCustomObject (ConvertFrom-Json) and dictionary (Read-Json) shapes.
 $legacyObject = '{"schema":1}' | ConvertFrom-Json

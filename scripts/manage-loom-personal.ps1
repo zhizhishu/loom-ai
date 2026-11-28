@@ -119,10 +119,25 @@ function Select-RuntimesInteractively([string]$DefaultList) {
     return (ConvertFrom-RuntimeSelection ($names -join ','))
 }
 
+function Test-StateKey($State, [string]$Name) {
+    # Key lookup that works for every dictionary shape Read-Json can return:
+    # PowerShell 5.1's JavaScriptSerializer dictionary (Dictionary[string,object])
+    # exposes ContainsKey but not Contains, Hashtable/OrderedDictionary expose
+    # both, and PS 6+ -AsHashtable is a plain Hashtable. Scan Keys so no single
+    # method name is assumed.
+    foreach ($key in @($State.Keys)) {
+        if ([string]::Equals([string]$key, $Name, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
 function Get-SavedRuntimes($State) {
     # StrictMode-safe read of the optional installation.json runtime selection.
     if (-not $State) { return $null }
-    if ($State -is [Collections.IDictionary]) { return $(if ($State.Contains('runtimes')) { $State['runtimes'] } else { $null }) }
+    if ($State -is [Collections.IDictionary]) {
+        if (Test-StateKey $State 'runtimes') { return $State['runtimes'] }
+        return $null
+    }
     $property = $State.PSObject.Properties['runtimes']
     if ($property) { return $property.Value }
     return $null
