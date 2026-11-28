@@ -27,6 +27,8 @@ import {
   readArtifactPreview,
   reviewDraftComplete,
   stripLeadingHeading,
+  stageReviewBlocked,
+  releaseStageReviewRework,
   prepareArtifactReviewAttempt,
   sendArtifactReviewAttempt,
   rememberUnconfirmedReviewAttempt,
@@ -82,18 +84,35 @@ export function ArtifactReviewStatus({ kind }: { kind: ArtifactReviewKind }): Re
 }
 
 /**
- * 受阻说明：任务被阻塞（或 Core 只写了阻塞原因）时，把真实原因和唯一安全的
- * 下一步（刷新）摆出来。原因键是 task.blockedReason（阶段审查为 `stage review: <reason>`）。
- * 不造 Core 没有的「继续/重新审查」按钮。
+ * 受阻说明：任务被阻塞（或 Core 只写了阻塞原因）时，把真实原因和安全的下一步摆出来。
+ * 原因键是 task.blockedReason（阶段审查为 `stage review: <reason>`）。
+ * 阶段审查受阻多一个已有的写出口「退回重做」（loom.task.release）；其他阻塞只有刷新，
+ * 因为 execution_authority_lost 之类不是退回重发能解决的。
  */
-export function ArtifactReviewBlockedNotice({ reason, onRefresh }: {
+export function ArtifactReviewBlockedNotice({ reason, onRefresh, onReleaseRework = null }: {
   reason: string | null
   onRefresh(): void
+  /** 只有阶段审查受阻才传真实调用；传 null 就不渲染退回重做按钮。失败提示由调用方负责。 */
+  onReleaseRework?: (() => Promise<void>) | null
 }): React.JSX.Element {
   const detail = (reason ?? '').trim()
+  // pending 只活在这一次点击里：重复点不会写出第二条 loom.task.release。
+  const [releasing, setReleasing] = useState(false)
+  // 只有阶段审查受阻、且调用方给了真实调用时，才有退回重做。
+  const rework = stageReviewBlocked(detail) ? onReleaseRework : null
   return <div className="ln-artifact-state" role="status" data-state="blocked">
     <strong>受阻</strong>
     <p className="ln-artifact-fact-note">{detail === '' ? '任务已被阻塞，但没有记录阻塞原因。' : detail}</p>
+    {rework !== null && <button
+      type="button" className="ln-artifact-retry" data-action="release-stage-review"
+      disabled={releasing} aria-busy={releasing}
+      onClick={() => {
+        if (releasing) return
+        setReleasing(true)
+        // 调用方用现有错误展示位承接失败；这里只结束这次点击的 pending。
+        void Promise.resolve(rework()).catch(() => undefined).finally(() => setReleasing(false))
+      }}
+    >{releasing ? '正在退回…' : '退回重做'}</button>}
     <button type="button" className="ln-artifact-retry" onClick={onRefresh}>刷新记录</button>
   </div>
 }
@@ -316,6 +335,20 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
     }
   }
 
+  // 退回重做只对阶段审查受阻开放：真实写已准入的 loom.task.release，missionId/taskId
+  // 只取当前浮层投影里的真任务；写成功后 await onRefresh()，界面只信重读后的状态。
+  // 失败沿用现有错误位（setFailure + readErrorMessage），不新增第二套状态机。
+  const releaseRework = async (): Promise<void> => {
+    const task = facts.task
+    if (task === null) return
+    setFailure(null)
+    try {
+      await releaseStageReviewRework({ rpc: client, missionId, taskId: task.taskId, refresh: onRefresh })
+    } catch (error) {
+      setFailure(readErrorMessage(error, '暂时不能退回重做'))
+    }
+  }
+
   const unavailableText = (reason: 'too_large' | 'binary' | 'not_archived'): string =>
     reason === 'too_large' ? '该文件较大，暂不支持预览。'
       : reason === 'binary' ? '这是二进制文件，不展示正文。'
@@ -453,6 +486,7 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
               {facts.reviewKind === 'blocked' && <ArtifactReviewBlockedNotice
                 reason={facts.task?.blockedReason ?? null}
                 onRefresh={() => { void onRefresh().catch(error => setFailure(readErrorMessage(error, '刷新失败'))) }}
+                onReleaseRework={facts.task === null ? null : releaseRework}
               />}
 
               <details className="ln-artifact-metadata"><summary>文件信息</summary>              <div className="ln-artifact-fact" data-fact="artifact">

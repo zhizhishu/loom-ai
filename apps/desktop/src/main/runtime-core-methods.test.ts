@@ -3,6 +3,10 @@ import { describe, expect, it } from 'vitest'
 import { RUNTIME_RENDERER_CORE_METHODS } from './runtime-core-methods'
 
 const mainSource = readFileSync(new URL('./index.ts', import.meta.url), 'utf8')
+const artifactServiceSource = readFileSync(
+  new URL('../renderer/src/loom-native/artifact-service.ts', import.meta.url),
+  'utf8'
+)
 
 describe('Runtime Renderer Core method allowlist', () => {
   it('exposes discovery, recovery wake, input reconciliation, explicit checking, and cancellation', () => {
@@ -49,5 +53,18 @@ describe('Runtime Renderer Core method allowlist', () => {
     expect(allowlistEnd).toBeGreaterThan(allowlistStart)
     expect(mainSource.slice(allowlistStart, allowlistEnd))
       .toContain("'singleChat.pendingInputs.edit'")
+  })
+
+  // The ArtifactView's 退回重做 writes `loom.task.release`; an allowlist without it makes the Host
+  // reject the shipped button before Core ever sees the Owner's decision. The electron fixture
+  // talks to a proxy, so only this static check guards the real IPC boundary.
+  it('allows the Loom stage-review rework release the ArtifactView writes', () => {
+    const allowlistStart = mainSource.indexOf('const allowedMethods = new Set<CoreMethod>([')
+    const allowlistEnd = mainSource.indexOf('\n])', allowlistStart)
+    expect(allowlistStart).toBeGreaterThan(-1)
+    expect(allowlistEnd).toBeGreaterThan(allowlistStart)
+    expect(mainSource.slice(allowlistStart, allowlistEnd))
+      .toContain("'loom.task.release'")
+    expect(artifactServiceSource).toContain("'loom.task.release'")
   })
 })

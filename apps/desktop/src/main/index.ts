@@ -310,6 +310,9 @@ const allowedMethods = new Set<CoreMethod>([
   'missions.create',
   'missions.update',
   'missions.status',
+  // 阶段审查受阻的退回重做：Owner 在 ArtifactView 里点「退回重做」写出的唯一 Loom 写操作，
+  // Core 侧只接受 CURRENT_USER_ID 注入的身份。读投影不走这条（网络端边界不变）。
+  'loom.task.release',
   'missions.start',
   'missions.linkPr',
   'threads.create',

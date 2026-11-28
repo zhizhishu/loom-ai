@@ -19,7 +19,10 @@ import {
   recallUnconfirmedReviewAttempt,
   refreshArtifactSelection,
   rememberUnconfirmedReviewAttempt,
+  releaseStageReviewRework,
+  releaseStageReviewTask,
   sendArtifactReviewAttempt,
+  stageReviewBlocked,
   submitArtifactReview,
   unconfirmedAttemptLifecycle,
   type ArtifactReviewAttempt,
@@ -808,5 +811,108 @@ describe('artifact status is derived from the real control and acceptance projec
     expect(latestCandidateReview([earlier, later], 'c1')?.reviewId).toBe('rev-b')
     expect(latestCandidateReview([earlier], 'other')).toBeNull()
     expect(latestCandidateReview([], 'c1')).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 「退回重做」：只有阶段审查受阻才有这条出口，写的是已准入的 loom.task.release。
+// ---------------------------------------------------------------------------
+
+describe('a stage review block is the only blocker with a rework exit', () => {
+  it('recognises exactly the stage review prefix and nothing else', () => {
+    expect(stageReviewBlocked('stage review: missing evidence')).toBe(true)
+    expect(stageReviewBlocked('  stage review: needs a second look  ')).toBe(true)
+    // 执行权丢失、预算耗尽、审查者不可用都不是阶段审查：没有退回重做的出口。
+    for (const reason of [
+      'execution_authority_lost',
+      'loom.rework_budget_exhausted',
+      'loom.dispatch_budget_exhausted',
+      'stage review missing evidence',
+      '状态未知'
+    ]) {
+      expect(stageReviewBlocked(reason)).toBe(false)
+    }
+    expect(stageReviewBlocked('')).toBe(false)
+    expect(stageReviewBlocked(null)).toBe(false)
+    expect(stageReviewBlocked(undefined)).toBe(false)
+  })
+
+  it('writes the real projected mission and task through the admitted loom.task.release op', async () => {
+    const request = vi.fn().mockResolvedValue({ missionId: 'm', planId: 'p' })
+    const blocked: WorkBundle = {
+      ...bundle(),
+      tasks: [{ ...task, status: 'blocked', blockedReason: 'stage review: missing evidence' }]
+    }
+    const blockedFacts = artifactCandidateFacts(blocked, artifact, first)
+    const projected = blockedFacts.task
+    if (projected === null) throw new Error('fixture must project the blocked task')
+    expect(stageReviewBlocked(projected.blockedReason)).toBe(true)
+    const refresh = vi.fn().mockResolvedValue(undefined)
+    await releaseStageReviewRework({
+      rpc: rpc(request),
+      missionId: blocked.mission.missionId,
+      taskId: projected.taskId,
+      refresh
+    })
+    expect(request).toHaveBeenCalledTimes(1)
+    const [method, input] = request.mock.calls[0]
+    expect(method).toBe('loom.task.release')
+    expect(input).toEqual({ missionId: 'm', taskId: 't' })
+    // 只发真实身份这两个字段：不自造 commandId/reason/reviewerId。
+    expect(Object.keys(input as object)).toEqual(['missionId', 'taskId'])
+    expect(refresh).toHaveBeenCalledTimes(1)
+  })
+
+  it('awaits the refresh after the write and calls a failed refresh a refresh failure', async () => {
+    const order: string[] = []
+    const request = vi.fn().mockImplementation(async () => {
+      order.push('release')
+      return { missionId: 'm', planId: 'p' }
+    })
+    const refresh = vi.fn().mockImplementation(async () => {
+      order.push('refresh')
+      throw new Error('连接已断开')
+    })
+    await expect(releaseStageReviewRework({ rpc: rpc(request), missionId: 'm', taskId: 't', refresh }))
+      .rejects.toThrow('已退回重做，但列表刷新失败：连接已断开')
+    // 先写、后刷新：界面只信刷新后的投影，不能反过来。
+    expect(order).toEqual(['release', 'refresh'])
+    // 写失败时不得刷新，也不得把失败说成刷新失败。
+    // Core 现在接受 DRAFT 或阶段审查受阻的 BLOCKED：这里拒绝的是别的 owner 写的阻塞。
+    const failing = vi.fn().mockRejectedValue(new Error(
+      'LOOM task t is BLOCKED for a reason its own owner must lift; only a stage-review block can be released for rework'))
+    const untouched = vi.fn()
+    await expect(releaseStageReviewRework({ rpc: rpc(failing), missionId: 'm', taskId: 't', refresh: untouched }))
+      .rejects.toThrow('only a stage-review block can be released')
+    expect(untouched).not.toHaveBeenCalled()
+  })
+
+  it('keeps one pending click to one write, then allows a new intent', async () => {
+    const port = rpc(vi.fn())
+    let settle: ((value: unknown) => void) | undefined
+    port.request.mockImplementation(() => new Promise(resolve => { settle = resolve }))
+    const refresh = vi.fn().mockResolvedValue(undefined)
+    const click = (): Promise<void> => releaseStageReviewRework({ rpc: port, missionId: 'm', taskId: 't', refresh })
+    const firstClick = click()
+    const secondClick = click()
+    // pending 期间的第二次点击复用同一次写入，不会多一条命令。
+    expect(port.request).toHaveBeenCalledTimes(1)
+    if (settle === undefined) throw new Error('the first release must be in flight')
+    settle({ missionId: 'm', planId: 'p' })
+    await Promise.all([firstClick, secondClick])
+    expect(port.request).toHaveBeenCalledTimes(1)
+    expect(refresh).toHaveBeenCalledTimes(1)
+    // 落定之后再点是一次新的真实意图。
+    port.request.mockResolvedValueOnce({ missionId: 'm', planId: 'p' })
+    await click()
+    expect(port.request).toHaveBeenCalledTimes(2)
+    expect(refresh).toHaveBeenCalledTimes(2)
+  })
+
+  it('refuses to release without a real projected identity', async () => {
+    const request = vi.fn()
+    await expect(releaseStageReviewTask(rpc(request), 'm', '   ')).rejects.toThrow('缺少真实的任务身份')
+    await expect(releaseStageReviewTask(rpc(request), '  ', 't')).rejects.toThrow('缺少真实的任务身份')
+    expect(request).not.toHaveBeenCalled()
   })
 })
