@@ -407,9 +407,11 @@ test('official rovai-host + two real guarded Pi writes -> production Web LoomApp
     assert.match(login.body.token, /^[0-9a-f]{64}$/)
     const session = login.body.token
 
-    // Negative: the producer side stays off the network capability even with a valid Session.
+    // Negative: producer-side operations (artifact.register / plan.import / candidate.record /
+    // claim.acquire) stay off the network capability even with a valid Session. Owner task release
+    // is admitted separately and is deliberately not part of this negative case.
     for (const operation of ['loom.artifact.register', 'loom.plan.import', 'loom.candidate.record',
-      'loom.claim.acquire', 'loom.task.release']) {
+      'loom.claim.acquire']) {
       const denied = await request(session, operation, {
         missionId, taskId: WORKERS[0].taskId, agentRunId: runs[0].agentRunId,
         relativePath: WORKERS[0].relativePath
