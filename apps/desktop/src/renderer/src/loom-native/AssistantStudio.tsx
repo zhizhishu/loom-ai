@@ -186,7 +186,7 @@ export function AssistantStudio({ open, environment, agents, initialAgentId, ini
           <footer className="ln-form-actions"><small>头像和既有运行配置不会被资料保存覆盖。</small><button type="button" className="ln-action is-primary" disabled={busy || !identityDirty || !identity.name.trim()} onClick={() => { void saveIdentity() }}>{busy ? '保存中…' : local ? '保存资料' : '创建助手'}</button></footer>
         </>}
         {tab === 'capabilities' && local && <AssistantCapabilityEditor key={`${local.agentId}:${catalogEpoch}`} environment={environment} agent={local} threadId={threadId} theme={theme} onDirtyChange={setCapDirty} onBusyChange={setWizardBusy} onSaved={() => { void onRefresh() }}/>}
-        {tab === 'location' && local && <ExecutionPanel environment={environment} agentId={local.agentId} theme={theme} onDirtyChange={setLocationDirty} onSaved={() => { void onRefresh() }}/>}
+        {tab === 'location' && local && <ExecutionPanel environment={environment} agentId={local.agentId} threadId={threadId} theme={theme} onDirtyChange={setLocationDirty} onSaved={() => { void onRefresh() }}/>}
         {tab === 'runtime' && local && <>
           <label className="ln-field"><span>运行端</span><ChoiceMenu label="助手运行端" theme={theme} value={runtime?.adapterKind ?? ''} onChange={switchRuntime} disabled={busy || loadingRuntime} choices={[
             { value:'', label: loadingRuntime ? '正在读取运行端…' : '选择运行端', disabled:true },

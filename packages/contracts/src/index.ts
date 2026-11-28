@@ -4398,6 +4398,7 @@ export type CoreMethod =
   | 'automations.get'
   | 'automations.runs.list'
   | 'missions.workspace.cleanup'
+  | 'missions.workspace.prepareRemote'
   | 'missions.cleanup.list'
   | 'missions.cleanup.retry'
   | 'missions.list'

@@ -686,6 +686,21 @@ impl NodeStore {
             .map_err(Into::into)
     }
 
+    /// The role of a node this Host paired and still trusts. A node it never
+    /// paired and a node it revoked both answer `None`, so a workspace prepare
+    /// can neither create nor revive a row on it.
+    pub fn active_node_role(&self, node_id: &str) -> Result<Option<String>> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT role FROM execution_node WHERE node_id=?1 AND revoked_at IS NULL",
+                [node_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn sqlite_directory(&self) -> Result<PathBuf> {
         let connection = self.lock()?;
         let path = connection
@@ -732,18 +747,31 @@ impl NodeStore {
     }
 
     pub fn workspace_by_id(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>> {
-        self.workspace_where("w.id=?1", workspace_id)
+        self.workspace_where("w.id=?1", &[workspace_id])
     }
 
     pub fn workspace_by_mission(&self, mission_id: &str) -> Result<Option<WorkspaceRecord>> {
-        self.workspace_where("w.mission_id=?1", mission_id)
+        self.workspace_where("w.mission_id=?1", &[mission_id])
+    }
+
+    /// The one ready row this Mission already has on one execution host. A row on
+    /// any other host is a different execution root and never substitutes for it.
+    pub fn workspace_by_mission_and_host(
+        &self,
+        mission_id: &str,
+        execution_host_id: &str,
+    ) -> Result<Option<WorkspaceRecord>> {
+        self.workspace_where(
+            "w.mission_id=?1 AND w.execution_host_id=?2",
+            &[mission_id, execution_host_id],
+        )
     }
 
     pub fn workspace_by_camp(&self, camp_id: &str) -> Result<Option<WorkspaceRecord>> {
-        self.workspace_where("w.camp_id=?1", camp_id)
+        self.workspace_where("w.camp_id=?1", &[camp_id])
     }
 
-    fn workspace_where(&self, clause: &str, value: &str) -> Result<Option<WorkspaceRecord>> {
+    fn workspace_where(&self, clause: &str, values: &[&str]) -> Result<Option<WorkspaceRecord>> {
         let connection = self.lock()?;
         let sql = format!(
             "SELECT w.id, w.mission_id, w.camp_id, w.execution_host_id, w.source_directory,
@@ -755,23 +783,27 @@ impl NodeStore {
              ORDER BY w.created_at DESC LIMIT 1"
         );
         connection
-            .query_row(&sql, [value], |row| {
-                Ok(WorkspaceRecord {
-                    id: row.get(0)?,
-                    mission_id: row.get(1)?,
-                    camp_id: row.get(2)?,
-                    execution_host_id: row.get(3)?,
-                    source_directory: row.get(4)?,
-                    repository_root: row.get(5)?,
-                    git_common_dir: row.get(6)?,
-                    worktree_path: row.get(7)?,
-                    branch: row.get(8)?,
-                    base_sha: row.get(9)?,
-                    owner_name: row.get(10)?,
-                    owner_role: row.get(11)?,
-                    last_heartbeat: row.get(12)?,
-                })
-            })
+            .query_row(
+                &sql,
+                rusqlite::params_from_iter(values.iter().copied()),
+                |row| {
+                    Ok(WorkspaceRecord {
+                        id: row.get(0)?,
+                        mission_id: row.get(1)?,
+                        camp_id: row.get(2)?,
+                        execution_host_id: row.get(3)?,
+                        source_directory: row.get(4)?,
+                        repository_root: row.get(5)?,
+                        git_common_dir: row.get(6)?,
+                        worktree_path: row.get(7)?,
+                        branch: row.get(8)?,
+                        base_sha: row.get(9)?,
+                        owner_name: row.get(10)?,
+                        owner_role: row.get(11)?,
+                        last_heartbeat: row.get(12)?,
+                    })
+                },
+            )
             .optional()
             .map_err(Into::into)
     }
@@ -1547,6 +1579,139 @@ mod tests {
             listed
                 .iter()
                 .any(|node| node.node_id == "node_b" && node.role == "remote")
+        );
+    }
+
+    /// A mission row on one host is not the answer for another host. The lookup
+    /// the shared prepare uses therefore never lets a local row stand in for a
+    /// remote one, and a non-ready or revoked row is not "already prepared".
+    #[test]
+    fn mission_workspace_lookup_is_host_scoped_and_ready_only() {
+        let store = NodeStore::open_ephemeral().unwrap();
+        let now = now_stamp();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO execution_node(
+                    node_id, display_name, role, os, arch, token_digest, paired_at, revoked_at, last_heartbeat
+                 ) VALUES('host', '本机', 'local', NULL, NULL, NULL, ?1, NULL, NULL)",
+                [&now],
+            )
+            .unwrap();
+        store
+            .insert_remote("node_b", "desk-b", &"ab".repeat(32))
+            .unwrap();
+        // The production table arrives with migration 231; this fixture is schema only.
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE mission_workspace (
+                    id TEXT PRIMARY KEY NOT NULL, mission_id TEXT NOT NULL, camp_id TEXT NOT NULL,
+                    execution_host_id TEXT NOT NULL, source_directory TEXT NOT NULL,
+                    repository_root TEXT NOT NULL, git_common_dir TEXT NOT NULL,
+                    worktree_path TEXT NOT NULL, working_directory TEXT NOT NULL, base_branch TEXT,
+                    branch TEXT NOT NULL, base_sha TEXT NOT NULL, preparation_token TEXT NOT NULL,
+                    preparation_kind TEXT NOT NULL, generation INTEGER NOT NULL, state TEXT NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    UNIQUE(mission_id,execution_host_id,git_common_dir))",
+            )
+            .unwrap();
+        let row = |id: &str, host: &str, worktree: &str| WorkspaceRecord {
+            id: id.into(),
+            mission_id: "mission_a".into(),
+            camp_id: "camp_a".into(),
+            execution_host_id: host.into(),
+            source_directory: "/srv/source".into(),
+            repository_root: "/srv/source".into(),
+            git_common_dir: "/srv/source/.git".into(),
+            worktree_path: worktree.into(),
+            branch: "loom/mission_a".into(),
+            base_sha: "sha".into(),
+            owner_name: String::new(),
+            owner_role: String::new(),
+            last_heartbeat: None,
+        };
+        // The local row is written last, so a mission-only lookup would answer it.
+        store
+            .save_workspace(&row("ws_remote", "node_b", "/srv/worktree-remote"))
+            .unwrap();
+        store
+            .save_workspace(&row("ws_local", "host", "/srv/worktree-local"))
+            .unwrap();
+        // Pin the ordering instead of trusting two timestamps to differ: the newest
+        // row is the remote one, which is exactly what a mission-only lookup returns.
+        for (id, created_at) in [
+            ("ws_remote", "2026-01-01T00:00:02Z"),
+            ("ws_local", "2026-01-01T00:00:01Z"),
+        ] {
+            store
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE mission_workspace SET created_at=?1 WHERE id=?2",
+                    rusqlite::params![created_at, id],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.workspace_by_mission("mission_a").unwrap().unwrap().id,
+            "ws_remote"
+        );
+        let remote = store
+            .workspace_by_mission_and_host("mission_a", "node_b")
+            .unwrap()
+            .expect("the remote row answers for its own host");
+        assert_eq!(remote.id, "ws_remote");
+        assert_eq!(remote.owner_role, "remote");
+        assert_eq!(
+            store
+                .workspace_by_mission_and_host("mission_a", "host")
+                .unwrap()
+                .unwrap()
+                .id,
+            "ws_local"
+        );
+        // A third host has nothing prepared even though the mission has two rows.
+        store
+            .insert_remote("node_c", "desk-c", &"cd".repeat(32))
+            .unwrap();
+        assert!(
+            store
+                .workspace_by_mission_and_host("mission_a", "node_c")
+                .unwrap()
+                .is_none()
+        );
+        // Only a ready row on a live node is already prepared.
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE mission_workspace SET state='cleanup_pending' WHERE id='ws_remote'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .workspace_by_mission_and_host("mission_a", "node_b")
+                .unwrap()
+                .is_none()
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE mission_workspace SET state='ready' WHERE id='ws_remote'",
+                [],
+            )
+            .unwrap();
+        store.revoke("node_b").unwrap();
+        assert!(
+            store
+                .workspace_by_mission_and_host("mission_a", "node_b")
+                .unwrap()
+                .is_none()
         );
     }
 

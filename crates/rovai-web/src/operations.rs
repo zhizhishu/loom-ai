@@ -7,6 +7,12 @@ use serde::{Deserialize, Serialize};
 pub enum Operation {
     #[serde(rename = "missions.workspace.cleanup")]
     MissionWorkspaceCleanup,
+    // The Web Host already owns remote workspace preparation at
+    // `POST /api/v1/nodes/workspaces`. This is that same prepare behind the
+    // admitted RPC surface, so a browser can prepare the workspace its own
+    // Mission needs without reaching any other node or any local path.
+    #[serde(rename = "missions.workspace.prepareRemote")]
+    MissionWorkspacePrepareRemote,
     #[serde(rename = "missions.cleanup.list")]
     MissionCleanupList,
     #[serde(rename = "missions.cleanup.retry")]
@@ -453,6 +459,9 @@ impl Operation {
             | Self::MissionCleanupRetry
             | Self::MissionChanges
             | Self::MissionFileDiff
+            // A remote prepare waits for the node's own Git answer, which the socket
+            // already budgets at 30s; the Host must not abandon it before that.
+            | Self::MissionWorkspacePrepareRemote
             | Self::RuntimeCheck
             | Self::RuntimeCatalog
             | Self::RuntimeDiscover
@@ -615,6 +624,7 @@ impl Operation {
             Self::NewConversationSetOneClick => "preferences.newConversation.setOneClick",
             Self::NewConversationInvalidate => "preferences.newConversation.invalidate",
             Self::MissionWorkspaceCleanup => "missions.workspace.cleanup",
+            Self::MissionWorkspacePrepareRemote => "missions.workspace.prepareRemote",
             Self::MissionCleanupList => "missions.cleanup.list",
             Self::MissionCleanupRetry => "missions.cleanup.retry",
             Self::MissionList => "missions.list",
@@ -1269,5 +1279,30 @@ mod tests {
         let continuation =
             serde_json::from_value::<Operation>(json!("agentRuns.continue")).unwrap();
         assert_eq!(continuation.method(), "agentRuns.continue");
+    }
+
+    /// The operation name is the whole permission: a browser may ask for the one
+    /// admitted remote workspace prepare and for nothing that was not individually
+    /// listed here, however close its spelling is.
+    #[test]
+    fn remote_workspace_prepare_is_admitted_by_its_own_name() {
+        let admitted =
+            serde_json::from_value::<Operation>(json!("missions.workspace.prepareRemote"))
+                .expect("the remote workspace prepare is individually admitted");
+        assert_eq!(admitted.method(), "missions.workspace.prepareRemote");
+        assert_eq!(admitted.timeout(), std::time::Duration::from_secs(120));
+        for unadmitted in [
+            // Not an admission list, a prefix match or a family grant.
+            "missions.workspace.prepare",
+            "missions.workspace.prepareRemoteAll",
+            "missions.workspace.prepareRemote ",
+            "nodes.workspaces.prepare",
+            "host.web.rotate",
+        ] {
+            assert!(
+                serde_json::from_value::<Operation>(json!(unadmitted)).is_err(),
+                "{unadmitted} must stay outside the network capability"
+            );
+        }
     }
 }

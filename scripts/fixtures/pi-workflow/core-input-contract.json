@@ -403,6 +403,185 @@
           }
         }
       }
+    },
+    {
+      "operation": "loom.workspace.list",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [],
+        "properties": {
+          "workspaceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Optional prepared workspace ID. Omit it and Core uses this Mission's only ready remote workspace; when the Mission has more than one, name the one to use."
+          },
+          "requestId": {
+            "type": "string",
+            "format": "uuid",
+            "minLength": 36,
+            "maxLength": 36,
+            "description": "Optional UUID for an explicit retry. Reuse with identical arguments within the same Run; Core retains the original deadline and never executes it twice."
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 300000,
+            "default": 30000
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 4096,
+            "description": "Path relative to the prepared workspace; absolute paths and traversal are refused.",
+            "minLength": 1
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200,
+            "default": 200
+          }
+        }
+      }
+    },
+    {
+      "operation": "loom.workspace.read",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "workspaceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Optional prepared workspace ID. Omit it and Core uses this Mission's only ready remote workspace; when the Mission has more than one, name the one to use."
+          },
+          "requestId": {
+            "type": "string",
+            "format": "uuid",
+            "minLength": 36,
+            "maxLength": 36,
+            "description": "Optional UUID for an explicit retry. Reuse with identical arguments within the same Run; Core retains the original deadline and never executes it twice."
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 300000,
+            "default": 30000
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 4096,
+            "description": "Path relative to the prepared workspace; absolute paths and traversal are refused.",
+            "minLength": 1
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "default": 0
+          },
+          "maxBytes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1048576,
+            "default": 65536
+          }
+        }
+      }
+    },
+    {
+      "operation": "loom.workspace.write",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "data"
+        ],
+        "properties": {
+          "workspaceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Optional prepared workspace ID. Omit it and Core uses this Mission's only ready remote workspace; when the Mission has more than one, name the one to use."
+          },
+          "requestId": {
+            "type": "string",
+            "format": "uuid",
+            "minLength": 36,
+            "maxLength": 36,
+            "description": "Optional UUID for an explicit retry. Reuse with identical arguments within the same Run; Core retains the original deadline and never executes it twice."
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 300000,
+            "default": 30000
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 4096,
+            "description": "Path relative to the prepared workspace; absolute paths and traversal are refused.",
+            "minLength": 1
+          },
+          "data": {
+            "type": "string",
+            "maxLength": 1398104,
+            "description": "Standard padded base64 of the complete new file bytes, at most 1 MiB decoded. The owner replaces that contained regular file in place; no directory is created and nothing is deleted."
+          }
+        }
+      }
+    },
+    {
+      "operation": "thread.message.send",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "type": "string",
+            "default": "",
+            "maxLength": 32768,
+            "description": "Optional exact public message body; omit it when at least one file supplies the complete payload."
+          },
+          "to": {
+            "type": "array",
+            "maxItems": 16,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Optional canonical Agent ID to wake; repeat for multiple recipients. Display names are not accepted here. Input order is presentation metadata, never scheduling priority."
+          },
+          "mentionUser": {
+            "type": "boolean",
+            "default": false,
+            "description": "Mention the User and create an Inbox notification. Ordinary public Thread messages are already visible to the User. Use this only when the message creates a new unresolved decision, answer, or action for the User, or when the User explicitly requested notification of an important result. It creates no Agent Delivery, does not represent approval, and may be combined with publicOnly. User attention is message-local and is never inherited."
+          },
+          "publicOnly": {
+            "type": "boolean",
+            "default": false,
+            "description": "Guarantee that this public Thread message addresses no Agent. When true, explicit Agent recipients are invalid, effectiveRecipients and deliveryIds are empty, and no Agent is woken. This may be combined with mentionUser because User attention is not Agent routing."
+          },
+          "files": {
+            "type": "array",
+            "default": [],
+            "maxItems": 10,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Optional local file or directory paths to attach, in order. Pass each actual path directly. Rovai registers a reference without copying, moving, linking or changing permissions. Later reads use the current file at that path. Temporary files may become unavailable when their source is cleaned up."
+          }
+        }
+      }
     }
   ]
 }

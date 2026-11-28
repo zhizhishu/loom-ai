@@ -68,10 +68,72 @@ pub fn resolve_workspace_authority(
         policy_revision,
         allow_list: true,
         allow_read: true,
+        // The same mission-workspace authorization that admits a read admits a
+        // write; the node still bounds the target to the prepared worktree.
+        allow_write: true,
         allowed_tools: BTreeSet::from(["git.status".to_owned()]),
         online_generation,
     };
     Ok((TrustedPrincipal::AgentRun(scope), grant))
+}
+
+/// The one ready remote workspace this Run's Mission owns, for a tool call that
+/// omitted `workspaceId`. The Run, its Member and its camp all come from the
+/// already authenticated lease; the model names none of them.
+///
+/// The candidate set is the same mission-workspace authorization that admits the
+/// request, narrowed to `n.role='remote'`: a local execution row is this Host's
+/// own directory and is never offered as a remote target. Zero candidates are
+/// `NotFound` and more than one is `InvalidRequest` — both existing variants, so
+/// no new wire error appears. An ineligible Run reads the same `NotFound` as a
+/// Mission without a prepared remote workspace and learns nothing extra; the
+/// resolved id is still authorized against the Run afterwards.
+pub fn resolve_mission_remote_workspace(
+    conn: &Connection,
+    authenticated: &AuthenticatedTeamToolRun,
+) -> Result<String, RpcErrorCode> {
+    let mut statement = conn
+        .prepare(
+            "SELECT w.id
+               FROM agent_run r
+               JOIN conversation c ON c.id=r.conversation_id
+               JOIN camp_member cm ON cm.camp_id=c.camp_id AND cm.agent_id=c.agent_id
+               JOIN mission m ON m.camp_id=c.camp_id
+               JOIN mission_workspace w ON w.mission_id=m.id AND w.camp_id=c.camp_id
+               JOIN execution_node n ON n.node_id=w.execution_host_id
+              WHERE r.id=?1 AND r.execution_epoch=?2
+                AND r.status IN ('running','waiting') AND r.cancel_requested_at IS NULL
+                AND c.agent_id=?3 AND c.camp_id=?4
+                AND cm.status='active' AND cm.leave_requested_at IS NULL
+                AND w.state='ready' AND length(w.preparation_token)>0
+                AND n.revoked_at IS NULL AND n.role='remote'
+              ORDER BY w.created_at, w.id
+              LIMIT 2",
+        )
+        .map_err(|_| RpcErrorCode::StorageUnavailable)?;
+    let candidates = statement
+        .query_map(
+            params![
+                authenticated.agent_run_id,
+                authenticated.execution_epoch,
+                authenticated.agent_id,
+                authenticated.camp_id
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| RpcErrorCode::StorageUnavailable)?
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .map_err(|_| RpcErrorCode::StorageUnavailable)?;
+    match candidates.len() {
+        0 => Err(RpcErrorCode::NotFound),
+        1 => candidates
+            .into_iter()
+            .next()
+            .ok_or(RpcErrorCode::NotFound),
+        // Two ready remote workspaces are a real choice, and only the caller can
+        // make it; guessing would silently write into the wrong machine.
+        _ => Err(RpcErrorCode::InvalidRequest),
+    }
 }
 
 /// The Hub invokes this on the exact journaled dispatch immediately before
@@ -116,6 +178,7 @@ pub fn revalidate_dispatch(
     let allowed = match &dispatch.request.operation {
         WorkspaceOperation::List { .. } => grant.allow_list,
         WorkspaceOperation::Read { .. } => grant.allow_read,
+        WorkspaceOperation::Write { .. } => grant.allow_write,
         WorkspaceOperation::Run { tool_id, .. } => grant.allowed_tools.contains(tool_id),
     };
     if !allowed {
@@ -153,6 +216,113 @@ mod tests {
             },
         )
     }
+    /// The same shape as `fixture`, with the two columns the remote resolver reads:
+    /// the row's creation order and the owner node's role.
+    fn remote_workspace_fixture() -> (Connection, AuthenticatedTeamToolRun) {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "
+            CREATE TABLE agent_run(id TEXT,conversation_id TEXT,execution_epoch INTEGER,status TEXT,cancel_requested_at TEXT);
+            CREATE TABLE conversation(id TEXT,agent_id TEXT,camp_id TEXT);
+            CREATE TABLE camp_member(camp_id TEXT,agent_id TEXT,status TEXT,leave_requested_at TEXT);
+            CREATE TABLE mission(id TEXT,camp_id TEXT);
+            CREATE TABLE mission_workspace(id TEXT,mission_id TEXT,camp_id TEXT,execution_host_id TEXT,created_at TEXT,state TEXT,preparation_token TEXT);
+            CREATE TABLE execution_node(node_id TEXT,role TEXT,revoked_at TEXT);
+            INSERT INTO agent_run VALUES('run','session',7,'running',NULL);
+            INSERT INTO conversation VALUES('session','member','camp');
+            INSERT INTO camp_member VALUES('camp','member','active',NULL);
+            INSERT INTO mission VALUES('mission','camp');
+            INSERT INTO execution_node VALUES('node-b','remote',NULL);
+            INSERT INTO execution_node VALUES('node-c','remote',NULL);
+            INSERT INTO execution_node VALUES('host','local',NULL);
+        ",
+        )
+        .unwrap();
+        (
+            db,
+            AuthenticatedTeamToolRun {
+                camp_id: "camp".into(),
+                agent_id: "member".into(),
+                agent_run_id: "run".into(),
+                execution_epoch: 7,
+            },
+        )
+    }
+    fn ready_workspace(db: &Connection, id: &str, host: &str, created_at: &str) {
+        db.execute(
+            "INSERT INTO mission_workspace(id,mission_id,camp_id,execution_host_id,created_at,state,preparation_token)
+             VALUES(?1,'mission','camp',?2,?3,'ready','fixture-preparation')",
+            params![id, host, created_at],
+        )
+        .unwrap();
+    }
+    /// An omitted workspaceId resolves only from the authenticated Run's own Mission,
+    /// only on a remote node, and only when exactly one candidate exists.
+    #[test]
+    fn an_omitted_workspace_id_resolves_only_one_ready_remote_workspace() {
+        let (db, auth) = remote_workspace_fixture();
+        // Zero candidates: this Mission has nothing prepared.
+        assert_eq!(
+            resolve_mission_remote_workspace(&db, &auth),
+            Err(RpcErrorCode::NotFound)
+        );
+        // This Host's own execution row is not a remote target, so it is not a candidate.
+        ready_workspace(&db, "workspace-local", "host", "2026-01-01T00:00:01Z");
+        assert_eq!(
+            resolve_mission_remote_workspace(&db, &auth),
+            Err(RpcErrorCode::NotFound)
+        );
+        // Exactly one remote candidate is used without asking.
+        ready_workspace(&db, "workspace-b", "node-b", "2026-01-01T00:00:02Z");
+        assert_eq!(
+            resolve_mission_remote_workspace(&db, &auth).unwrap(),
+            "workspace-b"
+        );
+        // Two remote candidates are a real choice: the caller must name one.
+        ready_workspace(&db, "workspace-c", "node-c", "2026-01-01T00:00:03Z");
+        assert_eq!(
+            resolve_mission_remote_workspace(&db, &auth),
+            Err(RpcErrorCode::InvalidRequest)
+        );
+        db.execute("DELETE FROM mission_workspace WHERE id='workspace-c'", [])
+            .unwrap();
+        assert_eq!(
+            resolve_mission_remote_workspace(&db, &auth).unwrap(),
+            "workspace-b"
+        );
+        // A row that is no longer ready, or whose node was revoked, is not prepared.
+        db.execute(
+            "UPDATE mission_workspace SET state='cleanup_pending' WHERE id='workspace-b'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_mission_remote_workspace(&db, &auth),
+            Err(RpcErrorCode::NotFound)
+        );
+        db.execute(
+            "UPDATE mission_workspace SET state='ready' WHERE id='workspace-b'",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE execution_node SET revoked_at='revoked' WHERE node_id='node-b'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_mission_remote_workspace(&db, &auth),
+            Err(RpcErrorCode::NotFound)
+        );
+        // A Run outside this camp reads the same closed answer, never another Mission's row.
+        let mut foreign = auth.clone();
+        foreign.camp_id = "other".into();
+        assert_eq!(
+            resolve_mission_remote_workspace(&db, &foreign),
+            Err(RpcErrorCode::NotFound)
+        );
+    }
+
     #[test]
     fn actual_run_conversation_membership_and_ready_workspace_define_rpc_scope() {
         let (db, auth) = fixture();
@@ -197,6 +367,35 @@ mod tests {
         )
         .unwrap();
         revalidate_dispatch(&db, &dispatch).unwrap();
+        // The same mission workspace admits a write on the same scope, and the
+        // dispatch itself still refuses an escaping or unwritable target.
+        use base64::Engine as _;
+        let write = WorkspaceDispatch::new(
+            WorkspaceRequest {
+                version: RPC_VERSION,
+                request_id: "write".into(),
+                workspace_id: "workspace".into(),
+                timeout_ms: 5000,
+                operation: WorkspaceOperation::Write {
+                    path: "out/report.md".into(),
+                    data: base64::engine::general_purpose::STANDARD.encode(b"done"),
+                },
+            },
+            dispatch.scope.clone(),
+            "node-b".into(),
+            3,
+            1000,
+        )
+        .unwrap();
+        revalidate_dispatch(&db, &write).unwrap();
+        let escaping = WorkspaceRequest {
+            operation: WorkspaceOperation::Write {
+                path: "../outside.md".into(),
+                data: base64::engine::general_purpose::STANDARD.encode(b"done"),
+            },
+            ..write.request.clone()
+        };
+        assert_eq!(escaping.validate(), Err(RpcErrorCode::PathRejected));
         db.execute("UPDATE agent_run SET cancel_requested_at='requested'", [])
             .unwrap();
         assert_eq!(

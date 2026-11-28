@@ -298,6 +298,7 @@ const allowedMethods = new Set<CoreMethod>([
   'navigation.findThread',
   'navigation.campViewed',
   'missions.workspace.cleanup',
+  'missions.workspace.prepareRemote',
   'missions.cleanup.list',
   'missions.cleanup.retry',
   'missions.list',

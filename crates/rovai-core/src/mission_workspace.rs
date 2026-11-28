@@ -1752,6 +1752,26 @@ pub fn execution_directory(connection: &Connection, camp_id: &str) -> Result<Opt
     Ok(connection.query_row("SELECT w.working_directory FROM mission_workspace w JOIN mission m ON m.id=w.mission_id WHERE m.camp_id=?1 AND w.state='ready' AND w.execution_host_id=(SELECT id FROM mission_execution_host WHERE singleton=1) ORDER BY w.created_at,w.id LIMIT 1",[camp_id],|r|r.get(0)).optional()?)
 }
 
+/// The one execution workspace this Host owns for a Mission.
+///
+/// A Mission may also have ready rows on remote nodes. Those are other machines'
+/// worktrees: they are never this Host's execution directory, its cleanup target or
+/// its cleanup projection, so every local reader selects by the singleton local host
+/// first and lets a remote row sort wherever it likes.
+pub fn local_workspace(
+    connection: &Connection,
+    mission_id: &str,
+) -> Result<Option<MissionWorkspace>> {
+    let current_host: String = connection.query_row(
+        "SELECT id FROM mission_execution_host WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(load_workspaces(connection, mission_id)?
+        .into_iter()
+        .find(|workspace| workspace.execution_host_id == current_host))
+}
+
 pub fn workspace_in_use(connection: &Connection, workspace: &MissionWorkspace) -> Result<bool> {
     Ok(connection.query_row(
         "SELECT EXISTS(
@@ -1781,21 +1801,16 @@ pub fn cleanup_projection(
     mission_id: &str,
     camp_id: &str,
 ) -> Result<(bool, bool, bool, Option<MissionWorkspaceCleanupProjection>)> {
-    let workspaces = load_workspaces(connection, mission_id)?;
-    let Some(workspace) = workspaces.first() else {
+    // Only this Host's own row can be cleaned from here: a remote row is another
+    // machine's worktree and cannot hide the local one or borrow its projection.
+    let Some(workspace) = local_workspace(connection, mission_id)? else {
         return Ok((false, false, false, None));
     };
     let resources_present = workspace.managed_resources_remain();
-    let current_host: String = connection.query_row(
-        "SELECT id FROM mission_execution_host WHERE singleton=1",
-        [],
-        |row| row.get(0),
-    )?;
     let available = resources_present
-        && workspace.execution_host_id == current_host
         && workspace.camp_id == camp_id
         && workspace.state == "ready"
-        && !workspace_in_use(connection, workspace)?;
+        && !workspace_in_use(connection, &workspace)?;
     let cleanup = if workspace.cleanup_finished() {
         Some(MissionWorkspaceCleanupProjection {
             state: "cleaned".into(),
@@ -2819,5 +2834,117 @@ mod tests {
                     .starts_with("h ")
             );
         }
+    }
+
+    /// A Mission may be prepared on this Host and on remote Nodes at once. Every
+    /// local reader must select the local host's row even when the remote row sorts
+    /// first, so a remote workspace is never this Host's execution directory, cleanup
+    /// target or cleanup projection.
+    #[test]
+    fn local_readers_ignore_the_remote_row_that_sorts_first() {
+        use crate::collaboration::{CollaborationService, CreateThreadCommand};
+        use crate::command::{ActorRef, CommandEnvelope};
+        let (mut database, directory) = crate::test_support::seeded_runtime_database_fast();
+        let project = directory.join("workspace");
+        fs::create_dir_all(&project).unwrap();
+        let created = CollaborationService::default()
+            .create_camp(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "local-readers-host-scope".into(),
+                    actor: ActorRef::User {
+                        user_id: "local_user".into(),
+                    },
+                    camp_id: None,
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: CreateThreadCommand::for_test_with_members(
+                        project.to_string_lossy().into_owned(),
+                        &["agent_1"],
+                        "agent_1",
+                    ),
+                },
+            )
+            .unwrap();
+        let camp_id = created.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let connection = database.connection();
+        let local_host: String = connection
+            .query_row(
+                "SELECT id FROM mission_execution_host WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO mission(id,number,camp_id,title,description,status,created_at,updated_at)
+                 VALUES('mission_host_scope',1,?1,'Both hosts','','in_progress','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                [&camp_id],
+            )
+            .unwrap();
+        let insert = |id: &str, host: &str, worktree: &str, state: &str, diagnostic: Option<&str>,
+                      created_at: &str| {
+            connection
+                .execute(
+                    "INSERT INTO mission_workspace(
+                        id,mission_id,camp_id,execution_host_id,source_directory,repository_root,
+                        git_common_dir,worktree_path,working_directory,base_branch,branch,base_sha,
+                        preparation_token,preparation_kind,generation,state,diagnostic,
+                        created_at,updated_at
+                     ) VALUES(?1,'mission_host_scope',?2,?3,'/source','/source','/source/.git',
+                        ?4,?4,'main','rovai/mission/host_scope','base','token','create',1,?5,?6,?7,?7)",
+                    rusqlite::params![id, camp_id, host, worktree, state, diagnostic, created_at],
+                )
+                .unwrap();
+        };
+        // The remote row is the oldest row, so `load_workspaces(..).first()` is the
+        // remote one: a host-blind reader would answer with another machine's state.
+        insert(
+            "ws_remote",
+            "node_b",
+            "/srv/remote-worktree",
+            "cleanup_failed",
+            Some("remote failure"),
+            "2026-01-01T00:00:01Z",
+        );
+        insert(
+            "ws_local",
+            &local_host,
+            "/srv/local-worktree",
+            "ready",
+            None,
+            "2026-01-01T00:00:02Z",
+        );
+        let local = local_workspace(connection, "mission_host_scope")
+            .unwrap()
+            .expect("the local row is the one this Host owns");
+        assert_eq!(local.id, "ws_local");
+        assert_eq!(local.execution_host_id, local_host);
+        // The local row is ready and unowned by any run, so it is a cleanable target
+        // with no failure projection; the remote row's diagnostic must not leak here.
+        assert_eq!(
+            cleanup_projection(connection, "mission_host_scope", &camp_id).unwrap(),
+            (true, true, true, None)
+        );
+        assert_eq!(
+            execution_directory(connection, &camp_id).unwrap(),
+            Some("/srv/local-worktree".to_owned())
+        );
+        // With no local row at all there is nothing this Host may read or clean, even
+        // though the Mission still has a ready remote workspace.
+        connection
+            .execute("DELETE FROM mission_workspace WHERE id='ws_local'", [])
+            .unwrap();
+        assert!(local_workspace(connection, "mission_host_scope")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            cleanup_projection(connection, "mission_host_scope", &camp_id).unwrap(),
+            (false, false, false, None)
+        );
+        assert_eq!(execution_directory(connection, &camp_id).unwrap(), None);
     }
 }

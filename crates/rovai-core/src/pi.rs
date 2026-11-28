@@ -69,13 +69,20 @@ pub(crate) const MANAGED_WORKFLOW_TOOL_EXTENSION_NAME: &str = "managed-workflow-
 pub(crate) const MANAGED_WORKFLOW_CONTRACT_NAME: &str = "loom-workflow-contract.json";
 
 /// The native tool consumes the existing Core input contracts, never a second schema registry.
+/// The operation set and its order come from the transport owner above, so a bridged operation
+/// without a catalog schema, or a catalog schema outside the bridged set, cannot drift silently.
 pub(crate) fn managed_workflow_contract() -> Value {
-    let operations: Vec<Value> = crate::loom_tool::tool_definitions()
-        .into_iter()
-        .filter(|definition| definition["name"].as_str().is_some_and(crate::loom_tool::is_loom_tool))
-        .map(|definition| json!({
-            "operation": definition["name"], "inputSchema": definition["inputSchema"]
-        }))
+    let definitions = crate::team_tool_catalog::builtin_tool_definitions();
+    let operations: Vec<Value> = crate::builtin_tool_transport::MANAGED_WORKFLOW_OPERATIONS
+        .iter()
+        .filter_map(|operation| {
+            definitions
+                .iter()
+                .find(|definition| definition["name"].as_str() == Some(*operation))
+                .map(|definition| json!({
+                    "operation": operation, "inputSchema": definition["inputSchema"]
+                }))
+        })
         .collect();
     json!({"schemaVersion": 1, "operations": operations})
 }
@@ -1098,13 +1105,17 @@ mod managed_workflow_source_tests {
     use super::*;
 
     #[test]
-    fn workflow_tool_sources_agree_on_one_tool_name_and_the_ten_operations() {
+    fn workflow_tool_sources_agree_on_one_tool_name_and_the_managed_operations() {
         // One fixture owns the Node seam; its contents must remain the actual Core schemas.
         let fixture: Value = serde_json::from_str(include_str!(
             "../../../scripts/fixtures/pi-workflow/core-input-contract.json"
         )).unwrap();
         assert_eq!(managed_workflow_contract(), fixture);
-        assert_eq!(fixture["operations"].as_array().unwrap().len(), 10);
+        assert_eq!(
+            fixture["operations"].as_array().unwrap().len(),
+            crate::builtin_tool_transport::MANAGED_WORKFLOW_OPERATIONS.len()
+        );
+        assert_eq!(fixture["operations"].as_array().unwrap().len(), 14);
         // The name and the operation set live in three places that MUST agree: the Rust contract
         // (file_grant.rs / builtin_tool_transport.rs), the managed Host extension that registers the
         // tool, and the shared guard that re-checks every call. A drift here is a silent policy hole,

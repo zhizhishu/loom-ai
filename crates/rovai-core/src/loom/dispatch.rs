@@ -2547,11 +2547,11 @@ fn latest_instant(candidates: impl IntoIterator<Item = Option<String>>) -> Optio
 /// must be reconciled before anything is replayed.
 ///
 /// LOOM's external effects are the Remote Workspace operations one Run dispatched to a Node, and
-/// only a `Run` operation can change the workspace at all: `List` and `Read` carry no effect, so an
-/// in-flight one is ordinary work and never a reason to stop the executor. A `Run` whose receipt
-/// is genuinely unsettled is one that is explicitly `unknown`, one that is already cancelling (the
-/// cancel race means its process may still be running), or one that is still in flight past its own
-/// deadline. A `Run` inside its deadline is running normally, not uncertain.
+/// only `Run` and `Write` can change the workspace at all: `List` and `Read` carry no effect, so an
+/// in-flight one is ordinary work and never a reason to stop the executor. A `Run` or `Write`
+/// whose receipt is genuinely unsettled is one that is explicitly `unknown`, one that is already
+/// cancelling (the cancel race means its process may still be running), or one that is still in
+/// flight past its own deadline. One inside its deadline is running normally, not uncertain.
 fn watchdog_uncertain_effect(
     transaction: &Transaction<'_>,
     runs: &[(String, String)],
@@ -2592,6 +2592,7 @@ fn watchdog_uncertain_effect(
         let changes_workspace = matches!(
             dispatch.request.operation,
             loom_protocol::workspace_rpc::WorkspaceOperation::Run { .. }
+                | loom_protocol::workspace_rpc::WorkspaceOperation::Write { .. }
         );
         let settled = matches!(state, 4 | 5 | 6);
         if settled || !changes_workspace {
