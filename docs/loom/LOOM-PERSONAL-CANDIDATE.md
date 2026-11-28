@@ -54,6 +54,22 @@ last_updated: 2026-11-17
 
 打开“电脑”，先允许查看屏幕，需要输入时再点“接管电脑”。手动控制最长五分钟；离开页面、按 Esc 或点“归还控制”会停止。给助手的权限需要单独确认，截图会发送给该助手使用的模型。当前支持的助手运行方式为 Codex、Claude 和 DSH；Pi 的助手电脑工具仍需显式启用，保持原有边界。
 
+## 只装被控端（另一台机器当执行节点）
+
+**Windows：有独立小包。** CI 的 Windows workflow 会单独打一个 zip（见 `.github/workflows/loom-v2-e3-windows.yml` 的 "Package the standalone Windows Node kit"，产物名 `loom-node-windows-<提交>`）。包里恰好四个文件：`loom-node.exe`（外连 Server 的 `/api/v1/nodes/connect`，不监听任何入站端口）、`rovai.exe`（同一次构建的本地 CLI helper，缺它无法使用持久原生会话，不要与 `loom-node.exe` 拆开或混版）、`Connect-LoomNode.ps1` 和 `README.md`。配对流程：先在 Server 机器上运行 `rovai-server node-pair --data-dir <Server 数据目录>`，拿到一次性配对码和 `connect:` 地址；再到节点机 PowerShell 运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\Connect-LoomNode.ps1 -Server wss://<Server 地址>/api/v1/nodes/connect`，按提示粘贴配对码（不回显）。配对成功后凭据由 `loom-node` 自己写进 `<DataDir>\node.json`，之后重连只要再跑一次脚本，不再要配对码。配对码只从隐藏输入或标准输入第一行读取，交给节点时走标准输入，不进命令行历史、环境变量或日志。
+
+**Linux：没有独立小包。** Linux workflow 只出一个完整个人包（`loom-personal-preview-linux-<提交>`），`loom-node` 二进制在整包里，不是单独的节点包；仓库也没有 Linux 版连接脚本（`scripts/node/` 下只有 PowerShell 版）。现状只能装整包后从包目录里取 `loom-node` 使用。最小补法是照 Windows 的现成做法：在 Linux workflow 里加一个对称的打包步骤，四件套换成 `loom-node`、`rovai`、一个读标准输入配对码的等价 shell 脚本和 Linux 版说明；配对命令 `rovai-server node-pair` 三端共用，不需要动。
+
+**macOS：没有。** macOS 构建 workflow 只出签名的正式 App 产物，完全没有 `loom-node` 小包、连接脚本或节点说明，本手册不声称 macOS 节点可用。补法与 Linux 同构（照 Windows 四件套），前提是先有 macOS 的节点构建产物。
+
+## 云端模拟多用户（实现中，尚未可用）
+
+这一节描述的是已批准的设计与操作边界，实现中；在它落地并验收前，不要把它当作现有功能。
+
+设计是给 `rovai-web` 加一个侧车配置文件 `cloud-multiuser.json`：用配置文件在个人版里模拟多账号，文件里带种子用户，由 Owner 负责拉人加入，全程零迁移——不建新表、不改现有 schema、不动 Purge。参考口径是 Mikka 的 workspace 成员判定与 rakazo 的 scope 收窄做法（Mikka `lib/workspace-access.ts`、rakazo `packages/db/src/scope.ts`；这两个参考文件本地快照缺失，行号未核验，方向以已批口径为准）。
+
+操作边界：用户名单来自侧车文件，邀请与移除由 Owner 在界面内完成；模拟成员沿用现有的 Owner 身份、设备配对与授权检查，不因模拟而放宽任何边界；文件里只有用户与角色信息，不包含凭据，也不迁移日常数据。它是演示与验收多用户交互的本地模拟，不是正式的多租户实现。
+
 ## 可选 Pi Purge 扩展
 
 带有 `optionalPiPurgeVersion` 清单字段的新候选会在 `runtime/extensions/pi-purge/` 内附带固定 v0.3.0 的原始源码、许可证、闭包清单，以及 LOOM 受管适配器。已有旧候选可能没有此目录，以实际清单为准。
