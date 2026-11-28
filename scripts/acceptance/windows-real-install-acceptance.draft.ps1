@@ -284,6 +284,8 @@ function Get-Value($Object, [string]$Name) {
     return $null
 }
 
+function New-CommandId { return [Guid]::NewGuid().ToString() }
+
 function Use-RequestOrigin([string]$Origin) {
     $script:RequestOrigin = $Origin
 }
@@ -2312,11 +2314,12 @@ try {
         setByHarness = $false
         decisionOwner = 'installer (scripts/manage-loom-personal.ps1 Set-ClaudeRuntimeEnvironment)'
     }
-    Add-Result 'RUNTIME_SELECTION_ENV' 'PASS' (if ($null -ne $inheritedClaudeOptIn) {
-            "an inherited {0} was removed from the acceptance process; every child instance starts with it unset and only the installer may set it" -f $script:ClaudeRuntimeEnvName
-        } else {
-            "{0} was unset in the parent environment; every child instance starts with it unset and only the installer may set it" -f $script:ClaudeRuntimeEnvName
-        })
+    $runtimeSelectionEnvDetail = if ($null -ne $inheritedClaudeOptIn) {
+        "an inherited {0} was removed from the acceptance process; every child instance starts with it unset and only the installer may set it" -f $script:ClaudeRuntimeEnvName
+    } else {
+        "{0} was unset in the parent environment; every child instance starts with it unset and only the installer may set it" -f $script:ClaudeRuntimeEnvName
+    }
+    Add-Result 'RUNTIME_SELECTION_ENV' 'PASS' $runtimeSelectionEnvDetail
 
     if ($script:InstallOnly) {
         # Install-only mode never reads, requires or sets a provider credential, and it never
